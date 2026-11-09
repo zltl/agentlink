@@ -19,8 +19,8 @@ pub mod e2e;
 pub mod engine;
 pub mod error;
 pub mod extensions;
-pub mod grant;
 pub mod frame;
+pub mod grant;
 pub mod ice;
 pub mod identity;
 pub mod invite;
@@ -38,8 +38,8 @@ pub mod s3;
 pub mod sandbox;
 pub mod sparse;
 pub mod tls;
-pub mod turn;
 pub mod tunnel;
+pub mod turn;
 pub mod util;
 pub mod ws;
 
@@ -50,14 +50,13 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use extensions::{NodeExtension, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL};
+pub use grant::{resolve_e2e_policy, SignedGrant, OWNER_KEYS_FILE};
 pub use ice::{ice_attempts, stun_urls, stun_urls_from_env, IceAttempt, DEFAULT_STUN_URLS};
 pub use identity::Identity;
-pub use grant::{resolve_e2e_policy, SignedGrant, OWNER_KEYS_FILE};
-pub use invite::{decode_invite, encode_invite, Invite};
+pub use invite::{decode_invite, encode_invite, parse_join_text, Invite, JoinText};
 pub use node_pin::{observe as observe_node_pin, PinStatus};
 pub use operate_guide::{
-    decode_operate_guide, encode_operate_guide, operate_guide_url, OperateGuide,
-    OPERATE_GUIDE_KEYS,
+    decode_operate_guide, encode_operate_guide, operate_guide_url, OperateGuide, OPERATE_GUIDE_KEYS,
 };
 pub use permissions::{parse_access, NodePolicy};
 pub use protocol::{

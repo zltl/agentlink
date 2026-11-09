@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
-use agentlink_core::{config, Client, ClientSettings, Identity};
+use agentlink_core::{config, parse_join_text, Client, ClientSettings, Identity, JoinText};
 use agentlink_node::{save_node_config, write_status, LinkState, LinkStatus, NodeConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -32,8 +32,6 @@ pub const TRAY_CALLBACK: u32 = 0x8000 + 1;
 pub const TRAY_SHOW: u32 = 0x8000 + 2;
 pub const TRAY_QUIT: u32 = 0x8000 + 3;
 pub const TRAY_START: u32 = 0x8000 + 4;
-
-const INVITE_PREFIX: &str = "agentlink-invite:";
 
 #[derive(Clone, Debug)]
 pub struct TrayContext {
@@ -273,7 +271,10 @@ fn describe(
     // session (share/devices). Keep node-link detail when the relay already set one.
     let detail = if !link_detail.is_empty() {
         link_detail
-    } else if enrolled && account.user.as_deref().filter(|u| !u.is_empty()).is_none() && !account.has_token {
+    } else if enrolled
+        && account.user.as_deref().filter(|u| !u.is_empty()).is_none()
+        && !account.has_token
+    {
         "Sign in to manage shares and devices from this PC.".to_string()
     } else {
         String::new()
@@ -1234,15 +1235,13 @@ pub fn apply_pairing_text(
     name: Option<String>,
 ) -> Result<String> {
     let text = text.trim();
-    if text.is_empty() {
-        bail!("paste an invite from `agentlink pair`, or a pairing token");
-    }
-    let (invite, pairing_token) = if text.starts_with(INVITE_PREFIX) {
-        (Some(text.to_string()), None)
-    } else if text.chars().any(char::is_whitespace) {
-        bail!("that text is not an invite or a pairing token");
-    } else {
-        (None, Some(text.to_string()))
+    let joined = parse_join_text(text).map_err(|err| anyhow!(err.to_string()))?;
+    let (invite, pairing_token) = match joined {
+        JoinText::Absent => {
+            bail!("paste an invite from `agentlink pair`, or a pairing token");
+        }
+        JoinText::Invite(_) => (Some(text.to_string()), None),
+        JoinText::Token(token) => (None, Some(token)),
     };
     let config = node_cfg::load(NodeArgs {
         relay,
@@ -1419,7 +1418,7 @@ fn list_run_values() -> Result<Vec<RunValue>> {
                 Some(PWSTR(name_buf.as_mut_ptr())),
                 &mut name_len,
                 None,
-                Some(&mut kind.0),  // windows 0.61 RegEnumValueW lpType is *mut u32
+                Some(&mut kind.0), // windows 0.61 RegEnumValueW lpType is *mut u32
                 Some(data.as_mut_ptr()),
                 Some(&mut data_len),
             );
@@ -1704,11 +1703,13 @@ mod tests {
     fn apply_invite_writes_node_json_without_printing_the_token() {
         std::env::set_var("AGENTLINK_DESKTOP", "mock");
         let dir = tempfile::tempdir().unwrap();
+        let token = "cd".repeat(32);
+        let pin = format!("sha256:{}", "ab".repeat(32));
         let invite = agentlink_core::encode_invite(&agentlink_core::Invite {
             relay: "wss://relay.example:7443".into(),
-            fingerprint: "sha256:ab".into(),
+            fingerprint: pin.clone(),
             trust: None,
-            token: "super-secret-token".into(),
+            token: token.clone(),
             name: "box".into(),
         })
         .unwrap();
@@ -1716,10 +1717,10 @@ mod tests {
         assert_eq!(name, "box");
         let text = std::fs::read_to_string(dir.path().join("node.json")).unwrap();
         assert!(text.contains("wss://relay.example:7443"), "{text}");
-        assert!(text.contains("super-secret-token"), "{text}");
-        assert!(text.contains("sha256:ab"), "{text}");
+        assert!(text.contains(&token), "{text}");
+        assert!(text.contains(&pin), "{text}");
         let plan = autostart_plan(Path::new(r"C:\agentlink\agentlink.exe"), dir.path());
-        assert!(!plan.contains("super-secret-token"), "{plan}");
+        assert!(!plan.contains(&token), "{plan}");
         assert!(plan.contains("HKCU\\"), "{plan}");
         assert!(plan.contains("tray --background"), "{plan}");
         assert_eq!(
@@ -1730,6 +1731,26 @@ mod tests {
             .as_deref(),
             Some("tray")
         );
+    }
+
+    #[test]
+    fn short_and_damaged_invites_do_not_write_node_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let short = apply_pairing_text(dir.path(), "123", None, None, None, None).unwrap_err();
+        assert!(short.to_string().contains("too short"), "{short}");
+        let empty = apply_pairing_text(dir.path(), "   ", None, None, None, None).unwrap_err();
+        assert!(empty.to_string().contains("paste an invite"), "{empty}");
+        let damaged = apply_pairing_text(
+            dir.path(),
+            "agentlink-invite:v1:%%%",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(damaged.to_string().contains("damaged"), "{damaged}");
+        assert!(!dir.path().join("node.json").exists());
     }
 
     fn probe_commands() -> (String, String, PathBuf) {

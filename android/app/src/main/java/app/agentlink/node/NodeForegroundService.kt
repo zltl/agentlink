@@ -18,6 +18,8 @@ import app.agentlink.MainActivity
 import app.agentlink.R
 import app.agentlink.model.auditRecord
 import app.agentlink.model.ceilingOf
+import app.agentlink.model.jsonString
+import app.agentlink.model.resolveJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import uniffi.agentlink_ffi.MobileNode
 import uniffi.agentlink_ffi.NodeOptions
@@ -69,8 +71,9 @@ class NodeForegroundService : Service() {
         if (projection != null && resultCode == android.app.Activity.RESULT_OK) {
             NodeRuntime.capture.attach(this, resultCode, projection)
         }
-        if (NodeRuntime.current() == null) {
-            startNode()
+        if (NodeRuntime.current() == null && !startNode()) {
+            stopSelf()
+            return START_NOT_STICKY
         }
         return START_STICKY
     }
@@ -80,13 +83,18 @@ class NodeForegroundService : Service() {
         super.onDestroy()
     }
 
-    private fun startNode() {
+    private fun startNode(): Boolean {
         val setup = ConsentStore(this).load()
         if (setup == null || !setup.choices.appStorage) {
             NodeRuntime.status.value = "{\"state\":\"fatal\",\"detail\":\"app storage was not allowed\"}"
-            stopSelf()
-            return
+            return false
         }
+        val resolved = resolveJoin(setup.relay, setup.fingerprint, setup.token, setup.name)
+            .getOrElse { err ->
+                val detail = jsonString(err.message ?: "invite was refused")
+                NodeRuntime.status.value = "{\"state\":\"fatal\",\"detail\":$detail}"
+                return false
+            }
         val ceiling = ceilingOf(setup.choices)
         val dataDir = File(noBackupFilesDir, "node")
         val filesDir = File(filesDir, "shared")
@@ -118,14 +126,14 @@ class NodeForegroundService : Service() {
             },
         )
         val options = NodeOptions(
-            relayUrl = setup.relay,
-            fingerprint = setup.fingerprint,
+            relayUrl = resolved.relay,
+            fingerprint = resolved.fingerprint,
             dataDir = dataDir.absolutePath,
             filesDir = filesDir.absolutePath,
             cacheDir = cacheDir.absolutePath,
             storageDir = storage,
-            name = setup.name.ifBlank { Build.MODEL ?: "android" },
-            pairingToken = setup.token,
+            name = resolved.name.ifBlank { setup.name.ifBlank { Build.MODEL ?: "android" } },
+            pairingToken = resolved.token,
             hostname = Build.MODEL ?: "android",
             arch = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64",
             version = BuildConfig.VERSION_NAME,
@@ -137,13 +145,14 @@ class NodeForegroundService : Service() {
             allowRemoteView = ceiling.allowRemoteView,
             allowRemoteControl = ceiling.allowRemoteControl,
         )
-        try {
+        return try {
             val node = MobileNode.start(options, host!!)
             NodeRuntime.bind(node)
+            true
         } catch (err: Exception) {
-            val detail = app.agentlink.model.jsonString(err.message ?: "start failed")
+            val detail = jsonString(err.message ?: "start failed")
             NodeRuntime.status.value = "{\"state\":\"fatal\",\"detail\":$detail}"
-            stopSelf()
+            false
         }
     }
 

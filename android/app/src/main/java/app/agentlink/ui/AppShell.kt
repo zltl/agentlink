@@ -77,8 +77,7 @@ import app.agentlink.bridge.MachineRow
 import app.agentlink.model.ConsentChoices
 import app.agentlink.model.ConsentStep
 import app.agentlink.model.consentSteps
-import app.agentlink.model.fingerprintProblem
-import app.agentlink.model.relayProblem
+import app.agentlink.model.resolveJoin
 import app.agentlink.node.ConsentStore
 import app.agentlink.node.NodeForegroundService
 import app.agentlink.node.NodeRuntime
@@ -561,16 +560,20 @@ internal fun AppShell(
                 )
             }
             composable(Routes.Setup) {
-                val problem = relayProblem(relay) ?: fingerprintProblem(fingerprint)
+                val problem = resolveJoin(relay, fingerprint, token, name).exceptionOrNull()?.message
                 SetupFields(
                     relay, fingerprint, token, name,
                     { relay = it }, { fingerprint = it }, { token = it }, { name = it },
                     onContinue = {
-                        if (problem == null) {
-                            step = ConsentStep.Notifications
-                            choices = ConsentChoices()
-                            nav.navigate(Routes.Consent)
-                        }
+                        val resolved = resolveJoin(relay, fingerprint, token, name).getOrNull()
+                            ?: return@SetupFields
+                        relay = resolved.relay
+                        fingerprint = resolved.fingerprint
+                        token = resolved.token
+                        name = resolved.name
+                        step = ConsentStep.Notifications
+                        choices = ConsentChoices()
+                        nav.navigate(Routes.Consent)
                     },
                     problem = problem,
                 )

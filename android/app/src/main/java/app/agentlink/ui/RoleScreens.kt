@@ -146,13 +146,13 @@ fun SetupFields(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("Pair this phone", style = MaterialTheme.typography.headlineMedium)
-        SupportingText("Paste the enrollment token. Enter the relay URL; nothing is selected for you.")
+        SupportingText("Paste an invite, or leave it empty if this phone is already enrolled. A short or damaged invite stays on this screen.")
         AgentField(
             token,
             onToken,
-            "Pairing token",
+            "Invite",
             Modifier.fillMaxWidth(),
-            supporting = "From the install command or the phone QR code.",
+            supporting = "From agentlink pair. A 64-character pairing token also works. This does not grant control.",
             placeholder = "Optional if this phone is already enrolled",
             keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None),
         )
