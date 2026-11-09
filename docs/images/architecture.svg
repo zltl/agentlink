@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="250" viewBox="0 0 960 250" role="img" aria-labelledby="archTitle archDesc">
+  <title id="archTitle">agentlink architecture</title>
+  <desc id="archDesc">The CLI and MCP server share one client library. That library and each node dial the relay over outbound WebSocket TLS. The relay is the only process that listens.</desc>
+  <style>
+    :root { color-scheme: light dark; }
+    .card { fill: #f4f7fb; stroke: #1f4e79; stroke-width: 1.6; }
+    .label { fill: #142033; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 16px; font-weight: 650; }
+    .sub { fill: #3d4d63; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; }
+    .arrow { stroke: #1f4e79; fill: none; stroke-width: 1.8; }
+    .head { fill: #1f4e79; }
+    @media (prefers-color-scheme: dark) {
+      .card { fill: #182230; stroke: #9ec1de; }
+      .label { fill: #e8eef6; }
+      .sub { fill: #b7c6d6; }
+      .arrow { stroke: #9ec1de; }
+      .head { fill: #9ec1de; }
+    }
+  </style>
+  <defs>
+    <marker id="arch-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="head"/>
+    </marker>
+  </defs>
+
+  <rect class="card" x="24" y="32" width="168" height="68" rx="10"/>
+  <text class="label" x="108" y="62" text-anchor="middle">agentlink CLI</text>
+  <text class="sub" x="108" y="82" text-anchor="middle">terminal</text>
+
+  <rect class="card" x="24" y="150" width="168" height="68" rx="10"/>
+  <text class="label" x="108" y="180" text-anchor="middle">agentlink mcp</text>
+  <text class="sub" x="108" y="200" text-anchor="middle">stdio tools</text>
+
+  <rect class="card" x="280" y="84" width="188" height="82" rx="10"/>
+  <text class="label" x="374" y="120" text-anchor="middle">shared client</text>
+  <text class="sub" x="374" y="142" text-anchor="middle">one library, two shells</text>
+
+  <rect class="card" x="560" y="72" width="176" height="106" rx="10"/>
+  <text class="label" x="648" y="112" text-anchor="middle">relay</text>
+  <text class="sub" x="648" y="134" text-anchor="middle">only listener</text>
+  <text class="sub" x="648" y="152" text-anchor="middle">enrollment and routes</text>
+
+  <rect class="card" x="812" y="84" width="124" height="82" rx="10"/>
+  <text class="label" x="874" y="120" text-anchor="middle">node</text>
+  <text class="sub" x="874" y="142" text-anchor="middle">one per machine</text>
+
+  <path class="arrow" marker-end="url(#arch-arrow)" d="M192 66 C 230 66, 244 108, 280 112"/>
+  <path class="arrow" marker-end="url(#arch-arrow)" d="M192 184 C 230 184, 244 146, 280 140"/>
+  <path class="arrow" marker-end="url(#arch-arrow)" d="M468 125 H 560"/>
+  <text class="sub" x="514" y="116" text-anchor="middle">WSS, pinned cert</text>
+  <path class="arrow" marker-end="url(#arch-arrow)" d="M812 125 H 736"/>
+  <text class="sub" x="774" y="116" text-anchor="middle">WSS, outbound</text>
+</svg>

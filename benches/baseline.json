@@ -1,0 +1,6 @@
+{
+  "frame_roundtrip_mib_s": 1495.0,
+  "blake3_mib_s": 7890.4,
+  "delta_plan_mib_s": 395.2,
+  "zstd_roundtrip_mib_s": 3609.7
+}

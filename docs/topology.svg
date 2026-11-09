@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="220" viewBox="0 0 760 220" role="img" aria-label="agentlink topology">
+  <title>agentlink topology</title>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; fill: #1c1917; }
+    .box { fill: #faf7f2; stroke: #44403c; stroke-width: 1.5; }
+    .relay { fill: #1c1917; }
+    .relay-text { fill: #faf7f2; font-weight: 650; }
+    .line { stroke: #44403c; stroke-width: 1.5; fill: none; }
+    .label { font-size: 12px; fill: #57534e; }
+  </style>
+  <rect class="box" x="24" y="28" width="180" height="48" rx="8"/>
+  <text x="114" y="57" text-anchor="middle">agentlink CLI</text>
+  <rect class="box" x="24" y="132" width="180" height="48" rx="8"/>
+  <text x="114" y="161" text-anchor="middle">agentlink mcp</text>
+  <rect class="box" x="280" y="80" width="200" height="48" rx="8"/>
+  <text x="380" y="109" text-anchor="middle">shared client library</text>
+  <rect class="box relay" x="556" y="80" width="180" height="48" rx="8"/>
+  <text class="relay-text" x="646" y="109" text-anchor="middle">agentlink relay</text>
+  <path class="line" d="M204 52 H250 V104 H280"/>
+  <path class="line" d="M204 156 H250 V104 H280"/>
+  <path class="line" d="M480 104 H556"/>
+  <text class="label" x="500" y="96" text-anchor="middle">WSS, pinned cert</text>
+  <rect class="box" x="556" y="168" width="180" height="40" rx="8"/>
+  <text x="646" y="193" text-anchor="middle">agentlink node</text>
+  <path class="line" d="M646 208 V216 H500 V128 H556"/>
+  <text class="label" x="470" y="176">WSS, outbound</text>
+</svg>

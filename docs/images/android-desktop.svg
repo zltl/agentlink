@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="260" viewBox="0 0 960 260" role="img" aria-labelledby="deskTitle deskDesc">
+  <title id="deskTitle">Remote view touch mapping</title>
+  <desc id="deskDesc">The client shows a letterboxed screenshot. A touch inside the image becomes a normalized tap or swipe. Live WebRTC is not in this build, so the view stays on screenshots.</desc>
+  <style>
+    :root { color-scheme: light dark; }
+    .card { fill: #f4f7fb; stroke: #1f4e79; stroke-width: 1.6; }
+    .shot { fill: #d7e4f2; stroke: #1f4e79; stroke-width: 1.4; }
+    .label { fill: #142033; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 16px; font-weight: 650; }
+    .sub { fill: #3d4d63; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; }
+    .arrow { stroke: #1f4e79; fill: none; stroke-width: 1.8; }
+    .head { fill: #1f4e79; }
+    @media (prefers-color-scheme: dark) {
+      .card { fill: #182230; stroke: #9ec1de; }
+      .shot { fill: #243246; stroke: #9ec1de; }
+      .label { fill: #e8eef6; }
+      .sub { fill: #b7c6d6; }
+      .arrow { stroke: #9ec1de; }
+      .head { fill: #9ec1de; }
+    }
+  </style>
+  <defs>
+    <marker id="desk-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="head"/>
+    </marker>
+  </defs>
+  <rect class="card" x="24" y="36" width="220" height="188" rx="10"/>
+  <text class="label" x="134" y="64" text-anchor="middle">Client view</text>
+  <rect class="shot" x="74" y="84" width="120" height="110" rx="4"/>
+  <circle cx="134" cy="140" r="5" class="head"/>
+  <text class="sub" x="134" y="210" text-anchor="middle">letterboxed JPEG</text>
+  <path class="arrow" marker-end="url(#desk-arrow)" d="M250 130 H360"/>
+  <text class="sub" x="305" y="118" text-anchor="middle">0..1</text>
+  <rect class="card" x="360" y="48" width="250" height="150" rx="10"/>
+  <text class="label" x="485" y="84" text-anchor="middle">inject_input</text>
+  <text class="sub" x="485" y="110" text-anchor="middle">tap, swipe, type, global</text>
+  <text class="sub" x="485" y="130" text-anchor="middle">UI tree, click element</text>
+  <text class="sub" x="485" y="150" text-anchor="middle">audited like any other op</text>
+  <rect class="card" x="680" y="48" width="250" height="150" rx="10"/>
+  <text class="label" x="805" y="84" text-anchor="middle">Phone node</text>
+  <text class="sub" x="805" y="110" text-anchor="middle">MediaProjection JPEG</text>
+  <text class="sub" x="805" y="130" text-anchor="middle">AccessibilityService</text>
+  <text class="sub" x="805" y="160" text-anchor="middle">webrtc_signal: use screenshots</text>
+  <path class="arrow" marker-end="url(#desk-arrow)" d="M610 120 H680"/>
+</svg>

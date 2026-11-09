@@ -1,0 +1,20 @@
+# Fast-transfer paths.
+# transfer.svg is the themed rendering committed for the README.
+# `d2 transfer.d2` regenerates a structural draft.
+
+direction: right
+
+Client: client
+Relay: relay
+Node: node
+
+Client -> Relay: "JSON control + binary frames"
+Relay -> Node: "JSON control + binary frames"
+Client -> Node: "QUIC, pinned keys" {
+  style.stroke-dash: 5
+}
+
+skip: BLAKE3 skip
+delta: block delta
+zstd: zstd chunks
+tar: directory tar

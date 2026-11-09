@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">agentlink</string>
+    <string name="accessibility_description">agentlink uses this service only after you allow it, to tap, swipe, type, run global actions, and read the on-screen UI tree for a paired client. Every action is written to the node audit log.</string>
+</resources>

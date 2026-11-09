@@ -1,0 +1,78 @@
+[package]
+name = "agentlink-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "agentlink CLI, node, relay, and MCP server"
+
+[[bin]]
+name = "agentlink"
+path = "src/main.rs"
+
+[dependencies]
+agentlink-core.workspace = true
+agentlink-relay.workspace = true
+agentlink-node.workspace = true
+agentlink-desktop.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64.workspace = true
+hostname.workspace = true
+toml.workspace = true
+crossterm.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+sha2.workspace = true
+url.workspace = true
+uuid.workspace = true
+tar.workspace = true
+blake2 = "0.10"
+flate2 = { version = "1.0.35", default-features = false, features = ["rust_backend"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+webpki-roots = "0.26"
+sysinfo.workspace = true
+tempfile.workspace = true
+
+# The controller window is glibc Linux, macOS, and Windows. Musl release
+# archives stay headless so the static link does not pull a GUI toolkit.
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+agentlink-view.workspace = true
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+openh264 = "0.8"
+
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+ksni = "0.3.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winres = "0.1"
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

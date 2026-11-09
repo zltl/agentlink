@@ -1,0 +1,23 @@
+# Optional listener for a zero-downtime relay restart.
+#
+# The service unit also binds 0.0.0.0:7443 with SO_REUSEPORT, so this socket
+# is not required. When it is enabled, systemd keeps the listening socket
+# across `systemctl restart agentlink-relay` and passes it as fd 3.
+#
+#   sudo cp deploy/agentlink-relay.socket /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now agentlink-relay.socket
+#
+# Do not enable the socket and also publish the same port from another
+# process. The relay prefers the inherited fd and does not bind a second time.
+
+[Unit]
+Description=agentlink relay socket
+
+[Socket]
+ListenStream=7443
+BindIPv6Only=both
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,2571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#fbf3ea">
+<title>agentlink</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='2' y='2' width='60' height='60' rx='18' fill='%23241814'/%3E%3Crect x='6' y='6' width='52' height='52' rx='16' fill='%23fffaf4'/%3E%3Cpath d='M24 40c-6 2-10 8-8 14' fill='none' stroke='%2368c0c0' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M30 42c-2 7-1 12 2 16' fill='none' stroke='%2368c0c0' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M38 42c3 7 6 11 4 16' fill='none' stroke='%2368c0c0' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M22 34c-6-6-6-12-1-16' fill='none' stroke='%2368c0c0' stroke-width='5' stroke-linecap='round'/%3E%3Cellipse cx='36' cy='30' rx='13' ry='11' fill='%2368c0c0' stroke='%23241814' stroke-width='2'/%3E%3Cellipse cx='31' cy='28' rx='3.4' ry='4' fill='%23fff' stroke='%23241814' stroke-width='1.2'/%3E%3Cellipse cx='41' cy='28' rx='3.4' ry='4' fill='%23fff' stroke='%23241814' stroke-width='1.2'/%3E%3Ccircle cx='31.4' cy='27' r='1.3' fill='%23241814'/%3E%3Ccircle cx='41.6' cy='26.6' r='1.3' fill='%23241814'/%3E%3Cellipse cx='36' cy='35' rx='2.4' ry='3.2' fill='%23f08a8c' stroke='%23241814' stroke-width='1'/%3E%3Cpath d='M45 31c.6 2 .4 3.4-.2 4.6a1.4 1.4 0 1 1-2 0c0-1.2.6-2.6 1.4-4.6z' fill='%23f7fbff' stroke='%23241814' stroke-width='.8'/%3E%3Ccircle cx='18' cy='16' r='4.2' fill='none' stroke='%23dfe3e6' stroke-width='2'/%3E%3C/svg%3E">
+<style>
+  /* Sticker palette sampled from the octopus mark and the sguala icon:
+     body #68c0c0, mouth #f08a8c, fur #f0b898 / #fbc7a5, tail #481562, contour #241814.
+     The field is warm paper so the stickers sit on a desk, not a dark ink panel. */
+  :root {
+    color-scheme: light;
+    --paper: #fbf3ea;
+    --card: #fffdfb;
+    --field: #fffdfb;
+    --ink: #241814;
+    --muted: #6a5146;
+    --cyan: #68c0c0;
+    --cyan-deep: #0e3f42;
+    --cyan-soft: #d7f4f3;
+    --peach: #f0b898;
+    --fur: #fbc7a5;
+    --tail: #481562;
+    --lilac-soft: #f3e6f8;
+    --mouth: #f08a8c;
+    --mouth-ink: #8a3040;
+    --mouth-soft: #fde8e6;
+    --danger-fill: #f7c9cb;
+    --offline-bg: #f6eadf;
+    --offline-ink: #5c463c;
+    --pending-ink: #4a215f;
+    --shadow: 4px 4px 0 var(--ink);
+    --shadow-sm: 3px 3px 0 var(--ink);
+    --radius: 28px;
+    --radius-sm: 16px;
+    --tap: 48px;
+    --font: ui-rounded, "SF Pro Rounded", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", "WenQuanYi Micro Hei", "Droid Sans Fallback", ui-sans-serif, system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Noto Sans Mono", "WenQuanYi Micro Hei Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html {
+    margin: 0;
+    min-height: 100%;
+    font-size: 16px;
+    overflow-x: clip;
+    background: var(--paper);
+    color-scheme: light;
+    -webkit-text-size-adjust: 100%;
+    scrollbar-color: #d7c4b4 var(--paper);
+  }
+  body {
+    margin: 0;
+    min-height: 100%;
+    min-height: 100dvh;
+    overflow-x: clip;
+    background-color: var(--paper);
+    background-image:
+      radial-gradient(880px 420px at -12% -18%, rgba(251, 199, 165, 0.72), transparent 62%),
+      radial-gradient(720px 380px at 112% -12%, rgba(104, 192, 192, 0.38), transparent 58%),
+      radial-gradient(540px 320px at 88% 112%, rgba(72, 21, 98, 0.10), transparent 62%);
+    color: var(--ink);
+    font: 1rem/1.55 var(--font);
+    text-rendering: optimizeLegibility;
+  }
+  button, input, select, textarea { font: inherit; font-size: 1rem; color: inherit; }
+  button, a, summary, input, select, textarea { touch-action: manipulation; }
+  button { cursor: pointer; }
+  a { color: var(--cyan-deep); font-weight: 700; text-underline-offset: 3px; }
+  ::selection { background: var(--cyan); color: var(--ink); }
+  :focus-visible {
+    outline: 3px solid var(--cyan-deep);
+    outline-offset: 3px;
+  }
+  .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+  .shell {
+    width: min(100%, 1120px);
+    margin: 0 auto;
+    padding:
+      max(14px, env(safe-area-inset-top))
+      max(16px, env(safe-area-inset-right))
+      max(32px, env(safe-area-inset-bottom))
+      max(16px, env(safe-area-inset-left));
+  }
+  .top {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .brand {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    min-height: var(--tap);
+    min-width: 0;
+    color: inherit;
+    text-decoration: none;
+  }
+  .brand strong {
+    display: block;
+    font-size: 1.28rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    line-height: 1.15;
+  }
+  .brand em {
+    display: block;
+    margin-top: 2px;
+    font-style: normal;
+    color: var(--muted);
+    font-size: 0.92rem;
+    font-weight: 700;
+    line-height: 1.3;
+  }
+  .mark, .login-mark, .empty-mark { display: block; flex: none; }
+  .mark { width: 56px; height: 56px; }
+  .login-mark {
+    width: min(148px, 42vw);
+    height: auto;
+    margin: 2px auto 2px;
+  }
+  .empty-mark { width: 88px; height: 88px; }
+  .top-actions {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+  .top-actions .btn,
+  .top-actions button,
+  .top-actions .who {
+    width: auto;
+    flex: 0 1 auto;
+  }
+  .who {
+    align-self: center;
+    max-width: 100%;
+    color: var(--ink);
+    background: var(--card);
+    border: 2px solid var(--ink);
+    border-radius: 999px;
+    box-shadow: 2px 2px 0 var(--ink);
+    padding: 8px 14px;
+    font-weight: 800;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+  }
+  .card, .machine, .token {
+    background: var(--card);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    min-width: 0;
+  }
+  .login-card {
+    width: min(100%, 440px);
+    margin: 8px auto 0;
+    padding: 22px 18px 20px;
+  }
+  .login-card h1 {
+    margin: 8px 0 6px;
+    font-size: clamp(1.85rem, 1.45rem + 1.5vw, 2.25rem);
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    line-height: 1.15;
+    text-align: center;
+  }
+  .login-card .muted {
+    text-align: center;
+    max-width: 34em;
+    margin-inline: auto;
+  }
+  form, .stack { display: grid; gap: 14px; }
+  label {
+    display: grid;
+    gap: 6px;
+    color: var(--ink);
+    font-size: 0.95rem;
+    font-weight: 800;
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 0.86rem;
+    font-weight: 700;
+    line-height: 1.35;
+  }
+  .field { display: flex; gap: 8px; align-items: stretch; min-width: 0; }
+  .field input { flex: 1 1 auto; min-width: 0; }
+  .field button { flex: 0 0 auto; width: auto; min-width: 4.75rem; padding-inline: 14px; }
+  input, select, textarea {
+    width: 100%;
+    max-width: 100%;
+    min-height: var(--tap);
+    background-color: var(--field);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    caret-color: var(--cyan-deep);
+    accent-color: var(--cyan-deep);
+  }
+  select {
+    appearance: none;
+    padding-right: 42px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%23241814' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    background-size: 14px 14px;
+  }
+  input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+  input:-webkit-autofill {
+    -webkit-text-fill-color: var(--ink);
+    box-shadow: 0 0 0 1000px var(--field) inset;
+  }
+  textarea {
+    min-height: 7.5rem;
+    height: auto;
+    resize: vertical;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: 0.92rem/1.5 var(--mono);
+    background: #fff;
+  }
+  button, .btn {
+    border: 2px solid var(--ink);
+    border-radius: var(--radius-sm);
+    padding: 12px 16px;
+    min-height: var(--tap);
+    background: var(--peach);
+    color: var(--ink);
+    font-weight: 800;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    line-height: 1.2;
+    box-shadow: var(--shadow-sm);
+    -webkit-tap-highlight-color: rgba(104, 192, 192, 0.35);
+  }
+  button.ghost, a.ghost {
+    background: var(--card);
+    color: var(--ink);
+    border-color: var(--ink);
+    font-weight: 700;
+    box-shadow: var(--shadow-sm);
+  }
+  button.danger {
+    background: var(--danger-fill);
+    color: var(--mouth-ink);
+    border-color: var(--ink);
+    box-shadow: var(--shadow-sm);
+  }
+  button:active, .btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--ink); }
+  button[disabled] { opacity: 0.55; cursor: progress; transform: none; }
+  .workspace { display: grid; gap: 26px; min-width: 0; }
+  .section { margin: 0; min-width: 0; }
+  .section-head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 4px;
+  }
+  .section-head .ghost { width: auto; padding-inline: 16px; }
+  h2 {
+    margin: 0;
+    font-size: clamp(1.35rem, 1.15rem + 0.7vw, 1.6rem);
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+  }
+  .muted { color: var(--muted); margin: 6px 0 0; }
+  .muted:empty { display: none; }
+  .error {
+    color: var(--mouth-ink);
+    background: var(--mouth-soft);
+    border: 2px solid var(--mouth-ink);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    margin: 0;
+    font-weight: 700;
+    overflow-wrap: anywhere;
+  }
+  .error:empty { display: none; }
+  .cards { display: grid; gap: 14px; margin-top: 12px; min-width: 0; align-items: stretch; }
+  .machine, .token {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    height: 100%;
+    padding: 16px;
+  }
+  .machine > *, .token > * { min-width: 0; max-width: 100%; }
+  .machine h3, .token strong {
+    margin: 0;
+    font-size: 1.12rem;
+    font-weight: 800;
+    line-height: 1.3;
+    letter-spacing: -0.02em;
+    overflow-wrap: anywhere;
+  }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    border: 2px solid var(--ink);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: 0.82rem;
+    font-weight: 800;
+    line-height: 1.35;
+    background: var(--offline-bg);
+    color: var(--offline-ink);
+  }
+  .pill.online { background: var(--cyan); color: var(--ink); }
+  .pill.offline { background: var(--offline-bg); color: var(--offline-ink); }
+  .pill.access { background: var(--fur); color: var(--ink); }
+  .pill.pending { background: var(--lilac-soft); color: var(--pending-ink); }
+  .pill.revoked, .pill.expired, .pill.used { background: var(--danger-fill); color: var(--mouth-ink); }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: flex-start;
+    justify-content: space-between;
+  }
+  .token .row { width: 100%; }
+  .token strong { flex: 1 1 8rem; min-width: 0; }
+  .row .pills { margin-top: 0; }
+  .facts {
+    display: block;
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.95rem;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+  .facts span { overflow-wrap: anywhere; }
+  .machine > button, .token > button { width: 100%; margin-top: auto; }
+  .segment { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .segment button {
+    width: 100%;
+    padding-inline: 8px;
+    background: var(--card);
+    color: var(--ink);
+    border-color: var(--ink);
+    box-shadow: var(--shadow-sm);
+    font-weight: 700;
+  }
+  .segment button[aria-pressed="true"] {
+    background: var(--cyan);
+    color: var(--ink);
+    border-color: var(--ink);
+    box-shadow: var(--shadow-sm);
+  }
+  .segment button[aria-pressed="false"] {
+    background: var(--card);
+    color: var(--ink);
+  }
+  .enroll {
+    padding: 28px 16px 16px;
+    background-color: var(--card);
+    background-image:
+      linear-gradient(var(--peach), var(--peach)),
+      linear-gradient(var(--tail), var(--tail)),
+      linear-gradient(var(--cyan), var(--cyan));
+    background-repeat: no-repeat;
+    background-size: 48% 12px, 24% 12px, 100% 12px;
+    background-position: left top, right top, left top;
+  }
+  .enroll > .muted { margin-top: 8px; }
+  .enroll a { display: inline-flex; align-items: center; min-height: 44px; }
+  #access-hint {
+    margin: 0;
+    padding: 10px 12px;
+    border: 2px solid var(--ink);
+    border-radius: 14px;
+    background: var(--cyan-soft);
+    color: var(--ink);
+    font-weight: 700;
+  }
+  #access-hint:empty { display: none; }
+  .grid-2 { display: grid; gap: 14px; }
+  #enroll-out {
+    display: grid;
+    gap: 12px;
+    margin-top: 2px;
+    padding-top: 14px;
+    border-top: 2px dashed rgba(36, 24, 20, 0.45);
+  }
+  details {
+    background: var(--paper);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius-sm);
+    padding: 0 14px 12px;
+  }
+  summary {
+    min-height: var(--tap);
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    font-weight: 800;
+  }
+  #qr { display: flex; justify-content: center; margin-top: 8px; }
+  #qr svg, #qr img {
+    width: min(220px, 100%);
+    height: auto;
+    background: #fff;
+    border: 2px solid var(--ink);
+    border-radius: var(--radius-sm);
+    padding: 8px;
+  }
+  .empty, .empty-note, .loading-card {
+    margin: 0;
+    padding: 22px 16px;
+    border: 2px dashed var(--ink);
+    border-radius: var(--radius);
+    color: var(--muted);
+    background: rgba(255, 253, 251, 0.72);
+    box-shadow: none;
+  }
+  .empty {
+    display: grid;
+    justify-items: center;
+    gap: 8px;
+    text-align: center;
+    color: var(--ink);
+  }
+  .empty p { margin: 0; max-width: 36ch; color: var(--muted); }
+  .loading-card {
+    display: grid;
+    place-items: center;
+    min-height: 112px;
+    text-align: center;
+    font-weight: 700;
+  }
+  .card-error { margin-top: 4px; }
+  .actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: auto;
+  }
+  .actions button {
+    width: 100%;
+    padding-inline: 6px;
+    font-size: 0.92rem;
+  }
+  .actions.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .actions.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .actions button.is-blocked {
+    background: var(--offline-bg);
+    color: var(--offline-ink);
+    box-shadow: none;
+  }
+  .pill.view-only {
+    height: 24px;
+    padding: 0 10px 0 6px;
+    gap: 4px;
+    background: var(--cyan-soft);
+    color: var(--ink);
+    box-shadow: none;
+    font-size: 0.78rem;
+  }
+  .pill.view-only svg { width: 14px; height: 14px; flex: none; }
+  .actions button .spin {
+    width: 16px;
+    height: 16px;
+    margin-right: 6px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    flex: none;
+  }
+  @media (max-width: 359px) {
+    .actions:not(.two) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .actions:not(.two) button[data-action="desktop"] { grid-column: 1 / -1; }
+  }
+  body.in-session .top,
+  body.in-session #app-view { display: none; }
+  body.in-session {
+    height: 100dvh;
+    overflow: hidden;
+  }
+  body.in-session .shell {
+    width: min(100%, 1120px);
+    height: 100dvh;
+    max-height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+  }
+  body.in-session main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .session {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+    min-width: 0;
+  }
+  #term-pane, #files-pane {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .session-bar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    min-width: 0;
+  }
+  .session-bar h2 {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .session-bar .ghost { width: auto; flex: none; }
+  .session-status { margin: 0; }
+  .term-screen {
+    flex: 1 1 0px;
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    touch-action: pan-x pan-y;
+    background: var(--ink);
+    color: var(--cyan-soft);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+    padding: 10px 12px;
+    font: 14px/1.35 var(--mono);
+    cursor: text;
+    scrollbar-color: var(--cyan) var(--ink);
+    -webkit-overflow-scrolling: touch;
+  }
+  .term-screen * { touch-action: pan-x pan-y; }
+  .term-line { white-space: pre; min-height: 1.35em; }
+  .term-cursor {
+    background: var(--cyan);
+    color: var(--ink);
+  }
+  .term-probe {
+    position: absolute;
+    visibility: hidden;
+    pointer-events: none;
+    font: 14px/1.35 var(--mono);
+  }
+  .composer, .path-form, .file-tools {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    min-width: 0;
+  }
+  .composer input, .path-form input { flex: 1 1 auto; min-width: 0; }
+  .composer button, .path-form button, .file-tools button { width: auto; flex: 0 0 auto; }
+  .composer button[aria-pressed="true"] { background: var(--cyan); }
+  .file-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    display: grid;
+    gap: 8px;
+    align-content: start;
+    -webkit-overflow-scrolling: touch;
+  }
+  .file-tools { flex-wrap: wrap; }
+  .file-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    padding: 0;
+  }
+  .file-row > button:first-child {
+    flex: 1 1 auto;
+    justify-content: space-between;
+    text-align: left;
+  }
+  .file-row .name {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-weight: 800;
+  }
+  .file-row .size {
+    color: var(--muted);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    flex: none;
+  }
+  .file-editor {
+    flex: 1 1 auto;
+    min-height: 160px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .file-editor textarea {
+    flex: 1 1 auto;
+    min-height: 0;
+    font: 0.92rem/1.45 var(--mono);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .term-cursor { outline: 2px solid var(--cyan); background: transparent; color: inherit; }
+  }
+  body:has(#login-view:not([hidden])) .shell {
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+  body:has(#login-view:not([hidden])) main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  body:has(#login-view:not([hidden])) .login-card {
+    margin-top: 4px;
+    margin-bottom: 8px;
+  }
+  @media (min-width: 640px) {
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .login-card { padding: 28px 26px 24px; }
+  }
+  @media (min-width: 720px) {
+    .top {
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 22px;
+    }
+    .top-actions { justify-content: flex-end; width: auto; }
+  }
+  @media (min-width: 800px) {
+    .shell {
+      padding-top: max(22px, env(safe-area-inset-top));
+      padding-left: max(28px, env(safe-area-inset-left));
+      padding-right: max(28px, env(safe-area-inset-right));
+    }
+  }
+  @media (min-width: 900px) {
+    .workspace {
+      grid-template-columns: minmax(0, 1fr) minmax(320px, 400px);
+      grid-template-areas:
+        "machines enroll"
+        "tokens enroll";
+      align-items: start;
+      column-gap: 22px;
+      row-gap: 26px;
+    }
+    .machines { grid-area: machines; }
+    .tokens { grid-area: tokens; }
+    .enroll {
+      grid-area: enroll;
+      position: sticky;
+      top: max(16px, env(safe-area-inset-top));
+      max-height: calc(100vh - 32px);
+      max-height: calc(100dvh - 32px);
+      overflow: auto;
+    }
+    .cards { grid-template-columns: 1fr 1fr; }
+  }
+  @media (min-width: 900px) and (max-width: 1180px) {
+    .cards { grid-template-columns: 1fr; }
+  }
+  @media (hover: hover) and (prefers-reduced-motion: no-preference) {
+    button:hover, .btn:hover { transform: translate(-1px, -1px); box-shadow: 5px 5px 0 var(--ink); }
+    button:active, .btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--ink); }
+    .actions button.is-blocked:hover {
+      transform: none;
+      box-shadow: none;
+    }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .login-mark { animation: bob 3.2s ease-in-out infinite alternate; }
+    button, .btn { transition: transform 120ms ease, box-shadow 120ms ease; }
+    .actions button .spin { animation: spin 0.8s linear infinite; }
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes bob {
+    from { transform: translateY(0) rotate(-2deg); }
+    to { transform: translateY(-6px) rotate(2deg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .login-mark, .actions button .spin { animation: none; }
+    button, .btn { transition: none; }
+    html { scroll-behavior: auto; }
+  }
+  @media (prefers-contrast: more) {
+    .card, .machine, .token, button, .btn, input, select, textarea, .pill, .who, details {
+      border-width: 3px;
+    }
+  }
+</style>
+</head>
+<body>
+<svg class="sprite" viewBox="0 0 128 128" aria-hidden="true">
+  <symbol id="octopus" viewBox="0 0 128 128">
+    <rect x="2" y="2" width="124" height="124" rx="38" fill="#241814"/>
+    <rect x="7" y="7" width="114" height="114" rx="34" fill="#fffaf4"/>
+    <g fill="none" stroke-linecap="round">
+      <g stroke="#241814" stroke-width="16">
+        <path d="M56 72 C40 80, 32 94, 40 108"/>
+        <path d="M64 76 C56 92, 54 102, 62 110"/>
+        <path d="M74 78 C74 96, 78 104, 84 110"/>
+        <path d="M86 74 C98 86, 104 96, 96 108"/>
+        <path d="M94 66 C106 72, 108 84, 100 96"/>
+        <path d="M52 66 C38 56, 34 46, 42 36"/>
+      </g>
+      <g stroke="#68c0c0" stroke-width="11">
+        <path d="M56 72 C40 80, 32 94, 40 108"/>
+        <path d="M64 76 C56 92, 54 102, 62 110"/>
+        <path d="M74 78 C74 96, 78 104, 84 110"/>
+        <path d="M86 74 C98 86, 104 96, 96 108"/>
+        <path d="M94 66 C106 72, 108 84, 100 96"/>
+        <path d="M52 66 C38 56, 34 46, 42 36"/>
+      </g>
+      <g stroke="#e7f7f6" stroke-width="3.2">
+        <path d="M56 76 C44 84, 38 96, 44 106"/>
+        <path d="M66 82 C60 94, 60 102, 66 108"/>
+        <path d="M76 84 C78 96, 80 104, 84 108"/>
+        <path d="M86 78 C96 88, 100 96, 96 104"/>
+      </g>
+    </g>
+    <path d="M74 32c16 0 30 12 30 28 0 14-10 26-24 28-16 2-32-8-34-24-2-16 12-32 28-32z" fill="#68c0c0" stroke="#241814" stroke-width="3" stroke-linejoin="round"/>
+    <ellipse cx="78" cy="66" rx="15" ry="10" fill="#9ed9d6"/>
+    <ellipse cx="64" cy="52" rx="9" ry="11" fill="#fff" stroke="#241814" stroke-width="2.2"/>
+    <ellipse cx="88" cy="52" rx="9" ry="11" fill="#fff" stroke="#241814" stroke-width="2.2"/>
+    <circle cx="65" cy="50" r="3" fill="#241814"/>
+    <circle cx="89.5" cy="49" r="3" fill="#241814"/>
+    <circle cx="63.8" cy="48.4" r="1.1" fill="#fff"/>
+    <circle cx="88.2" cy="47.4" r="1.1" fill="#fff"/>
+    <path d="M97 58c1.6 4.2 2.2 7.2.8 10.2a3.3 3.3 0 1 1-4.6-.2c-.2-2.8.8-6.2 2.4-10z" fill="#f7fbff" stroke="#241814" stroke-width="1.5" stroke-linejoin="round"/>
+    <ellipse cx="76" cy="68" rx="6.5" ry="8.2" fill="#f08a8c" stroke="#241814" stroke-width="2"/>
+    <ellipse cx="76" cy="69.5" rx="3.4" ry="4.4" fill="#e06d78"/>
+    <g stroke="#241814" stroke-width="2.3">
+      <circle cx="40" cy="32" r="8" fill="#dfe3e6"/>
+      <circle cx="40" cy="32" r="4.1" fill="#fffaf4" stroke="#9aa3ab" stroke-width="1.4"/>
+      <circle cx="51" cy="23" r="8" fill="#eceff1"/>
+      <circle cx="51" cy="23" r="4.1" fill="#fffaf4" stroke="#9aa3ab" stroke-width="1.4"/>
+    </g>
+  </symbol>
+</svg>
+<template id="empty-mark">
+  <svg class="empty-mark" width="80" height="80" viewBox="0 0 128 128" aria-hidden="true"><use href="#octopus"/></svg>
+</template>
+<div class="shell">
+  <header class="top">
+    <a class="brand" href="/">
+      <svg class="mark" width="56" height="56" viewBox="0 0 128 128" aria-hidden="true"><use href="#octopus"/></svg>
+      <span>
+        <strong>agentlink</strong>
+        <em>your machines</em>
+      </span>
+    </a>
+    <div class="top-actions" id="session-bar" hidden>
+      <span class="who" id="session-user"></span>
+      <a class="ghost btn" href="/download/agentlink.apk">Android app</a>
+      <button class="ghost" id="logout-btn" type="button">Log out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="login-view" class="card login-card">
+      <svg class="login-mark" width="132" height="132" viewBox="0 0 128 128" aria-hidden="true"><use href="#octopus"/></svg>
+      <h1>Sign in</h1>
+      <p class="muted">Same account as the Android app.</p>
+      <form id="login-form">
+        <label>Username
+          <input id="login-user" name="username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Account name" required>
+          <span class="hint">The name you use on the relay.</span>
+        </label>
+        <label>Password
+          <span class="field">
+            <input id="login-pass" name="password" type="password" autocomplete="current-password" required>
+            <button id="toggle-pass" type="button" class="ghost" aria-pressed="false" aria-controls="login-pass">Show</button>
+          </span>
+          <span class="hint">Password for that account.</span>
+        </label>
+        <label id="login-totp-field" hidden>Authenticator code
+          <input id="login-totp" name="totp" inputmode="numeric" autocomplete="one-time-code" autocapitalize="none" placeholder="6-digit code">
+          <span class="hint">The server asked for this code.</span>
+        </label>
+        <button id="login-btn" type="submit">Log in</button>
+        <p id="login-status" class="error" role="alert"></p>
+      </form>
+      <noscript><p class="error">This page needs JavaScript to sign in.</p></noscript>
+    </section>
+
+    <div id="app-view" class="workspace" hidden>
+      <section class="section machines">
+        <div class="section-head">
+          <h2 id="machines-title" tabindex="-1">Machines</h2>
+          <button class="ghost" id="refresh-btn" type="button">Refresh</button>
+        </div>
+        <p id="machine-meta" class="muted" role="status"></p>
+        <p id="trust-note" class="error" role="alert" hidden></p>
+        <p class="muted">Node ids are pinned in this browser after the first visit. A name that changes id is a different key. A CA-only relay certificate does not pin that mapping. The CLI uses AGENTLINK_RELAY_PIN for an optional SPKI or leaf pin.</p>
+        <p id="list-error" class="error" role="alert"></p>
+        <div id="node-list" class="cards"></div>
+      </section>
+
+      <section class="section card enroll">
+        <h2>Enroll a machine</h2>
+        <p class="muted">Creates a token and one command. On the new machine that command downloads agentlink, installs it, starts it, and signs it in.</p>
+        <div class="stack">
+          <label>Name
+            <input id="machine-name" placeholder="laptop" autocomplete="off" autocapitalize="words">
+          </label>
+          <label>Minutes
+            <input id="machine-ttl" type="number" inputmode="numeric" min="1" max="10080" value="15">
+          </label>
+          <p id="access-note" class="muted">Signing in as the owner or an admin is full access: shell, files, and remote desktop. No preset to pick.</p>
+          <label>Uses
+            <input id="machine-uses" type="number" inputmode="numeric" min="1" max="1000" value="1">
+          </label>
+          <button id="machine-add" type="button">Create install command</button>
+          <p id="enroll-error" class="error" role="alert"></p>
+          <div id="enroll-out" hidden>
+            <div class="segment" role="group" aria-label="Install command platform">
+              <button type="button" id="platform-unix" data-platform="unix" aria-pressed="true">Linux / macOS</button>
+              <button type="button" id="platform-windows" data-platform="windows" aria-pressed="false">Windows</button>
+            </div>
+            <label>Install command
+              <textarea id="install-command" readonly spellcheck="false"></textarea>
+            </label>
+            <button id="copy-command" type="button">Copy command</button>
+            <p id="enroll-note" class="muted"></p>
+            <details>
+              <summary>Phone instead</summary>
+              <p class="muted">Install the app, then scan this code. It carries the same enrollment token.</p>
+              <p><a href="/download/agentlink.apk">Download agentlink.apk</a></p>
+              <div id="qr"></div>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <section class="section tokens">
+        <h2>Enrollment tokens</h2>
+        <div id="token-list" class="cards"></div>
+      </section>
+    </div>
+
+    <section id="session-view" class="session" hidden>
+      <div class="session-bar">
+        <button class="ghost" id="session-back" type="button">Machines</button>
+        <h2 id="session-title">Session</h2>
+      </div>
+      <p id="session-status" class="muted session-status" role="status"></p>
+      <p id="session-error" class="error" role="alert"></p>
+
+      <div id="term-pane" hidden>
+        <div id="term-screen" class="term-screen" tabindex="0" role="log" aria-label="Terminal"></div>
+        <span id="term-probe" class="term-probe" aria-hidden="true">M</span>
+        <div class="composer">
+          <button id="term-ctrl" type="button" aria-pressed="false">Ctrl</button>
+          <input id="term-input" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="send" aria-label="Terminal input">
+        </div>
+      </div>
+
+      <div id="files-pane" hidden>
+        <form id="path-form" class="path-form">
+          <input id="path-input" aria-label="Remote path" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off">
+          <button type="submit">Go</button>
+        </form>
+        <div class="file-tools">
+          <button class="ghost" id="file-up" type="button">Up</button>
+          <button class="ghost" id="file-refresh" type="button">Refresh</button>
+          <button class="ghost" id="file-mkdir" type="button">New folder</button>
+          <button id="file-upload" type="button">Upload</button>
+          <input id="file-pick" type="file" hidden>
+        </div>
+        <form id="mkdir-form" class="path-form" hidden>
+          <input id="mkdir-name" aria-label="Folder name" placeholder="folder name" autocomplete="off">
+          <button type="submit">Create</button>
+        </form>
+        <p id="file-progress" class="muted" role="status"></p>
+        <div id="file-list" class="file-list"></div>
+        <div id="file-editor" class="file-editor" hidden>
+          <p id="editor-path" class="facts"></p>
+          <textarea id="editor-text" spellcheck="false" aria-label="File contents"></textarea>
+          <div class="file-tools">
+            <button class="ghost" id="editor-close" type="button">Close file</button>
+            <button id="editor-save" type="button">Save</button>
+            <button class="ghost" id="editor-download" type="button">Download</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+(function () {
+  let source = null;
+  let poll = 0;
+  let issued = null;
+  let restoredFocus = false;
+  const ZH = (navigator.language || "").toLowerCase().startsWith("zh");
+  const COPY = {
+    en: {
+      "card.desktop": "Desktop",
+      "card.viewOnly": "View only",
+      "card.headless": "Headless",
+      "card.headlessNote": "Headless · shell & files only.",
+      "card.screenshotsOnly": "Screenshots only · no live screen.",
+      "card.screenNoAccess": "Screen detected · desktop access is off.",
+      "card.noAccessUnknown": "Desktop access is off.",
+      "card.offline": "Offline · last seen {time}.",
+      "card.opening": "Opening…",
+      "card.forbidden": "Desktop is off for this account.",
+      "card.rate": "Too many attempts. Try again in {seconds}s.",
+      "card.error": "Couldn't open the desktop.",
+      "card.terminal": "Terminal",
+      "card.files": "Files",
+      "card.guide": "Guide",
+      "card.guideCopied": "Copied",
+      "aria.guide": "Open the documentation-only guide for {node}.",
+      "aria.desktop": "Open desktop for {node}. Starts watching."
+    },
+    zh: {
+      "card.desktop": "桌面",
+      "card.viewOnly": "仅观看",
+      "card.headless": "无屏幕",
+      "card.headlessNote": "无屏幕 · 仅终端和文件。",
+      "card.screenshotsOnly": "仅支持截图，没有实时画面。",
+      "card.screenNoAccess": "检测到屏幕 · 桌面访问未开启。",
+      "card.noAccessUnknown": "桌面访问未开启。",
+      "card.offline": "离线 · 最后在线 {time}。",
+      "card.opening": "正在打开…",
+      "card.forbidden": "此账号未开启桌面。",
+      "card.rate": "尝试次数过多，请 {seconds} 秒后再试。",
+      "card.error": "无法打开桌面。",
+      "card.terminal": "终端",
+      "card.files": "文件",
+      "card.guide": "指南",
+      "card.guideCopied": "已复制",
+      "aria.guide": "打开 {node} 的使用指南（仅文档）。",
+      "aria.desktop": "打开 {node} 的桌面。进入观看。"
+    }
+  };
+  function t(key, vars) {
+    let text = (ZH ? COPY.zh : COPY.en)[key] || COPY.en[key] || key;
+    if (vars) {
+      Object.keys(vars).forEach((name) => {
+        text = text.split("{" + name + "}").join(String(vars[name]));
+      });
+    }
+    return text;
+  }
+  if (ZH) document.documentElement.lang = "zh-Hans";
+  let platform = "unix";
+
+  function csrf() {
+    const match = document.cookie.match(/(?:^|; )agentlink_csrf=([^;]*)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+  async function api(path, opts) {
+    const options = opts || {};
+    options.credentials = "same-origin";
+    options.headers = Object.assign({ "x-csrf-token": csrf() }, options.headers || {});
+    const response = await fetch(path, options);
+    const text = await response.text();
+    if (response.status === 401 && path !== "/auth/login") {
+      showLogin();
+      throw new Error("session expired");
+    }
+    if (!response.ok) {
+      const err = new Error(text || response.statusText || "request failed");
+      err.status = response.status;
+      const retry = Number(response.headers.get("retry-after"));
+      if (retry) err.retryAfter = retry;
+      throw err;
+    }
+    return text ? JSON.parse(text) : {};
+  }
+  function lastSeen(unix) {
+    if (!unix) return "never seen";
+    const then = new Date(unix * 1000);
+    const sec = Math.round((Date.now() - then.getTime()) / 1000);
+    let rel = then.toLocaleString();
+    if (sec < 45) rel = "just now";
+    else if (sec < 3600) rel = Math.floor(sec / 60) + "m ago";
+    else if (sec < 86400) rel = Math.floor(sec / 3600) + "h ago";
+    else if (sec < 14 * 86400) rel = Math.floor(sec / 86400) + "d ago";
+    return rel;
+  }
+  function pill(text, kind) {
+    const span = document.createElement("span");
+    span.className = "pill" + (kind ? " " + kind : "");
+    span.textContent = text;
+    return span;
+  }
+  function reveal(el) {
+    if (!el || !el.scrollIntoView) return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollIntoView({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
+  }
+  function showListError(err) {
+    const meta = document.getElementById("machine-meta");
+    if (meta.textContent === "Loading machines…") meta.textContent = "";
+    document.getElementById("list-error").textContent = String((err && err.message) || err || "Could not load machines.");
+  }
+  function loadingCard() {
+    const card = document.createElement("div");
+    card.className = "loading-card";
+    card.setAttribute("role", "status");
+    card.textContent = "Loading machines…";
+    return card;
+  }
+  function emptyMachines() {
+    const box = document.createElement("div");
+    box.className = "empty";
+    const tpl = document.getElementById("empty-mark");
+    if (tpl) box.appendChild(tpl.content.cloneNode(true));
+    const text = document.createElement("p");
+    text.textContent = "No machines yet. Create an install command and run it on the new machine.";
+    box.appendChild(text);
+    return box;
+  }
+  function cardError(parent, message, detail) {
+    let note = parent.querySelector(".card-error");
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "error card-error";
+      note.setAttribute("role", "alert");
+      parent.appendChild(note);
+    }
+    note.replaceChildren(document.createTextNode(message));
+    if (detail && detail !== message) {
+      const more = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = ZH ? "详情" : "Details";
+      const raw = document.createElement("span");
+      raw.textContent = detail;
+      more.append(summary, raw);
+      note.appendChild(document.createTextNode(" "));
+      note.appendChild(more);
+    }
+    reveal(note);
+  }
+  function render(data) {
+    document.getElementById("list-error").textContent = "";
+    const nodes = document.getElementById("node-list");
+    nodes.replaceChildren();
+    const list = data.nodes || [];
+    document.getElementById("machine-meta").textContent = list.length
+      ? list.length + (list.length === 1 ? " machine" : " machines")
+      : "";
+    if (!list.length) nodes.appendChild(emptyMachines());
+    noteNodePins(list);
+    list.forEach((item) => {
+      const card = document.createElement("article");
+      card.className = "machine";
+      const title = document.createElement("h3");
+      title.textContent = item.name || item.id;
+      const pills = document.createElement("div");
+      pills.className = "pills";
+      card.dataset.node = item.id || "";
+      pills.appendChild(pill(item.online ? "online" : "offline", item.online ? "online" : "offline"));
+      if (item.has_display === false) pills.appendChild(pill(t("card.headless")));
+      if (item.relation && item.relation !== "owner") pills.appendChild(pill(item.relation));
+      const facts = document.createElement("p");
+      facts.className = "facts";
+      const os = [item.os, item.arch].filter(Boolean).join(" · ") || "os unknown";
+      const host = item.hostname ? " · " + item.hostname : "";
+      const seen = document.createElement("span");
+      seen.textContent = os + host;
+      const when = document.createElement("span");
+      when.textContent = "Last seen " + lastSeen(item.last_seen_unix);
+      if (item.last_seen_unix) when.title = new Date(item.last_seen_unix * 1000).toLocaleString();
+      facts.appendChild(seen);
+      facts.appendChild(document.createElement("br"));
+      facts.appendChild(when);
+      const screenNote = displayNote(item);
+      if (screenNote) {
+        const note = document.createElement("span");
+        note.textContent = screenNote;
+        facts.appendChild(document.createElement("br"));
+        facts.appendChild(note);
+      }
+      if (!item.online) {
+        const off = document.createElement("span");
+        off.textContent = t("card.offline", { time: lastSeen(item.last_seen_unix) });
+        facts.appendChild(document.createElement("br"));
+        facts.appendChild(off);
+      }
+      if (item.owner && item.relation !== "owner") {
+        const owner = document.createElement("span");
+        owner.textContent = "Owner " + item.owner;
+        facts.appendChild(document.createElement("br"));
+        facts.appendChild(owner);
+      }
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      actions.append(
+        actionButton(card, "terminal", t("card.terminal"), terminalState(item), () => openSession("terminal", item)),
+        actionButton(card, "files", t("card.files"), filesState(item), () => openSession("files", item))
+      );
+      if (showDesktop(item)) {
+        actions.appendChild(actionButton(card, "desktop", t("card.desktop"), desktopState(item), (button) => openDesktop(card, item, button)));
+        actions.classList.add("four");
+      }
+      actions.appendChild(actionButton(card, "guide", t("card.guide"), { enabled: true, reason: t("aria.guide", { node: item.name || item.id }) }, (button) => openGuide(item, button)));
+      card.append(title, pills, facts, actions);
+      nodes.appendChild(card);
+    });
+    const tokens = document.getElementById("token-list");
+    tokens.replaceChildren();
+    const rows = data.tokens || [];
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty-note";
+      empty.textContent = "No enrollment tokens.";
+      tokens.appendChild(empty);
+      return;
+    }
+    rows.forEach((item) => {
+      const card = document.createElement("article");
+      card.className = "token";
+      const head = document.createElement("div");
+      head.className = "row";
+      const title = document.createElement("strong");
+      title.textContent = item.name || item.id;
+      const pills = document.createElement("div");
+      pills.className = "pills";
+      pills.appendChild(pill(item.state || "pending", item.state || "pending"));
+      head.append(title, pills);
+      const facts = document.createElement("p");
+      facts.className = "facts";
+      const uses = (item.uses_remaining ?? "?") + " / " + (item.max_uses ?? "?") + " uses left";
+      const exp = item.expires_unix ? " · expires " + new Date(item.expires_unix * 1000).toLocaleString() : "";
+      facts.textContent = uses + exp;
+      card.append(head, facts);
+      if (item.state === "pending") {
+        const revoke = document.createElement("button");
+        revoke.type = "button";
+        revoke.className = "danger";
+        revoke.textContent = "Revoke";
+        revoke.addEventListener("click", async () => {
+          revoke.disabled = true;
+          const old = card.querySelector(".card-error");
+          if (old) old.remove();
+          try {
+            await api("/api/tokens/revoke", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ id: item.id })
+            });
+            await refresh();
+          } catch (err) {
+            revoke.disabled = false;
+            cardError(card, String(err.message || err));
+          }
+        });
+        card.appendChild(revoke);
+      }
+      tokens.appendChild(card);
+    });
+  }
+  async function refresh() {
+    const button = document.getElementById("refresh-btn");
+    const list = document.getElementById("node-list");
+    const meta = document.getElementById("machine-meta");
+    button.disabled = true;
+    list.setAttribute("aria-busy", "true");
+    const firstLoad = list.childElementCount === 0;
+    if (firstLoad) {
+      meta.textContent = "Loading machines…";
+      list.replaceChildren(loadingCard());
+    }
+    try {
+      render(await api("/api/nodes"));
+      meta.dataset.updated = "1";
+      if (!restoredFocus) {
+        restoredFocus = true;
+        restoreDashboardFocus();
+      }
+    } catch (err) {
+      if (firstLoad) {
+        list.replaceChildren();
+        if (meta.textContent === "Loading machines…") meta.textContent = "";
+      }
+      showListError(err);
+    } finally {
+      button.disabled = false;
+      list.removeAttribute("aria-busy");
+    }
+  }
+  function stopLive() {
+    if (source) { source.close(); source = null; }
+    if (poll) { clearInterval(poll); poll = 0; }
+  }
+  function listen() {
+    stopLive();
+    poll = setInterval(() => {
+      if (!document.hidden) refresh();
+    }, 8000);
+    source = new EventSource("/view/events");
+    source.onmessage = (ev) => {
+      try { render(JSON.parse(ev.data)); } catch (err) {}
+    };
+    source.onerror = () => {
+      if (source) source.close();
+      source = null;
+    };
+  }
+  function showLogin() {
+    stopLive();
+    if (document.body.classList.contains("in-session")) closeSession(true);
+    document.getElementById("login-view").hidden = false;
+    document.getElementById("app-view").hidden = true;
+    document.getElementById("session-bar").hidden = true;
+  }
+  async function showApp(user) {
+    document.getElementById("login-view").hidden = true;
+    document.getElementById("app-view").hidden = false;
+    document.getElementById("session-bar").hidden = false;
+    document.getElementById("session-user").textContent = user;
+    document.getElementById("login-pass").value = "";
+    document.getElementById("login-totp").value = "";
+    document.getElementById("login-totp-field").hidden = true;
+    document.getElementById("login-status").textContent = "";
+    await refresh();
+    listen();
+  }
+  function showCommand() {
+    if (!issued) return;
+    const box = document.getElementById("install-command");
+    box.value = platform === "windows" ? issued.windows : issued.command;
+    document.getElementById("platform-unix").setAttribute("aria-pressed", platform === "unix" ? "true" : "false");
+    document.getElementById("platform-windows").setAttribute("aria-pressed", platform === "windows" ? "true" : "false");
+  }
+  document.getElementById("toggle-pass").addEventListener("click", () => {
+    const input = document.getElementById("login-pass");
+    const button = document.getElementById("toggle-pass");
+    const show = input.type === "password";
+    input.type = show ? "text" : "password";
+    button.textContent = show ? "Hide" : "Show";
+    button.setAttribute("aria-pressed", show ? "true" : "false");
+    input.focus();
+  });
+  document.getElementById("login-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const status = document.getElementById("login-status");
+    const button = document.getElementById("login-btn");
+    status.textContent = "";
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = "Signing in…";
+    try {
+      const session = await api("/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("login-user").value,
+          password: document.getElementById("login-pass").value,
+          totp: document.getElementById("login-totp").value
+        })
+      });
+      await showApp(session.user + (session.role === "admin" ? " · admin" : ""));
+    } catch (err) {
+      const raw = String(err.message || err);
+      const lower = raw.toLowerCase();
+      if (lower.indexOf("totp") >= 0) {
+        document.getElementById("login-totp-field").hidden = false;
+        document.getElementById("login-totp").focus();
+        status.textContent = lower.indexOf("invalid") >= 0
+          ? "That authenticator code was not accepted."
+          : "This account needs the 6-digit authenticator code.";
+      } else {
+        status.textContent = raw;
+      }
+      reveal(status);
+    } finally {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      button.textContent = "Log in";
+    }
+  });
+  document.getElementById("logout-btn").addEventListener("click", async () => {
+    const status = document.getElementById("login-status");
+    try {
+      await api("/auth/logout", { method: "POST" });
+      showLogin();
+    } catch (err) {
+      status.textContent = String(err.message || err);
+      showLogin();
+    }
+  });
+  document.getElementById("refresh-btn").addEventListener("click", () => {
+    refresh();
+  });
+  document.querySelectorAll("[data-platform]").forEach((button) => {
+    button.addEventListener("click", () => {
+      platform = button.getAttribute("data-platform");
+      showCommand();
+    });
+  });
+  document.getElementById("copy-command").addEventListener("click", async () => {
+    const value = document.getElementById("install-command").value;
+    const button = document.getElementById("copy-command");
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const area = document.createElement("textarea");
+        area.value = value;
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand("copy");
+        area.remove();
+      }
+      button.textContent = "Copied";
+      setTimeout(() => { button.textContent = "Copy command"; }, 1600);
+    } catch (err) {
+      button.textContent = "Copy failed";
+    }
+  });
+  document.getElementById("machine-add").addEventListener("click", async () => {
+    const error = document.getElementById("enroll-error");
+    const button = document.getElementById("machine-add");
+    error.textContent = "";
+    const name = document.getElementById("machine-name").value.trim();
+    if (!name) {
+      error.textContent = "Name the machine first.";
+      document.getElementById("machine-name").focus();
+      reveal(error);
+      return;
+    }
+    button.disabled = true;
+    try {
+      issued = await api("/api/tokens", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: name,
+          access: "full",
+          ttl_secs: Number(document.getElementById("machine-ttl").value || 15) * 60,
+          uses: Number(document.getElementById("machine-uses").value || 1)
+        })
+      });
+      const out = document.getElementById("enroll-out");
+      out.hidden = false;
+      showCommand();
+      const when = issued.expires_unix ? new Date(issued.expires_unix * 1000).toLocaleString() : "";
+      const trust = issued.trust ? " Trust " + issued.trust + "." : "";
+      document.getElementById("enroll-note").textContent =
+        "Connects to " + (issued.relay || "the relay") + "." + trust +
+        " Expires " + when + ". " + (issued.uses || 1) + " use" + (issued.uses === 1 ? "" : "s") + ".";
+      const qr = document.getElementById("qr");
+      qr.replaceChildren();
+      if (issued.qr_svg) {
+        const holder = document.createElement("div");
+        holder.innerHTML = issued.qr_svg;
+        qr.appendChild(holder);
+      }
+      reveal(out);
+      if (window.matchMedia("(min-width: 800px)").matches) {
+        document.getElementById("install-command").focus();
+      }
+      await refresh();
+    } catch (err) {
+      error.textContent = String(err.message || err);
+      reveal(error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  const FILE_CHUNK = 256 * 1024;
+  const FILE_LIMIT = 64 * 1024 * 1024;
+  const routes = new Map();
+  let socket = null;
+  let socketWait = null;
+  let pingTimer = 0;
+  let sessionItem = null;
+  let pty = null;
+  let term = null;
+  let filePath = ".";
+  let pushed = false;
+  let ctrlArmed = false;
+  let composing = false;
+
+  function offlineReason(item) {
+    return t("card.offline", { time: lastSeen(item.last_seen_unix) });
+  }
+  function showDesktop(item) {
+    return item.has_display !== false;
+  }
+  function viewOnlyBadge() {
+    const span = document.createElement("span");
+    span.className = "pill view-only";
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("aria-hidden", "true");
+    const eye = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    eye.setAttribute("d", "M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12z");
+    eye.setAttribute("fill", "none");
+    eye.setAttribute("stroke", "currentColor");
+    eye.setAttribute("stroke-width", "2");
+    const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    dot.setAttribute("cx", "12");
+    dot.setAttribute("cy", "12");
+    dot.setAttribute("r", "2.5");
+    dot.setAttribute("fill", "currentColor");
+    icon.append(eye, dot);
+    span.append(icon, document.createTextNode(t("card.viewOnly")));
+    return span;
+  }
+  function terminalState(item) {
+    if (!item.online) return { enabled: false, reason: offlineReason(item) };
+    return { enabled: true, reason: "Open a shell on this machine" };
+  }
+  function filesState(item) {
+    if (!item.online) return { enabled: false, reason: offlineReason(item) };
+    return { enabled: true, reason: "Browse, upload, and download" };
+  }
+  function displayNote(item) {
+    if (item.has_display === false) return t("card.headlessNote");
+    return "";
+  }
+  function desktopState(item) {
+    const name = item.name || item.id;
+    if (!item.online) return { enabled: false, reason: offlineReason(item) };
+    return { enabled: true, reason: t("aria.desktop", { node: name }) };
+  }
+  function actionButton(card, action, label, state, onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.action = action;
+    button.dataset.node = card.dataset.node || "";
+    button.textContent = label;
+    if (!state.enabled) {
+      button.classList.add("is-blocked");
+      button.setAttribute("aria-disabled", "true");
+      button.dataset.blocked = "1";
+    }
+    button.setAttribute("aria-label", label + ". " + state.reason);
+    button.addEventListener("click", () => {
+      if (card.dataset.opening === "1") return;
+      const old = card.querySelector(".card-error");
+      if (old) old.remove();
+      if (button.getAttribute("aria-disabled") === "true") {
+        cardError(card, state.reason);
+        return;
+      }
+      onClick(button);
+    });
+    return button;
+  }
+  function restoreDashboardFocus() {
+    let id = "";
+    let y = 0;
+    try {
+      id = sessionStorage.getItem("agentlink.dashboard.focus") || "";
+      y = Number(sessionStorage.getItem("agentlink.dashboard.scroll") || "0");
+      sessionStorage.removeItem("agentlink.dashboard.focus");
+      sessionStorage.removeItem("agentlink.dashboard.scroll");
+    } catch (err) { return; }
+    if (!id && !y) return;
+    if (y) window.scrollTo(0, y);
+    const safe = id.replace(/["\\]/g, "");
+    const button = safe && document.querySelector('.actions button[data-action="desktop"][data-node="' + safe + '"]');
+    if (button) button.focus();
+    else {
+      const heading = document.getElementById("machines-title");
+      if (heading) heading.focus();
+    }
+  }
+  function noteNodePins(list) {
+    const note = document.getElementById("trust-note");
+    if (!note) return;
+    let pins = {};
+    try { pins = JSON.parse(localStorage.getItem("agentlink.nodePins") || "{}"); } catch (err) { pins = {}; }
+    const warnings = [];
+    list.forEach((item) => {
+      if (!item.name || !item.id) return;
+      const prev = pins[item.name];
+      if (!prev) pins[item.name] = item.id;
+      else if (prev !== item.id) {
+        warnings.push(item.name + " changed id (" + prev.slice(0, 8) + "… → " + item.id.slice(0, 8) + "…). The saved pin was kept.");
+      }
+    });
+    try { localStorage.setItem("agentlink.nodePins", JSON.stringify(pins)); } catch (err) {}
+    note.hidden = warnings.length === 0;
+    note.textContent = warnings.join(" ");
+  }
+  function desktopError(err) {
+    const status = err && err.status;
+    const raw = String((err && err.message) || err || "");
+    if (status === 403) return { message: t("card.forbidden"), detail: raw };
+    if (status === 429) return { message: t("card.rate", { seconds: (err && err.retryAfter) || 60 }), detail: raw };
+    if (status === 401) return { message: ZH ? "登录已过期。" : "Your sign-in expired.", detail: raw };
+    return { message: t("card.error"), detail: raw };
+  }
+  async function openDesktop(card, item, button) {
+    if (card.dataset.opening === "1") return;
+    card.dataset.opening = "1";
+    const buttons = card.querySelectorAll(".actions button");
+    buttons.forEach((el) => {
+      if (el !== button) el.setAttribute("aria-disabled", "true");
+    });
+    const previous = button.textContent;
+    button.setAttribute("aria-busy", "true");
+    button.replaceChildren();
+    const spin = document.createElement("span");
+    spin.className = "spin";
+    spin.setAttribute("aria-hidden", "true");
+    button.append(spin, document.createTextNode(t("card.opening")));
+    try {
+      const ticket = await api("/api/view-ticket", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ node: item.id, control: false })
+      });
+      try {
+        sessionStorage.setItem("agentlink.dashboard.scroll", String(window.scrollY || 0));
+        sessionStorage.setItem("agentlink.dashboard.focus", item.id);
+      } catch (err) {}
+      const id = ticket.node || item.id;
+      location.href = "/view#ticket=" + encodeURIComponent(ticket.ticket) + "&node=" + encodeURIComponent(id) + "&start=watch";
+    } catch (err) {
+      card.dataset.opening = "0";
+      button.removeAttribute("aria-busy");
+      button.textContent = previous;
+      buttons.forEach((el) => {
+        if (el !== button && el.dataset.blocked !== "1") el.removeAttribute("aria-disabled");
+      });
+      const shown = desktopError(err);
+      cardError(card, shown.message, shown.detail);
+    }
+  }
+  function guideRelay() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host;
+  }
+  function base64url(text) {
+    const bytes = new TextEncoder().encode(text);
+    let bin = "";
+    const step = 0x8000;
+    for (let i = 0; i < bytes.length; i += step) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + step, bytes.length)));
+    }
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function effectivePolicy(item) {
+    if (item.effective) return item.effective;
+    if (item.allow_remote_view || item.allow_remote_control || item.allow_desktop) return "custom";
+    if (item.allow_read && item.allow_write && item.allow_exec) return "exec";
+    if (item.allow_read && item.allow_write) return "read-write";
+    if (item.allow_read) return "read-only";
+    return "none";
+  }
+  function guideUrl(item) {
+    const guide = {
+      v: 1,
+      relay: guideRelay(),
+      node_id: item.id || "",
+      name: item.name || "",
+      os: item.os || "",
+      arch: item.arch || "",
+      version: item.version || "",
+      online: typeof item.online === "boolean" ? item.online : undefined,
+      has_display: item.has_display === true ? true : item.has_display === false ? false : null,
+      access: item.access || "",
+      effective: effectivePolicy(item),
+      notes: ""
+    };
+    return location.origin + "/operate/#v1." + base64url(JSON.stringify(guide));
+  }
+  function openGuide(item, button) {
+    const url = guideUrl(item);
+    const previous = button.textContent;
+    const fallbackCopy = () => {
+      const area = document.createElement("textarea");
+      area.value = url;
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).catch(fallbackCopy);
+      } else {
+        fallbackCopy();
+      }
+    } catch (err) { fallbackCopy(); }
+    window.open(url, "_blank", "noopener");
+    button.textContent = t("card.guideCopied");
+    setTimeout(() => { button.textContent = previous; }, 1600);
+  }
+  function rid() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
+      const n = Math.random() * 16 | 0;
+      return (ch === "x" ? n : (n & 0x3 | 0x8)).toString(16);
+    });
+  }
+  function b64encode(bytes) {
+    let text = "";
+    const step = 0x8000;
+    for (let i = 0; i < bytes.length; i += step) {
+      text += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + step, bytes.length)));
+    }
+    return btoa(text);
+  }
+  function b64decode(text) {
+    const bin = atob(text || "");
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function concatBytes(parts) {
+    let n = 0;
+    parts.forEach((part) => { n += part.length; });
+    const out = new Uint8Array(n);
+    let offset = 0;
+    parts.forEach((part) => { out.set(part, offset); offset += part.length; });
+    return out;
+  }
+  function failRoutes(message) {
+    routes.forEach((fn) => {
+      try { fn({ type: "result", ok: false, error: message, terminal: true }); } catch (err) {}
+    });
+    routes.clear();
+  }
+  function connectLink() {
+    if (socket && socket.readyState === 1) return Promise.resolve(socket);
+    if (socketWait) return socketWait;
+    socketWait = new Promise((resolve, reject) => {
+      const proto = location.protocol === "https:" ? "wss://" : "ws://";
+      let ws;
+      try {
+        ws = new WebSocket(proto + location.host + "/v1/web?csrf=" + encodeURIComponent(csrf()));
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      socket = ws;
+      let opened = false;
+      ws.onmessage = (ev) => {
+        if (typeof ev.data !== "string") return;
+        let env;
+        try { env = JSON.parse(ev.data); } catch (err) { return; }
+        if (!opened && env.type === "hello_ok") {
+          opened = true;
+          resolve(ws);
+          return;
+        }
+        if (env.type === "hello_err") {
+          reject(new Error(env.message || "connection rejected"));
+          ws.close();
+          return;
+        }
+        const route = env.request_id && routes.get(env.request_id);
+        if (route) route(env);
+      };
+      ws.onerror = () => {
+        if (!opened) reject(new Error("Could not open a session. Sign in again."));
+      };
+      ws.onclose = () => {
+        const current = socket === ws;
+        if (current) {
+          socket = null;
+          if (pingTimer) { clearInterval(pingTimer); pingTimer = 0; }
+          failRoutes("connection closed");
+        }
+        if (!opened) reject(new Error("Could not open a session. Sign in again."));
+      };
+      if (pingTimer) clearInterval(pingTimer);
+      pingTimer = setInterval(() => {
+        if (socket && socket.readyState === 1) socket.send(JSON.stringify({ type: "ping" }));
+      }, 25000);
+    }).finally(() => { socketWait = null; });
+    return socketWait;
+  }
+  function sendEnv(env) {
+    if (!socket || socket.readyState !== 1) throw new Error("connection closed");
+    socket.send(JSON.stringify(env));
+  }
+  function invoke(nodeId, op, timeoutMs) {
+    const requestId = rid();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        routes.delete(requestId);
+        reject(new Error("timed out"));
+      }, timeoutMs || 30000);
+      routes.set(requestId, (env) => {
+        if (env.type !== "result") return;
+        clearTimeout(timer);
+        routes.delete(requestId);
+        if (env.ok) resolve(env.body == null ? null : env.body);
+        else reject(new Error(env.error || "request failed"));
+      });
+      connectLink().then(() => {
+        sendEnv({ type: "invoke", request_id: requestId, node_id: nodeId, client_id: "", op: op });
+      }).catch((err) => {
+        clearTimeout(timer);
+        routes.delete(requestId);
+        reject(err);
+      });
+    });
+  }
+  function readSlice(nodeId, path, offset, maxBytes) {
+    const requestId = rid();
+    return new Promise((resolve, reject) => {
+      const parts = [];
+      const timer = setTimeout(() => {
+        routes.delete(requestId);
+        reject(new Error("timed out reading the file"));
+      }, 120000);
+      routes.set(requestId, (env) => {
+        if (env.type === "chunk") {
+          parts.push(b64decode(env.data_b64));
+          return;
+        }
+        if (env.type === "end" || env.type === "result") {
+          clearTimeout(timer);
+          routes.delete(requestId);
+          if (env.error || env.ok === false) reject(new Error(env.error || "read failed"));
+          else resolve(concatBytes(parts));
+        }
+      });
+      connectLink().then(() => {
+        sendEnv({
+          type: "invoke",
+          request_id: requestId,
+          node_id: nodeId,
+          client_id: "",
+          op: { op: "read_file", path: path, offset: offset, max_bytes: maxBytes }
+        });
+      }).catch((err) => {
+        clearTimeout(timer);
+        routes.delete(requestId);
+        reject(err);
+      });
+    });
+  }
+  async function readAll(nodeId, path, onProgress) {
+    const parts = [];
+    let offset = 0;
+    let total = 0;
+    for (;;) {
+      const slice = await readSlice(nodeId, path, offset, FILE_CHUNK);
+      if (!slice.length) break;
+      total += slice.length;
+      if (total > FILE_LIMIT) throw new Error("This file is over 64 MB. Use the Android app or the command line for large copies.");
+      parts.push(slice);
+      offset += slice.length;
+      if (onProgress) onProgress(offset);
+      if (slice.length < FILE_CHUNK) break;
+    }
+    return concatBytes(parts);
+  }
+  async function writeBytes(nodeId, path, bytes, onProgress) {
+    if (bytes.length > FILE_LIMIT) throw new Error("This file is over 64 MB. Use the Android app or the command line for large copies.");
+    if (!bytes.length) {
+      await invoke(nodeId, { op: "write_file", path: path, offset: 0, data_b64: "", truncate: true }, 120000);
+      return;
+    }
+    let offset = 0;
+    let first = true;
+    while (offset < bytes.length) {
+      const end = Math.min(offset + FILE_CHUNK, bytes.length);
+      await invoke(nodeId, {
+        op: "write_file",
+        path: path,
+        offset: offset,
+        data_b64: b64encode(bytes.subarray(offset, end)),
+        truncate: first
+      }, 120000);
+      first = false;
+      offset = end;
+      if (onProgress) onProgress(offset, bytes.length);
+    }
+  }
+  function setStatus(text) {
+    document.getElementById("session-status").textContent = text || "";
+  }
+  function setSessionError(text) {
+    const el = document.getElementById("session-error");
+    el.textContent = text || "";
+    if (text) reveal(el);
+  }
+  function setProgress(text) {
+    document.getElementById("file-progress").textContent = text || "";
+  }
+  function formatBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+    return (n / 1073741824).toFixed(1) + " GB";
+  }
+  function parentPath(path) {
+    if (!path || path === "/") return "/";
+    if (path === ".") return "..";
+    const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
+    const slash = trimmed.lastIndexOf("/");
+    if (slash < 0) return ".";
+    if (slash === 0) return "/";
+    return trimmed.slice(0, slash);
+  }
+  function childPath(parent, name) {
+    if (parent === "." || parent === "") return name;
+    if (parent.endsWith("/")) return parent + name;
+    return parent + "/" + name;
+  }
+  function fileBase(path) {
+    const trimmed = String(path || "").replace(/\/+$/, "");
+    const slash = trimmed.lastIndexOf("/");
+    return slash < 0 ? trimmed : trimmed.slice(slash + 1);
+  }
+  function escapeHtml(text) {
+    return text.replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[ch]));
+  }
+  function openSession(kind, item) {
+    sessionItem = item;
+    document.body.classList.add("in-session");
+    document.getElementById("session-view").hidden = false;
+    document.getElementById("term-pane").hidden = kind !== "terminal";
+    document.getElementById("files-pane").hidden = kind !== "files";
+    document.getElementById("session-title").textContent = (kind === "terminal" ? "Terminal" : "Files") + " · " + (item.name || item.id);
+    setSessionError("");
+    setStatus("Connecting…");
+    setProgress("");
+    if (!pushed) {
+      history.pushState({ agentlink: "session" }, "");
+      pushed = true;
+    }
+    document.getElementById("session-back").focus();
+    if (kind === "terminal") startTerminal(item);
+    else startFiles(item);
+  }
+  function closeSession(fromPop) {
+    const wasPushed = pushed;
+    pushed = false;
+    stopTerminal();
+    document.body.classList.remove("in-session");
+    document.getElementById("session-view").hidden = true;
+    document.getElementById("term-pane").hidden = true;
+    document.getElementById("files-pane").hidden = true;
+    sessionItem = null;
+    if (!fromPop && wasPushed) history.back();
+  }
+  function stopTerminal() {
+    if (term && term.resizeObserver) term.resizeObserver.disconnect();
+    const current = pty;
+    pty = null;
+    term = null;
+    if (current) invoke(current.node, { op: "pty_close", session_id: current.id }).catch(() => {});
+  }
+  function ptySend(bytes) {
+    if (!pty || !bytes.length) return;
+    invoke(pty.node, { op: "pty_input", session_id: pty.id, data_b64: b64encode(bytes) }).catch((err) => {
+      setSessionError(String(err.message || err));
+    });
+  }
+  function ptyResize(rows, cols) {
+    if (!pty) return;
+    invoke(pty.node, { op: "pty_resize", session_id: pty.id, rows: rows, cols: cols }).catch(() => {});
+  }
+  function openPty(nodeId, rows, cols) {
+    const requestId = rid();
+    return new Promise((resolve, reject) => {
+      let opened = false;
+      const timer = setTimeout(() => {
+        if (!opened) {
+          routes.delete(requestId);
+          reject(new Error("timed out opening the terminal"));
+        }
+      }, 30000);
+      routes.set(requestId, (env) => {
+        if (env.type === "chunk") {
+          if (term) term.write(b64decode(env.data_b64));
+          return;
+        }
+        if (env.type === "end") {
+          routes.delete(requestId);
+          setStatus(env.error ? String(env.error) : ("Shell exited" + (env.exit_code == null ? "" : " (" + env.exit_code + ")")));
+          pty = null;
+          return;
+        }
+        if (env.type === "result") {
+          if (!env.ok) {
+            clearTimeout(timer);
+            routes.delete(requestId);
+            if (!opened) reject(new Error(env.error || "terminal failed"));
+            else {
+              setStatus(env.error || "connection closed");
+              pty = null;
+            }
+            return;
+          }
+          if (!opened) {
+            clearTimeout(timer);
+            opened = true;
+            resolve(env.body || { session_id: requestId });
+          }
+        }
+      });
+      connectLink().then(() => {
+        sendEnv({
+          type: "invoke",
+          request_id: requestId,
+          node_id: nodeId,
+          client_id: "",
+          op: { op: "pty_open", rows: rows, cols: cols }
+        });
+      }).catch((err) => {
+        clearTimeout(timer);
+        routes.delete(requestId);
+        reject(err);
+      });
+    });
+  }
+  function createTerm(el) {
+    const fgColors = {
+      "30": "#8a7468", "31": "#f08a8c", "32": "#9ed9d6", "33": "#f0b898",
+      "34": "#9ec6ea", "35": "#e7b6ea", "36": "#68c0c0", "37": "#fbf3ea",
+      "90": "#b9a398", "91": "#ffc1c3", "92": "#d7f4f3", "93": "#fbc7a5",
+      "94": "#c5e4f5", "95": "#f3e6f8", "96": "#d7f4f3", "97": "#fffdfb"
+    };
+    const bgColors = {
+      "40": "#241814", "41": "#8a3040", "42": "#0e3f42", "43": "#6a4128",
+      "44": "#1d3d55", "45": "#481562", "46": "#0e3f42", "47": "#fbf3ea"
+    };
+    const ansi256Fg = [
+      fgColors["30"], fgColors["31"], fgColors["32"], fgColors["33"],
+      fgColors["34"], fgColors["35"], fgColors["36"], fgColors["37"],
+      fgColors["90"], fgColors["91"], fgColors["92"], fgColors["93"],
+      fgColors["94"], fgColors["95"], fgColors["96"], fgColors["97"]
+    ];
+    const ansi256Bg = [
+      bgColors["40"], bgColors["41"], bgColors["42"], bgColors["43"],
+      bgColors["44"], bgColors["45"], bgColors["46"], bgColors["47"],
+      bgColors["40"], bgColors["41"], bgColors["42"], bgColors["43"],
+      bgColors["44"], bgColors["45"], bgColors["46"], bgColors["47"]
+    ];
+    const colorCube = [0, 95, 135, 175, 215, 255];
+    function hexByte(value) {
+      const v = Math.max(0, Math.min(255, Math.round(value)));
+      return v.toString(16).padStart(2, "0");
+    }
+    function rgbHex(r, g, b) {
+      return "#" + hexByte(r) + hexByte(g) + hexByte(b);
+    }
+    function color256(index, table) {
+      if (!(index >= 0 && index <= 255)) return "";
+      if (index < 16) return table[index];
+      if (index < 232) {
+        const n = index - 16;
+        return rgbHex(colorCube[Math.floor(n / 36)], colorCube[Math.floor((n % 36) / 6)], colorCube[n % 6]);
+      }
+      const level = 8 + (index - 232) * 10;
+      return rgbHex(level, level, level);
+    }
+    const SCROLLBACK = 1000;
+    const view = {
+      el: el, cols: 80, rows: 24, screen: [], scrollback: [], x: 0, y: 0,
+      saved: null,
+      fg: "", bg: "", bold: false, reverse: false, state: "ground", params: "",
+      decoder: new TextDecoder("utf-8"), resizeTimer: 0, resizeObserver: null
+    };
+    function blank() { return { ch: " ", fg: "", bg: "", bold: false, reverse: false }; }
+    function makeRow(cols) {
+      const cells = [];
+      for (let i = 0; i < cols; i++) cells.push(blank());
+      return cells;
+    }
+    function resetScreen() {
+      view.screen = [];
+      for (let i = 0; i < view.rows; i++) view.screen.push(makeRow(view.cols));
+      view.x = 0;
+      view.y = 0;
+    }
+    function trimScrollback() {
+      if (view.scrollback.length > SCROLLBACK) {
+        view.scrollback.splice(0, view.scrollback.length - SCROLLBACK);
+      }
+    }
+    function paint() {
+      const top = view.el.scrollTop;
+      const stick = view.el.scrollHeight - (top + view.el.clientHeight) <= 24;
+      const lines = [];
+      function pushLine(cells, live, y) {
+        let html = "";
+        for (let x = 0; x < cells.length; x++) {
+          const cell = cells[x];
+          let style = "";
+          let fg = cell.fg, bg = cell.bg;
+          if (cell.reverse) { fg = cell.bg || "#fbf3ea"; bg = cell.fg || "#241814"; }
+          if (fg) style += "color:" + fg + ";";
+          if (bg) style += "background:" + bg + ";";
+          if (cell.bold) style += "font-weight:800;";
+          const cursor = live && y === view.y && x === view.x;
+          html += "<span" + (cursor ? " class=\"term-cursor\"" : "") + (style ? " style=\"" + style + "\"" : "") + ">" + escapeHtml(cell.ch) + "</span>";
+        }
+        lines.push("<div class=\"term-line\">" + (html || " ") + "</div>");
+      }
+      view.scrollback.forEach((cells) => pushLine(cells, false, -1));
+      view.screen.forEach((cells, y) => pushLine(cells, true, y));
+      view.el.innerHTML = lines.join("");
+      view.el.scrollTop = stick ? view.el.scrollHeight : top;
+    }
+    function scrollOne(keepCursor) {
+      view.scrollback.push(view.screen.shift());
+      trimScrollback();
+      view.screen.push(makeRow(view.cols));
+      // Auto-wrap from put() parks the cursor on the new bottom row.
+      // CSI S (SU) must leave the cursor where it was.
+      if (!keepCursor) view.y = view.rows - 1;
+    }
+    function put(ch) {
+      if (view.x >= view.cols) { view.x = 0; view.y += 1; }
+      if (view.y >= view.rows) scrollOne();
+      view.screen[view.y][view.x] = { ch: ch, fg: view.fg, bg: view.bg, bold: view.bold, reverse: view.reverse };
+      view.x += 1;
+    }
+    function eraseFrom(x, y) {
+      for (let col = x; col < view.cols; col++) view.screen[y][col] = blank();
+      for (let row = y + 1; row < view.rows; row++) {
+        for (let col = 0; col < view.cols; col++) view.screen[row][col] = blank();
+      }
+    }
+    function eraseTo(x, y) {
+      for (let row = 0; row < y; row++) {
+        for (let col = 0; col < view.cols; col++) view.screen[row][col] = blank();
+      }
+      for (let col = 0; col <= x && col < view.cols; col++) view.screen[y][col] = blank();
+    }
+    function num(parts, index, fallback) {
+      const value = parseInt(parts[index], 10);
+      return Number.isFinite(value) ? value : fallback;
+    }
+    function csi(final) {
+      const parts = view.params.length ? view.params.split(";") : [];
+      if (final === "A") view.y = Math.max(0, view.y - num(parts, 0, 1));
+      else if (final === "B") view.y = Math.min(view.rows - 1, view.y + num(parts, 0, 1));
+      else if (final === "C") view.x = Math.min(view.cols - 1, view.x + num(parts, 0, 1));
+      else if (final === "D") view.x = Math.max(0, view.x - num(parts, 0, 1));
+      else if (final === "G") view.x = Math.max(0, Math.min(view.cols - 1, num(parts, 0, 1) - 1));
+      else if (final === "H" || final === "f") {
+        view.y = Math.max(0, Math.min(view.rows - 1, num(parts, 0, 1) - 1));
+        view.x = Math.max(0, Math.min(view.cols - 1, num(parts, 1, 1) - 1));
+      } else if (final === "J") {
+        const mode = num(parts, 0, 0);
+        if (mode === 2 || mode === 3) {
+          if (mode === 3) view.scrollback = [];
+          resetScreen();
+        } else if (mode === 0) eraseFrom(view.x, view.y);
+        else if (mode === 1) eraseTo(view.x, view.y);
+      } else if (final === "K") {
+        const mode = num(parts, 0, 0);
+        const line = view.screen[view.y];
+        const from = mode === 0 ? view.x : 0;
+        const to = mode === 1 ? view.x + 1 : line.length;
+        for (let x = from; x < to; x++) line[x] = blank();
+      } else if (final === "m") {
+        const list = parts.length ? parts : ["0"];
+        for (let i = 0; i < list.length; i++) {
+          const code = list[i];
+          if (code === "38" || code === "48") {
+            const mode = list[i + 1];
+            if (mode === "5") {
+              const index = parseInt(list[i + 2], 10);
+              if (Number.isFinite(index)) {
+                const color = color256(index, code === "38" ? ansi256Fg : ansi256Bg);
+                if (color) {
+                  if (code === "38") view.fg = color;
+                  else view.bg = color;
+                }
+              }
+              i += 2;
+            } else if (mode === "2") {
+              const r = parseInt(list[i + 2], 10);
+              const g = parseInt(list[i + 3], 10);
+              const b = parseInt(list[i + 4], 10);
+              if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
+                if (code === "38") view.fg = rgbHex(r, g, b);
+                else view.bg = rgbHex(r, g, b);
+              }
+              i += 4;
+            } else if (mode !== undefined) {
+              i += 1;
+            }
+            continue;
+          }
+          if (code === "0" || code === "") { view.fg = ""; view.bg = ""; view.bold = false; view.reverse = false; }
+          else if (code === "1") view.bold = true;
+          else if (code === "7") view.reverse = true;
+          else if (code === "22") view.bold = false;
+          else if (code === "27") view.reverse = false;
+          else if (code === "39") view.fg = "";
+          else if (code === "49") view.bg = "";
+          else if (fgColors[code]) view.fg = fgColors[code];
+          else if (bgColors[code]) view.bg = bgColors[code];
+        }
+      } else if (final === "S") {
+        // CSI n S — scroll up (SU). Cursor stays put.
+        const n = Math.max(1, num(parts, 0, 1));
+        for (let i = 0; i < n; i++) scrollOne(true);
+      } else if (final === "T") {
+        // CSI n T — scroll down (SD). Cursor stays put.
+        const n = Math.max(1, num(parts, 0, 1));
+        for (let i = 0; i < n; i++) {
+          const line = view.scrollback.length
+            ? view.scrollback.pop()
+            : Array.from({ length: view.cols }, () => blank());
+          view.screen.pop();
+          view.screen.unshift(fitLine(line, view.cols));
+        }
+      }
+    }
+    function feedString(text) {
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        const code = ch.charCodeAt(0);
+        if (view.state === "ground") {
+          if (ch === "\u001b") { view.state = "esc"; continue; }
+          if (ch === "\r") { view.x = 0; continue; }
+          if (ch === "\n") {
+            view.x = 0;
+            view.y += 1;
+            if (view.y >= view.rows) scrollOne();
+            continue;
+          }
+          if (ch === "\b" || ch === "\u007f") { view.x = Math.max(0, view.x - 1); continue; }
+          if (ch === "\t") {
+            view.x = Math.min(view.cols - 1, view.x + (8 - (view.x % 8)));
+            continue;
+          }
+          if (code < 32) continue;
+          put(ch);
+        } else if (view.state === "esc") {
+          // CSI / OSC, or a charset designator that consumes one more byte
+          // (ESC ( B etc). Without esc-int, top's ESC ( B prints a literal B.
+          if (ch === "[") { view.state = "csi"; view.params = ""; continue; }
+          if (ch === "]") { view.state = "osc"; continue; }
+          if ("()*+-.%/".indexOf(ch) >= 0) { view.state = "esc-int"; continue; }
+          // ESC 7 / ESC 8 — DECSC / DECRC (save / restore cursor)
+          if (ch === "7") {
+            view.saved = { x: view.x, y: view.y, fg: view.fg, bg: view.bg, bold: view.bold, reverse: view.reverse };
+            view.state = "ground";
+            continue;
+          }
+          if (ch === "8") {
+            if (view.saved) {
+              view.x = Math.max(0, Math.min(view.cols - 1, view.saved.x));
+              view.y = Math.max(0, Math.min(view.rows - 1, view.saved.y));
+              view.fg = view.saved.fg;
+              view.bg = view.saved.bg;
+              view.bold = view.saved.bold;
+              view.reverse = view.saved.reverse;
+            }
+            view.state = "ground";
+            continue;
+          }
+          view.state = "ground";
+        } else if (view.state === "esc-int") {
+          view.state = "ground";
+        } else if (view.state === "csi") {
+          if (ch === "?") { view.state = "csi-priv"; view.params = ""; continue; }
+          if ((ch >= "0" && ch <= "9") || ch === ";" || ch === ":") { view.params += ch; continue; }
+          if (code >= 64 && code <= 126) { csi(ch); view.state = "ground"; continue; }
+          view.state = "ground";
+        } else if (view.state === "csi-priv") {
+          if ((ch >= "0" && ch <= "9") || ch === ";" || ch === ":") { view.params += ch; continue; }
+          if (code >= 64 && code <= 126) view.state = "ground";
+        } else if (view.state === "osc") {
+          if (ch === "\u0007") view.state = "ground";
+          else if (ch === "\u001b") view.state = "osc-esc";
+        } else if (view.state === "osc-esc") {
+          view.state = "ground";
+        }
+      }
+    }
+    view.write = function (bytes) {
+      feedString(view.decoder.decode(bytes, { stream: true }));
+      paint();
+    };
+    function fitLine(cells, cols) {
+      const line = makeRow(cols);
+      if (cells) {
+        for (let x = 0; x < Math.min(cols, cells.length); x++) line[x] = cells[x];
+      }
+      return line;
+    }
+    view.fit = function () {
+      const probe = document.getElementById("term-probe");
+      const mark = probe.getBoundingClientRect();
+      const box = view.el.getBoundingClientRect();
+      const cols = Math.max(20, Math.min(500, Math.floor((box.width - 24) / (mark.width || 8.4))));
+      // term-screen padding is 10px top+bottom; keep PTY rows inside the visible box.
+      const rows = Math.max(8, Math.min(400, Math.floor((box.height - 20) / (mark.height || 19))));
+      if (cols === view.cols && rows === view.rows && view.screen.length === rows) return { cols: cols, rows: rows };
+      const old = view.screen.map((line) => line.slice());
+      if (rows < old.length) {
+        const dropped = old.splice(0, old.length - rows);
+        dropped.forEach((line) => view.scrollback.push(fitLine(line, cols)));
+        trimScrollback();
+        view.y = Math.max(0, view.y - dropped.length);
+      } else if (rows > old.length) {
+        const take = Math.min(rows - old.length, view.scrollback.length);
+        const restored = view.scrollback.splice(view.scrollback.length - take, take);
+        for (let i = restored.length - 1; i >= 0; i--) old.unshift(restored[i]);
+        while (old.length < rows) old.push(null);
+        view.y = Math.min(rows - 1, view.y + take);
+      }
+      view.cols = cols;
+      view.rows = rows;
+      view.screen = old.slice(0, rows).map((line) => fitLine(line, cols));
+      while (view.screen.length < rows) view.screen.push(makeRow(cols));
+      view.x = Math.max(0, Math.min(cols - 1, view.x));
+      view.y = Math.max(0, Math.min(rows - 1, view.y));
+      paint();
+      return { cols: cols, rows: rows };
+    };
+    resetScreen();
+    paint();
+    if (window.ResizeObserver) {
+      view.resizeObserver = new ResizeObserver(() => {
+        clearTimeout(view.resizeTimer);
+        view.resizeTimer = setTimeout(() => {
+          const size = view.fit();
+          ptyResize(size.rows, size.cols);
+        }, 120);
+      });
+      view.resizeObserver.observe(view.el);
+    }
+    return view;
+  }
+  async function startTerminal(item) {
+    stopTerminal();
+    const screen = document.getElementById("term-screen");
+    screen.replaceChildren();
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    term = createTerm(screen);
+    const size = term.fit();
+    try {
+      const body = await openPty(item.id, size.rows, size.cols);
+      pty = { id: (body && body.session_id) || "", node: item.id };
+      if (!pty.id) throw new Error("terminal did not start");
+      setStatus("Connected. Type into the shell.");
+      document.getElementById("term-input").focus();
+    } catch (err) {
+      setStatus("");
+      setSessionError(String(err.message || err));
+    }
+  }
+  function looksText(bytes) {
+    const n = Math.min(bytes.length, 8000);
+    for (let i = 0; i < n; i++) if (bytes[i] === 0) return false;
+    return true;
+  }
+  async function loadDir(path) {
+    if (!sessionItem) return;
+    setSessionError("");
+    setStatus("Loading " + path + "…");
+    document.getElementById("path-input").value = path;
+    try {
+      const entries = await invoke(sessionItem.id, { op: "list_dir", path: path });
+      filePath = path;
+      const list = Array.isArray(entries) ? entries.slice() : [];
+      list.sort((a, b) => Number(b.is_dir) - Number(a.is_dir) || String(a.name).localeCompare(String(b.name)));
+      renderFiles(list);
+      setStatus(list.length + (list.length === 1 ? " item" : " items"));
+    } catch (err) {
+      setStatus("");
+      setSessionError(String(err.message || err));
+    }
+  }
+  function renderFiles(entries) {
+    const box = document.getElementById("file-list");
+    box.hidden = false;
+    document.getElementById("file-editor").hidden = true;
+    box.replaceChildren();
+    if (!entries.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty-note";
+      empty.textContent = "This folder is empty.";
+      box.appendChild(empty);
+      return;
+    }
+    entries.forEach((entry) => {
+      const row = document.createElement("div");
+      row.className = "file-row";
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "ghost";
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = entry.name;
+      const size = document.createElement("span");
+      size.className = "size";
+      size.textContent = entry.is_dir ? "Folder" : formatBytes(entry.size);
+      open.append(name, size);
+      const next = childPath(filePath, entry.name);
+      open.addEventListener("click", () => {
+        if (entry.is_dir) loadDir(next);
+        else openFile(next, Number(entry.size) || 0);
+      });
+      row.appendChild(open);
+      if (!entry.is_dir && sessionItem && sessionItem.allow_read) {
+        const down = document.createElement("button");
+        down.type = "button";
+        down.className = "ghost";
+        down.textContent = "Download";
+        down.addEventListener("click", () => downloadFile(next));
+        row.appendChild(down);
+      }
+      box.appendChild(row);
+    });
+  }
+  async function openFile(path, size) {
+    if (!sessionItem || !sessionItem.allow_read) return;
+    if (size > 262144) {
+      setSessionError("That file is too large to open here. Download it instead.");
+      return;
+    }
+    setStatus("Opening…");
+    try {
+      const bytes = await readAll(sessionItem.id, path);
+      if (!looksText(bytes)) {
+        setStatus("");
+        setSessionError("This file is not shown as text. Download it instead.");
+        return;
+      }
+      document.getElementById("file-list").hidden = true;
+      const editor = document.getElementById("file-editor");
+      editor.hidden = false;
+      editor.dataset.path = path;
+      document.getElementById("editor-path").textContent = path;
+      document.getElementById("editor-text").value = new TextDecoder().decode(bytes);
+      document.getElementById("editor-text").readOnly = !sessionItem.allow_write;
+      document.getElementById("editor-save").hidden = !sessionItem.allow_write;
+      setStatus("");
+      setSessionError("");
+    } catch (err) {
+      setStatus("");
+      setSessionError(String(err.message || err));
+    }
+  }
+  async function downloadFile(path) {
+    if (!sessionItem) return;
+    setSessionError("");
+    setProgress("Downloading…");
+    try {
+      const bytes = await readAll(sessionItem.id, path, (n) => setProgress("Downloading " + formatBytes(n)));
+      const blob = new Blob([bytes], { type: "application/octet-stream" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = fileBase(path) || "download";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(link.href), 4000);
+      setProgress("Downloaded " + formatBytes(bytes.length));
+    } catch (err) {
+      setProgress("");
+      setSessionError(String(err.message || err));
+    }
+  }
+  async function startFiles(item) {
+    filePath = ".";
+    document.getElementById("file-editor").hidden = true;
+    document.getElementById("file-list").hidden = false;
+    document.getElementById("file-mkdir").hidden = !item.allow_write;
+    document.getElementById("file-upload").hidden = !item.allow_write;
+    document.getElementById("mkdir-form").hidden = true;
+    document.getElementById("path-input").value = filePath;
+    if (!item.allow_read) {
+      document.getElementById("file-list").replaceChildren();
+      setStatus(item.allow_write ? "Upload is allowed. Listing is turned off." : "");
+      return;
+    }
+    await loadDir(filePath);
+  }
+  function sendTermText(text) {
+    if (!text) return;
+    if (ctrlArmed) {
+      ctrlArmed = false;
+      document.getElementById("term-ctrl").setAttribute("aria-pressed", "false");
+      const code = text.charCodeAt(0);
+      const lower = text[0].toLowerCase().charCodeAt(0);
+      if (lower >= 97 && lower <= 122) {
+        ptySend(new Uint8Array([lower & 31]));
+        if (text.length > 1) ptySend(new TextEncoder().encode(text.slice(1)));
+        return;
+      }
+      if (code < 32) {
+        ptySend(new Uint8Array([code]));
+        return;
+      }
+    }
+    ptySend(new TextEncoder().encode(text));
+  }
+  const termInput = document.getElementById("term-input");
+  document.getElementById("term-ctrl").addEventListener("click", () => {
+    ctrlArmed = !ctrlArmed;
+    document.getElementById("term-ctrl").setAttribute("aria-pressed", ctrlArmed ? "true" : "false");
+    termInput.focus();
+  });
+  document.getElementById("term-screen").addEventListener("click", () => termInput.focus());
+  termInput.addEventListener("compositionstart", () => { composing = true; });
+  termInput.addEventListener("compositionend", (ev) => {
+    composing = false;
+    const text = ev.data || termInput.value;
+    termInput.value = "";
+    sendTermText(text);
+  });
+  termInput.addEventListener("keydown", (ev) => {
+    if (composing || ev.isComposing) return;
+    if (ev.key === "Enter") { ev.preventDefault(); ptySend(new Uint8Array([13])); return; }
+    if (ev.key === "Backspace") { ev.preventDefault(); ptySend(new Uint8Array([127])); return; }
+    if (ev.key === "Tab") { ev.preventDefault(); ptySend(new Uint8Array([9])); return; }
+    if (ev.key === "ArrowUp") { ev.preventDefault(); sendTermText("\u001b[A"); return; }
+    if (ev.key === "ArrowDown") { ev.preventDefault(); sendTermText("\u001b[B"); return; }
+    if (ev.key === "ArrowRight") { ev.preventDefault(); sendTermText("\u001b[C"); return; }
+    if (ev.key === "ArrowLeft") { ev.preventDefault(); sendTermText("\u001b[D"); return; }
+    if (ev.key === "Home") { ev.preventDefault(); sendTermText("\u001b[H"); return; }
+    if (ev.key === "End") { ev.preventDefault(); sendTermText("\u001b[F"); return; }
+    if (ev.key === "Delete") { ev.preventDefault(); sendTermText("\u001b[3~"); return; }
+    if (ev.ctrlKey && ev.key.length === 1) {
+      const code = ev.key.toLowerCase().charCodeAt(0);
+      if (code >= 97 && code <= 122) {
+        ev.preventDefault();
+        ptySend(new Uint8Array([code & 31]));
+      }
+    }
+  });
+  termInput.addEventListener("input", () => {
+    if (composing) return;
+    const value = termInput.value;
+    if (!value || value === "\n" || value === "\r" || value === "\r\n") {
+      termInput.value = "";
+      return;
+    }
+    termInput.value = "";
+    sendTermText(value);
+  });
+  termInput.addEventListener("paste", (ev) => {
+    const text = ev.clipboardData && ev.clipboardData.getData("text");
+    if (!text) return;
+    ev.preventDefault();
+    termInput.value = "";
+    sendTermText(text);
+  });
+  document.getElementById("session-back").addEventListener("click", () => closeSession(false));
+  window.addEventListener("popstate", () => {
+    if (document.body.classList.contains("in-session")) closeSession(true);
+  });
+  document.getElementById("path-form").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    loadDir(document.getElementById("path-input").value.trim() || ".");
+  });
+  document.getElementById("file-up").addEventListener("click", () => loadDir(parentPath(filePath)));
+  document.getElementById("file-refresh").addEventListener("click", () => loadDir(filePath));
+  document.getElementById("file-mkdir").addEventListener("click", () => {
+    const form = document.getElementById("mkdir-form");
+    form.hidden = !form.hidden;
+    if (!form.hidden) document.getElementById("mkdir-name").focus();
+  });
+  document.getElementById("mkdir-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (!sessionItem || !sessionItem.allow_write) return;
+    const name = document.getElementById("mkdir-name").value.trim();
+    if (!name || name.indexOf("/") >= 0 || name.indexOf("\\") >= 0 || name === "." || name === "..") {
+      setSessionError("Use a folder name without slashes.");
+      return;
+    }
+    try {
+      await invoke(sessionItem.id, { op: "mkdir", path: childPath(filePath, name), recursive: true });
+      document.getElementById("mkdir-name").value = "";
+      document.getElementById("mkdir-form").hidden = true;
+      if (sessionItem.allow_read) await loadDir(filePath);
+      else setStatus("Created " + name);
+    } catch (err) {
+      setSessionError(String(err.message || err));
+    }
+  });
+  document.getElementById("file-upload").addEventListener("click", () => {
+    document.getElementById("file-pick").click();
+  });
+  document.getElementById("file-pick").addEventListener("change", async () => {
+    const picked = document.getElementById("file-pick").files && document.getElementById("file-pick").files[0];
+    document.getElementById("file-pick").value = "";
+    if (!picked || !sessionItem) return;
+    if (!sessionItem.allow_write) {
+      setSessionError("Upload is turned off for this machine.");
+      return;
+    }
+    if (picked.size > FILE_LIMIT) {
+      setSessionError("This file is over 64 MB. Use the Android app or the command line for large copies.");
+      return;
+    }
+    const safe = String(picked.name || "upload").replace(/[\\/]/g, "_");
+    const dest = childPath(filePath, safe);
+    setSessionError("");
+    setProgress("Uploading…");
+    try {
+      const bytes = new Uint8Array(await picked.arrayBuffer());
+      await writeBytes(sessionItem.id, dest, bytes, (done, total) => {
+        setProgress("Uploading " + formatBytes(done) + " / " + formatBytes(total));
+      });
+      setProgress("Uploaded " + safe);
+      if (sessionItem.allow_read) await loadDir(filePath);
+    } catch (err) {
+      setProgress("");
+      setSessionError(String(err.message || err));
+    }
+  });
+  document.getElementById("editor-close").addEventListener("click", () => {
+    document.getElementById("file-editor").hidden = true;
+    document.getElementById("file-list").hidden = false;
+    if (sessionItem && sessionItem.allow_read) loadDir(filePath);
+  });
+  document.getElementById("editor-save").addEventListener("click", async () => {
+    if (!sessionItem || !sessionItem.allow_write) return;
+    const path = document.getElementById("file-editor").dataset.path;
+    if (!path) return;
+    setSessionError("");
+    setProgress("Saving…");
+    try {
+      const bytes = new TextEncoder().encode(document.getElementById("editor-text").value);
+      await writeBytes(sessionItem.id, path, bytes, (done, total) => {
+        setProgress("Saving " + formatBytes(done) + " / " + formatBytes(total));
+      });
+      setProgress("Saved");
+    } catch (err) {
+      setProgress("");
+      setSessionError(String(err.message || err));
+    }
+  });
+  document.getElementById("editor-download").addEventListener("click", () => {
+    const path = document.getElementById("file-editor").dataset.path;
+    if (path) downloadFile(path);
+  });
+
+  api("/auth/session").then((session) => {
+    return showApp(session.user + (session.role === "admin" ? " · admin" : ""));
+  }).catch(() => {});
+})();
+</script>
+</body>
+</html>

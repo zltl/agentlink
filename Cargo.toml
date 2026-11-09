@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentlink-core",
+    "crates/agentlink-relay",
+    "crates/agentlink-node",
+    "crates/agentlink-cli",
+    "crates/agentlink-desktop",
+    "crates/agentlink-ffi",
+    "crates/agentlink-view",
+]
+exclude = ["bench-micro", "fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+agentlink-core = { path = "crates/agentlink-core" }
+agentlink-relay = { path = "crates/agentlink-relay" }
+agentlink-node = { path = "crates/agentlink-node" }
+agentlink-desktop = { path = "crates/agentlink-desktop" }
+agentlink-view = { path = "crates/agentlink-view" }
+tokio = { version = "1.41", features = ["full"] }
+tokio-util = "0.7"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+futures-util = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+directories = "5"
+hostname = "0.4"
+portable-pty = "0.8"
+url = "2"
+tempfile = "3"
+blake3 = { version = "1", default-features = false }
+command-group = { version = "5.0", features = ["with-tokio"] }
+crossterm = "0.28"
+diffy = "0.4"
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+notify = "6.1"
+regex = "1"
+sysinfo = "0.33"
+zstd = "0.13"
+quinn = "0.11"
+tar = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+flate2 = "1"
+toml = "0.8"
+aes-gcm = "0.10"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+argon2 = "0.5"
+sha1 = "0.10"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "migrate", "macros", "derive"] }
+libsqlite3-sys = { version = "0.30.1", features = ["bundled"] }
+qrcode = "0.14"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

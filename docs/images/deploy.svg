@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="250" viewBox="0 0 960 250" role="img" aria-labelledby="deployTitle deployDesc">
+  <title id="deployTitle">agentlink deployment</title>
+  <desc id="deployDesc">An installer downloads a release, checks its checksum, and installs a user-session service. That service dials the relay. A system service is a separate option and stays outside the GUI session.</desc>
+  <style>
+    :root { color-scheme: light dark; }
+    .card { fill: #f4f7fb; stroke: #1f4e79; stroke-width: 1.6; }
+    .label { fill: #142033; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 16px; font-weight: 650; }
+    .sub { fill: #3d4d63; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; }
+    .arrow { stroke: #1f4e79; fill: none; stroke-width: 1.8; }
+    .head { fill: #1f4e79; }
+    @media (prefers-color-scheme: dark) {
+      .card { fill: #182230; stroke: #9ec1de; }
+      .label { fill: #e8eef6; }
+      .sub { fill: #b7c6d6; }
+      .arrow { stroke: #9ec1de; }
+      .head { fill: #9ec1de; }
+    }
+  </style>
+  <defs>
+    <marker id="deploy-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="head"/>
+    </marker>
+  </defs>
+
+  <rect class="card" x="24" y="36" width="180" height="78" rx="10"/>
+  <text class="label" x="114" y="68" text-anchor="middle">installer</text>
+  <text class="sub" x="114" y="90" text-anchor="middle">checksum, then pair</text>
+
+  <rect class="card" x="268" y="36" width="200" height="78" rx="10"/>
+  <text class="label" x="368" y="68" text-anchor="middle">user service</text>
+  <text class="sub" x="368" y="90" text-anchor="middle">GUI session for phase 2</text>
+
+  <rect class="card" x="532" y="36" width="180" height="78" rx="10"/>
+  <text class="label" x="622" y="68" text-anchor="middle">relay</text>
+  <text class="sub" x="622" y="90" text-anchor="middle">container or systemd</text>
+
+  <rect class="card" x="268" y="150" width="200" height="68" rx="10"/>
+  <text class="label" x="368" y="178" text-anchor="middle">system service</text>
+  <text class="sub" x="368" y="198" text-anchor="middle">boot, no desktop</text>
+
+  <path class="arrow" marker-end="url(#deploy-arrow)" d="M204 75 H 268"/>
+  <path class="arrow" marker-end="url(#deploy-arrow)" d="M468 75 H 532"/>
+  <text class="sub" x="500" y="66" text-anchor="middle">WSS</text>
+  <path class="arrow" marker-end="url(#deploy-arrow)" d="M368 150 V 114"/>
+</svg>

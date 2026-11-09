@@ -1,0 +1,19 @@
+# Structure of the agentlink architecture diagram.
+# The committed architecture.svg is hand-drawn so it stays legible in
+# GitHub light and dark themes. Regenerate a draft with `d2 architecture.d2`
+# and fold the result back into the themed SVG.
+
+direction: right
+
+CLI: agentlink CLI
+MCP: agentlink mcp
+Core: shared client library
+Relay: agentlink relay
+Node: agentlink node
+
+CLI -> Core
+MCP -> Core
+Core -> Relay: "WSS, pinned certificate"
+Node -> Relay: "WSS, outbound" {
+  style.stroke-dash: 0
+}

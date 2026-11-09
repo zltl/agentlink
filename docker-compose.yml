@@ -1,0 +1,12 @@
+services:
+  relay:
+    build: .
+    image: agentlink-relay
+    restart: unless-stopped
+    ports:
+      - "7443:7443"
+    volumes:
+      - relay-data:/var/lib/agentlink
+
+volumes:
+  relay-data:

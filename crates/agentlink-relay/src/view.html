@@ -1,0 +1,2334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<title>agentlink</title>
+<style>
+  :root {
+    color-scheme: light;
+    --paper: #fbf3ea;
+    --card: #fffdfb;
+    --ink: #241814;
+    --muted: #6a5146;
+    --cyan: #68c0c0;
+    --cyan-deep: #0e3f42;
+    --cyan-soft: #d7f4f3;
+    --peach: #f0b898;
+    --mouth: #f08a8c;
+    --mouth-soft: #fde8e6;
+    --offline-bg: #f6eadf;
+    --offline-ink: #5c463c;
+    --session-canvas: #14110f;
+    --font: ui-rounded, "SF Pro Rounded", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+  }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 100dvh;
+    height: 100dvh;
+    overflow: hidden;
+    background: var(--paper);
+    color: var(--ink);
+    font: 14px/1.4 var(--font);
+  }
+  button, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  #session-top, #session-bottom, #tool-header {
+    flex: none;
+    background: rgba(251, 243, 234, .96);
+    color: var(--ink);
+  }
+  #session-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 56px;
+    padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left));
+    border-bottom: 2px solid var(--ink);
+  }
+  #back-btn, .icon-btn, .cta, .text-btn, #sheet button, #leave button, #overlay button {
+    min-height: 48px;
+    border: 2px solid var(--ink);
+    border-radius: 16px;
+    background: var(--card);
+    color: var(--ink);
+    font-weight: 800;
+    box-shadow: 3px 3px 0 var(--ink);
+  }
+  #back-btn, .icon-btn { width: 44px; min-width: 44px; padding: 0; }
+  .cta { background: var(--peach); padding: 0 16px; }
+  .cta.ghost { background: var(--card); }
+  .cta[aria-disabled="true"] { background: var(--offline-bg); box-shadow: none; }
+  #node-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 1rem;
+  }
+  #mode-live { flex: none; }
+  .sticker {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 32px;
+    padding: 2px 10px 2px 6px;
+    border: 2px solid var(--ink);
+    border-radius: 999px;
+    background: var(--cyan);
+    color: var(--ink);
+    font-size: 0.8rem;
+    font-weight: 800;
+    box-shadow: 2px 2px 0 var(--ink);
+    pointer-events: none;
+    user-select: none;
+  }
+  .sticker svg { width: 18px; height: 18px; }
+  .sticker.soft { background: var(--cyan-soft); border-style: dashed; }
+  .sticker.control { background: var(--peach); }
+  .sticker.down { background: var(--offline-bg); color: var(--offline-ink); }
+  .sticker .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--mouth);
+    margin-left: 4px;
+  }
+  #cta-desktop { display: none; min-width: 148px; }
+  header, #tool-header {
+    display: flex;
+    gap: 8px 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    border-bottom: 2px solid var(--ink);
+  }
+  #tool-header select, #tool-header button { background: var(--card); color: var(--ink); border: 2px solid var(--ink); border-radius: 12px; padding: 8px 10px; min-height: 44px; }
+  #link-mode { font: 12px ui-monospace, monospace; padding: 4px 8px; border: 2px solid var(--ink); border-radius: 12px; }
+  main { position: relative; flex: 1; min-height: 0; background: var(--session-canvas); }
+  #session-bottom {
+    display: grid;
+    gap: 8px;
+    padding: 8px 12px max(8px, env(safe-area-inset-bottom));
+    border-top: 2px solid var(--ink);
+    box-shadow: 0 -3px 0 var(--ink);
+  }
+  #session-bottom .icon-row { display: flex; gap: 8px; }
+  #session-bottom .cta { width: 100%; }
+  #passive { margin: 0; font-weight: 800; }
+  .text-btn { background: transparent; border: 0; box-shadow: none; min-height: 44px; text-decoration: underline; padding: 0 8px; }
+  @media (min-width: 900px) {
+    #session-top { min-height: 64px; }
+    #cta-desktop { display: inline-flex; }
+    #session-bottom .cta { display: none !important; }
+    #session-bottom { display: flex; align-items: center; min-height: 32px; box-shadow: none; }
+    #node-label { max-width: 28ch; flex: 0 1 auto; }
+  }
+  @media (max-width: 899px) {
+    #fs-btn { display: none; }
+  }
+  @media (max-width: 720px) {
+    header select, header button { padding: 10px 12px; font-size: 16px; }
+    #link-mode { padding: 8px 10px; font-size: 14px; }
+  }
+  video, #shot, #hold { width: 100%; height: 100%; object-fit: contain; background: var(--session-canvas); touch-action: none; }
+  #hold { position: absolute; inset: 0; }
+  #overlay {
+    position: absolute; inset: 0; z-index: 4;
+    display: grid; align-content: center; justify-items: center; gap: 12px;
+    padding: 24px; text-align: center;
+    background: rgba(20, 17, 15, .72); color: var(--paper);
+  }
+  #overlay p { margin: 0; font-weight: 800; max-width: 36ch; }
+  .scrim-wait { position: absolute; inset: 0; background: rgba(20, 17, 15, .2); z-index: 2; pointer-events: none; }
+  #shot { position: absolute; inset: 0; }
+  #banner { position: absolute; left: 12px; right: 12px; top: 12px; z-index: 2; background: rgba(20, 20, 24, .92); color: #f2e6c9; border: 1px solid #6b5a32; border-radius: 8px; padding: 10px 12px; }
+  #banner.error { color: #ffd7d7; border-color: #8a3a3a; background: rgba(48, 18, 18, .94); }
+  #cursor { position: absolute; width: 12px; height: 12px; margin: -2px 0 0 -2px; border-left: 2px solid #fff; border-top: 2px solid #fff; pointer-events: none; display: none; z-index: 3; }
+  #stats { position: absolute; left: 8px; bottom: 8px; background: rgba(0,0,0,.55); padding: 6px 8px; border-radius: 6px; font: 12px ui-monospace, monospace; }
+  #status { margin-left: auto; opacity: .8; }
+  #portal { position: fixed; inset: 0; z-index: 5; overflow: auto; background: #101114; padding: 24px; }
+  #portal h1 { font-size: 20px; margin: 0 0 12px; }
+  #portal form, #portal section { max-width: 720px; display: grid; gap: 8px; margin-bottom: 20px; }
+  #portal input, #portal select, #portal button, #portal textarea { background: #2a2d34; color: inherit; border: 1px solid #3c4048; border-radius: 6px; padding: 8px; font: inherit; }
+  #portal textarea { min-height: 72px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .muted { opacity: .75; }
+  #sheet, #leave {
+    position: fixed; inset: 0; z-index: 6;
+    background: rgba(36, 24, 20, .55);
+    display: grid; align-items: end; justify-items: center;
+  }
+  #sheet .panel, #leave .panel {
+    width: min(420px, 100%);
+    max-height: 70dvh;
+    overflow: auto;
+    background: var(--card);
+    color: var(--ink);
+    border: 2px solid var(--ink);
+    border-radius: 24px 24px 0 0;
+    padding: 12px 20px 20px;
+    box-shadow: 4px 4px 0 var(--ink);
+  }
+  @media (min-width: 900px) {
+    #sheet, #leave { align-items: center; }
+    #sheet .panel, #leave .panel { border-radius: 24px; padding: 24px; }
+  }
+  .grabber { width: 36px; height: 4px; border-radius: 4px; background: var(--ink); margin: 4px auto 12px; }
+  #toast, #coach {
+    position: fixed; left: 12px; right: 12px; bottom: 120px; z-index: 5;
+    background: var(--card); color: var(--ink); border: 2px solid var(--ink);
+    border-radius: 16px; padding: 10px 12px; box-shadow: 3px 3px 0 var(--ink);
+    font-weight: 800;
+  }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  :focus-visible { outline: 3px solid var(--cyan-deep); outline-offset: 3px; }
+  @media (prefers-reduced-motion: reduce) {
+    .sticker, button { transition: none; animation: none; }
+  }
+  @media (hover: hover) and (prefers-reduced-motion: no-preference) {
+    #back-btn:active, .icon-btn:active, .cta:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--ink); }
+  }
+</style>
+</head>
+<body>
+<div id="portal">
+  <h1>agentlink</h1>
+  <p class="muted"><a href="/">Machine dashboard</a></p>
+  <form id="login-form">
+    <label>Username <input id="login-user" autocomplete="username" autocapitalize="none" placeholder="Account name" required></label>
+    <p class="muted">The name you use on the relay.</p>
+    <label>Password <input id="login-pass" type="password" autocomplete="current-password" required></label>
+    <p class="muted">Password for that account.</p>
+    <div id="login-totp-field" hidden>
+      <label>Authenticator code <input id="login-totp" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code"></label>
+      <p class="muted">The server asked for this code.</p>
+    </div>
+    <button id="login-btn" type="submit">Log in</button>
+    <p id="login-status" class="muted"></p>
+  </form>
+  <div id="app" hidden>
+    <div class="row">
+      <strong id="session-user"></strong>
+      <button id="logout-btn" type="button">Log out</button>
+    </div>
+    <section>
+      <h2>Machines</h2>
+      <div id="node-list"></div>
+    </section>
+    <section>
+      <h2>Add machine</h2>
+      <label>Name <input id="machine-name" placeholder="laptop"></label>
+      <p class="muted">Signing in as the owner or an admin is full access: shell, files, and remote desktop.</p>
+      <label>Minutes <input id="machine-ttl" type="number" min="1" value="15"></label>
+      <label>Uses <input id="machine-uses" type="number" min="1" max="1000" value="1"></label>
+      <button id="machine-add" type="button">Create enrollment token</button>
+      <div id="enroll-out"></div>
+    </section>
+    <section>
+      <h2>Tokens</h2>
+      <div id="token-list"></div>
+    </section>
+    <p id="portal-status" class="muted"></p>
+  </div>
+</div>
+<div id="session-top">
+  <button id="back-btn" type="button" aria-label="Back to machines">‹</button>
+  <strong id="node-label"></strong>
+  <div id="mode-live" role="status" aria-live="polite" aria-atomic="true">
+    <span id="mode-sticker" class="sticker soft">Connecting…</span>
+  </div>
+  <button id="cta-desktop" class="cta" type="button" hidden>Take control</button>
+  <button id="fs-btn" class="icon-btn" type="button" aria-label="Fullscreen">⛶</button>
+  <button id="more-btn" class="icon-btn" type="button" aria-expanded="false" aria-controls="tool-header">⋯</button>
+</div>
+<header id="tool-header" hidden>
+  <strong>agentlink</strong>
+  <label>Monitor <select id="monitor"></select></label>
+  <label>Connection
+    <select id="ice-mode" aria-label="Connection mode" title="Relay only sets iceTransportPolicy to relay (Force TURN). Live video is DTLS-SRTP. Screenshots stay on the screenshot invoke.">
+      <option value="auto">Auto</option>
+      <option value="relay">Relay only</option>
+    </select>
+  </label>
+  <button id="connect" type="button">Connect</button>
+  <span id="link-mode">Auto</span>
+  <button id="audio" type="button">Audio off</button>
+  <span id="status">idle</span>
+</header>
+<main>
+  <video id="video" autoplay playsinline tabindex="0" aria-label="Remote screen"></video>
+  <img id="shot" alt="remote screenshot" hidden>
+  <canvas id="hold" hidden></canvas>
+  <div id="wait-scrim" class="scrim-wait" hidden></div>
+  <div id="banner" hidden></div>
+  <div id="overlay" hidden>
+    <p id="overlay-text"></p>
+    <button id="overlay-primary" type="button"></button>
+    <button id="overlay-back" type="button">Back to machines</button>
+  </div>
+  <div id="cursor"></div>
+  <div id="stats">
+    <span id="stat-latency">latency —</span>
+    <span id="stat-fps">fps —</span>
+    <span id="stat-bitrate">bitrate —</span>
+    <span id="stat-codec">codec —</span>
+    <span id="stat-encoder">encoder —</span>
+  </div>
+</main>
+<div id="session-bottom">
+  <div class="icon-row">
+    <button id="keyboard-btn" class="icon-btn" type="button" hidden aria-label="Keyboard">⌨</button>
+    <button id="fs-bottom" class="icon-btn" type="button" aria-label="Fullscreen">⛶</button>
+    <button id="more-bottom" class="icon-btn" type="button" aria-label="More">⋯</button>
+  </div>
+  <button id="cta" class="cta" type="button" hidden>Take control</button>
+  <p id="passive" hidden></p>
+  <button id="cancel-connect" class="text-btn" type="button" hidden>Cancel</button>
+</div>
+<div id="coach" hidden></div>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<div id="announce" class="sr" aria-live="polite"></div>
+<div id="sheet" hidden>
+  <div class="panel" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <div class="grabber" aria-hidden="true"></div>
+    <h2 id="sheet-title">View only</h2>
+    <p id="sheet-body"></p>
+    <details id="sheet-help">
+      <summary id="sheet-help-summary">How to change access</summary>
+      <p id="sheet-help-body"></p>
+    </details>
+    <button id="sheet-ok" type="button">Got it</button>
+    <button id="sheet-retry" type="button" hidden>Try again</button>
+  </div>
+</div>
+<div id="leave" hidden>
+  <div class="panel" role="dialog" aria-modal="true" aria-labelledby="leave-title">
+    <h2 id="leave-title">Release control and leave?</h2>
+    <button id="leave-go" type="button">Release and leave</button>
+    <button id="leave-stay" class="ghost cta" type="button">Keep controlling</button>
+  </div>
+</div>
+<input id="key-capture" aria-label="Keyboard" autocomplete="off" autocapitalize="off" hidden>
+<script src="/view/pointer.js"></script>
+<script>
+function readLoc() {
+  const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+  const query = new URLSearchParams(location.search || "");
+  const pick = (key) => hash.get(key) || query.get(key) || "";
+  return { ticket: pick("ticket"), token: pick("token"), node: pick("node"), monitor: pick("monitor") || "0", start: pick("start") };
+}
+let loc = readLoc();
+let ticket = loc.ticket;
+let legacyToken = loc.token;
+let ticketId = ticket.replace(/^view\./, "").split(".")[0];
+let boundSession = "";
+try { boundSession = sessionStorage.getItem("agentlink.view.session." + ticketId) || ""; } catch (err) {}
+let token = legacyToken;
+if (ticketId && boundSession) token = "view." + ticketId + "." + boundSession;
+else if (ticket) token = ticket.startsWith("view.") ? ticket : "view." + ticket;
+let node = loc.node;
+let startedWatch = loc.start === "watch";
+let ticketControl = startedWatch ? false : null;
+if (!ticket && !legacyToken && node) {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem("agentlink.view.resume") || "null");
+    if (saved && saved.node === node && saved.ticketId && saved.boundSession) {
+      ticketId = saved.ticketId;
+      boundSession = saved.boundSession;
+      token = "view." + ticketId + "." + boundSession;
+      startedWatch = true;
+      ticketControl = false;
+    }
+  } catch (err) {}
+}
+const video = document.getElementById("video");
+const shot = document.getElementById("shot");
+const banner = document.getElementById("banner");
+const cursor = document.getElementById("cursor");
+const statusEl = document.getElementById("status");
+let pc, ws, inputCh, sessionId = "", control = false, audioOn = false, req = 1;
+let mode = "connecting";
+let inputEnabled = false;
+let inputSuspended = false;
+let nodeControl = null;
+let canControl = false;
+let dashboardSession = false;
+let nodeName = "";
+let ownerName = "";
+let relation = "";
+let deniedReason = "";
+let transport = "live";
+let switchKind = "initial";
+let settledFor = -1;
+let busy = false;
+let requestGen = 0;
+let controlAttempts = 0;
+let retryLeft = 0;
+let retryTimer = 0;
+let stillTimer = 0;
+let guardArmed = false;
+let leaving = false;
+let pendingWasControlling = false;
+let coachShown = false;
+let capabilityReady = false;
+let shortcutShown = false;
+const pressedKeys = new Set();
+const pressedButtons = new Set();
+let lastPoint = { x: 0, y: 0 };
+const ZH = (navigator.language || "").toLowerCase().startsWith("zh");
+const COPY = {
+  en: {
+    "session.connecting": "Connecting…",
+    "session.stillConnecting": "Still connecting…",
+    "session.watching": "Watching",
+    "session.controlling": "Controlling",
+    "session.paused": "Controlling · paused",
+    "session.requesting": "Taking control…",
+    "session.requestingShort": "Taking control…",
+    "session.waiting": "Connecting desktop…",
+    "session.releasing": "Releasing…",
+    "session.reconnecting": "Reconnecting…",
+    "session.disconnected": "Disconnected",
+    "session.ended": "Session ended",
+    "cta.takeControl": "Take control",
+    "cta.releaseControl": "Release control",
+    "cta.cancel": "Cancel",
+    "cta.tryAgain": "Try again",
+    "cta.keepWatching": "Keep watching",
+    "cta.why": "Why?",
+    "cta.back": "Back to machines",
+    "cta.reconnect": "Reconnect",
+    "cta.reopen": "Reopen",
+    "cta.gotIt": "Got it",
+    "cta.resumeInput": "Resume input",
+    "card.viewOnly": "View only",
+    "coach.watching": "You're watching. Keyboard and mouse are off.",
+    "coach.viewOnly": "You're watching. This account can't control {node}.",
+    "coach.controlling": "You have control.",
+    "toast.released": "Control released. You're watching.",
+    "toast.reconnected": "Reconnected. You're watching.",
+    "toast.controlAvailable": "Control is now available.",
+    "toast.controlSuspended": "Input paused while this tab was hidden.",
+    "toast.screenshotMode": "Screenshot mode · may be slower.",
+    "toast.systemShortcuts": "Some system shortcuts stay on your device.",
+    "chip.screenshots": "Screenshots",
+    "deny.policy": "View only. This account can't control {node}.",
+    "deny.shared": "This account can watch {node}, but can't use its keyboard and mouse. Ask {owner} for control.",
+    "deny.sharedNoOwner": "This account can watch {node}, but can't use its keyboard and mouse.",
+    "deny.owner": "{node} did not accept control. Sign in as the owner or an admin and try again.",
+    "deny.streamDeclined": "The machine didn't allow the desktop connection.",
+    "deny.streamTimeout": "No answer from {node}.",
+    "deny.transport": "Control didn't start. You're still watching.",
+    "deny.rateLimited": "Too many attempts. Try again in {seconds}s.",
+    "error.connectionLost": "Connection lost. Reconnecting…",
+    "error.nodeOffline": "{node} went offline.",
+    "error.noScreen": "No screen found on {node}.",
+    "error.ticketExpired": "This desktop link expired.",
+    "error.revoked": "This session was ended by the machine.",
+    "error.authExpired": "Your sign-in expired.",
+    "error.webrtc": "Couldn't connect to the screen.",
+    "error.releaseFailed": "Couldn't release control safely.",
+    "error.generic": "Something went wrong.",
+    "confirm.leaveControlling": "Release control and leave?",
+    "confirm.releaseAndLeave": "Release and leave",
+    "confirm.keepControlling": "Keep controlling",
+    "help.change": "How to change access",
+    "help.body": "On a machine signed in as the owner, run agentlink perm. Enroll creates a new machine. It does not change this one.",
+    "announce.watching": "Watching {node}. Keyboard and mouse are off.",
+    "announce.requesting": "Taking control of {node}.",
+    "announce.controlling": "Controlling {node}. Keyboard and mouse are active.",
+    "announce.released": "Watching {node}. Control released.",
+    "announce.denied": "Control not allowed. {reason}.",
+    "announce.reconnecting": "Reconnecting to {node}.",
+    "announce.reconnected": "Reconnected. Watching {node}. Control was not resumed.",
+    "announce.ended": "Session ended. {reason}.",
+    "aria.take": "Take control of {node}. Keyboard and mouse will be active.",
+    "aria.release": "Release control of {node}. Keyboard and mouse will stop.",
+    "aria.back": "Back to machines",
+    "aria.screenWatch": "Remote screen for {node}. Watching. Keyboard and mouse are off.",
+    "aria.screenControl": "Remote screen for {node}. Controlling. Keyboard and mouse are active."
+  },
+  zh: {
+    "session.connecting": "正在连接…",
+    "session.stillConnecting": "仍在连接…",
+    "session.watching": "观看中",
+    "session.controlling": "控制中",
+    "session.paused": "控制中 · 已暂停",
+    "session.requesting": "正在接管控制…",
+    "session.requestingShort": "接管中…",
+    "session.waiting": "正在连接桌面…",
+    "session.releasing": "正在退出控制…",
+    "session.reconnecting": "正在重连…",
+    "session.disconnected": "已断开",
+    "session.ended": "会话已结束",
+    "cta.takeControl": "接管键鼠",
+    "cta.releaseControl": "退出控制",
+    "cta.cancel": "取消",
+    "cta.tryAgain": "重试",
+    "cta.keepWatching": "继续观看",
+    "cta.why": "为什么？",
+    "cta.back": "返回机器列表",
+    "cta.reconnect": "重新连接",
+    "cta.reopen": "重新打开",
+    "cta.gotIt": "知道了",
+    "cta.resumeInput": "恢复输入",
+    "card.viewOnly": "仅观看",
+    "coach.watching": "你正在观看，键盘和鼠标已关闭。",
+    "coach.viewOnly": "你正在观看，此账号不能控制 {node}。",
+    "coach.controlling": "你已接管键鼠。",
+    "toast.released": "已退出控制，当前为观看模式。",
+    "toast.reconnected": "已重连，当前为观看模式。",
+    "toast.controlAvailable": "现在可以控制了。",
+    "toast.controlSuspended": "标签页隐藏时输入已暂停。",
+    "toast.screenshotMode": "截图模式 · 可能会有延迟。",
+    "toast.systemShortcuts": "部分系统快捷键仍在本机生效。",
+    "chip.screenshots": "截图",
+    "deny.policy": "仅观看。此账号不能控制 {node}。",
+    "deny.shared": "此账号只能观看 {node}，不能使用键盘和鼠标。向 {owner} 申请控制权限。",
+    "deny.sharedNoOwner": "此账号只能观看 {node}，不能使用键盘和鼠标。",
+    "deny.owner": "{node} 当前为仅观看。把访问权限改为 Full 或 remote-control 后即可控制。",
+    "deny.streamDeclined": "机器端没有允许桌面连接。",
+    "deny.streamTimeout": "机器端没有响应。",
+    "deny.transport": "控制未能启动，你仍在观看。",
+    "deny.rateLimited": "尝试次数过多，请 {seconds} 秒后再试。",
+    "error.connectionLost": "连接断开，正在重连…",
+    "error.nodeOffline": "{node} 已离线。",
+    "error.noScreen": "没有找到 {node} 的屏幕。",
+    "error.ticketExpired": "桌面链接已过期。",
+    "error.revoked": "会话已被机器端结束。",
+    "error.authExpired": "登录已过期。",
+    "error.webrtc": "无法连接画面。",
+    "error.releaseFailed": "无法安全退出控制。",
+    "error.generic": "出了点问题。",
+    "confirm.leaveControlling": "退出控制并离开？",
+    "confirm.releaseAndLeave": "退出控制并离开",
+    "confirm.keepControlling": "继续控制",
+    "help.change": "如何修改访问权限",
+    "help.body": "在已登录为所有者的机器上运行 agentlink perm。注册新机器不会修改这一台。",
+    "announce.watching": "正在观看 {node}。键盘和鼠标已关闭。",
+    "announce.requesting": "正在接管 {node}。",
+    "announce.controlling": "正在控制 {node}。键盘和鼠标已开启。",
+    "announce.released": "正在观看 {node}。已退出控制。",
+    "announce.denied": "不能控制。{reason}。",
+    "announce.reconnecting": "正在重新连接 {node}。",
+    "announce.reconnected": "已重连。正在观看 {node}。控制没有恢复。",
+    "announce.ended": "会话已结束。{reason}。",
+    "aria.take": "接管 {node} 的键鼠。键盘和鼠标将开启。",
+    "aria.release": "退出 {node} 的控制。键盘和鼠标将停止。",
+    "aria.back": "返回机器列表",
+    "aria.screenWatch": "{node} 的远程画面。观看中。键盘和鼠标已关闭。",
+    "aria.screenControl": "{node} 的远程画面。控制中。键盘和鼠标已开启。"
+  }
+};
+function t(key, vars) {
+  let text = (ZH ? COPY.zh : COPY.en)[key] || COPY.en[key] || key;
+  if (vars) Object.keys(vars).forEach((name) => { text = text.split("{" + name + "}").join(String(vars[name])); });
+  return text;
+}
+function nodeLabel() { return nodeName || node || "machine"; }
+let helloWait, shotTimer = null, shotBusy = false, failReason = "", iceAttempts = 0;
+let connectGen = 0;
+// Progressive JPEG ladder: a cheap preview paints first, then full-quality
+// steady. Cold path skips the mid "enhance" rung (Ark): preview→steady cuts
+// one encode+transfer before usable quality (~3s on box). Enhance remains
+// defined for optional slow hosts but is not used on the cold ladder.
+// Preview scale stays <=0.4 so the node uses Nearest resize (faster TTFF).
+const SHOT_STEPS = {
+  preview: { quality: 28, scale: 0.25 },
+  enhance: { quality: 50, scale: 0.5 },
+  steady: { quality: 70, scale: 1.0 }
+};
+let shotPhase = "idle", shotPreview = false, shotGen = 0;
+const pending = new Map();
+const ICE_MODE_KEY = "agentlink.viewer.ice";
+
+function iceMode() {
+  try { return localStorage.getItem(ICE_MODE_KEY) === "relay" ? "relay" : "auto"; }
+  catch (err) { return "auto"; }
+}
+
+function applyIceMode(mode) {
+  const relay = mode === "relay";
+  try { localStorage.setItem(ICE_MODE_KEY, relay ? "relay" : "auto"); } catch (err) {}
+  const picker = document.getElementById("ice-mode");
+  if (picker) picker.value = relay ? "relay" : "auto";
+  document.getElementById("link-mode").textContent = relay ? "Relay" : "Auto";
+}
+
+applyIceMode(iceMode());
+
+let lastConnectError = null;
+let pathLabel = "";
+let activeAttempt = null;
+let statsStarted = false;
+let inputWired = false;
+
+function attemptsFor(config) {
+  let attempts = Array.isArray(config.attempts) ? config.attempts.slice() : [];
+  if (!attempts.length) {
+    const servers = [];
+    if (config.stun && config.stun.length) servers.push({ urls: config.stun });
+    (config.turn || []).forEach((turn) => servers.push(turn));
+    attempts = [{
+      id: iceMode() === "relay" ? "relay-udp" : "srflx",
+      banner: iceMode() === "relay" ? "via TURN udp" : "via STUN",
+      ice_transport_policy: iceMode() === "relay" ? "relay" : "all",
+      gather_ms: iceMode() === "relay" ? 5000 : 2500,
+      connect_ms: iceMode() === "relay" ? 6000 : 4000,
+      ice_servers: servers
+    }];
+  }
+  if (iceMode() === "relay") {
+    attempts = attempts.filter((item) => item.ice_transport_policy === "relay");
+  }
+  return attempts;
+}
+
+function wantedType(attempt) {
+  if (attempt.id === "host") return "host";
+  if (attempt.id === "srflx") return "srflx";
+  return "relay";
+}
+
+function sdpHasType(peer, typ) {
+  const sdp = (peer.localDescription && peer.localDescription.sdp) || "";
+  return sdp.indexOf(" typ " + typ) >= 0;
+}
+
+function waitForCandidate(peer, typ, ms) {
+  return new Promise((resolve) => {
+    if (sdpHasType(peer, typ)) { resolve(true); return; }
+    const poll = setInterval(() => {
+      if (sdpHasType(peer, typ)) { clearInterval(poll); clearTimeout(timer); resolve(true); }
+    }, 50);
+    const timer = setTimeout(() => { clearInterval(poll); resolve(sdpHasType(peer, typ)); }, ms);
+  });
+}
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function showBanner(text, isError) {
+  banner.hidden = false;
+  banner.textContent = text;
+  banner.classList.toggle("error", !!isError);
+}
+
+function hideBanner() {
+  banner.hidden = true;
+  banner.textContent = "";
+  banner.classList.remove("error");
+}
+
+function stopScreenshots() {
+  if (shotTimer) { clearInterval(shotTimer); shotTimer = null; }
+  shotGen += 1;
+  shot.hidden = true;
+  shot.removeAttribute("src");
+  shotPhase = "idle";
+  shotPreview = false;
+}
+
+function noteLive() {
+  if (!video.videoWidth) return;
+  stopScreenshots();
+  hideHold();
+  if (pathLabel && mode !== "denied") showBanner(pathLabel, false);
+  else if (mode !== "denied") hideBanner();
+  settleSession();
+}
+
+function rpc(op, timeoutMs) {
+  const request_id = "v" + (req++);
+  return new Promise((resolve, reject) => {
+    pending.set(request_id, { resolve, reject });
+    ws.send(JSON.stringify({
+      type: "invoke", request_id, node_id: node, client_id: "viewer", op
+    }));
+    setTimeout(() => {
+      if (pending.has(request_id)) {
+        pending.delete(request_id);
+        reject(new Error("timed out"));
+      }
+    }, timeoutMs || 20000);
+  });
+}
+
+function signal(payload, timeoutMs) {
+  return rpc({ op: "extension", name: "webrtc_signal", payload }, timeoutMs);
+}
+
+async function connect() {
+  if (!token || !node) { setStatus("open this page with agentlink view"); return; }
+  const gen = ++connectGen;
+  lastConnectError = null;
+  if (switchKind !== "elevate" && switchKind !== "release") {
+    if (switchKind === "transport") setMode("reconnecting");
+    else if (mode !== "reconnecting") setMode("connecting");
+  }
+  inputEnabled = false;
+  armStill();
+  pathLabel = "";
+  activeAttempt = null;
+  stopScreenshots();
+  hideBanner();
+  iceAttempts = 0;
+  await abandonPeer();
+  let config = await fetch("/view/config.json").then((r) => r.json());
+  const authed = await fetchIce();
+  if (authed) config = authed;
+  if (gen !== connectGen) return;
+  ws = await openSocket();
+  if (gen !== connectGen) return;
+  const listed = await signal({ action: "list_monitors" });
+  if (gen !== connectGen) return;
+  const select = document.getElementById("monitor");
+  select.innerHTML = "";
+  (listed.monitors || [{ index: 0, name: "screen", width: 0, height: 0 }]).forEach((mon) => {
+    const opt = document.createElement("option");
+    opt.value = String(mon.index);
+    opt.textContent = mon.name + " " + mon.width + "x" + mon.height;
+    if (String(mon.index) === (readLoc().monitor || "0")) opt.selected = true;
+    select.appendChild(opt);
+  });
+  if (listed.capturable === false || (listed.monitors || []).some((m) => m.capturable === false)) {
+    showBanner(listed.reason || "Remote screen is on a secure desktop and cannot be captured.", true);
+  }
+  // Paint pixels while ICE is still gathering. Non-blocking and independent
+  // of the screenshot fallback path.
+  previewShot(gen);
+  const attempts = attemptsFor(config);
+  if (!attempts.length) {
+    startScreenshots(iceMode() === "relay" ? "relay only and no TURN server" : "no connection path");
+    return;
+  }
+  ws.onclose = () => onSignalingClose();
+  for (const attempt of attempts) {
+    if (gen !== connectGen) return;
+    showBanner("Trying " + attempt.banner + "…", false);
+    setStatus("trying " + attempt.id);
+    let result;
+    try {
+      result = await tryAttempt(attempt, gen, Number(select.value || 0));
+    } catch (err) {
+      await abandonPeer();
+      lastConnectError = err;
+      if (err && err.fallback) {
+        // Watching and Take control both work over JPEG when live WebRTC is
+        // unavailable (Android nodes). Do not treat elevate fallback as deny.
+        startScreenshots(err.message || "node has no live video");
+        return;
+      }
+      // Stream consent decline/timeout must not block Take control when the
+      // reminted ticket already grants control — fall through to JPEG.
+      if (switchKind === "elevate" && ticketControl === true
+          && (classifyStream(err) === "stream_declined" || classifyStream(err) === "stream_timeout")) {
+        result = false;
+      } else if (switchKind === "release" && classifyStream(err) !== "transport") {
+        failRelease();
+        return;
+      } else {
+        result = false;
+      }
+    }
+    if (gen !== connectGen) return;
+    if (result) return;
+    await abandonPeer();
+  }
+  if (gen === connectGen) {
+    if (switchKind === "elevate") {
+      // ICE often fails after a real SDP answer (no candidate pairs). PR #39
+      // only accepted answer.fallback === "screenshot"; elevate still denied
+      // otherwise. Fall through to JPEG with inject_input when the ticket
+      // grants control.
+      if (ticketControl === true) {
+        if (nodeControl === null) nodeControl = true;
+        if (nodeControl === true) {
+          control = controlGrant();
+          const why = (lastConnectError && (lastConnectError.message || String(lastConnectError)))
+            || "no WebRTC path connected";
+          startScreenshots(why);
+        } else {
+          deny("policy");
+        }
+      } else {
+        deny(lastConnectError ? classifyStream(lastConnectError) : "transport");
+      }
+    } else if (switchKind === "release") failRelease();
+    else startScreenshots("no WebRTC path connected");
+  }
+}
+
+async function abandonPeer() {
+  const id = sessionId;
+  sessionId = "";
+  if (pc) {
+    pc.onconnectionstatechange = null;
+    try { pc.close(); } catch (err) {}
+    pc = null;
+  }
+  if (id && ws && ws.readyState === 1) {
+    signal({ action: "close", session_id: id }).catch(() => {});
+  }
+}
+
+async function tryAttempt(attempt, gen, monitorIndex) {
+  const servers = attempt.ice_servers || [];
+  const policy = attempt.ice_transport_policy || "all";
+  const gatherMs = Number(attempt.gather_ms || 2500);
+  const connectMs = Number(attempt.connect_ms || 4000);
+  const want = wantedType(attempt);
+  const peer = new RTCPeerConnection({ iceServers: servers, iceTransportPolicy: policy });
+  pc = peer;
+  const queuedIce = [];
+  let iceReady = false;
+  peer.onicecandidate = (ev) => {
+    if (!ev.candidate || peer !== pc) return;
+    const candidate = ev.candidate.toJSON();
+    if (!iceReady) queuedIce.push(candidate);
+    else if (sessionId) signal({ action: "ice", session_id: sessionId, candidate });
+  };
+  const input = peer.createDataChannel("input");
+  inputCh = input;
+  const cursorCh = peer.createDataChannel("cursor");
+  const meta = peer.createDataChannel("meta");
+  peer.addTransceiver("video", { direction: "recvonly" });
+  if (audioOn) peer.addTransceiver("audio", { direction: "recvonly" });
+  peer.ontrack = (ev) => {
+    if (peer !== pc) return;
+    if (ev.track.kind === "video" || !video.srcObject) {
+      video.srcObject = ev.streams[0];
+      ev.track.onunmute = () => noteLive();
+    } else if (video.srcObject) {
+      video.srcObject.addTrack(ev.track);
+    }
+  };
+  cursorCh.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    const rect = video.getBoundingClientRect();
+    if (!video.videoWidth) return;
+    const box = window.AgentlinkPointer.contentRect(rect, video.videoWidth, video.videoHeight);
+    if (msg.visible === false) {
+      cursor.style.display = "none";
+      return;
+    }
+    cursor.style.display = "block";
+    cursor.style.left = (box.left + (msg.x / video.videoWidth) * box.width) + "px";
+    cursor.style.top = (box.top + (msg.y / video.videoHeight) * box.height) + "px";
+    // shape is informational; unknown values keep the crosshair overlay.
+    if (msg.shape) cursor.dataset.shape = String(msg.shape);
+  };
+  meta.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.t) document.getElementById("stat-latency").textContent = "latency " + Math.max(0, Date.now() - msg.t) + " ms";
+    if (msg.type === "state" && msg.capturable === false) {
+      showBanner(msg.reason || "Remote screen is on a secure desktop and cannot be captured.", true);
+    }
+  };
+  const offer = await peer.createOffer();
+  if (gen !== connectGen || peer !== pc) return false;
+  await peer.setLocalDescription(offer);
+  const saw = await waitForCandidate(peer, want, gatherMs);
+  if (gen !== connectGen || peer !== pc) return false;
+  if (!saw) return false;
+  const answer = await signal({
+    action: "offer",
+    sdp: peer.localDescription.sdp,
+    viewer: "browser",
+    monitor: monitorIndex,
+    codec: "h264",
+    max_fps: 30,
+    bitrate: 2000000,
+    audio: audioOn,
+    ice_servers: servers,
+    ice_transport_policy: policy,
+    ice_path: attempt.id,
+    gather_ms: gatherMs
+  }, (switchKind === "elevate" || switchKind === "release") ? 35000 : 20000);
+  if (gen !== connectGen || peer !== pc) return false;
+  if (answer.fallback === "screenshot" || answer.status === "unavailable") {
+    // Screenshot-mode Take control is valid. Prefer the node's control bit;
+    // Android fallback historically omitted it, so trust the clipped ticket.
+    if (typeof answer.control === "boolean") nodeControl = answer.control;
+    else if (switchKind === "elevate" || switchKind === "release") nodeControl = ticketControl === true;
+    control = controlGrant();
+    const err = new Error("node has no live video");
+    err.fallback = true;
+    throw err;
+  }
+  if (!answer.sdp) return false;
+  sessionId = answer.session_id || "";
+  nodeControl = !!answer.control;
+  control = controlGrant();
+  document.getElementById("stat-codec").textContent = "codec " + (answer.codec || "");
+  document.getElementById("stat-encoder").textContent = "encoder " + (answer.encoder || "");
+  // Screenshot fallback settles from startScreenshots. Live video settles
+  // from noteLive. If elevate/release already has frames (or will stay on
+  // the hold until unmute), mark that a fresh answer exists so settle can
+  // proceed once the peer connects / first frame arrives.
+  await peer.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+  if (gen !== connectGen || peer !== pc) return false;
+  for (const cand of answer.candidates || []) {
+    try { await peer.addIceCandidate(cand); } catch (err) {}
+  }
+  iceReady = true;
+  for (const candidate of queuedIce) {
+    signal({ action: "ice", session_id: sessionId, candidate });
+  }
+  const connected = await waitConnected(peer, connectMs);
+  if (gen !== connectGen || peer !== pc) return false;
+  if (!connected) return false;
+  activeAttempt = attempt;
+  pathLabel = attempt.banner;
+  showBanner(pathLabel, false);
+  setStatus(mode);
+  if (!input.__feedback) {
+    input.__feedback = true;
+    input.onopen = () => { if (!window.__feedbackTimer) window.__feedbackTimer = setInterval(sendFeedback, 1000); };
+    if (input.readyState === "open" && !window.__feedbackTimer) window.__feedbackTimer = setInterval(sendFeedback, 1000);
+  }
+  if (!statsStarted) {
+    statsStarted = true;
+    setInterval(readStats, 1000);
+  }
+  peer.onconnectionstatechange = () => onPeerState();
+  requestKeyframe();
+  armLiveWatch();
+  return true;
+}
+
+function requestKeyframe() {
+  if (!sessionId || !ws || ws.readyState !== 1) return;
+  signal({ action: "keyframe", session_id: sessionId }).catch(() => {});
+  if (inputCh && inputCh.readyState === "open") {
+    try { inputCh.send(JSON.stringify({ type: "keyframe" })); } catch (err) {}
+  }
+}
+
+function waitConnected(peer, ms) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(peer.connectionState === "connected"), ms);
+    const prev = peer.onconnectionstatechange;
+    peer.onconnectionstatechange = () => {
+      if (typeof prev === "function") prev();
+      if (peer.connectionState === "connected") finish(true);
+      else if (peer.connectionState === "failed") finish(false);
+    };
+    if (peer.connectionState === "connected") finish(true);
+    else if (peer.connectionState === "failed") finish(false);
+  });
+}
+
+function onSignalingClose() {
+  const state = pc && pc.connectionState;
+  if (state === "connected" || state === "connecting" || shotTimer) reconnectSignaling();
+  else if (state !== "closed") {
+    setStatus("signaling down");
+    showBanner("Signaling websocket closed. Live video is down.", true);
+  }
+}
+
+function onPeerState() {
+  if (!pc) return;
+  const state = pc.connectionState;
+  if (state === "connected") {
+    if (video.videoWidth) noteLive();
+    return;
+  }
+  if (state === "failed" || state === "disconnected") {
+    if (mode === "controlling") pendingWasControlling = true;
+    inputEnabled = false;
+    flushAllUp();
+    if (switchKind !== "elevate" && switchKind !== "release") {
+      switchKind = "transport";
+      settledFor = -1;
+      setMode("reconnecting");
+      announce(t("announce.reconnecting", { node: nodeLabel() }));
+    }
+  }
+  if (state === "failed") recoverOrShots("peer connection failed");
+  else if (state === "disconnected") {
+    setStatus("disconnected");
+    showBanner("WebRTC disconnected. Waiting for ICE, then screenshots.", false);
+    setTimeout(() => {
+      if (pc && pc.connectionState === "disconnected") recoverOrShots("peer connection disconnected");
+    }, 8000);
+  }
+}
+
+function armLiveWatch() {
+  setTimeout(() => {
+    if (shotTimer || !pc || video.videoWidth) return;
+    if (pc.connectionState === "connected") requestKeyframe();
+  }, 1500);
+  setTimeout(() => {
+    if (shotTimer || !pc || iceAttempts > 0) return;
+    if (pc.connectionState === "connected" && video.videoWidth) {
+      noteLive();
+      return;
+    }
+    if (pc.connectionState === "connected") startScreenshots("connected with no video frames");
+    else recoverOrShots("no video (" + pc.connectionState + ")");
+  }, 8000);
+}
+
+function startScreenshots(reason) {
+  failReason = reason;
+  transport = "screenshot";
+  showBanner("Live video failed (" + reason + "). Showing screenshots.", false);
+  setStatus("screenshot fallback");
+  if (mode === "connecting" || mode === "reconnecting" || mode === "requesting" || mode === "releasing") settleSession();
+  else paint();
+  if (!window.__shotToast) {
+    window.__shotToast = true;
+    toast(t("toast.screenshotMode"));
+  }
+  if (shotTimer) return;
+  // Keep an early preview on screen. Upgrade from it instead of blanking.
+  if (shotPhase === "idle") shotPhase = shotPreview ? "steady" : "preview";
+  else if (shotPhase === "preview" && shotPreview) shotPhase = "steady";
+  pullScreenshot();
+  shotTimer = setInterval(pullScreenshot, 1000);
+}
+
+// Early first paint while WebRTC is still negotiating. Non-blocking: no
+// shotTimer and no transport switch, so live video can still win. Ignore
+// late results if the session generation moved on or real frames arrived.
+async function previewShot(gen) {
+  if (shotBusy || !ws || ws.readyState !== 1) return;
+  const shotAt = shotGen;
+  shotBusy = true;
+  let body = null;
+  try {
+    const select = document.getElementById("monitor");
+    const step = SHOT_STEPS.preview;
+    body = await rpc({
+      op: "extension",
+      name: "screenshot",
+      payload: {
+        target: "monitor",
+        monitor: Number((select && select.value) || 0),
+        format: "jpeg",
+        quality: step.quality,
+        scale: step.scale
+      }
+    }, 12000);
+  } catch (err) {
+    body = null;
+  } finally {
+    shotBusy = false;
+  }
+  if (gen !== connectGen || shotAt !== shotGen || video.videoWidth) return;
+  if (transport === "screenshot" && !shot.hidden) return;
+  if (!body || !body.data_b64) return;
+  shot.src = "data:" + (body.mime || "image/jpeg") + ";base64," + body.data_b64;
+  shot.hidden = false;
+  shotPreview = true;
+  if (shotPhase === "idle") shotPhase = "preview";
+  if (transport === "screenshot" && shotTimer) {
+    // Cold path skips enhance: go straight to steady after the preview paints.
+    shotPhase = "steady";
+    pullScreenshot();
+  }
+}
+
+// JPEG fallback is the screenshot invoke, not an RTP frame. Agent sessions
+// seal that invoke. This page cannot complete the Noise handshake, so the
+// ticket scopes it. Live video stays DTLS-SRTP. Relay only forces TURN.
+async function pullScreenshot() {
+  if (shotBusy) return;
+  if (!ws || ws.readyState !== 1) {
+    showBanner("Live video failed (" + failReason + "). Signaling is down, so screenshots cannot load.", true);
+    setStatus("video failed");
+    return;
+  }
+  if (shotPhase === "idle") shotPhase = "preview";
+  const phase = shotPhase;
+  const step = SHOT_STEPS[phase] || SHOT_STEPS.steady;
+  const gen = shotGen;
+  shotBusy = true;
+  let advance = false;
+  try {
+    const select = document.getElementById("monitor");
+    const body = await rpc({
+      op: "extension",
+      name: "screenshot",
+      payload: {
+        target: "monitor",
+        monitor: Number(select.value || 0),
+        format: "jpeg",
+        quality: step.quality,
+        scale: step.scale
+      }
+    });
+    if (gen !== shotGen) return;
+    if (!body.data_b64) throw new Error("screenshot has no image");
+    shot.src = "data:" + (body.mime || "image/jpeg") + ";base64," + body.data_b64;
+    shot.hidden = false;
+    shotPreview = false;
+    // Cold path: preview → steady (skip enhance). Enhance still advances to steady
+    // if a slow-path caller ever enters that phase.
+    if (phase === "preview") { shotPhase = "steady"; advance = true; }
+    else if (phase === "enhance") { shotPhase = "steady"; }
+    showBanner("Live video failed (" + failReason + "). Showing screenshots.", false);
+    setStatus("screenshot fallback");
+  } catch (err) {
+    if (gen !== shotGen) return;
+    // Keep the last frame on screen while a quality upgrade fails; only clear
+    // when there is nothing painted yet.
+    if (shot.hidden) {
+      showBanner("Live video failed (" + failReason + "). Screenshot failed: " + (err.message || err), true);
+      setStatus("video failed");
+    } else {
+      showBanner("Live video failed (" + failReason + "). Screenshot failed: " + (err.message || err), false);
+    }
+  } finally {
+    shotBusy = false;
+  }
+  // Steady right after the preview paints (enhance skipped on cold path);
+  // the 1s interval then keeps refreshing at steady quality.
+  if (advance && shotTimer && gen === shotGen) pullScreenshot();
+}
+
+async function recoverOrShots(reason) {
+  if (shotTimer || !pc || pc.__recovering || pc.connectionState === "closed") return;
+  if (iceAttempts >= 1) {
+    startScreenshots(reason);
+    return;
+  }
+  iceAttempts += 1;
+  pc.__recovering = true;
+  showBanner("WebRTC " + reason + ". Restarting ICE.", false);
+  let ok = false;
+  try {
+    ok = await restartIce();
+  } finally {
+    if (pc) pc.__recovering = false;
+  }
+  if (!ok) {
+    startScreenshots(reason + "; ICE restart failed");
+    return;
+  }
+  setTimeout(() => {
+    if (!pc || shotTimer) return;
+    if (pc.connectionState === "connected" && video.videoWidth) noteLive();
+    else if (pc.connectionState !== "connected" && pc.connectionState !== "connecting") {
+      startScreenshots(reason);
+    }
+  }, 8000);
+}
+
+async function fetchIce() {
+  if (!ticketId && !legacyToken) return null;
+  const body = { ticket: ticketId || legacyToken };
+  if (boundSession) body.session = boundSession;
+  try {
+    const response = await fetch("/api/ice", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (err) {
+    return null;
+  }
+}
+
+async function openSocket() {
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(scheme + "//" + location.host + "/v1/webrtc");
+  socket.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (err) { return; }
+    if (msg.type === "going_away") { setStatus("relay restarting"); return; }
+    if (msg.type === "hello_ok") {
+      if (msg.view_session && ticketId) {
+        boundSession = msg.view_session;
+        token = "view." + ticketId + "." + boundSession;
+        try { sessionStorage.setItem("agentlink.view.session." + ticketId, boundSession); } catch (err) {}
+        rememberView();
+      }
+      if (helloWait) helloWait();
+      return;
+    }
+    if (msg.type === "hello_err") {
+      const message = msg.message || "hello failed";
+      if (/expired/i.test(message)) endSession("ticket");
+      else if (/revok/i.test(message)) endSession("revoked");
+      else if (/invalid view ticket|already used/i.test(message)) endSession("ticket");
+      else { setStatus(message); showBanner(message, true); }
+      return;
+    }
+    if (msg.type === "result" && pending.has(msg.request_id)) {
+      const waiter = pending.get(msg.request_id);
+      pending.delete(msg.request_id);
+      if (msg.ok) waiter.resolve(msg.body || {});
+      else waiter.reject(new Error(msg.error || "request failed"));
+    }
+  };
+  await new Promise((resolve, reject) => {
+    socket.onopen = resolve;
+    socket.onerror = () => reject(new Error("websocket failed"));
+  });
+  const helloDone = new Promise((resolve) => { helloWait = resolve; setTimeout(resolve, 3000); });
+  socket.send(JSON.stringify({ type: "hello", role: "client", protocol: 2, token }));
+  await helloDone;
+  return socket;
+}
+
+async function reconnectSignaling() {
+  if (!pc || pc.__signaling) return;
+  pc.__signaling = true;
+  setStatus("signaling reconnect");
+  for (let attempt = 0; attempt < 8 && pc.connectionState !== "closed"; attempt++) {
+    try {
+      const socket = await openSocket();
+      ws = socket;
+      ws.onclose = () => onSignalingClose();
+      setStatus(shotTimer ? "screenshot fallback" : mode);
+      pc.__signaling = false;
+      return;
+    } catch (err) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(10000, 200 * (2 ** attempt))));
+    }
+  }
+  pc.__signaling = false;
+}
+
+async function restartIce() {
+  if (!pc || pc.__restarting || pc.connectionState === "closed") return;
+  pc.__restarting = true;
+  setStatus("ice restart");
+  try {
+    if (pc.restartIce) pc.restartIce();
+    const offer = await pc.createOffer({ iceRestart: true });
+    await pc.setLocalDescription(offer);
+    if (activeAttempt) await waitForCandidate(pc, wantedType(activeAttempt), Number(activeAttempt.gather_ms || 1500));
+    const answer = await signal({
+      action: "ice_restart",
+      session_id: sessionId,
+      sdp: pc.localDescription.sdp,
+      ice_transport_policy: activeAttempt ? activeAttempt.ice_transport_policy : (iceMode() === "relay" ? "relay" : "all"),
+      ice_path: activeAttempt ? activeAttempt.id : ""
+    });
+    await pc.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+    for (const cand of answer.candidates || []) {
+      try { await pc.addIceCandidate(cand); } catch (err) {}
+    }
+    setStatus("ice restarted");
+    return true;
+  } catch (err) {
+    setStatus("ice restart failed");
+    return false;
+  } finally {
+    pc.__restarting = false;
+  }
+}
+
+let lastBytes = 0;
+let lastStatsAt = 0;
+function sendFeedback() {
+  if (!pc || !inputCh || inputCh.readyState !== "open") return;
+  pc.getStats().then((stats) => {
+    let loss = 0;
+    stats.forEach((report) => {
+      if (report.type === "inbound-rtp" && report.kind === "video" && report.packetsReceived) {
+        loss = (report.packetsLost || 0) / (report.packetsReceived + (report.packetsLost || 0));
+      }
+    });
+    inputCh.send(JSON.stringify({ type: "feedback", loss }));
+  });
+}
+
+function readStats() {
+  if (!pc) return;
+  pc.getStats().then((stats) => {
+    stats.forEach((report) => {
+      if (report.type === "inbound-rtp" && report.kind === "video") {
+        if (report.framesPerSecond) document.getElementById("stat-fps").textContent = "fps " + Math.round(report.framesPerSecond);
+        if (report.bytesReceived) {
+          const now = performance.now();
+          if (lastStatsAt) {
+            const kbps = Math.round(((report.bytesReceived - lastBytes) * 8) / (now - lastStatsAt));
+            document.getElementById("stat-bitrate").textContent = "bitrate " + kbps + " kbps";
+          }
+          lastBytes = report.bytesReceived;
+          lastStatsAt = now;
+        }
+      }
+    });
+  });
+}
+
+function csrf() {
+  const match = document.cookie.match(/(?:^|; )agentlink_csrf=([^;]*)/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+async function api(path, opts) {
+  const options = opts || {};
+  options.credentials = "same-origin";
+  options.headers = Object.assign({ "x-csrf-token": csrf() }, options.headers || {});
+  const response = await fetch(path, options);
+  const text = await response.text();
+  if (!response.ok) {
+    const err = new Error(text || response.statusText);
+    err.status = response.status;
+    const retry = Number(response.headers.get("retry-after"));
+    if (retry) err.retryAfter = retry;
+    throw err;
+  }
+  return text ? JSON.parse(text) : {};
+}
+function inputLive() {
+  return inputEnabled && mode === "controlling" && !inputSuspended;
+}
+function selectedMonitor() {
+  const select = document.getElementById("monitor");
+  const value = Number((select && select.value) || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+function sendInput(msg) {
+  if (!inputLive()) return;
+  if (!inputCh || inputCh.readyState !== "open") return;
+  inputCh.send(JSON.stringify(msg));
+}
+function sendRaw(msg) {
+  if (!inputCh || inputCh.readyState !== "open") return;
+  try { inputCh.send(JSON.stringify(msg)); } catch (err) {}
+}
+function sendKey(name, down) {
+  if (down) {
+    if (!inputLive()) return;
+    pressedKeys.add(name);
+  } else if (!pressedKeys.has(name)) return;
+  else pressedKeys.delete(name);
+  if (!shot.hidden) {
+    rpc({ op: "extension", name: "inject_input", payload: { action: "key", keys: name, down: down } }).catch(() => {});
+    return;
+  }
+  const msg = { type: "key", keys: name, down: down };
+  if (down) sendInput(msg);
+  else sendRaw(msg);
+}
+function flushAllUp() {
+  Array.from(pressedKeys).forEach((key) => {
+    pressedKeys.delete(key);
+    if (!shot.hidden) rpc({ op: "extension", name: "inject_input", payload: { action: "key", keys: key, down: false } }).catch(() => {});
+    else sendRaw({ type: "key", keys: key, down: false });
+  });
+  Array.from(pressedButtons).forEach((button) => {
+    pressedButtons.delete(button);
+    sendRaw({ type: "mouse", action: "up", button, x: lastPoint.x, y: lastPoint.y, monitor: selectedMonitor() });
+  });
+  if (document.pointerLockElement) {
+    try { document.exitPointerLock(); } catch (err) {}
+  }
+}
+function keyName(ev) {
+  const raw = ev.key || "";
+  const map = {
+    Control: "ctrl", Shift: "shift", Alt: "alt", Meta: "meta",
+    Enter: "enter", Escape: "escape", Backspace: "backspace",
+    Delete: "delete", Tab: "tab", " ": "space",
+    ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down",
+    PageUp: "pageup", PageDown: "pagedown", Home: "home", End: "end"
+  };
+  if (map[raw]) return map[raw];
+  if (raw.length === 1) return raw.toLowerCase();
+  return "";
+}
+function reservedShortcut(ev) {
+  const key = (ev.key || "").toLowerCase();
+  if ((ev.metaKey || ev.ctrlKey) && ["w", "t", "n", "q", "r", "l", "tab"].indexOf(key) >= 0) return true;
+  if (ev.altKey && key === "f4") return true;
+  return false;
+}
+function controlGrant() {
+  if (ticketControl === true && nodeControl === true) return true;
+  if (ticketControl === false) return false;
+  return nodeControl === true;
+}
+function classifyStream(err) {
+  const text = String((err && err.message) || err || "").toLowerCase();
+  if (text.indexOf("denied") >= 0) return "stream_declined";
+  if (text.indexOf("timed out") >= 0 || text.indexOf("timeout") >= 0 || text.indexOf("consent") >= 0) return "stream_timeout";
+  return "transport";
+}
+function announce(text) {
+  const live = document.getElementById("announce");
+  if (!live) return;
+  live.textContent = "";
+  live.textContent = text;
+}
+function toast(text) {
+  const el = document.getElementById("toast");
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = text;
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => { el.hidden = true; }, 3200);
+}
+function rememberView() {
+  if (!node || !ticketId) return;
+  try {
+    sessionStorage.setItem("agentlink.view.resume", JSON.stringify({ node: node, ticketId: ticketId, boundSession: boundSession }));
+  } catch (err) {}
+  const next = "/view?node=" + encodeURIComponent(node);
+  if ((location.pathname + location.search) !== next || location.hash) {
+    history.replaceState({ agentlinkView: 1 }, "", next);
+  }
+}
+function snapshotFrame() {
+  const hold = document.getElementById("hold");
+  if (!hold || !video.videoWidth) return;
+  hold.width = video.videoWidth;
+  hold.height = video.videoHeight;
+  try { hold.getContext("2d").drawImage(video, 0, 0); hold.hidden = false; } catch (err) {}
+}
+function hideHold() {
+  const hold = document.getElementById("hold");
+  if (hold) hold.hidden = true;
+}
+function armStill() {
+  clearTimeout(stillTimer);
+  const cancel = document.getElementById("cancel-connect");
+  if (cancel) cancel.hidden = true;
+  stillTimer = setTimeout(() => {
+    if (mode !== "connecting") return;
+    paint();
+    if (cancel) { cancel.hidden = false; cancel.textContent = t("cta.cancel"); }
+  }, 8000);
+}
+function stickerMarkup(kind, label, dot) {
+  const icon = kind === "hand"
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 11V6.5a1.5 1.5 0 0 1 3 0V11M11 10V5.5a1.5 1.5 0 0 1 3 0V12M14 10.5V7.5a1.5 1.5 0 0 1 3 0V14c0 3-2 5-5 5h-1c-2 0-3-1-4-2l-3-4a1.5 1.5 0 0 1 2-2l1 1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></svg>';
+  return icon + "<span>" + label + "</span>" + (dot ? '<span class="live-dot" aria-hidden="true"></span>' : "");
+}
+function setCta(label, action, disabled, aria) {
+  ["cta", "cta-desktop"].forEach((id) => {
+    const button = document.getElementById(id);
+    if (!button) return;
+    button.hidden = !label;
+    button.textContent = label || "";
+    button.classList.toggle("ghost", action === "release" || action === "resume");
+    button.dataset.action = action || "";
+    if (disabled) button.setAttribute("aria-disabled", "true");
+    else button.removeAttribute("aria-disabled");
+    button.setAttribute("aria-busy", disabled ? "true" : "false");
+    if (aria) button.setAttribute("aria-label", aria);
+  });
+}
+function denyText() {
+  const name = nodeLabel();
+  if (deniedReason === "stream_declined") return t("deny.streamDeclined");
+  if (deniedReason === "stream_timeout") return t("deny.streamTimeout", { node: name });
+  if (deniedReason === "transport" || deniedReason === "unknown") return t("deny.transport");
+  if (deniedReason === "rate_limited") return t("deny.rateLimited", { seconds: retryLeft || 0 });
+  return t("deny.policy", { node: name });
+}
+function whyText() {
+  const name = nodeLabel();
+  if (deniedReason === "stream_declined") return t("deny.streamDeclined");
+  if (deniedReason === "stream_timeout") return t("deny.streamTimeout", { node: name });
+  if (relation && relation !== "owner") {
+    return ownerName ? t("deny.shared", { node: name, owner: ownerName }) : t("deny.sharedNoOwner", { node: name });
+  }
+  return t("deny.owner", { node: name });
+}
+function paint() {
+  const sticker = document.getElementById("mode-sticker");
+  const passive = document.getElementById("passive");
+  const keyboard = document.getElementById("keyboard-btn");
+  const overlay = document.getElementById("overlay");
+  const label = nodeLabel();
+  document.getElementById("node-label").textContent = label;
+  document.getElementById("back-btn").setAttribute("aria-label", t("aria.back"));
+  document.getElementById("back-btn").textContent = "‹";
+  let stickerClass = "sticker";
+  let stickerText = t("session.watching");
+  let icon = "eye";
+  let dot = false;
+  const showTake = dashboardSession && canControl && !!csrf();
+  setCta("", "", false, "");
+  if (passive) { passive.hidden = true; passive.replaceChildren(); }
+  if (keyboard) keyboard.hidden = mode !== "controlling";
+  if (overlay && mode !== "disconnected" && mode !== "ended") overlay.hidden = true;
+  if (mode === "connecting") {
+    stickerClass += " soft";
+    stickerText = t("session.connecting");
+  } else if (mode === "requesting") {
+    stickerClass += " soft";
+    stickerText = t("session.requestingShort");
+    setCta(t("session.requesting"), "busy", true, t("session.requesting"));
+    document.getElementById("wait-scrim").hidden = false;
+  } else if (mode === "releasing") {
+    stickerClass += " soft";
+    stickerText = t("session.releasing");
+    setCta(t("session.releasing"), "busy", true, t("session.releasing"));
+  } else if (mode === "controlling") {
+    stickerClass += " control";
+    stickerText = inputSuspended ? t("session.paused") : t("session.controlling");
+    icon = "hand";
+    dot = !inputSuspended;
+    if (inputSuspended) setCta(t("cta.resumeInput"), "resume", false, t("cta.resumeInput"));
+    else if (dashboardSession) setCta(t("cta.releaseControl"), "release", false, t("aria.release", { node: label }));
+    video.setAttribute("aria-label", t("aria.screenControl", { node: label }));
+  } else if (mode === "reconnecting") {
+    stickerClass += " down";
+    stickerText = t("session.reconnecting");
+    setCta(t("cta.reconnect"), "reconnect", false, t("cta.reconnect"));
+    showBanner(t("error.connectionLost"), false);
+  } else if (mode === "disconnected" || mode === "ended") {
+    stickerClass += " down";
+    stickerText = mode === "ended" ? t("session.ended") : t("session.disconnected");
+  } else if (mode === "denied" || (mode === "watching" && !showTake)) {
+    stickerText = t("session.watching");
+    video.setAttribute("aria-label", t("aria.screenWatch", { node: label }));
+    if (passive) {
+      passive.hidden = false;
+      const note = document.createElement("span");
+      note.textContent = mode === "denied" ? denyText() : t("card.viewOnly");
+      const why = document.createElement("button");
+      why.type = "button";
+      why.className = "text-btn";
+      why.textContent = t("cta.why");
+      why.addEventListener("click", () => openWhy());
+      passive.append(note, why);
+      if (mode === "denied" && deniedReason !== "policy" && controlAttempts < 3) {
+        const again = document.createElement("button");
+        again.type = "button";
+        again.className = "text-btn";
+        again.textContent = retryLeft ? t("deny.rateLimited", { seconds: retryLeft }) : t("cta.tryAgain");
+        again.disabled = retryLeft > 0;
+        again.addEventListener("click", () => { if (!retryLeft) takeControl(); });
+        const keep = document.createElement("button");
+        keep.type = "button";
+        keep.className = "text-btn";
+        keep.textContent = t("cta.keepWatching");
+        keep.addEventListener("click", keepWatching);
+        passive.append(again, keep);
+      }
+    }
+  } else {
+    stickerText = t("session.watching");
+    video.setAttribute("aria-label", t("aria.screenWatch", { node: label }));
+    setCta(t("cta.takeControl"), "take", false, t("aria.take", { node: label }));
+  }
+  if (transport === "screenshot" && (mode === "watching" || mode === "controlling" || mode === "denied")) {
+    stickerText += " · " + t("chip.screenshots");
+  }
+  if (sticker) {
+    sticker.className = stickerClass;
+    sticker.innerHTML = stickerMarkup(icon, stickerText, dot);
+  }
+  if (mode !== "requesting" && mode !== "releasing") {
+    const scrim = document.getElementById("wait-scrim");
+    if (scrim && mode !== "reconnecting") scrim.hidden = true;
+  }
+}
+function setMode(next) {
+  mode = next;
+  paint();
+}
+function enterWatching() {
+  mode = "watching";
+  deniedReason = "";
+  inputEnabled = false;
+  inputSuspended = false;
+  control = false;
+  hideHold();
+  paint();
+  announce(t("announce.watching", { node: nodeLabel() }));
+  showCoach();
+}
+function enterControlling() {
+  mode = "controlling";
+  deniedReason = "";
+  inputSuspended = false;
+  inputEnabled = true;
+  control = true;
+  hideHold();
+  paint();
+  announce(t("announce.controlling", { node: nodeLabel() }));
+  let seen = false;
+  try { seen = sessionStorage.getItem("agentlink.shortcut.hint") === "1"; } catch (err) {}
+  if (!seen) {
+    try { sessionStorage.setItem("agentlink.shortcut.hint", "1"); } catch (err) {}
+    toast(t("coach.controlling") + " " + t("toast.systemShortcuts"));
+  } else toast(t("coach.controlling"));
+  shortcutShown = true;
+  if (!guardArmed) {
+    guardArmed = true;
+    history.pushState({ agentlinkGuard: 1 }, "");
+  }
+}
+function showCoach() {
+  if (coachShown) return;
+  if (!capabilityReady) return;
+  try { if (sessionStorage.getItem("agentlink.coach.watch")) { coachShown = true; return; } } catch (err) {}
+  coachShown = true;
+  const el = document.getElementById("coach");
+  if (!el) return;
+  const text = (dashboardSession && !canControl) ? t("coach.viewOnly", { node: nodeLabel() }) : t("coach.watching");
+  el.replaceChildren();
+  const span = document.createElement("span");
+  span.textContent = text + " ";
+  const ok = document.createElement("button");
+  ok.type = "button";
+  ok.className = "text-btn";
+  ok.textContent = t("cta.gotIt");
+  ok.addEventListener("click", () => {
+    el.hidden = true;
+    try { sessionStorage.setItem("agentlink.coach.watch", "1"); } catch (err) {}
+    ok.focus();
+  });
+  el.append(span, ok);
+  el.hidden = false;
+}
+function deny(reason, seconds) {
+  mode = "denied";
+  deniedReason = reason || "unknown";
+  inputEnabled = false;
+  inputSuspended = false;
+  control = false;
+  switchKind = "live";
+  const retryable = deniedReason !== "policy";
+  retryLeft = !retryable || controlAttempts >= 3 ? 0 : (seconds || (deniedReason === "rate_limited" ? 60 : 5));
+  paint();
+  showBanner(denyText(), deniedReason === "policy");
+  announce(t("announce.denied", { reason: denyText() }));
+  clearInterval(retryTimer);
+  if (retryLeft) {
+    retryTimer = setInterval(() => {
+      retryLeft -= 1;
+      if (retryLeft <= 0) { clearInterval(retryTimer); retryLeft = 0; }
+      paint();
+      if (mode === "denied") showBanner(denyText(), deniedReason === "policy");
+    }, 1000);
+  }
+}
+function keepWatching() {
+  clearInterval(retryTimer);
+  retryLeft = 0;
+  deniedReason = "";
+  hideBanner();
+  enterWatching();
+}
+function failRelease() {
+  inputEnabled = false;
+  flushAllUp();
+  endSession("release");
+}
+function endSession(kind) {
+  mode = "ended";
+  inputEnabled = false;
+  switchKind = "live";
+  const overlay = document.getElementById("overlay");
+  const text = document.getElementById("overlay-text");
+  const primary = document.getElementById("overlay-primary");
+  const back = document.getElementById("overlay-back");
+  const name = nodeLabel();
+  let message = t("error.generic");
+  let action = "reopen";
+  if (kind === "release") message = t("error.releaseFailed");
+  else if (kind === "ticket") message = t("error.ticketExpired");
+  else if (kind === "revoked") message = t("error.revoked");
+  else if (kind === "screen") message = t("error.noScreen", { node: name });
+  else if (kind === "webrtc") message = t("error.webrtc");
+  else if (kind === "offline") message = t("error.nodeOffline", { node: name });
+  else if (kind === "auth") message = t("error.authExpired");
+  if (text) text.textContent = message;
+  if (primary) {
+    primary.hidden = false;
+    primary.textContent = t(action === "reopen" ? "cta.reopen" : "cta.reconnect");
+    primary.onclick = () => reopenWatch();
+  }
+  if (back) { back.textContent = t("cta.back"); back.onclick = () => leaveSession(); }
+  if (overlay) overlay.hidden = false;
+  paint();
+  announce(t("announce.ended", { reason: message }));
+}
+function openWhy() {
+  const sheet = document.getElementById("sheet");
+  const title = document.getElementById("sheet-title");
+  const body = document.getElementById("sheet-body");
+  const help = document.getElementById("sheet-help");
+  title.textContent = (deniedReason === "stream_declined" || deniedReason === "stream_timeout") ? (ZH ? "桌面连接" : "Desktop connection") : t("card.viewOnly");
+  body.textContent = whyText();
+  const owner = !relation || relation === "owner";
+  help.hidden = !owner || deniedReason === "stream_declined" || deniedReason === "stream_timeout";
+  document.getElementById("sheet-help-summary").textContent = t("help.change");
+  document.getElementById("sheet-help-body").textContent = t("help.body");
+  document.getElementById("sheet-ok").textContent = t("cta.gotIt");
+  const retry = document.getElementById("sheet-retry");
+  retry.hidden = !(deniedReason === "stream_declined" || deniedReason === "stream_timeout") || retryLeft > 0 || controlAttempts >= 3;
+  retry.textContent = t("cta.tryAgain");
+  sheet.hidden = false;
+  document.getElementById("sheet-ok").focus();
+}
+function closeSheet() {
+  const sheet = document.getElementById("sheet");
+  sheet.hidden = true;
+  const why = document.querySelector("#passive .text-btn");
+  if (why) why.focus();
+}
+function openLeave() {
+  const leave = document.getElementById("leave");
+  document.getElementById("leave-title").textContent = t("confirm.leaveControlling");
+  document.getElementById("leave-go").textContent = t("confirm.releaseAndLeave");
+  document.getElementById("leave-stay").textContent = t("confirm.keepControlling");
+  leave.hidden = false;
+  document.getElementById("leave-stay").focus();
+}
+function closeLeave() {
+  document.getElementById("leave").hidden = true;
+  const cta = document.getElementById("cta-desktop");
+  if (cta && !cta.hidden) cta.focus();
+}
+function leaveSession() {
+  // Clear controlling/guard first so popstate cannot reopen #leave and trap
+  // history.back(). Tear down is best-effort; navigate immediately.
+  leaving = true;
+  mode = "ended";
+  guardArmed = false;
+  inputEnabled = false;
+  inputSuspended = false;
+  control = false;
+  switchKind = "live";
+  flushAllUp();
+  try { closeLeave(); } catch (err) {}
+  try { stopScreenshots(); } catch (err) {}
+  try { if (ws) { ws.onclose = null; ws.close(); } } catch (err) {}
+  try { if (pc) pc.close(); } catch (err) {}
+  pc = null;
+  ws = null;
+  location.assign("/");
+}
+function suspendInput() {
+  if (mode !== "controlling") return;
+  flushAllUp();
+  inputEnabled = false;
+  inputSuspended = true;
+  paint();
+  toast(t("toast.controlSuspended"));
+}
+function resumeInput() {
+  if (mode !== "controlling") return;
+  inputSuspended = false;
+  inputEnabled = true;
+  paint();
+}
+async function loadNodes() {
+  if (!node) return;
+  const before = canControl;
+  try {
+    const data = await api("/api/nodes");
+    dashboardSession = true;
+    const item = (data.nodes || []).find((entry) => entry.id === node || entry.name === node);
+    if (!item) {
+      capabilityReady = true;
+      paint();
+      if (mode === "watching") showCoach();
+      return;
+    }
+    canControl = item.allow_remote_control === true;
+    nodeName = item.name || nodeName || node;
+    ownerName = item.owner || "";
+    relation = item.relation || "owner";
+    if (!before && canControl && (mode === "watching" || mode === "denied")) toast(t("toast.controlAvailable"));
+    capabilityReady = true;
+    paint();
+    if (mode === "watching") showCoach();
+  } catch (err) {
+    if (err.status === 401) {
+      dashboardSession = false;
+      if (startedWatch || ticketControl === false) canControl = false;
+    }
+    capabilityReady = true;
+    paint();
+    if (mode === "watching") showCoach();
+  }
+}
+async function adoptTicket(minted) {
+  const raw = String((minted && minted.ticket) || "");
+  ticket = raw;
+  ticketId = raw.replace(/^view\./, "").split(".")[0];
+  boundSession = "";
+  legacyToken = "";
+  token = raw.indexOf("view.") === 0 ? raw : "view." + raw;
+  if (minted.node) node = minted.node;
+  try { sessionStorage.removeItem("agentlink.view.session." + ticketId); } catch (err) {}
+  // Drop the previous answer and media so a stale track cannot settle
+  // Take control / Release with the old control bit.
+  nodeControl = null;
+  control = false;
+  try { video.srcObject = null; } catch (err) {}
+  await abandonPeer();
+  if (ws) {
+    const old = ws;
+    ws = null;
+    try { old.onclose = null; old.close(); } catch (err) {}
+  }
+}
+async function reopenWatch() {
+  if (!dashboardSession || !csrf()) { leaveSession(); return; }
+  busy = true;
+  try {
+    const minted = await api("/api/view-ticket", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ node: node, control: false })
+    });
+    ticketControl = minted.control === true;
+    startedWatch = true;
+    if (ticketControl) { failRelease(); return; }
+    switchKind = "initial";
+    settledFor = -1;
+    await adoptTicket(minted);
+    await connect();
+  } catch (err) {
+    endSession(err.status === 401 ? "auth" : "generic");
+  } finally {
+    busy = false;
+  }
+}
+async function takeControl() {
+  if (busy || mode === "requesting" || mode === "controlling") return;
+  if (!dashboardSession || !canControl || !csrf()) { openWhy(); return; }
+  const gen = ++requestGen;
+  busy = true;
+  controlAttempts += 1;
+  inputEnabled = false;
+  flushAllUp();
+  deniedReason = "";
+  // Account already has control permission — remint and elevate immediately.
+  // No human approve gate on the node; "requesting" is only a short connecting state.
+  setMode("requesting");
+  announce(t("announce.requesting", { node: nodeLabel() }));
+  showBanner(t("session.requesting"), false);
+  try {
+    const minted = await api("/api/view-ticket", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ node: node, control: true })
+    });
+    if (gen !== requestGen) return;
+    if (minted.control !== true) { deny("policy"); return; }
+    ticketControl = true;
+    switchKind = "elevate";
+    settledFor = -1;
+    snapshotFrame();
+    await adoptTicket(minted);
+    if (gen !== requestGen) return;
+    await connect();
+  } catch (err) {
+    if (gen !== requestGen) return;
+    if (err.status === 429) deny("rate_limited", err.retryAfter || 60);
+    else if (err.status === 403 || err.status === 401) deny("policy");
+    else deny(classifyStream(err));
+  } finally {
+    busy = false;
+  }
+}
+async function releaseControl() {
+  if (busy || mode !== "controlling") return;
+  busy = true;
+  inputEnabled = false;
+  inputSuspended = false;
+  flushAllUp();
+  setMode("releasing");
+  try {
+    const minted = await api("/api/view-ticket", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ node: node, control: false })
+    });
+    ticketControl = minted.control === true;
+    if (ticketControl) { failRelease(); return; }
+    switchKind = "release";
+    settledFor = -1;
+    snapshotFrame();
+    await adoptTicket(minted);
+    await connect();
+  } catch (err) {
+    failRelease();
+  } finally {
+    busy = false;
+  }
+}
+function cancelRequest() {
+  requestGen += 1;
+  busy = false;
+  const scrim = document.getElementById("wait-scrim");
+  if (scrim) scrim.hidden = true;
+  if (pc && (pc.connectionState === "connected" || pc.connectionState === "connecting") && switchKind !== "elevate") {
+    switchKind = "live";
+    enterWatching();
+    return;
+  }
+  startedWatch = true;
+  ticketControl = false;
+  reopenWatch();
+}
+function onCta(ev) {
+  const button = ev.currentTarget;
+  if (button.getAttribute("aria-disabled") === "true") return;
+  const action = button.dataset.action;
+  if (action === "take") takeControl();
+  else if (action === "release") releaseControl();
+  else if (action === "resume") resumeInput();
+  else if (action === "reconnect") { switchKind = "transport"; settledFor = -1; connect().catch(failView); }
+}
+function toggleTools() {
+  const header = document.getElementById("tool-header");
+  const open = header.hidden;
+  header.hidden = !open;
+  document.getElementById("more-btn").setAttribute("aria-expanded", open ? "true" : "false");
+}
+function toggleFullscreen() {
+  const target = document.querySelector("main");
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (target && target.requestFullscreen) target.requestFullscreen();
+}
+function prepareLocation() {
+  loc = readLoc();
+  ticket = loc.ticket;
+  legacyToken = loc.token;
+  ticketId = ticket.replace(/^view\./, "").split(".")[0];
+  boundSession = "";
+  try { boundSession = sessionStorage.getItem("agentlink.view.session." + ticketId) || ""; } catch (err) {}
+  token = legacyToken;
+  if (ticketId && boundSession) token = "view." + ticketId + "." + boundSession;
+  else if (ticket) token = ticket.indexOf("view.") === 0 ? ticket : "view." + ticket;
+  node = loc.node || node;
+  if (loc.start === "watch") { startedWatch = true; ticketControl = false; }
+}
+function settleSession() {
+  if (settledFor === connectGen && (mode === "watching" || mode === "controlling" || mode === "denied" || mode === "ended")) {
+    paint();
+    return;
+  }
+  // Elevate/release must wait for the answer from THIS peer. A null
+  // nodeControl means adoptTicket cleared the old bit and the offer has
+  // not returned yet — do not deny or release on a stale frame.
+  if ((switchKind === "elevate" || switchKind === "release") && nodeControl === null) {
+    return;
+  }
+  settledFor = connectGen;
+  clearTimeout(stillTimer);
+  const cancel = document.getElementById("cancel-connect");
+  if (cancel) cancel.hidden = true;
+  const legacy = !startedWatch && ticketControl === null;
+  if (switchKind === "elevate") {
+    if (ticketControl === true && nodeControl === true) enterControlling();
+    else deny("policy");
+  } else if (switchKind === "release") {
+    if (ticketControl === true || nodeControl === true) failRelease();
+    else {
+      enterWatching();
+      toast(t("toast.released"));
+      announce(t("announce.released", { node: nodeLabel() }));
+    }
+  } else if (switchKind === "transport") {
+    inputEnabled = false;
+    if (legacy && nodeControl) enterControlling();
+    else {
+      if (startedWatch || dashboardSession) ticketControl = false;
+      const resumed = pendingWasControlling;
+      pendingWasControlling = false;
+      enterWatching();
+      toast(resumed ? t("announce.reconnected", { node: nodeLabel() }) : t("toast.reconnected"));
+      if (resumed) announce(t("announce.reconnected", { node: nodeLabel() }));
+    }
+  } else if (legacy && nodeControl) {
+    enterControlling();
+  } else {
+    enterWatching();
+  }
+  switchKind = "live";
+  if (mode !== "denied" && mode !== "ended") hideHold();
+}
+function wireInput() {
+  const point = (ev) => {
+    const rect = video.getBoundingClientRect();
+    // 0–1 of the letterboxed content; desktop maps via selected monitor.
+    const at = window.AgentlinkPointer.toFraction(ev, rect, video.videoWidth || 0, video.videoHeight || 0);
+    lastPoint = at;
+    return at;
+  };
+  const buttonOf = (ev) => ev.button === 2 ? "right" : ev.button === 1 ? "middle" : "left";
+  video.addEventListener("mousemove", (ev) => {
+    const at = point(ev);
+    if (!inputLive()) return;
+    sendInput({ type: "mouse", action: "move", ...at, monitor: selectedMonitor() });
+  });
+  video.addEventListener("mousedown", (ev) => {
+    const at = point(ev);
+    if (!inputLive()) return;
+    const button = buttonOf(ev);
+    pressedButtons.add(button);
+    sendInput({ type: "mouse", action: "down", button, ...at, monitor: selectedMonitor() });
+  });
+  video.addEventListener("mouseup", (ev) => {
+    const at = point(ev);
+    const button = buttonOf(ev);
+    if (!pressedButtons.has(button)) return;
+    pressedButtons.delete(button);
+    sendRaw({ type: "mouse", action: "up", button, ...at, monitor: selectedMonitor() });
+  });
+  video.addEventListener("wheel", (ev) => {
+    if (!inputLive()) return;
+    ev.preventDefault();
+    const notches = window.AgentlinkPointer.wheelNotches;
+    sendInput({
+      type: "mouse",
+      action: "scroll",
+      dx: notches(ev.deltaX),
+      dy: notches(-ev.deltaY),
+      ...point(ev),
+      monitor: selectedMonitor(),
+    });
+  }, { passive: false });
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") {
+      if (document.pointerLockElement) {
+        try { document.exitPointerLock(); } catch (err) {}
+        ev.preventDefault();
+      }
+      if (!document.getElementById("leave").hidden) closeLeave();
+      if (!document.getElementById("sheet").hidden) closeSheet();
+      return;
+    }
+    if (reservedShortcut(ev)) return;
+    const target = ev.target;
+    const capture = target && target.id === "key-capture";
+    if (!capture && target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+    if (!inputLive() || ev.repeat) return;
+    const name = keyName(ev);
+    if (!name) return;
+    sendKey(name, true);
+  });
+  window.addEventListener("keyup", (ev) => {
+    const name = keyName(ev);
+    if (!name || !pressedKeys.has(name)) return;
+    sendKey(name, false);
+  });
+  window.addEventListener("blur", () => { if (mode === "controlling") suspendInput(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && mode === "controlling") suspendInput();
+    if (document.visibilityState === "visible") loadNodes();
+  });
+}
+
+function failView(err) {
+  const text = String((err && err.message) || err || "viewer failed");
+  setStatus(text);
+  showBanner(text, true);
+  if (ws && ws.readyState === 1) startScreenshots(text);
+}
+
+function wireShot() {
+  const send = (payload) => {
+    if (!inputLive() || shot.hidden) return;
+    if (payload && payload.action === "key" && payload.down === false) {
+      rpc({ op: "extension", name: "inject_input", payload }).catch(() => {});
+      return;
+    }
+    rpc({ op: "extension", name: "inject_input", payload }).catch(() => {});
+  };
+  const point = (ev) => {
+    const rect = shot.getBoundingClientRect();
+    // 0–1 of letterboxed JPEG content; scale must not affect click mapping.
+    return window.AgentlinkPointer.toFraction(ev, rect, shot.naturalWidth || 0, shot.naturalHeight || 0);
+  };
+  let lastMove = 0;
+  shot.addEventListener("mousemove", (ev) => {
+    const now = performance.now();
+    if (now - lastMove < 50) return;
+    lastMove = now;
+    send({ action: "move", ...point(ev), monitor: selectedMonitor() });
+  });
+  shot.addEventListener("mousedown", (ev) => {
+    ev.preventDefault();
+    const p = point(ev);
+    send({ action: "click", button: ev.button === 2 ? "right" : "left", ...p, monitor: selectedMonitor() });
+  });
+  shot.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const notches = window.AgentlinkPointer.wheelNotches;
+    send({
+      action: "scroll",
+      dx: notches(ev.deltaX),
+      dy: notches(-ev.deltaY),
+      ...point(ev),
+      monitor: selectedMonitor(),
+    });
+  }, { passive: false });
+}
+
+video.addEventListener("resize", () => noteLive());
+video.addEventListener("loadeddata", () => noteLive());
+wireShot();
+if (!inputWired) {
+  inputWired = true;
+  wireInput();
+}
+document.getElementById("ice-mode").addEventListener("change", () => {
+  applyIceMode(document.getElementById("ice-mode").value);
+  if (token && node) {
+    if (startedWatch || dashboardSession) {
+      switchKind = "transport";
+      if (mode === "controlling") pendingWasControlling = true;
+      inputEnabled = false;
+      flushAllUp();
+    }
+    settledFor = -1;
+    connect().catch(failView);
+  }
+});
+document.getElementById("connect").onclick = () => {
+  switchKind = startedWatch || dashboardSession ? "transport" : "initial";
+  settledFor = -1;
+  connect().catch(failView);
+};
+document.getElementById("audio").onclick = (ev) => { audioOn = !audioOn; ev.target.textContent = audioOn ? "Audio on" : "Audio off"; };
+document.getElementById("back-btn").addEventListener("click", () => {
+  if (mode === "controlling") openLeave();
+  else leaveSession();
+});
+document.getElementById("cta").addEventListener("click", onCta);
+document.getElementById("cta-desktop").addEventListener("click", onCta);
+document.getElementById("fs-btn").addEventListener("click", toggleFullscreen);
+document.getElementById("fs-bottom").addEventListener("click", toggleFullscreen);
+document.getElementById("more-btn").addEventListener("click", toggleTools);
+document.getElementById("more-bottom").addEventListener("click", toggleTools);
+document.getElementById("keyboard-btn").addEventListener("click", () => {
+  const input = document.getElementById("key-capture");
+  input.hidden = false;
+  input.focus();
+});
+document.getElementById("cancel-connect").addEventListener("click", () => {
+  if (mode === "requesting") cancelRequest();
+  else leaveSession();
+});
+document.getElementById("sheet-ok").addEventListener("click", closeSheet);
+document.getElementById("sheet-retry").addEventListener("click", () => { closeSheet(); if (!retryLeft) takeControl(); });
+document.getElementById("sheet").addEventListener("click", (ev) => { if (ev.target.id === "sheet") closeSheet(); });
+document.getElementById("leave-go").addEventListener("click", () => {
+  leaveSession();
+});
+document.getElementById("leave-stay").addEventListener("click", closeLeave);
+document.getElementById("leave").addEventListener("click", (ev) => { if (ev.target.id === "leave") closeLeave(); });
+window.addEventListener("popstate", () => {
+  if (leaving || mode === "ended") return;
+  if (mode === "controlling") {
+    history.pushState({ agentlinkGuard: 1 }, "");
+    openLeave();
+  } else guardArmed = false;
+});
+if (ZH) document.documentElement.lang = "zh-Hans";
+paint();
+if (token && node) {
+  document.getElementById("portal").style.display = "none";
+  document.getElementById("back-btn").focus();
+  loadNodes();
+  connect().catch(failView);
+  setInterval(() => { if (!document.hidden) loadNodes(); }, 30000);
+}
+window.agentlinkPrepare = prepareLocation;
+window.agentlinkConnect = connect;
+window.agentlinkSetStatus = setStatus;
+window.agentlinkFail = failView;
+window.agentlinkStartScreenshots = startScreenshots;
+window.agentlinkAttempts = attemptsFor;
+window.agentlinkHasTicket = !!(token && node);
+</script>
+<script>
+(function () {
+  const portal = document.getElementById("portal");
+  if (window.agentlinkHasTicket) return;
+  const loginForm = document.getElementById("login-form");
+  const app = document.getElementById("app");
+  function csrf() {
+    const match = document.cookie.match(/(?:^|; )agentlink_csrf=([^;]*)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+  async function api(path, opts) {
+    const options = opts || {};
+    options.credentials = "same-origin";
+    options.headers = Object.assign({ "x-csrf-token": csrf() }, options.headers || {});
+    const response = await fetch(path, options);
+    const text = await response.text();
+    if (!response.ok) throw new Error(text || response.statusText);
+    return text ? JSON.parse(text) : {};
+  }
+  function copyButton(value) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Copy";
+    button.addEventListener("click", () => {
+      const area = document.createElement("textarea");
+      area.value = value;
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+      button.textContent = "Copied";
+    });
+    return button;
+  }
+  function line(label, value) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const text = document.createElement("code");
+    text.textContent = label + " " + value;
+    row.appendChild(text);
+    row.appendChild(copyButton(value));
+    return row;
+  }
+  function render(data) {
+    const nodes = document.getElementById("node-list");
+    nodes.innerHTML = "";
+    (data.nodes || []).forEach((item) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      const label = document.createElement("span");
+      label.textContent = item.name + " " + item.relation + " " + item.access + (item.online ? " online" : " offline");
+      const open = document.createElement("button");
+      open.type = "button";
+      open.textContent = "Open";
+      open.addEventListener("click", async () => {
+        const ticket = await api("/api/view-ticket", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ node: item.id })
+        });
+        location.hash = "ticket=" + encodeURIComponent(ticket.ticket) + "&node=" + encodeURIComponent(ticket.node) + "&start=watch";
+        portal.style.display = "none";
+        if (window.agentlinkPrepare) window.agentlinkPrepare();
+        window.agentlinkConnect().catch((err) => window.agentlinkFail(err));
+      });
+      row.appendChild(label);
+      row.appendChild(open);
+      nodes.appendChild(row);
+    });
+    const tokens = document.getElementById("token-list");
+    tokens.innerHTML = "";
+    (data.tokens || []).forEach((item) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.textContent = item.name + " " + item.state + " " + item.uses_remaining + "/" + item.max_uses;
+      if (item.state === "pending") {
+        const revoke = document.createElement("button");
+        revoke.type = "button";
+        revoke.textContent = "Revoke";
+        revoke.addEventListener("click", async () => {
+          await api("/api/tokens/revoke", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ id: item.id })
+          });
+          refresh();
+        });
+        row.appendChild(revoke);
+      }
+      tokens.appendChild(row);
+    });
+  }
+  async function refresh() {
+    render(await api("/api/nodes"));
+  }
+  function listen() {
+    const source = new EventSource("/view/events");
+    source.onmessage = (ev) => { try { render(JSON.parse(ev.data)); } catch (err) {} };
+    source.onerror = () => { source.close(); setTimeout(listen, 2000); };
+  }
+  async function showApp(user) {
+    loginForm.hidden = true;
+    app.hidden = false;
+    document.getElementById("session-user").textContent = user;
+    await refresh();
+    listen();
+  }
+  loginForm.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const status = document.getElementById("login-status");
+    status.textContent = "";
+    try {
+      const session = await api("/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("login-user").value,
+          password: document.getElementById("login-pass").value,
+          totp: document.getElementById("login-totp").value
+        })
+      });
+      await showApp(session.user);
+    } catch (err) {
+      const raw = String(err.message || err);
+      const lower = raw.toLowerCase();
+      if (lower.indexOf("totp") >= 0) {
+        document.getElementById("login-totp-field").hidden = false;
+        document.getElementById("login-totp").focus();
+        status.textContent = lower.indexOf("invalid") >= 0
+          ? "That authenticator code was not accepted."
+          : "This account needs the 6-digit authenticator code.";
+      } else {
+        status.textContent = raw;
+      }
+    }
+  });
+  document.getElementById("logout-btn").addEventListener("click", async () => {
+    await api("/auth/logout", { method: "POST" });
+    location.reload();
+  });
+  document.getElementById("machine-add").addEventListener("click", async () => {
+    const status = document.getElementById("portal-status");
+    status.textContent = "";
+    try {
+      const created = await api("/api/tokens", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: document.getElementById("machine-name").value,
+          access: "full",
+          ttl_secs: Number(document.getElementById("machine-ttl").value || 15) * 60,
+          uses: Number(document.getElementById("machine-uses").value || 1)
+        })
+      });
+      const out = document.getElementById("enroll-out");
+      out.innerHTML = "";
+      out.appendChild(line("Linux/macOS", created.linux));
+      out.appendChild(line("Windows", created.windows));
+      out.appendChild(line("Android", created.android));
+      if (created.qr_svg) {
+        const holder = document.createElement("div");
+        holder.innerHTML = created.qr_svg;
+        out.appendChild(holder);
+      }
+      refresh();
+    } catch (err) {
+      status.textContent = String(err.message || err);
+    }
+  });
+  api("/auth/session").then((session) => showApp(session.user)).catch(() => {});
+})();
+</script>
+</body>
+</html>

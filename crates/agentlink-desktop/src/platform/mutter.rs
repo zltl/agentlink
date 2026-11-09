@@ -1,0 +1,429 @@
+//! Capture and input through Mutter's private ScreenCast + RemoteDesktop APIs.
+//!
+//! Under GNOME Wayland the X11 root window is an empty XWayland surface, so
+//! XShm capture reads black. The xdg-desktop-portal asks for a permission
+//! dialog that cannot be answered from a service. Mutter exposes the same
+//! capture path to the logged-in user without a portal:
+//!
+//! 1. `org.gnome.Mutter.RemoteDesktop.CreateSession` gives a session id.
+//! 2. `org.gnome.Mutter.ScreenCast.CreateSession` is associated with it via
+//!    `remote-desktop-session-id`; the remote desktop session starts and stops
+//!    the screencast.
+//! 3. `RecordMonitor(connector)` returns a stream path. `PipeWireStreamAdded`
+//!    reports the PipeWire node.
+//! 4. Input goes to the same remote desktop session. Absolute pointer
+//!    positions are in stream pixels, so `NotifyPointerMotionAbsolute` takes
+//!    the stream path.
+//!
+//! The PipeWire node lives on the user's default PipeWire daemon (not a
+//! portal-provided fd), so [`PwCapture::open_default`] connects to it directly.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::{Connection, Proxy};
+
+use crate::capture::{crop_frame, CaptureTarget, Frame, MonitorInfo};
+use crate::error::{msg, Result};
+use crate::stream::pipewire::PwCapture;
+
+const MUTTER_RD: &str = "org.gnome.Mutter.RemoteDesktop";
+const MUTTER_SC: &str = "org.gnome.Mutter.ScreenCast";
+const MUTTER_DISPLAY: &str = "org.gnome.Mutter.DisplayConfig";
+const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
+const RD_IFACE: &str = "org.gnome.Mutter.RemoteDesktop";
+const RD_SESSION_IFACE: &str = "org.gnome.Mutter.RemoteDesktop.Session";
+const SC_PATH: &str = "/org/gnome/Mutter/ScreenCast";
+const SC_IFACE: &str = "org.gnome.Mutter.ScreenCast";
+const SC_SESSION_IFACE: &str = "org.gnome.Mutter.ScreenCast.Session";
+const SC_STREAM_IFACE: &str = "org.gnome.Mutter.ScreenCast.Stream";
+const DISPLAY_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
+const DISPLAY_IFACE: &str = "org.gnome.Mutter.DisplayConfig";
+
+type MonitorSpec = (String, String, String, String);
+type ModeState = (
+    String,
+    i32,
+    i32,
+    f64,
+    f64,
+    Vec<f64>,
+    HashMap<String, OwnedValue>,
+);
+type MonitorState = (
+    MonitorSpec,
+    Vec<ModeState>,
+    HashMap<String, OwnedValue>,
+);
+type LogicalState = (
+    i32,
+    i32,
+    f64,
+    u32,
+    bool,
+    Vec<MonitorSpec>,
+    HashMap<String, OwnedValue>,
+);
+
+pub struct MutterDesk {
+    conn: Connection,
+    session: String,
+    stream: String,
+    connector: String,
+    node: u32,
+    monitors: Vec<MonitorInfo>,
+    capture: Option<PwCapture>,
+    last: Option<Frame>,
+    /// Last `max_width` applied to the shared PipeWire consumer. When this
+    /// changes we drop `last` so a full-res screenshot is not reused as a
+    /// downsampled stream frame.
+    last_target_width: Option<u32>,
+}
+
+impl MutterDesk {
+    pub async fn connect() -> Result<Self> {
+        let conn = Connection::session()
+            .await
+            .map_err(|err| msg(format!("session bus: {err}")))?;
+        let monitors = display_monitors(&conn).await.unwrap_or_default();
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(name) = std::env::var("AGENTLINK_DESKTOP_MONITOR")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            candidates.push(name);
+        }
+        for monitor in &monitors {
+            if !candidates.iter().any(|name| name == &monitor.name) {
+                candidates.push(monitor.name.clone());
+            }
+        }
+        if candidates.is_empty() {
+            return Err(msg(
+                "Mutter reported no monitor connector; set AGENTLINK_DESKTOP_MONITOR (for example eDP-1)",
+            ));
+        }
+        let mut last_err = String::new();
+        for connector in candidates {
+            match open_screencast(&conn, &connector).await {
+                Ok((session, stream, node)) => {
+                    tracing::info!(%connector, node, "Mutter ScreenCast is ready");
+                    return Ok(Self {
+                        conn,
+                        session,
+                        stream,
+                        connector,
+                        node,
+                        monitors,
+                        capture: None,
+                        last: None,
+                        last_target_width: None,
+                    });
+                }
+                Err(err) => last_err = err.to_string(),
+            }
+        }
+        Err(msg(format!("Mutter ScreenCast: {last_err}")))
+    }
+
+    pub fn connection(&self) -> Connection {
+        self.conn.clone()
+    }
+
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+
+    pub fn connector(&self) -> &str {
+        &self.connector
+    }
+
+    pub fn node(&self) -> u32 {
+        self.node
+    }
+
+    pub fn monitors(&self) -> Vec<MonitorInfo> {
+        self.monitors.clone()
+    }
+
+    pub fn capture_wait(
+        &mut self,
+        target: &CaptureTarget,
+        wait_ms: i32,
+        max_width: u32,
+    ) -> Result<Frame> {
+        let frame = self
+            .take_frame(wait_ms, max_width)?
+            .ok_or_else(|| msg("Mutter ScreenCast has not delivered a frame yet"))?;
+        match target {
+            CaptureTarget::FullScreen | CaptureTarget::Monitor(0) => Ok(frame),
+            CaptureTarget::Monitor(index) => Err(msg(format!(
+                "Mutter records {} only; monitor {index} is not open",
+                self.connector
+            ))),
+            CaptureTarget::Region(rect) => crop_frame(&frame, *rect),
+            CaptureTarget::Window(_) => Err(msg(
+                "Mutter ScreenCast cannot capture one window; capture the screen or the region",
+            )),
+        }
+    }
+
+    /// Reuse one PipeWire consumer for screenshots and the live session: a
+    /// second link gets no initial buffer, and dropping the first one leaves
+    /// the stream waiting for damage.
+    ///
+    /// `max_width` is applied capture-side (0 = full stream resolution). Cursor
+    /// positions from Mutter stay in stream pixels; callers that expose a
+    /// cursor overlay must scale by out/src (see `pipewire::coord_scale`).
+    pub fn take_frame(&mut self, wait_ms: i32, max_width: u32) -> Result<Option<Frame>> {
+        if self.capture.is_none() {
+            self.capture = Some(PwCapture::open_default(self.node)?);
+            self.last = None;
+            self.last_target_width = None;
+        }
+        let target = crate::stream::pipewire::resolve_target_width(max_width);
+        if self.last_target_width != Some(target) {
+            // Drop the cached frame so a full-res screenshot is never reused as
+            // a downsampled stream probe (static desktops may not emit damage).
+            self.last = None;
+            self.last_target_width = Some(target);
+        }
+        let capture = self.capture.as_mut().unwrap();
+        capture.set_target_width(target);
+        // First buffer after connect (or after a max_width change) can take
+        // multiple seconds on a quiet desktop; poll rather than one short wait.
+        let attempts = if self.last.is_none() { 8 } else { 1 };
+        let per_wait = if self.last.is_none() {
+            wait_ms.max(500)
+        } else {
+            wait_ms
+        };
+        for attempt in 0..attempts {
+            match capture.take(per_wait)? {
+                Some((frame, _dma)) => {
+                    self.last = Some(frame.clone());
+                    return Ok(Some(frame));
+                }
+                None => {
+                    if let Some(previous) = self.last.clone() {
+                        let mut previous = previous;
+                        previous.mark_unchanged();
+                        previous.captured_unix_ms = crate::capture::unix_ms();
+                        return Ok(Some(previous));
+                    }
+                    if attempt + 1 == attempts {
+                        return Err(msg(
+                            "Mutter ScreenCast has not delivered a frame yet",
+                        ));
+                    }
+                }
+            }
+        }
+        Err(msg("Mutter ScreenCast has not delivered a frame yet"))
+    }
+
+}
+
+async fn open_screencast(conn: &Connection, connector: &str) -> Result<(String, String, u32)> {
+    let remote = Proxy::new(conn, MUTTER_RD, RD_PATH, RD_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter RemoteDesktop: {err}")))?;
+    let remote_path: OwnedObjectPath = remote
+        .call("CreateSession", &())
+        .await
+        .map_err(|err| msg(format!("RemoteDesktop.CreateSession: {err}")))?;
+    let remote_session = Proxy::new(conn, MUTTER_RD, remote_path.as_str(), RD_SESSION_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter RemoteDesktop session: {err}")))?;
+    let session_id: String = remote_session
+        .get_property("SessionId")
+        .await
+        .map_err(|err| msg(format!("RemoteDesktop SessionId: {err}")))?;
+
+    let screencast = Proxy::new(conn, MUTTER_SC, SC_PATH, SC_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter ScreenCast: {err}")))?;
+    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+    options.insert(
+        "remote-desktop-session-id",
+        Value::from(session_id.as_str()),
+    );
+    let screencast_path: OwnedObjectPath = screencast
+        .call("CreateSession", &(options,))
+        .await
+        .map_err(|err| msg(format!("ScreenCast.CreateSession: {err}")))?;
+    let screencast_session = Proxy::new(conn, MUTTER_SC, screencast_path.as_str(), SC_SESSION_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter ScreenCast session: {err}")))?;
+    let mut props: HashMap<&str, Value<'_>> = HashMap::new();
+    props.insert("cursor-mode", Value::from(1u32));
+    let stream_path: OwnedObjectPath = screencast_session
+        .call("RecordMonitor", &(connector, props))
+        .await
+        .map_err(|err| msg(format!("RecordMonitor({connector}): {err}")))?;
+    let stream = Proxy::new(conn, MUTTER_SC, stream_path.as_str(), SC_STREAM_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter ScreenCast stream: {err}")))?;
+    let mut signals = stream
+        .receive_signal("PipeWireStreamAdded")
+        .await
+        .map_err(|err| msg(format!("PipeWireStreamAdded: {err}")))?;
+
+    remote_session
+        .call::<_, _, ()>("Start", &())
+        .await
+        .map_err(|err| msg(format!("RemoteDesktop.Start: {err}")))?;
+    let message = tokio::time::timeout(Duration::from_secs(10), signals.next())
+        .await
+        .map_err(|_| msg("Mutter did not add a PipeWire stream within 10s"))?
+        .ok_or_else(|| msg("Mutter closed the ScreenCast stream"))?;
+    let node: u32 = message
+        .body()
+        .deserialize()
+        .map_err(|err| msg(format!("PipeWireStreamAdded node: {err}")))?;
+    Ok((
+        remote_path.to_string(),
+        stream_path.to_string(),
+        node,
+    ))
+}
+
+async fn display_monitors(conn: &Connection) -> Result<Vec<MonitorInfo>> {
+    let display = Proxy::new(conn, MUTTER_DISPLAY, DISPLAY_PATH, DISPLAY_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter DisplayConfig: {err}")))?;
+    let reply = display
+        .call_method("GetCurrentState", &())
+        .await
+        .map_err(|err| msg(format!("DisplayConfig.GetCurrentState: {err}")))?;
+    let body = reply.body();
+    let (_serial, monitors, logicals, _props): (
+        u32,
+        Vec<MonitorState>,
+        Vec<LogicalState>,
+        HashMap<String, OwnedValue>,
+    ) = body
+        .deserialize()
+        .map_err(|err| msg(format!("DisplayConfig state: {err}")))?;
+
+    let mut out = Vec::new();
+    for (index, (x, y, _scale, _transform, primary, specs, _props)) in
+        logicals.iter().enumerate()
+    {
+        let Some(spec) = specs.first() else {
+            continue;
+        };
+        let (width, height) = monitors
+            .iter()
+            .find(|monitor| monitor.0 .0 == spec.0)
+            .and_then(current_mode)
+            .unwrap_or((0, 0));
+        out.push(MonitorInfo {
+            index: index as u32,
+            name: spec.0.clone(),
+            x: *x,
+            y: *y,
+            width,
+            height,
+            primary: *primary,
+        });
+    }
+    if out.is_empty() {
+        for (index, monitor) in monitors.iter().enumerate() {
+            let (width, height) = current_mode(monitor).unwrap_or((0, 0));
+            out.push(MonitorInfo {
+                index: index as u32,
+                name: monitor.0 .0.clone(),
+                x: 0,
+                y: 0,
+                width,
+                height,
+                primary: index == 0,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn current_mode(monitor: &MonitorState) -> Option<(u32, u32)> {
+    for (_name, width, height, _rate, _scale, _scales, props) in &monitor.1 {
+        if matches!(
+            props.get("is-current").map(|value| &**value),
+            Some(Value::Bool(true))
+        ) {
+            return Some((*width as u32, *height as u32));
+        }
+    }
+    monitor
+        .1
+        .first()
+        .map(|(_name, width, height, ..)| (*width as u32, *height as u32))
+}
+
+async fn remote_session<'a>(conn: &'a Connection, session: &'a str) -> Result<Proxy<'a>> {
+    Proxy::new(conn, MUTTER_RD, session, RD_SESSION_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter RemoteDesktop session: {err}")))
+}
+
+pub async fn notify_motion(
+    conn: &Connection,
+    session: &str,
+    stream: &str,
+    x: i32,
+    y: i32,
+) -> Result<()> {
+    remote_session(conn, session)
+        .await?
+        .call::<_, _, ()>(
+            "NotifyPointerMotionAbsolute",
+            &(stream, x as f64, y as f64),
+        )
+        .await
+        .map_err(|err| msg(format!("pointer motion: {err}")))
+}
+
+pub async fn notify_button(
+    conn: &Connection,
+    session: &str,
+    button: u32,
+    down: bool,
+) -> Result<()> {
+    remote_session(conn, session)
+        .await?
+        .call::<_, _, ()>("NotifyPointerButton", &(button as i32, down))
+        .await
+        .map_err(|err| msg(format!("pointer button: {err}")))
+}
+
+pub async fn notify_axis(
+    conn: &Connection,
+    session: &str,
+    dx: f64,
+    dy: f64,
+) -> Result<()> {
+    remote_session(conn, session)
+        .await?
+        .call::<_, _, ()>("NotifyPointerAxis", &(dx, dy, 0u32))
+        .await
+        .map_err(|err| msg(format!("pointer axis: {err}")))
+}
+
+pub async fn notify_keysym(
+    conn: &Connection,
+    session: &str,
+    keysym: u32,
+    down: bool,
+) -> Result<()> {
+    remote_session(conn, session)
+        .await?
+        .call::<_, _, ()>("NotifyKeyboardKeysym", &(keysym, down))
+        .await
+        .map_err(|err| msg(format!("keysym: {err}")))
+}

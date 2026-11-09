@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="220" viewBox="0 0 960 220" role="img" aria-labelledby="consentTitle consentDesc">
+  <title id="consentTitle">Android consent screens</title>
+  <desc id="consentDesc">Each permission is a separate screen. Allow or skip sets the node ceiling. The relay cannot grant more than that ceiling.</desc>
+  <style>
+    :root { color-scheme: light dark; }
+    .card { fill: #f4f7fb; stroke: #1f4e79; stroke-width: 1.6; }
+    .label { fill: #142033; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; font-weight: 650; }
+    .sub { fill: #3d4d63; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; }
+    .arrow { stroke: #1f4e79; fill: none; stroke-width: 1.6; }
+    .head { fill: #1f4e79; }
+    @media (prefers-color-scheme: dark) {
+      .card { fill: #182230; stroke: #9ec1de; }
+      .label { fill: #e8eef6; }
+      .sub { fill: #b7c6d6; }
+      .arrow { stroke: #9ec1de; }
+      .head { fill: #9ec1de; }
+    }
+  </style>
+  <defs>
+    <marker id="consent-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="head"/>
+    </marker>
+  </defs>
+  <rect class="card" x="16" y="70" width="120" height="72" rx="8"/>
+  <text class="label" x="76" y="100" text-anchor="middle">Notify</text>
+  <text class="sub" x="76" y="120" text-anchor="middle">foreground</text>
+  <rect class="card" x="168" y="70" width="120" height="72" rx="8"/>
+  <text class="label" x="228" y="100" text-anchor="middle">App files</text>
+  <text class="sub" x="228" y="120" text-anchor="middle">required</text>
+  <rect class="card" x="320" y="70" width="120" height="72" rx="8"/>
+  <text class="label" x="380" y="100" text-anchor="middle">Commands</text>
+  <text class="sub" x="380" y="120" text-anchor="middle">sandbox shell</text>
+  <rect class="card" x="472" y="24" width="140" height="64" rx="8"/>
+  <text class="label" x="542" y="50" text-anchor="middle">Folders / all files</text>
+  <text class="sub" x="542" y="70" text-anchor="middle">optional</text>
+  <rect class="card" x="472" y="124" width="140" height="64" rx="8"/>
+  <text class="label" x="542" y="150" text-anchor="middle">Screen + a11y</text>
+  <text class="sub" x="542" y="170" text-anchor="middle">desktop ceiling</text>
+  <rect class="card" x="648" y="70" width="120" height="72" rx="8"/>
+  <text class="label" x="708" y="100" text-anchor="middle">Shizuku / root</text>
+  <text class="sub" x="708" y="120" text-anchor="middle">default off</text>
+  <rect class="card" x="800" y="70" width="140" height="72" rx="8"/>
+  <text class="label" x="870" y="100" text-anchor="middle">Review</text>
+  <text class="sub" x="870" y="120" text-anchor="middle">then start</text>
+  <path class="arrow" marker-end="url(#consent-arrow)" d="M136 106 H168"/>
+  <path class="arrow" marker-end="url(#consent-arrow)" d="M288 106 H320"/>
+  <path class="arrow" marker-end="url(#consent-arrow)" d="M440 106 H472"/>
+  <path class="arrow" marker-end="url(#consent-arrow)" d="M612 56 H648 V90"/>
+  <path class="arrow" marker-end="url(#consent-arrow)" d="M612 156 H648 V124"/>
+  <path class="arrow" marker-end="url(#consent-arrow)" d="M768 106 H800"/>
+</svg>

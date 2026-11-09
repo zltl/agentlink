@@ -1,0 +1,5 @@
+[bindings.kotlin]
+package_name = "uniffi.agentlink_ffi"
+cdylib_name = "agentlink_ffi"
+android = true
+android_cleaner = true

@@ -1,0 +1,47 @@
+[package]
+name = "agentlink-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "agentlink node daemon"
+
+[dependencies]
+agentlink-core.workspace = true
+base64.workspace = true
+agentlink-desktop.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+portable-pty.workspace = true
+hostname.workspace = true
+chrono.workspace = true
+url.workspace = true
+rustls.workspace = true
+blake3.workspace = true
+command-group.workspace = true
+diffy.workspace = true
+globset.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
+notify.workspace = true
+regex.workspace = true
+sysinfo.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+flate2.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+agentlink-desktop.workspace = true
+agentlink-relay.workspace = true
+anyhow.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true

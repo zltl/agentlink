@@ -1,0 +1,24 @@
+[package]
+name = "agentlink-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "cargo-fuzz targets for agentlink. This is its own workspace so libfuzzer is not a CI dependency."
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[dependencies]
+agentlink-core = { path = "../crates/agentlink-core" }
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false

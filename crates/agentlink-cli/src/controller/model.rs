@@ -1,0 +1,436 @@
+//! Controller decisions that do not need a window.
+//!
+//! Login checks, capability gates, terminal scrollback, and path joins live
+//! here so `cargo test` can cover them without opening a display.
+
+use std::collections::VecDeque;
+
+use agentlink_core::{NodePolicy, RelayTrust};
+
+pub const SCROLLBACK: usize = 1000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    pub enabled: bool,
+    pub reason: &'static str,
+}
+
+pub fn terminal_action(online: bool, policy: NodePolicy) -> Action {
+    if !online {
+        return Action {
+            enabled: false,
+            reason: "Unavailable while offline",
+        };
+    }
+    if !policy.allow_exec {
+        return Action {
+            enabled: false,
+            reason: "Needs exec permission",
+        };
+    }
+    Action {
+        enabled: true,
+        reason: "Open a shell on this machine",
+    }
+}
+
+pub fn files_action(online: bool, policy: NodePolicy) -> Action {
+    if !online {
+        return Action {
+            enabled: false,
+            reason: "Unavailable while offline",
+        };
+    }
+    if !policy.allow_read && !policy.allow_write {
+        return Action {
+            enabled: false,
+            reason: "File transfer is turned off",
+        };
+    }
+    if policy.allow_read && policy.allow_write {
+        return Action {
+            enabled: true,
+            reason: "Browse, upload, and download",
+        };
+    }
+    if policy.allow_read {
+        return Action {
+            enabled: true,
+            reason: "Browse and download. Upload is turned off",
+        };
+    }
+    Action {
+        enabled: true,
+        reason: "Upload is allowed. Listing files is turned off",
+    }
+}
+
+pub fn desktop_allowed(policy: NodePolicy) -> bool {
+    policy.allow_desktop || policy.allows_remote_view() || policy.allows_remote_control()
+}
+
+pub fn desktop_action(online: bool, has_display: Option<bool>, policy: NodePolicy) -> Action {
+    if has_display == Some(false) {
+        return Action {
+            enabled: false,
+            reason: "Headless machine. No desktop session.",
+        };
+    }
+    if !online {
+        return Action {
+            enabled: false,
+            reason: "Unavailable while offline",
+        };
+    }
+    if has_display == Some(true) && !desktop_allowed(policy) {
+        return Action {
+            enabled: false,
+            reason: "This machine has a screen. Set access to full to open Desktop.",
+        };
+    }
+    Action {
+        enabled: true,
+        reason: "Open the desktop viewer",
+    }
+}
+
+pub fn display_note(has_display: Option<bool>, policy: NodePolicy) -> Option<&'static str> {
+    if has_display == Some(false) {
+        return Some("Headless. Shell and files only.");
+    }
+    if has_display == Some(true) && !desktop_allowed(policy) {
+        return Some("Screen detected. Set access to full to open Desktop.");
+    }
+    None
+}
+
+/// `host` beats `stun`, which beats `turn`. Empty input is the relay socket.
+pub fn connection_label(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("quic") {
+        "quic"
+    } else if lower.contains("host") {
+        "host"
+    } else if lower.contains("stun") || lower.contains("srflx") {
+        "stun"
+    } else if lower.contains("turn") || lower.contains(" typ relay") {
+        "turn"
+    } else {
+        "relay"
+    }
+}
+
+pub fn asks_for_totp(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("totp") || lower.contains("authenticator")
+}
+
+pub fn login_problem(username: &str, password: &str, relay: &str, pin: &str, trust: &str) -> Option<String> {
+    if username.trim().is_empty() {
+        return Some("Username is required.".into());
+    }
+    if password.is_empty() {
+        return Some("Password is required.".into());
+    }
+    if !relay.trim().is_empty() {
+        if let Err(err) = agentlink_core::parse_relay_url(relay) {
+            return Some(err.to_string());
+        }
+    }
+    let pin = pin.trim();
+    let trust = trust.trim();
+    if !pin.is_empty() || !trust.is_empty() {
+        let trust = if trust.is_empty() { None } else { Some(trust) };
+        if let Err(err) = RelayTrust::parse(pin, trust) {
+            return Some(err.to_string());
+        }
+    }
+    None
+}
+
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Install line for a freshly minted enrollment token.
+pub fn enroll_command(token: &str, name: &str, access: &str) -> String {
+    format!(
+        "curl -fsSL https://relay.example.com/install.sh | sh -s -- --token {} --name {} --access {} --max-access {}",
+        shell_quote(token),
+        shell_quote(name),
+        shell_quote(access),
+        shell_quote(access),
+    )
+}
+
+pub fn child_path(parent: &str, name: &str) -> String {
+    let parent = parent.trim();
+    if parent.is_empty() || parent == "." {
+        return name.to_string();
+    }
+    let sep = if parent.contains('\\') && !parent.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    if parent.ends_with(sep) {
+        format!("{parent}{name}")
+    } else {
+        format!("{parent}{sep}{name}")
+    }
+}
+
+pub fn parent_path(path: &str) -> String {
+    let path = path.trim().trim_end_matches(['/', '\\']);
+    if path.is_empty() || path == "." {
+        return ".".into();
+    }
+    let sep = if path.contains('\\') && !path.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    match path.rsplit_once(sep) {
+        Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+        _ => ".".into(),
+    }
+}
+
+pub fn looks_textual(bytes: &[u8]) -> bool {
+    !bytes.contains(&0)
+}
+
+/// Plain-text terminal with a fixed scrollback. Cursor motion is enough for
+/// shells and progress lines; full-screen TUI apps stay on the web viewer.
+#[derive(Clone, Debug)]
+pub struct Scrollback {
+    lines: VecDeque<String>,
+    current: Vec<char>,
+    col: usize,
+    cap: usize,
+    escape: Escape,
+}
+
+#[derive(Clone, Debug)]
+enum Escape {
+    None,
+    Esc,
+    Csi,
+}
+
+impl Default for Scrollback {
+    fn default() -> Self {
+        Self::new(SCROLLBACK)
+    }
+}
+
+impl Scrollback {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            current: Vec::new(),
+            col: 0,
+            cap: cap.max(1),
+            escape: Escape::None,
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes);
+        for ch in text.chars() {
+            self.push_char(ch);
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !self.current.is_empty() {
+            out.extend(self.current.iter().copied());
+        }
+        out
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn line_count(&self) -> usize {
+        self.lines.len() + usize::from(!self.current.is_empty())
+    }
+
+    fn push_char(&mut self, ch: char) {
+        match self.escape {
+            Escape::None => self.plain(ch),
+            Escape::Esc => match ch {
+                '[' => self.escape = Escape::Csi,
+                _ => self.escape = Escape::None,
+            },
+            Escape::Csi => {
+                if ('@'..='~').contains(&ch) {
+                    self.escape = Escape::None;
+                }
+            }
+        }
+    }
+
+    fn plain(&mut self, ch: char) {
+        match ch {
+            '\u{1b}' => self.escape = Escape::Esc,
+            '\n' => self.commit(),
+            '\r' => self.col = 0,
+            '\u{8}' => {
+                if self.col > 0 {
+                    self.col -= 1;
+                    if self.col < self.current.len() {
+                        self.current.remove(self.col);
+                    }
+                }
+            }
+            other if other.is_control() => {}
+            other => {
+                if self.col < self.current.len() {
+                    self.current[self.col] = other;
+                } else {
+                    self.current.push(other);
+                }
+                self.col += 1;
+                if self.current.len() > 8192 {
+                    self.commit();
+                }
+            }
+        }
+    }
+
+    fn commit(&mut self) {
+        let line: String = self.current.iter().collect();
+        self.lines.push_back(line);
+        while self.lines.len() > self.cap {
+            self.lines.pop_front();
+        }
+        self.current.clear();
+        self.col = 0;
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn pty_key(name: &str, ctrl: bool) -> Option<Vec<u8>> {
+    if ctrl {
+        let byte = match name {
+            "c" => Some(0x03),
+            "d" => Some(0x04),
+            "z" => Some(0x1a),
+            "a" => Some(0x01),
+            "e" => Some(0x05),
+            "l" => Some(0x0c),
+            _ => None,
+        };
+        if let Some(byte) = byte {
+            return Some(vec![byte]);
+        }
+    }
+    let bytes: &[u8] = match name {
+        "enter" => b"\r",
+        "backspace" => b"\x7f",
+        "tab" => b"\t",
+        "escape" => b"\x1b",
+        "up" => b"\x1b[A",
+        "down" => b"\x1b[B",
+        "right" => b"\x1b[C",
+        "left" => b"\x1b[D",
+        "home" => b"\x1b[H",
+        "end" => b"\x1b[F",
+        _ => return None,
+    };
+    Some(bytes.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentlink_core::NodePolicy;
+
+    #[test]
+    fn headless_desktop_is_off_and_shell_stays_on() {
+        let full = NodePolicy::full();
+        let desktop = desktop_action(true, Some(false), full);
+        assert!(!desktop.enabled);
+        assert!(desktop.reason.contains("Headless"));
+        assert!(terminal_action(true, full).enabled);
+        assert!(files_action(true, full).enabled);
+        assert_eq!(
+            display_note(Some(false), full),
+            Some("Headless. Shell and files only.")
+        );
+    }
+
+    #[test]
+    fn exec_hides_desktop_when_a_screen_is_reported() {
+        let exec = NodePolicy::exec();
+        let desktop = desktop_action(true, Some(true), exec);
+        assert!(!desktop.enabled);
+        assert!(desktop.reason.contains("full"));
+        assert!(!desktop_allowed(exec));
+        assert!(desktop_allowed(NodePolicy::full()));
+        assert!(terminal_action(false, exec).reason.contains("offline"));
+        let files = files_action(true, NodePolicy::remote_view());
+        assert!(files.enabled);
+        assert!(files.reason.contains("Upload is turned off"));
+    }
+
+    #[test]
+    fn connection_labels_name_the_path() {
+        assert_eq!(connection_label("wss://relay.example.com"), "relay");
+        assert_eq!(connection_label("typ host"), "host");
+        assert_eq!(connection_label("via STUN srflx"), "stun");
+        assert_eq!(connection_label("TURN udp"), "turn");
+        assert_eq!(connection_label("quic"), "quic");
+    }
+
+    #[test]
+    fn totp_errors_open_the_code_field() {
+        assert!(asks_for_totp("totp code required"));
+        assert!(asks_for_totp("Authenticator required"));
+        assert!(!asks_for_totp("wrong password"));
+    }
+
+    #[test]
+    fn login_rejects_a_blank_user_and_a_bad_relay() {
+        assert!(login_problem("", "secret", "", "", "").is_some());
+        assert!(login_problem("ada", "", "", "", "").is_some());
+        assert!(login_problem("ada", "secret", "not a url :::", "", "").is_some());
+        assert!(login_problem("ada", "secret", "", "", "").is_none());
+        assert!(login_problem("ada", "secret", "wss://relay.example:7443", "", "system").is_none());
+    }
+
+    #[test]
+    fn scrollback_overwrites_on_cr_strips_color_and_caps() {
+        let mut one = Scrollback::new(4);
+        one.push_bytes(b"hello\rxy");
+        assert_eq!(one.text(), "xyllo");
+        let mut screen = Scrollback::new(2);
+        screen.push_bytes(b"hello\rxy\n");
+        screen.push_bytes(b"\x1b[31mred\x1b[0m\n");
+        screen.push_bytes(b"third\n");
+        let text = screen.text();
+        assert!(text.contains("red\n"), "{text}");
+        assert!(text.contains("third"), "{text}");
+        assert!(!text.contains("xyllo"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert_eq!(screen.line_count(), 2);
+    }
+
+    #[test]
+    fn paths_join_and_pty_keys_are_stable() {
+        assert_eq!(child_path(".", "notes"), "notes");
+        assert_eq!(child_path("/tmp", "a"), "/tmp/a");
+        assert_eq!(parent_path("/tmp/a"), "/tmp");
+        assert_eq!(parent_path("."), ".");
+        assert_eq!(child_path(r"C:\work", "a"), r"C:\work\a");
+        assert_eq!(pty_key("enter", false).unwrap(), b"\r");
+        assert_eq!(pty_key("c", true).unwrap(), vec![0x03]);
+        assert!(enroll_command("tok'en", "lab top", "exec").contains("--token 'tok'\\''en'"));
+        assert!(looks_textual(b"hi"));
+        assert!(!looks_textual(b"a\0b"));
+    }
+}

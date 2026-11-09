@@ -1,0 +1,20 @@
+/target
+bench-micro/target
+fuzz/target
+fuzz/artifacts
+fuzz/corpus
+**/*.rs.bk
+.DS_Store
+*.log
+agentlink-data/
+android/.gradle/
+android/build/
+android/app/build/
+android/app/src/main/jniLibs/
+android/.kotlin/
+android/local.properties
+
+# Release signing seed (AGENTLINK_SIGNING_KEY). Never commit.
+signing.key
+**/signing.key
+.env.signing

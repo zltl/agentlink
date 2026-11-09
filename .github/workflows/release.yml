@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        shell: bash
+        run: echo "AGENTLINK_RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: ${{ matrix.target }}
+      # Linker setup matches the musl job in ci.yml.
+      - name: Install musl
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          triple="${{ matrix.target }}"
+          upper=$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${upper}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          echo "CC_${triple//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p agentlink-cli
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${AGENTLINK_RELEASE_VERSION}"
+          target="${{ matrix.target }}"
+          mkdir -p dist
+          if [[ "$target" == *windows* ]]; then
+            bin="target/${target}/release/agentlink.exe"
+            out="dist/agentlink-${version}-${target}.zip"
+            tar -a -cf "$out" -C "$(dirname "$bin")" "$(basename "$bin")"
+          else
+            bin="target/${target}/release/agentlink"
+            out="dist/agentlink-${version}-${target}.tar.gz"
+            tar -czf "$out" -C "$(dirname "$bin")" "$(basename "$bin")"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  universal-macos:
+    name: universal-apple-darwin
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Version
+        run: echo "AGENTLINK_RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-apple-darwin"
+          path: slices
+      - name: Lipo
+        run: |
+          set -euo pipefail
+          version="${AGENTLINK_RELEASE_VERSION}"
+          mkdir -p arm x64 dist
+          tar -xzf slices/aarch64-apple-darwin/*.tar.gz -C arm
+          tar -xzf slices/x86_64-apple-darwin/*.tar.gz -C x64
+          lipo -create arm/agentlink x64/agentlink -output agentlink
+          tar -czf "dist/agentlink-${version}-universal-apple-darwin.tar.gz" agentlink
+      - uses: actions/upload-artifact@v4
+        with:
+          name: universal-apple-darwin
+          path: dist/*
+
+  release:
+    name: checksums and GitHub release
+    needs: [build, universal-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        run: echo "AGENTLINK_RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and signature
+        env:
+          AGENTLINK_SIGNING_KEY: ${{ secrets.AGENTLINK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          version="${AGENTLINK_RELEASE_VERSION}"
+          cd dist
+          required="
+          agentlink-${version}-x86_64-unknown-linux-musl.tar.gz
+          agentlink-${version}-aarch64-unknown-linux-musl.tar.gz
+          agentlink-${version}-x86_64-pc-windows-msvc.zip
+          agentlink-${version}-aarch64-pc-windows-msvc.zip
+          agentlink-${version}-x86_64-apple-darwin.tar.gz
+          agentlink-${version}-aarch64-apple-darwin.tar.gz
+          agentlink-${version}-universal-apple-darwin.tar.gz
+          "
+          for file in $required; do
+            test -f "$file" || { echo "missing $file"; exit 1; }
+          done
+          sha256sum agentlink-* | LC_ALL=C sort -k2 > SHA256SUMS
+          if [ -n "${AGENTLINK_SIGNING_KEY:-}" ]; then
+            tar -xzf "agentlink-${version}-x86_64-unknown-linux-musl.tar.gz"
+            ./agentlink internal sign-checksums SHA256SUMS --pubkey-out minisign.pub
+            rm -f agentlink
+          else
+            echo "AGENTLINK_SIGNING_KEY is not set; publishing checksums only"
+          fi
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          notes="agentlink ${version}. Linux archives are static musl builds. macOS also publishes a universal archive. SHA256SUMS covers every archive. When the AGENTLINK_SIGNING_KEY secret is set, SHA256SUMS.minisig is a minisign signature and minisign.pub is the public key. Pin that key out of band."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "$tag" --notes "$notes"
+          fi

@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Agentlink operate guide</title>
+<style>
+  :root {
+    --ink: #16202b;
+    --muted: #5b6b7c;
+    --line: #d9e1ea;
+    --bg: #f4f7fa;
+    --card: #ffffff;
+    --accent: #0f6d8c;
+    --warn-bg: #fff4d6;
+    --warn-line: #e0b44a;
+    --code-bg: #0f1a24;
+    --code-ink: #e7eef6;
+    --ok: #1d7a4c;
+    --off: #a33a3a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 1.6rem; line-height: 1.2; }
+  h2 { margin: 0 0 8px; font-size: 1.08rem; }
+  p { margin: 0 0 10px; }
+  .muted { color: var(--muted); }
+  .banner {
+    margin: 14px 0;
+    padding: 12px 14px;
+    border: 1px solid var(--warn-line);
+    background: var(--warn-bg);
+    border-radius: 10px;
+    font-weight: 700;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px;
+    margin: 14px 0;
+  }
+  .node-head { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; }
+  .node-head h2 { margin: 0; font-size: 1.25rem; word-break: break-word; }
+  .pill {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 999px;
+    background: #e8eef4;
+    font-size: 0.78rem;
+    font-weight: 700;
+  }
+  .pill.online { background: #dcf3e6; color: var(--ok); }
+  .pill.offline { background: #f7dcdc; color: var(--off); }
+  .id-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-top: 10px;
+  }
+  code, pre, textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  code.id {
+    display: inline-block;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    background: #edf3f8;
+    padding: 4px 7px;
+    border-radius: 6px;
+    font-size: 0.82rem;
+  }
+  pre {
+    margin: 8px 0 0;
+    padding: 12px 13px;
+    overflow-x: auto;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border-radius: 9px;
+    font-size: 0.86rem;
+    line-height: 1.45;
+    white-space: pre;
+  }
+  .cmds { display: grid; gap: 8px; }
+  .cmd { position: relative; }
+  .cmd pre { margin: 0; padding-right: 74px; }
+  .copy {
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 700;
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--ink);
+    border-radius: 8px;
+    padding: 5px 9px;
+    cursor: pointer;
+  }
+  .cmd .copy {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: #203140;
+    color: #e7eef6;
+    border-color: #203140;
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .fact { display: grid; grid-template-columns: minmax(110px, 30%) 1fr; gap: 4px 12px; margin: 10px 0 0; }
+  .fact dt { color: var(--muted); }
+  .fact dd { margin: 0; overflow-wrap: anywhere; }
+  .note { color: var(--muted); font-size: 0.92rem; }
+  .fallback { display: none; }
+  a { color: var(--accent); }
+  ul { margin: 6px 0 0; padding-left: 20px; }
+  @media (max-width: 420px) {
+    body { padding-left: 12px; padding-right: 12px; }
+    .fact { grid-template-columns: 1fr; }
+    .fact dt { font-weight: 700; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Agentlink operate guide</h1>
+  <p class="muted">How to use one paired node from the CLI. This page runs entirely in your browser.</p>
+
+  <div class="banner" role="note">Documentation only — this link does not grant access.</div>
+
+  <section class="card" id="node-card" hidden>
+    <div class="node-head">
+      <h2 id="node-name">Node</h2>
+      <span id="node-online" class="pill" hidden></span>
+      <span id="node-display" class="pill" hidden></span>
+    </div>
+    <div class="id-row">
+      <span class="muted">Node id</span>
+      <code class="id" id="node-id"></code>
+      <button class="copy" id="copy-id" type="button">Copy id</button>
+    </div>
+    <dl class="fact">
+      <dt>System</dt><dd id="node-system">unknown</dd>
+      <dt>Access</dt><dd id="node-access">unknown</dd>
+      <dt>Effective policy</dt><dd id="node-effective">unknown</dd>
+      <dt>Relay</dt><dd id="node-relay"></dd>
+    </dl>
+    <p class="note" id="node-notes" hidden></p>
+    <div class="actions">
+      <button class="copy" id="copy-url" type="button">Copy page URL</button>
+    </div>
+    <p class="note">Share this URL only as documentation. It contains no pairing token, session, ticket, grant, or issuer key.</p>
+  </section>
+
+  <section class="fallback" id="fallback">
+    <div class="card">
+      <h2>No node guide in this link</h2>
+      <p>The URL fragment is missing or invalid. A guide link looks like
+        <code>/operate/#v1.&lt;base64url&gt;</code>.</p>
+      <p>Mint a pasteable URL on a machine signed in to the relay, or use the dashboard <strong>Guide</strong> button:</p>
+      <div class="cmds">
+        <div class="cmd"><pre>agentlink guide &lt;node&gt; --print-only</pre></div>
+      </div>
+      <p class="note">Replace <code>&lt;node&gt;</code> with a name or id, e.g. <code>agentlink guide lab-box --print-only</code>.
+        On the node host use <code>agentlink guide --local --print-only</code>. Without <code>--print-only</code> the CLI opens the page in a browser.</p>
+    </div>
+  </section>
+
+  <section id="guide-body" hidden>
+    <div class="card">
+      <h2>1. Install or update the CLI</h2>
+      <div class="cmds" id="install-cmds"></div>
+      <p class="note">Windows PowerShell: <code>irm &lt;origin&gt;/install.ps1 | iex</code>. Keep the CLI and node on the same release when possible.</p>
+    </div>
+
+    <div class="card">
+      <h2>2. Sign in to the relay</h2>
+      <div class="cmds" id="login-cmds"></div>
+      <p class="note">Sign in as the owner or an admin. That session is full access to the machine: shell, files, and desktop. The relay still cannot read the sealed operation payloads.</p>
+    </div>
+
+    <div class="card">
+      <h2>3. Open the machine</h2>
+      <div class="cmds" id="grant-cmds"></div>
+      <p class="note">A signed-in owner or admin does not paste a <strong>SignedGrant</strong>.
+        The commands below are only for a key that is not an account session.
+        Payloads stay sealed; the relay cannot read them.
+        See the <a href="https://github.com/zltl/agentlink/blob/main/docs/e2e-auth.md" rel="noopener noreferrer" target="_blank">E2E trust model</a>.</p>
+    </div>
+
+    <div class="card">
+      <h2>4. Common operations</h2>
+      <div class="cmds" id="ops-cmds"></div>
+      <p class="note">Use the node name or the hex id. Add <code>--json</code> for machine-readable output.</p>
+    </div>
+
+    <div class="card">
+      <h2>5. TCP port forwarding</h2>
+      <div class="cmds" id="port-cmds"></div>
+      <p class="note">Both listeners bind loopback. Forward exposes a port on this machine to the node; reverse exposes a node-loopback port to this machine.</p>
+    </div>
+
+    <div class="card" id="desktop-card">
+      <h2>6. Desktop</h2>
+      <div class="cmds" id="desktop-cmds"></div>
+      <p class="note" id="desktop-note"></p>
+    </div>
+
+    <div class="card">
+      <h2>7. Limits and safety</h2>
+      <ul>
+        <li>Effective policy for this caller: <strong id="limit-effective">unknown</strong>. The node's local ceiling can be narrower.</li>
+        <li>Grants expire. Re-issue with <code>agentlink grant issue --node &lt;id&gt; --ttl 1h</code>.</li>
+        <li>Screenshots and remote view need a graphical session. Headless nodes use shell and files.</li>
+        <li>This URL is documentation. It cannot authorize operations, mint grants, or reveal pairing tokens, sessions, refresh tokens, issuer keys, or view tickets.</li>
+      </ul>
+    </div>
+  </section>
+
+  <p class="muted" style="text-align:center;margin-top:20px">agentlink</p>
+</main>
+<script>
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const DEFAULT_RELAY = "";
+
+  function decodeGuide(hash) {
+    let raw = String(hash || "").replace(/^#/, "");
+    const cut = raw.indexOf(".");
+    if (cut < 0) return null;
+    const version = raw.slice(0, cut);
+    const payload = raw.slice(cut + 1);
+    if (version !== "v1" || !payload) return null;
+    try {
+      const bin = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
+      const bytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+      const guide = JSON.parse(new TextDecoder().decode(bytes));
+      if (!guide || guide.v !== 1 || !guide.relay || !guide.node_id) return null;
+      return guide;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function shellQuote(value) {
+    const text = String(value == null ? "" : value);
+    if (/^[A-Za-z0-9._:\/@%+,\[\]-]+$/.test(text)) return text;
+    return "'" + text.replace(/'/g, "'\\''") + "'";
+  }
+
+  function nodeArg(guide) {
+    const id = String(guide.node_id || "").trim();
+    return /^[0-9a-fA-F]+$/.test(id) ? id : shellQuote(id);
+  }
+
+  function suggestedPolicy(guide) {
+    const known = ["read-only", "read-write", "exec", "desktop", "remote-view", "remote-control", "full"];
+    for (const value of [guide.effective, guide.access]) {
+      const name = String(value || "").trim().toLowerCase();
+      if (known.indexOf(name) >= 0) return name;
+    }
+    return "exec";
+  }
+
+  function commandRow(parent, text) {
+    const wrap = document.createElement("div");
+    wrap.className = "cmd";
+    const pre = document.createElement("pre");
+    pre.textContent = text;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "copy";
+    button.textContent = "Copy";
+    button.addEventListener("click", () => copyText(text, button));
+    wrap.append(pre, button);
+    parent.appendChild(wrap);
+  }
+
+  async function copyText(text, button) {
+    const previous = button.textContent;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const area = document.createElement("textarea");
+        area.value = text;
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand("copy");
+        area.remove();
+      }
+      button.textContent = "Copied";
+    } catch (err) {
+      button.textContent = "Copy failed";
+    }
+    setTimeout(() => { button.textContent = previous; }, 1500);
+  }
+
+  function set(id, text) {
+    const el = $(id);
+    if (el) el.textContent = text;
+  }
+
+  function render(guide) {
+    const origin = location.protocol === "https:" ? location.origin : (guide.relay.replace(/^wss:\/\//, "https://"));
+    const node = nodeArg(guide);
+    const relayFlag = String(guide.relay || "").trim() !== DEFAULT_RELAY ? " --relay " + shellQuote(guide.relay) : "";
+    const policy = suggestedPolicy(guide);
+
+    $("fallback").style.display = "none";
+    $("guide-body").hidden = false;
+    const card = $("node-card");
+    card.hidden = false;
+    set("node-name", guide.name || guide.node_id);
+    set("node-id", guide.node_id);
+    set("node-system", [guide.os, guide.arch, guide.version].filter(Boolean).join(" · ") || "unknown");
+    set("node-access", guide.access || "unknown");
+    set("node-effective", guide.effective || "unknown");
+    set("node-relay", guide.relay || "");
+    set("limit-effective", guide.effective || "unknown");
+    if (guide.notes) {
+      $("node-notes").hidden = false;
+      set("node-notes", guide.notes);
+    }
+    const online = $("node-online");
+    online.hidden = false;
+    if (guide.online === true) {
+      online.className = "pill online";
+      online.textContent = "online";
+    } else if (guide.online === false) {
+      online.className = "pill offline";
+      online.textContent = "offline";
+    } else {
+      online.className = "pill";
+      online.textContent = "presence unknown";
+    }
+    const display = $("node-display");
+    display.hidden = false;
+    if (guide.has_display === false) {
+      display.textContent = "headless";
+    } else if (guide.has_display === true) {
+      display.textContent = "desktop";
+    } else {
+      display.textContent = "display unknown";
+    }
+
+    $("install-cmds").replaceChildren();
+    commandRow($("install-cmds"), "curl -fsSL " + origin + "/install.sh | sh");
+    commandRow($("install-cmds"), "agentlink update");
+
+    $("login-cmds").replaceChildren();
+    commandRow($("login-cmds"), "agentlink login --user <you>" + relayFlag);
+
+    $("grant-cmds").replaceChildren();
+    commandRow($("grant-cmds"), "agentlink grant issue --node " + node + " --ttl 1h --policy " + policy);
+    commandRow($("grant-cmds"), "agentlink grant show --node " + node);
+    commandRow($("grant-cmds"), "agentlink grant trust-owner <issuer-hex> --data-dir ~/.local/share/agentlink/node");
+
+    $("ops-cmds").replaceChildren();
+    [
+      "agentlink nodes",
+      "agentlink ls " + node + " /tmp",
+      "agentlink cat " + node + " /etc/os-release",
+      "agentlink exec " + node + " uname -a",
+      "agentlink shell " + node,
+      "agentlink cp ./file node://" + node + "/tmp/file",
+      "agentlink bg " + node + " start -- sleep 60",
+      "agentlink bg " + node + " list"
+    ].forEach((text) => commandRow($("ops-cmds"), text));
+
+    $("port-cmds").replaceChildren();
+    commandRow($("port-cmds"), "agentlink port forward " + node + " 8080 127.0.0.1:80");
+    commandRow($("port-cmds"), "agentlink port reverse " + node + " 9000 127.0.0.1:3000");
+
+    $("desktop-cmds").replaceChildren();
+    if (guide.has_display === false) {
+      $("desktop-card").querySelector("h2").textContent = "6. Desktop (not available)";
+      const pre = document.createElement("pre");
+      pre.textContent = "This node is headless (no graphical session).\nUse `agentlink shell` or the file commands above.";
+      $("desktop-cmds").appendChild(pre);
+      set("desktop-note", "Screenshots and remote view will fail. The node reports no desktop session.");
+    } else {
+      commandRow($("desktop-cmds"), "agentlink screenshot " + node + " screen.jpg");
+      commandRow($("desktop-cmds"), "agentlink view " + node);
+      set("desktop-note", guide.has_display === true
+        ? "Desktop reported. `view` opens the browser session. The account owner can take control from that page."
+        : "The node has not reported whether it has a desktop. `view` will explain if there is no graphical session.");
+    }
+  }
+
+  function renderFallback() {
+    $("node-card").hidden = true;
+    $("guide-body").hidden = true;
+    $("fallback").style.display = "block";
+  }
+
+  $("copy-id").addEventListener("click", (ev) => {
+    copyText($("node-id").textContent, ev.currentTarget);
+  });
+  $("copy-url").addEventListener("click", (ev) => {
+    copyText(location.href, ev.currentTarget);
+  });
+
+  const guide = decodeGuide(location.hash);
+  if (guide) render(guide);
+  else renderFallback();
+  window.addEventListener("hashchange", () => {
+    const next = decodeGuide(location.hash);
+    if (next) render(next);
+    else renderFallback();
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+# agentlink relay.
+#
+# Create the account once:
+#   sudo useradd --system --home-dir /var/lib/agentlink --shell /usr/sbin/nologin agentlink
+#   sudo install -d -o agentlink -g agentlink /var/lib/agentlink
+#   sudo install -m 755 /path/to/agentlink /usr/local/bin/agentlink
+#   sudo cp deploy/agentlink-relay.service /etc/systemd/system/agentlink-relay.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now agentlink-relay
+#
+# The first start prints the listen address, certificate fingerprint, and admin
+# token. Later starts print the path of admin.token instead of the token.
+# Read the first start with: journalctl -u agentlink-relay | grep 'admin token'
+# The token file is /var/lib/agentlink/admin.token (mode 0600).
+# Do not add --print-admin-token to this unit. That flag puts the token in the journal on every start.
+# Behind nginx, add --trust-proxy 127.0.0.1/32 and see docs/deploy.md.
+
+[Unit]
+Description=agentlink relay
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentlink
+Group=agentlink
+EnvironmentFile=-/etc/agentlink/db.env
+ExecStart=/usr/local/bin/agentlink relay --bind 0.0.0.0:7443 --data-dir /var/lib/agentlink
+# SIGTERM asks peers to reconnect before the process exits.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agentlink
+StateDirectory=agentlink
+
+[Install]
+WantedBy=multi-user.target

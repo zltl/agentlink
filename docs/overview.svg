@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="220" viewBox="0 0 760 220" role="img" aria-label="agentlink clients connect to the relay, and the node dials out to the same relay">
+  <style>
+    .box { fill: #f4f7fb; stroke: #1f3a5f; stroke-width: 1.5; }
+    .label { font: 14px sans-serif; fill: #1b2430; }
+    .small { font: 12px sans-serif; fill: #3d4c5f; }
+    .arrow { stroke: #1f3a5f; stroke-width: 1.5; fill: none; marker-end: url(#head); }
+  </style>
+  <defs>
+    <marker id="head" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#1f3a5f"/>
+    </marker>
+  </defs>
+  <rect class="box" x="20" y="24" width="180" height="48" rx="6"/>
+  <text class="label" x="110" y="53" text-anchor="middle">agentlink CLI</text>
+  <rect class="box" x="20" y="148" width="180" height="48" rx="6"/>
+  <text class="label" x="110" y="177" text-anchor="middle">agentlink mcp</text>
+  <rect class="box" x="280" y="86" width="200" height="48" rx="6"/>
+  <text class="label" x="380" y="107" text-anchor="middle">shared client</text>
+  <text class="small" x="380" y="124" text-anchor="middle">WSS, pinned certificate</text>
+  <rect class="box" x="540" y="30" width="200" height="56" rx="6"/>
+  <text class="label" x="640" y="54" text-anchor="middle">agentlink relay</text>
+  <text class="small" x="640" y="72" text-anchor="middle">only listening port</text>
+  <rect class="box" x="540" y="140" width="200" height="56" rx="6"/>
+  <text class="label" x="640" y="164" text-anchor="middle">agentlink node</text>
+  <text class="small" x="640" y="182" text-anchor="middle">dials out, reconnects</text>
+  <path class="arrow" d="M200 48 H250 V110 H280"/>
+  <path class="arrow" d="M200 172 H250 V110 H280"/>
+  <path class="arrow" d="M480 110 H540"/>
+  <path class="arrow" d="M640 140 V86"/>
+</svg>
