@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use agentlink_core::engine::XferOpts;
 use agentlink_core::protocol::{CompressPref, NodeInfo, TransferStats};
 use agentlink_core::{
-    encode_invite, load_settings, operate_guide_url, parse_access, save_settings, viewer_url,
+    encode_invite, load_settings, operate_guide_url, parse_access, save_settings,
     Client, ClientSettings, ExecRequest, Identity, Invite, NodePolicy, Op, OperateGuide,
     PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT,
 };
@@ -570,15 +570,10 @@ enum Command {
         #[arg(long)]
         value: Option<String>,
     },
-    /// Open the browser viewer for a node's desktop.
+    /// Removed. Browser desktop control is not a sealed channel.
     ///
-    /// Uses the saved login session when present (same as `screenshot`), or a
-    /// registered agent identity when no token is saved. The link is view-only
-    /// unless `--control` is set. Input still requires remote-control on the
-    /// account grant. Headless nodes (`DISPLAY` column `no`) and offline
-    /// nodes are refused — use shell or files on a live graphical machine.
-    ///
-    /// `desktop` is a visible alias for this command.
+    /// The command fails. Control the node from a sealed client after the
+    /// node operator has issued a grant for that client's key.
     #[command(visible_alias = "desktop")]
     View {
         node: String,
@@ -1548,46 +1543,10 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
             monitor,
             control,
         } => {
-            // Prefer the saved user/admin session (same as screenshot/exec). A
-            // registered agent identity without a token still works: connect_client
-            // dials without a token when none is saved.
-            let saved = settings(cli)?;
-            let client = connect_client(cli, "").await?;
-            // Fail fast when the node last reported no graphical session so we
-            // do not mint a useless ticket (relay also refuses; this mirrors
-            // the controller Desktop button).
-            let nodes = client
-                .list_nodes()
-                .await
-                .map_err(|err| anyhow!(err.to_string()))?;
-            let info = agentlink_core::protocol::resolve_node(&nodes, node)
-                .map_err(|err| anyhow!(err.to_string()))?;
-            if info.has_display == Some(false) {
-                return Err(anyhow!(
-                    "{} is headless (no desktop session). Use shell or files instead of view.",
-                    info.name
-                ));
-            }
-            if !info.online {
-                return Err(anyhow!("node offline: {}", info.name));
-            }
-            let (ticket, node_id) = client
-                .issue_view_ticket_with(node, *control)
-                .await
-                .map_err(|err| {
-                    anyhow!(
-                        "{err}. Sign in (`agentlink login`), or register this identity and grant remote-view / remote-control on the node."
-                    )
-                })?;
-            let url = viewer_url(&saved.relay, &ticket, &node_id, *monitor)
-                .map_err(|err| anyhow!(err.to_string()))?;
-            emit(cli.json, json!({"url": url, "node": node_id}), || {
-                println!("{url}");
-            });
-            if !no_open {
-                open_browser(&url);
-            }
-            Ok(0)
+            let _ = (node, no_open, monitor, control);
+            return Err(anyhow!(
+                "browser view is not available; use a sealed client with a node-local grant"
+            ));
         }
         Command::Guide {
             node,
@@ -16876,7 +16835,6 @@ async fn connect_client(cli: &Cli, _label: &str) -> Result<Client> {
         }
     }
     let use_token = !settings.token.is_empty();
-    let auto_grant = agentlink_core::grant::auto_grant_enabled();
     let client = Client::connect_identity(&settings, identity.clone(), use_token)
         .await
         .map_err(|err| {
@@ -16886,20 +16844,7 @@ async fn connect_client(cli: &Cli, _label: &str) -> Result<Client> {
         })?;
     if let Ok(dir) = config_dir(cli) {
         client.remember_node_pins(dir.clone());
-        client.remember_grants(dir.clone());
-        if auto_grant {
-            // Same discovery as `grant ensure` (env, then a local node dir with
-            // issuer artifacts, then the operator identity) but quiet on connect.
-            let issuer_dir = auto_grant_issuer_data_dir();
-            if let Ok(issuer) = grant_issuer(issuer_dir.as_deref(), &identity) {
-                client.enable_auto_grant(
-                    dir,
-                    issuer,
-                    agentlink_core::grant::auto_grant_ttl_secs(),
-                    agentlink_core::grant::auto_grant_policy(),
-                );
-            }
-        }
+        client.remember_grants(dir);
     }
     warn_ca_only(&settings);
     Ok(client)
@@ -17086,17 +17031,6 @@ fn resolve_issuer_data_dir_with(
     (has_issuer || has_owner_keys).then(|| (dir.to_path_buf(), IssuerDirSource::LocalNode))
 }
 
-/// Issuer data dir for auto-grant.
-///
-/// Mirrors `grant ensure` precedence (env, then a local node dir that already
-/// has issuer artifacts, else the operator identity) without the LocalNode
-/// stderr note on every connect. Discovery never creates files.
-fn auto_grant_issuer_data_dir() -> Option<PathBuf> {
-    let env = std::env::var_os("AGENTLINK_ISSUER_DATA_DIR");
-    let node_dir = agentlink_core::config::default_data_dir("node").ok();
-    auto_grant_issuer_data_dir_with(env.as_deref(), node_dir.as_deref())
-}
-
 fn auto_grant_issuer_data_dir_with(
     env: Option<&std::ffi::OsStr>,
     node_dir: Option<&Path>,
@@ -17111,7 +17045,7 @@ fn grant_issuer(issuer_data_dir: Option<&std::path::Path>, operator: &Identity) 
     let owner_keys = agentlink_core::grant::load_owner_keys(dir)
         .map_err(|err| anyhow!(err.to_string()))?;
     if owner_keys.is_empty() {
-        return agentlink_core::grant::bootstrap_issuer_with_mode(dir, false)
+        return agentlink_core::grant::bootstrap_issuer_with_mode(dir)
             .map_err(|err| anyhow!(err.to_string()))?
             .ok_or_else(|| anyhow!("could not create an issuer in {}", dir.display()));
     }
@@ -17375,13 +17309,8 @@ fn operator_trust_owner_cmd(
 
 /// Concrete next step when the node rejects a client-signed grant issuer.
 fn tip_untrusted_grant_issuer(issuer: &str) -> String {
-    let lead = if agentlink_core::grant::auto_grant_enabled() {
-        "tip: auto-grant signs with this CLI identity, which the node does not trust yet."
-    } else {
-        "tip: this grant's issuer is not trusted by the node yet."
-    };
     format!(
-        "{lead}\n  on the node host, paste:\n    {cmd}\n    (hot-reloads on the next request)\n  or mint with the node issuer, then retry:\n    agentlink grant ensure --node <name> --issuer-data-dir {dir}\n  or set AGENTLINK_ISSUER_DATA_DIR=…; opt out: AGENTLINK_AUTO_GRANT=0",
+        "tip: this grant's issuer is not trusted by the node yet.\n  on the node host, paste:\n    {cmd}\n    (hot-reloads on the next request)\n  or mint with the node issuer, then retry:\n    agentlink grant ensure --node <name> --issuer-data-dir {dir}\n  or set AGENTLINK_ISSUER_DATA_DIR=…",
         cmd = trust_owner_paste_cmd(issuer),
         dir = NODE_DATA_DIR_TIP,
     )
@@ -17998,7 +17927,7 @@ mod grant_ttl_tests {
         let tip = tip_untrusted_grant_issuer(&issuer);
         assert!(tip.contains(&format!("trust-owner {issuer}")), "{tip}");
         assert!(tip.contains("grant ensure"), "{tip}");
-        assert!(tip.contains("AGENTLINK_AUTO_GRANT=0"), "{tip}");
+        assert!(!tip.contains("AGENTLINK_AUTO_GRANT"), "{tip}");
         assert!(tip.contains("~/.local/share/agentlink/node"), "{tip}");
         let paste = trust_owner_paste_cmd(&issuer);
         assert!(tip.contains(&format!("    {paste}")), "{tip}");

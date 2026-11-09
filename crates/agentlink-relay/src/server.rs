@@ -17,7 +17,7 @@ use agentlink_core::protocol::{
 };
 use agentlink_core::util::{self, unix_now};
 use agentlink_core::ws::{self, Incoming, Outbound};
-use agentlink_core::{Error, NodePolicy, Op, Result, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL};
+use agentlink_core::{Error, NodePolicy, Op, Result, PHASE3_WEBRTC_SIGNAL};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -1464,96 +1464,15 @@ fn web_principal(session: &crate::models::WebSession, token: &str) -> Principal 
 fn web_message_allowed(env: &Envelope) -> std::result::Result<(), String> {
     match env {
         Envelope::Ping | Envelope::Cancel { .. } => Ok(()),
-        Envelope::Invoke { op, .. } => web_op_allowed(op),
-        _ => Err("this browser session can only browse files and open a terminal".into()),
+        Envelope::Invoke { .. } => Err(
+            "browser control is disabled: that path is plaintext at the relay, and a web login is not a node-local grant"
+                .into(),
+        ),
+        _ => Err(
+            "browser control is disabled: that path is plaintext at the relay, and a web login is not a node-local grant"
+                .into(),
+        ),
     }
-}
-
-fn web_op_allowed(op: &Op) -> std::result::Result<(), String> {
-    match op {
-        Op::Stat { path } | Op::ListDir { path } | Op::Mkdir { path, .. } => {
-            bounded_path(path)?;
-            Ok(())
-        }
-        Op::ReadFile {
-            path, max_bytes, ..
-        } => {
-            bounded_path(path)?;
-            if *max_bytes > 8 * 1024 * 1024 {
-                return Err("read is larger than 8 MiB".into());
-            }
-            Ok(())
-        }
-        Op::WriteFile { path, data_b64, .. } => {
-            bounded_path(path)?;
-            if data_b64.len() > 1_400_000 {
-                return Err("write chunk is larger than 1 MiB".into());
-            }
-            Ok(())
-        }
-        Op::PtyOpen {
-            command,
-            cwd,
-            rows,
-            cols,
-        } => {
-            if let Some(command) = command {
-                if command.len() > 4096 || command.contains('\0') {
-                    return Err("command is too long".into());
-                }
-            }
-            if let Some(cwd) = cwd {
-                bounded_path(cwd)?;
-            }
-            bounded_window(*rows, *cols)?;
-            Ok(())
-        }
-        Op::PtyInput {
-            session_id,
-            data_b64,
-        } => {
-            bounded_id(session_id)?;
-            if data_b64.len() > 64 * 1024 {
-                return Err("terminal input is too large".into());
-            }
-            Ok(())
-        }
-        Op::PtyResize {
-            session_id,
-            rows,
-            cols,
-        } => {
-            bounded_id(session_id)?;
-            bounded_window(*rows, *cols)?;
-            Ok(())
-        }
-        Op::PtyClose { session_id } => {
-            bounded_id(session_id)?;
-            Ok(())
-        }
-        _ => Err("this browser session can only browse files and open a terminal".into()),
-    }
-}
-
-fn bounded_path(path: &str) -> std::result::Result<(), String> {
-    if path.is_empty() || path.len() > 4096 || path.contains('\0') {
-        return Err("path is not allowed".into());
-    }
-    Ok(())
-}
-
-fn bounded_id(id: &str) -> std::result::Result<(), String> {
-    if id.len() > 80 || id.is_empty() || !id.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-') {
-        return Err("session id is not allowed".into());
-    }
-    Ok(())
-}
-
-fn bounded_window(rows: u16, cols: u16) -> std::result::Result<(), String> {
-    if rows == 0 || rows > 400 || cols == 0 || cols > 500 {
-        return Err("terminal size is out of range".into());
-    }
-    Ok(())
 }
 
 async fn client_principal(
@@ -1705,8 +1624,6 @@ async fn client_principal(
     })
 }
 
-const VIEW_TICKET_TTL_SECS: i64 = 600;
-
 fn split_view_token(ticket_id: &str) -> (&str, Option<&str>) {
     match ticket_id.split_once('.') {
         Some((id, session)) if !id.is_empty() && !session.is_empty() => (id, Some(session)),
@@ -1716,6 +1633,7 @@ fn split_view_token(ticket_id: &str) -> (&str, Option<&str>) {
 
 /// First bare redeem binds a session and returns it. A second bare redeem fails.
 /// The bound session can reconnect until the ticket expires.
+#[cfg(test)]
 fn bind_view_ticket(
     record: &mut ViewTicketRecord,
     presented_session: Option<&str>,
@@ -1751,6 +1669,7 @@ fn ticket_allows_ice(record: &ViewTicketRecord, presented_session: Option<&str>,
 
 /// Fields `/api/view-ticket` may show the caller. They follow the clipped
 /// grant, not the `control` bit that was requested.
+#[cfg(test)]
 pub(crate) fn web_ticket_fields(grant: &NodePolicy) -> (bool, &'static str) {
     let control = grant.allows_remote_control();
     let access = if control {
@@ -1765,6 +1684,7 @@ pub(crate) fn web_ticket_fields(grant: &NodePolicy) -> (bool, &'static str) {
 
 /// Shareable and desktop links are view-only unless `control` is explicit and
 /// the account grant already includes remote control. Write and exec stay off.
+#[cfg(test)]
 fn clip_desktop_grant(access: NodePolicy, control: bool) -> NodePolicy {
     if !access.allows_remote_view() {
         return NodePolicy::none();
@@ -1782,64 +1702,24 @@ fn clip_desktop_grant(access: NodePolicy, control: bool) -> NodePolicy {
 }
 
 async fn redeem_view_ticket(ws: &mut RelaySocket, hub: &Hub, ticket_id: &str) -> Result<Principal> {
-    let (id, presented) = split_view_token(ticket_id);
-    let decided = {
-        let mut tickets = hub
-            .view_tickets
-            .lock()
-            .map_err(|_| Error::Message("view tickets poisoned".into()))?;
-        let now = unix_now();
-        tickets.retain(|_, ticket| ticket.expires_unix > now);
-        match tickets.get_mut(id) {
-            None => None,
-            Some(record) => {
-                let fresh = util::random_hex(32);
-                let result = bind_view_ticket(record, presented, now, &fresh);
-                Some(result.map(|session| (record.clone(), session)))
-            }
-        }
-    };
-    let (ticket, view_session) = match decided {
-        Some(Ok(ready)) => ready,
-        other => {
-            let message = match other {
-                Some(Err(message)) => message,
-                _ => "invalid view ticket",
-            };
-            send_env(
-                ws,
-                &Envelope::HelloErr {
-                    message: message.into(),
-                    fatal: true,
-                },
-            )
-            .await?;
-            return Err(Error::Auth(message.into()));
-        }
-    };
-    Ok(Principal {
-        admin: false,
-        operator: false,
-        legacy: false,
-        user: String::new(),
-        role: "view".into(),
-        device_id: String::new(),
-        access_hash: String::new(),
-        client_id: ticket.client_id,
-        name: "viewer".into(),
-        view: Some(ViewScope {
-            node_id: ticket.node_id,
-            grant: ticket.grant,
-        }),
-        web: false,
-        web_token: String::new(),
-        view_session,
-    })
+    let _ = (hub, ticket_id);
+    let message = "browser view is not available; use a sealed client with a node-local grant";
+    send_env(
+        ws,
+        &Envelope::HelloErr {
+            message: message.into(),
+            fatal: true,
+        },
+    )
+    .await?;
+    return Err(Error::Auth(message.into()));
 }
+
 
 /// Refuse minting a desktop viewer ticket when the node last reported no
 /// graphical session. `None` (never reported) still allows the ticket — the
 /// node/desktop layer will fail the stream if there really is no display.
+#[cfg(test)]
 fn headless_view_error(node_name: &str, has_display: Option<bool>) -> Option<String> {
     if has_display == Some(false) {
         Some(format!(
@@ -1850,53 +1730,13 @@ fn headless_view_error(node_name: &str, has_display: Option<bool>) -> Option<Str
     }
 }
 
+#[cfg(test)]
 fn offline_view_error(node_name: &str, online: bool) -> Option<String> {
     if !online {
         Some(format!("node offline: {node_name}"))
     } else {
         None
     }
-}
-
-async fn prepare_view_ticket(
-    hub: &Hub,
-    principal: &Principal,
-    node_id: &str,
-) -> Result<(String, String, NodePolicy, Option<bool>)> {
-    if principal.operator || principal.admin {
-        let visible = hub.db.access_to(&caller_of(principal), node_id).await?;
-        return Ok((
-            visible.node.id,
-            visible.node.name.clone(),
-            visible.access,
-            visible.node.has_display,
-        ));
-    }
-    let node = hub.db.resolve_node(node_id).await?;
-    let Some(record) = hub.db.client_record(&principal.client_id).await? else {
-        return Err(Error::NotFound(format!("client '{}'", principal.client_id)));
-    };
-    if record.revoked {
-        return Err(Error::Auth("client is revoked".into()));
-    }
-    let grant = record
-        .grants
-        .get(&node.id)
-        .copied()
-        .unwrap_or_else(NodePolicy::none)
-        .intersect(node.effective());
-    Ok((node.id, node.name, grant, node.has_display))
-}
-
-fn store_view_ticket(hub: &Hub, id: String, record: ViewTicketRecord) -> Result<()> {
-    let mut tickets = hub
-        .view_tickets
-        .lock()
-        .map_err(|_| Error::Message("view tickets poisoned".into()))?;
-    let now = unix_now();
-    tickets.retain(|_, item| item.expires_unix > now);
-    tickets.insert(id, record);
-    Ok(())
 }
 
 async fn issue_view_ticket(
@@ -1908,89 +1748,17 @@ async fn issue_view_ticket(
     control: bool,
     audit_ip: IpAddr,
 ) -> Result<()> {
-    if principal.view.is_some() || (principal.legacy && principal.admin) {
-        return send_out(
-            tx,
-            &Envelope::result_err(request_id, "connect with an agent identity"),
-        )
-        .await;
-    }
-    if !rate_allow(hub, "ticket", audit_ip, 30, 60) {
-        return send_out(
-            tx,
-            &Envelope::result_err(request_id, "too many view tickets"),
-        )
-        .await;
-    }
-    let prepared = match prepare_view_ticket(hub, principal, &node_id).await {
-        Ok(ready) => Ok(ready),
-        Err(err) => Err(err.to_string()),
-    };
-    let (node_real_id, node_name, grant, has_display) = match prepared {
-        Ok(ready) => ready,
-        Err(message) => {
-            return send_out(tx, &Envelope::result_err(request_id, message)).await;
-        }
-    };
-    if let Some(message) = headless_view_error(&node_name, has_display) {
-        return send_out(tx, &Envelope::result_err(request_id, message)).await;
-    }
-    let online = online_flags(hub)
-        .get(&node_real_id)
-        .copied()
-        .unwrap_or(false);
-    if let Some(message) = offline_view_error(&node_name, online) {
-        return send_out(tx, &Envelope::result_err(request_id, message)).await;
-    }
-    if !grant.allows_remote_view() {
-        return send_out(
-            tx,
-            &Envelope::result_err(
-                request_id,
-                format!("remote view is not allowed for this agent on {node_name}"),
-            ),
-        )
-        .await;
-    }
-    let grant = clip_desktop_grant(grant, control);
-    let ticket = util::random_hex(32);
-    let expires = unix_now() + VIEW_TICKET_TTL_SECS;
-    let owner = if principal.user.is_empty() {
-        principal.client_id.clone()
-    } else {
-        principal.user.clone()
-    };
-    store_view_ticket(
-        hub,
-        ticket.clone(),
-        ViewTicketRecord {
-            owner: owner.clone(),
-            client_id: principal.client_id.clone(),
-            node_id: node_real_id.clone(),
-            grant,
-            expires_unix: expires,
-            session: None,
-        },
-    )?;
-    audit_auth(
-        &hub.audit_path,
-        "view.ticket",
-        &owner,
-        &node_real_id,
-        true,
-        if control { "control" } else { "view" },
-    );
-    send_out(
+    let _ = (hub, principal, node_id, control, audit_ip);
+    return send_out(
         tx,
-        &Envelope::ViewTicket {
+        &Envelope::result_err(
             request_id,
-            ticket,
-            node_id: node_real_id,
-            expires_unix: expires,
-        },
+            "browser view is not available; use a sealed client with a node-local grant",
+        ),
     )
-    .await
+    .await;
 }
+
 
 pub(crate) fn online_flags(hub: &Hub) -> HashMap<String, bool> {
     let Ok(online) = lock_online(hub) else {
@@ -2018,59 +1786,12 @@ pub(crate) async fn issue_web_ticket(
     node_id: &str,
     control: bool,
 ) -> Result<IssuedWebTicket> {
-    let caller = Caller {
-        user: user.to_string(),
-        admin,
-    };
-    let visible = hub.db.access_to(&caller, node_id).await?;
-    if let Some(message) = headless_view_error(&visible.node.name, visible.node.has_display) {
-        return Err(Error::Message(message));
-    }
-    let online = online_flags(hub)
-        .get(&visible.node.id)
-        .copied()
-        .unwrap_or(false);
-    if let Some(message) = offline_view_error(&visible.node.name, online) {
-        return Err(Error::Message(message));
-    }
-    if !visible.access.allows_remote_view() {
-        return Err(Error::Message(format!(
-            "remote view is not allowed on {}",
-            visible.node.name
-        )));
-    }
-    let grant = clip_desktop_grant(visible.access, control);
-    let (actual_control, access) = web_ticket_fields(&grant);
-    let ticket = util::random_hex(32);
-    let expires = unix_now() + VIEW_TICKET_TTL_SECS;
-    store_view_ticket(
-        hub,
-        ticket.clone(),
-        ViewTicketRecord {
-            owner: user.to_string(),
-            client_id: format!("web:{user}"),
-            node_id: visible.node.id.clone(),
-            grant,
-            expires_unix: expires,
-            session: None,
-        },
-    )?;
-    audit_auth(
-        &hub.audit_path,
-        "view.ticket",
-        user,
-        &visible.node.id,
-        true,
-        if actual_control { "control" } else { "view" },
-    );
-    Ok(IssuedWebTicket {
-        ticket,
-        node_id: visible.node.id,
-        expires_unix: expires,
-        control: actual_control,
-        access,
-    })
+    let _ = (hub, user, admin, node_id, control);
+    return Err(Error::Message(
+        "browser view is not available; use a sealed client with a node-local grant".into(),
+    ));
 }
+
 
 pub(crate) fn revoke_view_tickets(
     hub: &Hub,
@@ -2125,19 +1846,10 @@ pub(crate) fn turn_subject_for_ticket(hub: &Hub, presented: &str) -> Result<Stri
     Ok(format!("view:{}", record.owner))
 }
 
-/// A view ticket may open the live stream, the JPEG fallback, and (when the
-/// clipped grant allows input) `inject_input` for screenshot-mode control.
-/// Shell and files stay on the agent session. [`NodePolicy::allows`] still
-/// applies to whichever op gets through.
+/// Browser view tickets are not a control channel. Every op is refused.
 fn view_ticket_may_invoke(op: &Op) -> bool {
-    match op {
-        Op::Extension { name, .. } => {
-            name == PHASE3_WEBRTC_SIGNAL
-                || name == PHASE2_SCREENSHOT
-                || name == PHASE2_INJECT_INPUT
-        }
-        _ => false,
-    }
+    let _ = op;
+    false
 }
 
 fn stamp_stream_flags(op: Op, grant: &NodePolicy) -> Op {
@@ -2445,7 +2157,7 @@ async fn handle_client(
                         tx,
                         &Envelope::result_err(
                             request_id,
-                            "view ticket can only signal a desktop stream or take a screenshot",
+                            "browser view is not available; use a sealed client with a node-local grant",
                         ),
                     )
                     .await;
@@ -5279,6 +4991,7 @@ async fn handle_account(
 #[cfg(test)]
 mod view_ticket_tests {
     use super::*;
+    use agentlink_core::{PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT};
 
     #[test]
     fn headless_nodes_cannot_mint_view_tickets() {
@@ -5307,9 +5020,9 @@ mod view_ticket_tests {
 
     #[test]
     fn view_ticket_can_signal_screenshot_or_input_and_the_grant_still_applies() {
-        assert!(view_ticket_may_invoke(&ext(PHASE3_WEBRTC_SIGNAL)));
-        assert!(view_ticket_may_invoke(&ext(PHASE2_SCREENSHOT)));
-        assert!(view_ticket_may_invoke(&ext(PHASE2_INJECT_INPUT)));
+        assert!(!view_ticket_may_invoke(&ext(PHASE3_WEBRTC_SIGNAL)));
+        assert!(!view_ticket_may_invoke(&ext(PHASE2_SCREENSHOT)));
+        assert!(!view_ticket_may_invoke(&ext(PHASE2_INJECT_INPUT)));
         assert!(!view_ticket_may_invoke(&Op::SysInfo));
 
         let view = NodePolicy::remote_view();

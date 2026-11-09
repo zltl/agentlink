@@ -106,13 +106,7 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
     tracing::info!(node_id = identity.node_id(), name = %config.name, "node identity ready");
     let endpoint = Endpoint::new(identity.clone());
     let service = AuditService::open(&config.data_dir, identity.node_id(), &config.name);
-    if agentlink_core::grant::legacy_relay_auth_enabled() {
-        tracing::warn!(
-            "AGENTLINK_LEGACY_RELAY_AUTH is set: the relay's grant stamps authorize node\
-             operations. Unset it to require owner-signed grants"
-        );
-    } else {
-        match agentlink_core::grant::bootstrap_issuer_with_mode(&config.data_dir, false) {
+    match agentlink_core::grant::bootstrap_issuer_with_mode(&config.data_dir) {
             Ok(Some(issuer)) => tracing::info!(
                 issuer = issuer.public_hex(),
                 path = %config.data_dir.join(agentlink_core::grant::GRANT_ISSUER_FILE).display(),
@@ -120,7 +114,6 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
             ),
             Ok(None) => {}
             Err(err) => tracing::warn!(error = %err, "could not bootstrap grant issuer"),
-        }
     }
     let owner_keys = agentlink_core::grant::refresh_owner_keys(
         &config.data_dir,
@@ -129,7 +122,7 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
     if !owner_keys.is_empty() {
         tracing::info!(
             issuers = owner_keys.len(),
-            "owner keys loaded; account owner and admin sessions are full access"
+            "owner keys loaded; remote control needs a grant signed by one of them"
         );
     }
     let revoked_jtis = agentlink_core::grant::refresh_revoked_jtis(

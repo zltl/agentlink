@@ -1,6 +1,6 @@
 # Testing and benchmarks
 
-Functional tests run on Ubuntu, Windows, and macOS in `.github/workflows/ci.yml`. Benchmarks live in a separate workflow so a normal pull request does not spend time on them.
+Run functional tests locally. This repository does not include GitHub Actions workflows.
 
 ## Functional tests
 

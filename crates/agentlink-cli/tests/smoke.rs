@@ -417,11 +417,7 @@ fn mcp_round_trip(
 }
 
 fn command(bin: &str) -> Command {
-    let mut cmd = Command::new(bin);
-    // The harness mints a node-trusted grant explicitly; stop the CLI and MCP
-    // child from auto-issuing a client-signed grant the node does not trust.
-    cmd.env("AGENTLINK_AUTO_GRANT", "0");
-    cmd
+    Command::new(bin)
 }
 
 fn run(bin: &str, prefix: &[String], args: &[&str]) -> std::process::Output {

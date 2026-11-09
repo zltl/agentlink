@@ -121,8 +121,8 @@ async fn flow() -> anyhow::Result<()> {
         .copy_upload("box", &remote_s, &local, &opts, None)
         .await?;
     assert_eq!(
-        up.transport, "quic",
-        "direct path should win on localhost: {up:?}"
+        up.transport, "relay",
+        "direct offer is not a sealed grant path: {up:?}"
     );
     assert_eq!(std::fs::read(&remote)?, std::fs::read(&local)?);
     assert!(up.payload_bytes > 0);
@@ -384,8 +384,8 @@ async fn stream_round_trip(
         .stream_upload("box", &remote.to_string_lossy(), &mut reader, opts)
         .await?;
     assert_eq!(
-        up.transport, "quic",
-        "stream upload should use QUIC: {up:?}"
+        up.transport, "relay",
+        "stream upload stays on the sealed relay path: {up:?}"
     );
     assert_eq!(up.logical_bytes, raw.len() as u64);
     assert_eq!(std::fs::read(&remote)?, raw);
@@ -404,7 +404,7 @@ async fn stream_round_trip(
             opts,
         )
         .await?;
-    assert_eq!(down.stats.transport, "quic", "{down:?}");
+    assert_eq!(down.stats.transport, "relay", "{down:?}");
     assert_eq!(downloaded.inner, raw);
     assert!(
         downloaded.writes >= 2,

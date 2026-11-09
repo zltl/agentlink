@@ -80,14 +80,17 @@ async fn flow() -> anyhow::Result<()> {
         stop.clone(),
     ));
     wait_online(&admin, "box").await;
-    let box_id = admin
-        .list_nodes()
-        .await?
-        .into_iter()
-        .find(|node| node.name == "box")
-        .unwrap()
-        .id;
+    let ident = std::fs::read_to_string(node_dir.join("identity.json"))?;
+    let box_id = serde_json::from_str::<serde_json::Value>(&ident)?
+        .get("public_hex")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .to_string();
     admin.install_local_grant(&node_dir, &box_id)?;
+    assert!(
+        admin.load_grant_for_node(&box_id)?.is_some(),
+        "admin grant was not stored"
+    );
 
     let secret_cmd = "echo SECRETCOMMANDVALUE";
     let output = admin
@@ -164,7 +167,11 @@ async fn flow() -> anyhow::Result<()> {
         identity,
     )
     .await?;
-    agent.list_dir("box", ".").await?;
+    let agent_list = agent.list_dir("box", ".").await;
+    assert!(
+        agent_list.is_err(),
+        "a relay read-only preset is not a node-local grant"
+    );
     let agent_exec = agent
         .exec_collect(
             "box",
@@ -181,6 +188,7 @@ async fn flow() -> anyhow::Result<()> {
         trust: None,
     })
     .await?;
+    runner.install_local_grant(&node_dir, &box_id)?;
     let held = tokio::spawn(async move {
         runner
             .exec_collect(

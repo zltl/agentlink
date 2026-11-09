@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dashboard_can_browse_upload_and_open_a_shell_when_the_grant_allows_it() {
+async fn dashboard_control_is_rejected_without_a_sealed_grant() {
     let result = tokio::time::timeout(Duration::from_secs(90), flow()).await;
     match result {
         Ok(Ok(())) => {}

@@ -834,7 +834,7 @@
           <label>Minutes
             <input id="machine-ttl" type="number" inputmode="numeric" min="1" max="10080" value="15">
           </label>
-          <p id="access-note" class="muted">Signing in as the owner or an admin is full access: shell, files, and remote desktop. No preset to pick.</p>
+          <p id="access-note" class="muted">This page enrolls machines and lists them. Shell, files, and desktop are not available in the browser. Control a machine from a sealed client after this node has a grant for that client's key.</p>
           <label>Uses
             <input id="machine-uses" type="number" inputmode="numeric" min="1" max="1000" value="1">
           </label>
@@ -1117,14 +1117,6 @@
       }
       const actions = document.createElement("div");
       actions.className = "actions";
-      actions.append(
-        actionButton(card, "terminal", t("card.terminal"), terminalState(item), () => openSession("terminal", item)),
-        actionButton(card, "files", t("card.files"), filesState(item), () => openSession("files", item))
-      );
-      if (showDesktop(item)) {
-        actions.appendChild(actionButton(card, "desktop", t("card.desktop"), desktopState(item), (button) => openDesktop(card, item, button)));
-        actions.classList.add("four");
-      }
       actions.appendChild(actionButton(card, "guide", t("card.guide"), { enabled: true, reason: t("aria.guide", { node: item.name || item.id }) }, (button) => openGuide(item, button)));
       card.append(title, pills, facts, actions);
       nodes.appendChild(card);
@@ -1518,6 +1510,7 @@
     return { message: t("card.error"), detail: raw };
   }
   async function openDesktop(card, item, button) {
+    return;
     if (card.dataset.opening === "1") return;
     card.dataset.opening = "1";
     const buttons = card.querySelectorAll(".actions button");
@@ -1840,6 +1833,7 @@
     return text.replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[ch]));
   }
   function openSession(kind, item) {
+    return;
     sessionItem = item;
     document.body.classList.add("in-session");
     document.getElementById("session-view").hidden = false;

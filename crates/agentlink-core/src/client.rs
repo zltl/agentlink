@@ -61,15 +61,6 @@ pub(crate) enum TransferInbound {
     Frame(Vec<u8>),
 }
 
-/// Client-side grant ensure/mint settings.
-#[derive(Clone)]
-struct AutoGrantConfig {
-    config_dir: std::path::PathBuf,
-    issuer: crate::identity::Identity,
-    ttl_secs: i64,
-    policy: NodePolicy,
-}
-
 pub(crate) struct ClientInner {
     pub(crate) tx: mpsc::Sender<Outbound>,
     pub(crate) pending: Arc<Mutex<HashMap<String, UnboundedSender<Envelope>>>>,
@@ -91,8 +82,6 @@ pub(crate) struct ClientInner {
     pub(crate) transfers: Arc<Mutex<HashSet<String>>>,
     /// Config directory holding `grants/<node_id>.json`.
     pub(crate) grant_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
-    /// When set, missing or expired grants are ensured/minted locally.
-    auto_grant: Mutex<Option<AutoGrantConfig>>,
     resend: Notify,
     fast: AtomicBool,
 }
@@ -104,38 +93,12 @@ impl ClientInner {
         }
     }
 
-    /// Load the grant this client should attach for `node_id`.
+    /// Load the grant this client attaches for `node_id`.
     ///
-    /// When auto-grant is configured, a missing or expired grant is refreshed
-    /// or issued locally; other load errors still surface. The ensured grant is
-    /// returned directly, never re-loaded.
+    /// Missing means the caller has not issued one. This does not mint a grant.
     pub(crate) fn authz_for(&self, node_id: &str) -> Result<Option<crate::grant::SignedGrant>> {
         let dir = self.grant_dir.lock().ok().and_then(|slot| slot.clone());
-        let loaded = crate::grant::load_grant_for(dir.as_deref(), node_id, self.e2e.peer_id());
-        match loaded {
-            Ok(Some(grant)) => Ok(Some(grant)),
-            Ok(None) => self.ensure_auto_grant(node_id),
-            Err(err) => match self.ensure_auto_grant(node_id)? {
-                Some(grant) => Ok(Some(grant)),
-                None => Err(err),
-            },
-        }
-    }
-
-    fn ensure_auto_grant(&self, node_id: &str) -> Result<Option<crate::grant::SignedGrant>> {
-        let config = self.auto_grant.lock().ok().and_then(|slot| slot.clone());
-        let Some(config) = config else {
-            return Ok(None);
-        };
-        let (grant, _action) = crate::grant::ensure_grant(
-            &config.config_dir,
-            &config.issuer,
-            node_id,
-            self.e2e.peer_id(),
-            config.policy,
-            config.ttl_secs,
-        )?;
-        Ok(Some(grant))
+        crate::grant::load_grant_for(dir.as_deref(), node_id, self.e2e.peer_id())
     }
 }
 
@@ -531,7 +494,6 @@ impl Client {
             cursors: Mutex::new(crate::resume::Cursors::default()),
             transfers: Arc::new(Mutex::new(HashSet::new())),
             grant_dir: Arc::new(Mutex::new(None)),
-            auto_grant: Mutex::new(None),
             resend: Notify::new(),
             fast: AtomicBool::new(false),
         });
@@ -604,30 +566,8 @@ impl Client {
         }
     }
 
-    /// Ensure a usable grant on demand instead of failing when none exists.
-    ///
-    /// Missing or expired grants are signed with `issuer` and stored under
-    /// `config_dir/grants/<node_id>.json`. Nothing is minted on the relay, and
-    /// the node still verifies the grant against its own `owner-keys.json`.
-    pub fn enable_auto_grant(
-        &self,
-        config_dir: impl Into<std::path::PathBuf>,
-        issuer: crate::identity::Identity,
-        ttl_secs: i64,
-        policy: NodePolicy,
-    ) {
-        if let Ok(mut slot) = self.inner.auto_grant.lock() {
-            *slot = Some(AutoGrantConfig {
-                config_dir: config_dir.into(),
-                issuer,
-                ttl_secs,
-                policy,
-            });
-        }
-    }
-
     /// Grant this client would attach for `node_id`, validating node, grantee,
-    /// and validity window. `None` means no grant is configured (legacy node).
+    /// and validity window. `None` means no grant file is stored for this client.
     pub fn load_grant_for_node(&self, node_id: &str) -> Result<Option<crate::grant::SignedGrant>> {
         self.inner.authz_for(node_id)
     }

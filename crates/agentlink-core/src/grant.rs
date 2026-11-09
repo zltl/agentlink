@@ -30,17 +30,6 @@ pub const GRANTS_DIR: &str = "grants";
 pub const GRANT_FILE_ENV: &str = "AGENTLINK_GRANT_FILE";
 /// Raw grant JSON for one invocation.
 pub const GRANT_JSON_ENV: &str = "AGENTLINK_GRANT_JSON";
-/// Opt out of signed-grant bootstrap and keep legacy relay grants.
-pub const LEGACY_RELAY_AUTH_ENV: &str = "AGENTLINK_LEGACY_RELAY_AUTH";
-/// Opt out of client-side automatic grant ensure/mint (`0`/`false`/`no`/`off`).
-pub const AUTO_GRANT_ENV: &str = "AGENTLINK_AUTO_GRANT";
-/// Lifetime in seconds for automatically issued grants (default 3600).
-pub const AUTO_GRANT_TTL_ENV: &str = "AGENTLINK_AUTO_GRANT_TTL";
-/// Default automatic grant lifetime.
-pub const DEFAULT_AUTO_GRANT_TTL_SECS: i64 = 3600;
-/// Policy for automatically issued grants (default `exec`).
-pub const AUTO_GRANT_POLICY_ENV: &str = "AGENTLINK_AUTO_GRANT_POLICY";
-
 /// What [`ensure_grant`] did with the stored grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnsureGrantAction {
@@ -418,55 +407,9 @@ pub fn ensure_grant(
     }
 }
 
-/// True only when `AGENTLINK_AUTO_GRANT` is `1`/`true`/`yes`/`on`.
-///
-/// Unset means off. The client must not mint a grant just because an account
-/// session exists. Issuing still requires a local issuer key the operator
-/// already has; the node accepts it only if that key is in `owner-keys.json`.
-pub fn auto_grant_enabled() -> bool {
-    matches!(
-        std::env::var(AUTO_GRANT_ENV)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-/// `AGENTLINK_AUTO_GRANT_TTL` in raw seconds; invalid or non-positive values
-/// fall back to [`DEFAULT_AUTO_GRANT_TTL_SECS`].
-pub fn auto_grant_ttl_secs() -> i64 {
-    std::env::var(AUTO_GRANT_TTL_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_AUTO_GRANT_TTL_SECS)
-}
-
-/// Policy for auto-issued grants, from [`AUTO_GRANT_POLICY_ENV`].
-///
-/// Unset or empty → [`NodePolicy::full`]. Invalid names fall back to `full`
-/// as well: a connected owner is not clipped to a narrower preset.
-pub fn auto_grant_policy() -> NodePolicy {
-    let raw = std::env::var(AUTO_GRANT_POLICY_ENV).unwrap_or_default();
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return NodePolicy::full();
-    }
-    crate::permissions::parse_access(raw).unwrap_or_else(|err| {
-        tracing::warn!(
-            value = raw,
-            error = %err,
-            "invalid {AUTO_GRANT_POLICY_ENV}; auto-issued grants use full"
-        );
-        NodePolicy::full()
-    })
-}
-
 /// Load trusted issuer public keys from `dir/owner-keys.json`.
 ///
-/// Missing file → empty set (legacy relay_grant mode).
+/// Missing file → empty set. An empty set denies remote control.
 pub fn load_owner_keys(dir: &Path) -> Result<BTreeSet<String>> {
     let path = dir.join(OWNER_KEYS_FILE);
     if !path.exists() {
@@ -688,18 +631,6 @@ pub fn add_revoked_jti_until(
     Ok(map.into_keys().collect())
 }
 
-/// True when the operator asked for the pre-grant relay behavior.
-pub fn legacy_relay_auth_enabled() -> bool {
-    matches!(
-        std::env::var(LEGACY_RELAY_AUTH_ENV)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
 /// Load the persistent grant issuer, if the node has one.
 pub fn load_issuer(data_dir: &Path) -> Result<Option<Identity>> {
     let path = data_dir.join(GRANT_ISSUER_FILE);
@@ -712,16 +643,8 @@ pub fn load_issuer(data_dir: &Path) -> Result<Option<Identity>> {
 /// Create `<data_dir>/grant-issuer.json` and enroll it in `owner-keys.json`
 /// when the node has no trusted issuers yet.
 ///
-/// `legacy_relay_auth` skips bootstrap and leaves owner keys empty, which keeps
-/// the old relay-stamped behavior. The caller passes the env decision explicitly
-/// so tests do not race on process-global environment variables.
-pub fn bootstrap_issuer_with_mode(
-    data_dir: &Path,
-    legacy_relay_auth: bool,
-) -> Result<Option<Identity>> {
-    if legacy_relay_auth {
-        return Ok(None);
-    }
+/// Create the node issuer when `owner-keys.json` is still empty.
+pub fn bootstrap_issuer_with_mode(data_dir: &Path) -> Result<Option<Identity>> {
     if !load_owner_keys(data_dir)?.is_empty() {
         return Ok(None);
     }
@@ -730,9 +653,9 @@ pub fn bootstrap_issuer_with_mode(
     Ok(Some(issuer))
 }
 
-/// Read `AGENTLINK_LEGACY_RELAY_AUTH` and bootstrap if signed grants are on.
+/// Create the node issuer when none is enrolled yet.
 pub fn bootstrap_issuer(data_dir: &Path) -> Result<Option<Identity>> {
-    bootstrap_issuer_with_mode(data_dir, legacy_relay_auth_enabled())
+    bootstrap_issuer_with_mode(data_dir)
 }
 
 /// Sign a full grant with the issuer stored in `node_data`.
@@ -742,7 +665,7 @@ pub fn bootstrap_issuer(data_dir: &Path) -> Result<Option<Identity>> {
 /// already in `owner-keys.json` (bootstrap creates both on a fresh data dir).
 pub fn issue_local_grant(node_data: &Path, node_id: &str, grantee_id: &str) -> Result<SignedGrant> {
     if load_owner_keys(node_data)?.is_empty() {
-        bootstrap_issuer_with_mode(node_data, false)?;
+        bootstrap_issuer_with_mode(node_data)?;
     }
     let issuer = load_issuer(node_data)?.ok_or_else(|| {
         Error::Message(
@@ -780,19 +703,6 @@ pub fn add_owner_key(dir: &Path, issuer_hex: &str) -> Result<BTreeSet<String>> {
     Ok(keys)
 }
 
-/// True when the relay stamped an account session on the outer envelope.
-///
-/// This is not a local approval. The node does not authorize from it.
-pub fn relay_account_connected(relay_admin: bool, relay_grant: Option<NodePolicy>) -> bool {
-    if relay_admin {
-        return true;
-    }
-    match relay_grant {
-        Some(policy) => policy != NodePolicy::none(),
-        None => false,
-    }
-}
-
 fn connected_capability(invoke_grant: Option<NodePolicy>) -> NodePolicy {
     let mut policy = NodePolicy::full();
     if let Some(extra) = invoke_grant {
@@ -808,8 +718,8 @@ fn connected_capability(invoke_grant: Option<NodePolicy>) -> NodePolicy {
 /// `owner-keys.json`. `relay_admin` and `relay_grant` are cleartext stamps
 /// the relay can set; they are ignored. A missing issuer list, a missing
 /// grant, a bad signature, the wrong node or grantee, a time window miss, or
-/// a revoked jti is a denial. A grant the node accepts is full use. A
-/// per-call cap can only narrow that.
+/// a revoked jti is a denial. A grant the node accepts is full use, then
+/// clipped by this node's own ceiling. A per-call cap can only narrow that.
 pub fn resolve_e2e_policy(
     trusted_issuers: &BTreeSet<String>,
     revoked_jtis: &BTreeSet<String>,
@@ -822,7 +732,7 @@ pub fn resolve_e2e_policy(
     relay_grant: Option<NodePolicy>,
     invoke_grant: Option<NodePolicy>,
 ) -> Result<NodePolicy> {
-    let _untrusted_relay = (relay_admin, relay_grant, ceiling);
+    let _untrusted_relay = (relay_admin, relay_grant);
     if trusted_issuers.is_empty() {
         return Err(Error::Auth(
             "signed grant required; this node has no local issuer in owner-keys.json. \
@@ -833,7 +743,7 @@ pub fn resolve_e2e_policy(
     }
     let Some(grant) = authz else {
         return Err(Error::Auth(format!(
-            "signed grant required (owner keys configured); this connection is not signed in as the owner or an admin of node {expected_node_id}; the controller public key is {expected_grantee_id}"
+            "signed grant required (owner keys configured) for node {expected_node_id}; the controller public key is {expected_grantee_id}. A relay login, admin bit, owner, or share is not a grant."
         )));
     };
     grant.authorize(
@@ -843,7 +753,9 @@ pub fn resolve_e2e_policy(
         expected_grantee_id,
         now_unix,
     )?;
-    Ok(connected_capability(invoke_grant))
+    // The node's own ceiling (phone consent, phase cap) still applies.
+    // A relay stamp cannot raise it.
+    Ok(connected_capability(invoke_grant).intersect(ceiling))
 }
 
 /// One grant file on disk.
@@ -1108,7 +1020,7 @@ mod tests {
         .unwrap_err();
         let err = err.to_string();
         assert!(err.contains("signed grant required"), "{err}");
-        assert!(err.contains("not signed in"), "{err}");
+        assert!(err.contains("is not a grant"), "{err}");
         assert!(err.contains(&format!("node {}", "cd".repeat(32))), "{err}");
         assert!(
             err.contains(&format!("controller public key is {}", "ef".repeat(32))),
@@ -1456,31 +1368,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_grant_policy_defaults_to_exec_and_reads_env() {
-        // One test covers all cases so the process-global env var is not
-        // mutated concurrently by parallel tests.
-        std::env::remove_var(AUTO_GRANT_POLICY_ENV);
-        assert_eq!(auto_grant_policy(), NodePolicy::full());
-
-        std::env::set_var(AUTO_GRANT_POLICY_ENV, "");
-        assert_eq!(auto_grant_policy(), NodePolicy::full());
-
-        std::env::set_var(AUTO_GRANT_POLICY_ENV, "full");
-        assert_eq!(auto_grant_policy(), NodePolicy::full());
-
-        std::env::set_var(AUTO_GRANT_POLICY_ENV, "exec");
-        assert_eq!(auto_grant_policy(), NodePolicy::exec());
-
-        std::env::set_var(AUTO_GRANT_POLICY_ENV, "definitely-not-a-policy");
-        assert_eq!(auto_grant_policy(), NodePolicy::full());
-
-        std::env::remove_var(AUTO_GRANT_POLICY_ENV);
-    }
-
-    #[test]
     fn bootstrap_creates_a_persistent_issuer_and_owner_key() {
         let dir = tempfile::tempdir().unwrap();
-        let issuer = bootstrap_issuer_with_mode(dir.path(), false)
+        let issuer = bootstrap_issuer_with_mode(dir.path())
             .unwrap()
             .expect("issuer created");
         let keys = load_owner_keys(dir.path()).unwrap();
@@ -1491,20 +1381,9 @@ mod tests {
         // The same secret is reused, and an enrolled owner key is not touched.
         let again = load_issuer(dir.path()).unwrap().expect("issuer exists");
         assert_eq!(again.public_hex(), issuer.public_hex());
-        assert!(bootstrap_issuer_with_mode(dir.path(), false)
+        assert!(bootstrap_issuer_with_mode(dir.path())
             .unwrap()
             .is_none());
-    }
-
-    #[test]
-    fn legacy_bootstrap_skips_issuer_and_owner_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(bootstrap_issuer_with_mode(dir.path(), true)
-            .unwrap()
-            .is_none());
-        assert!(!dir.path().join(GRANT_ISSUER_FILE).exists());
-        assert!(!dir.path().join(OWNER_KEYS_FILE).exists());
-        assert!(load_owner_keys(dir.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -1932,7 +1811,7 @@ mod tests {
                 None,
             )
             .unwrap(),
-            NodePolicy::full()
+            NodePolicy::read_only()
         );
     }
 

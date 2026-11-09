@@ -359,29 +359,17 @@ It fails if `agentlink` is not on PATH, the node is offline, the sync fails, or 
 
 ## Release archives (arm / mac / linux / windows)
 
-Tag builds are defined by `deploy/github-release.yml` (canonical copy of the GitHub Actions Release workflow). That matrix publishes seven archives so `agentlink update` and `install.sh` work on each arch:
+This repository does not run GitHub Actions. Do not add `.github/workflows`. Build the archives you need on the machines you already have. The names `install.sh` looks for are:
 
 - `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
 - `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`
 - `x86_64-apple-darwin`, `aarch64-apple-darwin`, `universal-apple-darwin`
 
-`aarch64-pc-windows-msvc` is built on `windows-latest` (cross) so a scarce `windows-11-arm` runner cannot block the whole release. Linux aarch64 musl stays on `ubuntu-24.04-arm`. macOS builds both slices on `macos-latest` and lipo’s a universal tarball.
-
-Validate locally:
+Validate the name list locally:
 
 ```sh
 sh scripts/check-release-matrix.sh
 ```
-
-`workflow_dispatch` on the Release workflow supports a dry-run that packages and checksums without publishing.
-
-GitHub App / OAuth tokens need the **`workflow`** scope to update `.github/workflows/release.yml`. Until then, keep `deploy/github-release.yml` in sync and copy it into `.github/workflows/release.yml` with a PAT that has that scope:
-
-```sh
-cp deploy/github-release.yml .github/workflows/release.yml
-```
-
-Manual cuts (when Actions is spending-limited) may still ship only the archives built on the box; the workflow is what restores the full arm/mac set on the next green tag run.
 
 ## Install signatures
 

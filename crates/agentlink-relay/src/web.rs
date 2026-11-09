@@ -1020,9 +1020,11 @@ mod tests {
         assert!(text.contains("id=\"login-totp\""));
         assert!(!text.contains("admin.token is only for automation"));
         assert!(text.contains("id=\"install-command\""));
-        assert!(text.contains("full access"));
+        assert!(text.contains("not available in the browser"));
         assert!(!text.contains("id=\"machine-access\""));
-        assert!(text.contains("No preset to pick"));
+        assert!(!text.contains("No preset to pick"));
+        assert!(!text.contains("openSession(\"terminal\""));
+        assert!(!text.contains("openSession(\"files\""));
         assert!(!text.contains("desktop-mode"));
         assert!(!text.contains("data-mode"));
         assert!(!text.contains(">View<"));

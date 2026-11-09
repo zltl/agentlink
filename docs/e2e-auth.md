@@ -28,9 +28,9 @@ has issued a grant for that key.
 A full shell on the machine can edit the grant files. That is the trust
 boundary of exec, not a separate sealed store.
 
-`AGENTLINK_AUTO_GRANT` defaults off. Set it to `1` only when this client
-already holds an issuer key the node has trusted. Nothing is minted from an
-account session alone.
+Connecting does not mint a grant. Issue one on the node host with
+`agentlink grant issue` or `agentlink grant ensure`. An account session
+never becomes a grant.
 
 ## Findings (current code)
 
@@ -38,12 +38,12 @@ account session alone.
 | --- | --- | --- |
 | `Envelope::E2e` body | ciphertext only | session keys from X25519; never on the wire in clear |
 | `class` | coarse `read`/`write`/`exec`/`desktop`/`meta` | used for relay ACL; not a secret |
-| `relay_admin` / `relay_grant` | **cleartext on the outer envelope** | The node treats an authenticated owner, admin, or share as full access. These stamps are how it learns that. They are not a preset cap |
+| `relay_admin` / `relay_grant` | **cleartext on the outer envelope** | Ignored by the node. They are not a grant. |
 | `Invoke.grant` | cleartext on plaintext invokes; also inside sealed body if client set it | relay overwrites for view tickets; unsigned |
 | Name → node id | listing / hello routing | TOFU pins (`node-pins.json`) stop silent key swap |
 | Same-owner peer paths (PR #42) | relay DB `owner` | correct isolation **if** the relay is honest; a malicious relay can still lie |
 | WebRTC media | DTLS-SRTP between viewer and node | TURN sees SRTP ciphertext only; JPEG fallback is sealed invoke |
-| Dashboard / web socket | plaintext `Invoke` | treated as privileged (`relay_admin`-like); browser session is the auth |
+| Dashboard / web socket | plaintext `Invoke` | Control invokes are rejected. The page lists and enrolls machines only. |
 
 Hypothesis that "the relay may still see plaintext signaling or assert peer
 identity" is **confirmed** for authorization: outer `relay_*` fields and
@@ -54,7 +54,7 @@ for E2E session keys.
 
 | Threat | Goal | Mitigation (target) |
 | --- | --- | --- |
-| Malicious relay | Decrypt sessions or read file and command bytes | Ciphertext. The relay cannot open the sealed body. It does decide which account session may reach a node, and that session is full access |
+| Malicious relay | Decrypt sessions or read file and command bytes | Ciphertext. The relay cannot open the sealed body or sign a local grant. |
 | Stolen relay DB | Impersonate users, rewrite grants | Grants are signatures, not DB rows; DB theft alone does not mint a valid `SignedGrant` |
 | MITM on WSS | Swap peer identity | Pin relay cert; pin node id; handshake binds both ed25519 identities |
 | Compromised node | Attack other accounts | Same-owner peer rule (PR #42); node ceiling; no cross-account grants |
@@ -100,8 +100,8 @@ browser extensions on the dashboard, and side channels on TURN timing.
 3. **Owner issuer keys** — ed25519 keys allowed to sign grants for a node.
    Stored on the node as `owner-keys.json` (hex public keys). The daemon
    bootstraps one on first start (`grant-issuer.json`); operators add more with
-   `agentlink grant trust-owner`. `AGENTLINK_LEGACY_RELAY_AUTH=1` keeps the
-   old empty-key behavior (see rollout).
+   `agentlink grant trust-owner`. There is no switch that restores account
+   sessions as authorization.
 4. **Session keys** — X25519 ephemeral DH → HKDF → ChaCha20-Poly1305 direction
    keys (`agentlink-e2e-v1`). Ephemeral; never leave the two endpoints.
 
@@ -136,8 +136,7 @@ Verification on the node:
 
 The grant travels **inside** the sealed `Envelope::Invoke` as `authz`, and
 inside sealed `Envelope::Transfer` bodies for file transfers. The
-relay never needs to parse it. Outer `relay_grant` / `relay_admin` are ignored
-for E2E when `owner-keys.json` is non-empty.
+relay never needs to parse it. Outer `relay_grant` / `relay_admin` are ignored.
 
 ## Handshake and authz flow
 
@@ -157,18 +156,15 @@ advisory at most.
 
 | Client / node | Behavior |
 | --- | --- |
-| Node (default) | Bootstraps `grant-issuer.json` when `owner-keys.json` is empty. A signed-in owner, admin, or share is full access with no grant file. A key that is not an account session still needs `authz`. |
-| Node (legacy) | `AGENTLINK_LEGACY_RELAY_AUTH=1` skips issuer bootstrap. Account sessions are still full. |
-| CLI / MCP / tray | Account login is enough. A local `grants/<node_id>.json` is optional and is ignored when it is stale, so it cannot block the session. |
-| Android client | Same account session on an updated node. If the node still requires a signed grant, the phone shows its controller public key and can import a grant issued for that key. |
+| Node | Bootstraps `grant-issuer.json` when `owner-keys.json` is empty. Every remote control call needs a signed grant for the E2E peer. Owner, admin, and share do not authorize. |
+| CLI / MCP / tray | Login discovers nodes. Control needs a grant file for that client's key. |
+| Android client | Shows the controller public key. Import a grant issued for that key. |
 | Android node | Verifies the same way. The phone's own consent ceiling still caps what a remote user can do *to the phone*. |
-| Dashboard / web | Cookie session. Terminal, files, and desktop are full for the owner. Desktop opens watch-first; Take control drives input. |
-| Node → node peer copy | Same-owner peers are full. The relay still refuses a peer from another account. |
+| Dashboard / web | Login, node list, and enrollment. Terminal, files, and desktop are not offered. |
+| Node → node peer copy | The relay may refuse a peer from another account. The target node still requires a grant for the peer key. |
 
-**Signing in as the owner or an admin is node authorization.** The account
-session is full access. A signed grant is not required for that session and
-does not narrow it. A key that is not an account session still needs a grant
-signed by a trusted owner issuer when the node has owner keys.
+**Signing in does not authorize the machine.** A grant signed by a key in
+`owner-keys.json`, for this node and this E2E peer, is the authorization.
 
 Phased rollout:
 
@@ -179,15 +175,13 @@ Phased rollout:
    in `owner-keys.json`; CLI `grant issue/show/list/refresh/revoke-local/revoke/trust-owner`
    (with `clear` as an alias for `revoke-local`); clients attach `authz`
    on invokes and transfers (including TCP tunnels);
-   `AGENTLINK_LEGACY_RELAY_AUTH=1` is the explicit escape hatch.
+   There is no legacy relay-auth escape hatch.
 3. **Done (v0.1.105)**: node-local grant revocation deny-list keyed by `jti`
    (`revoked-grants.json` in the node data dir). `grant revoke --data-dir`
    appends the jti; the node reloads it before each authz decision.
-4. **This PR (v0.1.106)**: remote revoke over the sealed E2E session. The CLI
-   signs an issuer `SignedRevoke` and sends `Op::RevokeGrant`; the node verifies
-   the issuer against `owner-keys.json` and appends the jti to its own
-   `revoked-grants.json`. No node `--data-dir` access is required.
-5. **Later**: relay-distributed opaque grants, narrow plaintext web path.
+4. Remote `Op::RevokeGrant` is rejected. Revoke by editing `revoked-grants.json`
+   on the node host. A sealed caller cannot change the grant list.
+5. Browser control stays off. A later client would need its own device key and a sealed session; a login cookie is not that.
 
 ## CLI workflow
 
@@ -263,30 +257,16 @@ data dir (`~/.local/share/agentlink/node`) when it already contains
 `grant-issuer.json` or non-empty `owner-keys.json`. Discovery never creates an
 issuer; with none of these, they sign with this CLI's operator identity.
 
-An account session does not need a local grant file. When
-`auto_grant_enabled()` is on (the default), a command that is **not** an
-account session can still mint a local grant. Auto-grant picks its issuer data
-dir with the same precedence as `grant ensure`: `AGENTLINK_ISSUER_DATA_DIR`,
-then the default node data dir when it already contains `grant-issuer.json` or
-non-empty `owner-keys.json`, otherwise this CLI's operator identity. Local
-discovery never creates an issuer. The relay still only routes ciphertext.
-Auto-issued grants default to `full`. Set `AGENTLINK_AUTO_GRANT_POLICY` only
-if a non-account key should record a different name; the node treats a valid
-grant as full use. A stale grant file is ignored when it cannot be refreshed,
-so it does not block the account session.
+A command does not mint a grant by itself. `grant issue`, `grant refresh`, and
+`grant ensure` are the explicit way to write `grants/<node_id>.json` for this
+client key. `AGENTLINK_ISSUER_DATA_DIR` selects the node data dir whose
+`grant-issuer.json` signs those commands. When it is unset they use
+`~/.local/share/agentlink/node` if that directory already has issuer artifacts,
+otherwise this CLI's operator identity. Discovery never creates an issuer.
 
-| Env var | Default | Meaning |
-| --- | --- | --- |
-| `AGENTLINK_AUTO_GRANT` | on | `0` / `false` / `no` / `off` disables automatic ensure/mint. |
-| `AGENTLINK_AUTO_GRANT_TTL` | `3600` | Lifetime in raw seconds for auto-issued grants; invalid values fall back to 3600. |
-| `AGENTLINK_AUTO_GRANT_POLICY` | `full` | Name recorded on auto-issued grants for a non-account key. Unset, empty, or invalid values fall back to `full`. The node does not clip an account session to this name. |
-| `AGENTLINK_ISSUER_DATA_DIR` | unset | Node data dir whose `grant-issuer.json` signs auto-grant and `grant issue|refresh|ensure` instead of the operator key. Overrides local node discovery; when unset both use the default node data dir if it already has issuer artifacts (optional; an env/explicit dir with empty `owner-keys.json` may be bootstrapped, local discovery never is). |
-
-A connection that is not an account session, on a node with owner keys and no
-valid grant, is rejected with `signed grant required … this connection is not
-signed in as the owner or an admin`. Sign in as the owner instead of pasting a
-grant. A revoked jti on a non-account grant fails with `grant was revoked (jti
-<jti>)`. If that grant's issuer is not trusted, the error names the issuer.
+A connection with no valid grant is rejected with `signed grant required`.
+A revoked jti fails with `grant was revoked (jti <jti>)`. An untrusted issuer
+is named in the error. Signing in does not skip any of these checks.
 
 For a documentation-only shareable how-to link for a node, run
 `agentlink guide <node>` and see [operate-guide.md](operate-guide.md).
@@ -305,8 +285,8 @@ Implemented:
 - `agentlink_core::grant` — bootstrap (`bootstrap_issuer_with_mode`), storage
   (`save_grant` / `load_grant` / `list_stored_grants` / `delete_grant`),
   env overrides, validation
-- Node daemon: bootstraps `grant-issuer.json` and `owner-keys.json` on load;
-  `AGENTLINK_LEGACY_RELAY_AUTH=1` opts out with a warning
+- Node daemon: bootstraps `grant-issuer.json` and `owner-keys.json` on load.
+  Account stamps are not an opt-out.
 - `Invoke.authz` and `Transfer.authz` (`Option<SignedGrant>`, sealed inside E2e)
 - Node E2E path: owner keys require a valid `authz` for invokes **and**
   transfers; policy is `grant ∩ ceiling`; outer `relay_admin` / `relay_grant`
@@ -314,12 +294,11 @@ Implemented:
 - Client: grant loading from `grants/` + env, attached to unary, exec/pty,
   copy, and stream links
 - CLI: `grant issue/show/list/refresh/revoke/revoke-local/trust-owner`;
-  `revoke-local` is also reachable as `grant clear` (local file only);
-  `grant revoke` signs a `SignedRevoke` and sends `Op::RevokeGrant` over E2E,
-  falling back to `--data-dir` (`revoked-grants.json`) when the node cannot be
-  reached
+  `revoke-local` is also reachable as `grant clear` (local file only).
+  `grant revoke` writes the node deny-list on the node host. A remote
+  `Op::RevokeGrant` is rejected.
 - Node-local `revoked-grants.json` deny-list, hot-reloaded before each authz
-  decision (`grant was revoked (jti <jti>)`); remote revokes update it in place
+  decision (`grant was revoked (jti <jti>)`)
 - Unit tests for TTL, serde, forge resistance, issuer bootstrap, revocation,
   and `SignedRevoke` round-trip/authorization
 
@@ -328,7 +307,7 @@ Deferred:
 - Relay-distributed grant revocation (the deny-list stays node-local; the relay
   remains untrusted and never sees the revoke or grant list)
 - Automatic node→node peer grants (operators issue them explicitly)
-- Browser sessions behind grants
+- Browser control (removed; the page would be plaintext at the relay)
 - Changing PR #42 relay checks (they stay as defense in depth)
 
 ## Non-goals

@@ -26,23 +26,15 @@ Accounts, device login, sharing, and the browser Add-machine page are described 
 - A tamper-evident JSONL audit log on the node, with optional relay and S3 sinks. Handlers call `audit::submit(AuditEvent)`.
 - `agentlink mcp` on stdio for Cursor and Claude Desktop.
 
-Phase 2 is screenshots, pointer and keyboard input, and the accessibility tree. A connected owner or admin can use it without a separate preset.
+Phase 2 is screenshots, pointer and keyboard input, and the accessibility tree. A sealed client can use them after the node has a grant for that client's key. An account login is not that grant.
 
 ## Remote desktop
 
-Phase 3 is a live desktop for a browser. Picture bytes go peer-to-peer. The relay only carries signaling and the viewer page.
+Phase 3 is a live desktop for a sealed client. Picture bytes go peer-to-peer after the node accepts a grant for that client. The browser does not open a desktop. `agentlink view` fails, and `GET /view` only says that browser control is not available.
 
 ![Capture, damage, encode, then WebRTC. Signaling stays on the relay. Input and the cursor use data channels.](docs/stream.svg)
 
-```bash
-agentlink view <node>
-agentlink view <node> --no-open
-agentlink view <node> --monitor 1
-```
-
-`view` turns the saved relay URL into `https://<relay>/view/#token=…&node=…`. The token is in the URL fragment, so the relay does not see it in the request log. The page is served on the relay's TLS port (`GET /view`, `GET /view/config.json`). Accept the self-signed certificate once in the browser. The page then opens a WebSocket to `/v1/webrtc`, says hello with that admin token, and invokes the `webrtc_signal` extension. The node answers. Video is a WebRTC track. Mouse, keyboard, scroll, clipboard text, and congestion feedback use a data channel named `input`. Cursor position is a separate `cursor` channel (`x`, `y`, and a shape name such as `arrow`), drawn by the page on top of the video. The video itself does not burn the cursor in.
-
-A signed-in owner or admin has the stream and remote control. The browser Add-machine form does not ask for a preset. A node reports whether it has a graphical session. A headless machine, such as a Linux server with no `DISPLAY` or `WAYLAND_DISPLAY`, keeps shell and files, and the dashboard leaves Desktop off for that machine. The node also asks for consent before it answers an offer:
+A node reports whether it has a graphical session. A headless machine, such as a Linux server with no `DISPLAY` or `WAYLAND_DISPLAY`, has no desktop stream. The node also asks for consent before it answers an offer:
 
 | `--stream-consent` | Behavior |
 | --- | --- |
@@ -144,7 +136,7 @@ cargo build --release
 # target/release/agentlink
 ```
 
-CI builds and tests on Ubuntu, Windows, and macOS (see `.github/workflows/ci.yml`).
+Tests run locally with `cargo test`. This repository does not include GitHub Actions workflows.
 
 ## Run a relay
 
@@ -213,7 +205,7 @@ Optional limits on the node:
 
 ![An installer checks a release and installs a user-session service that dials the relay](docs/images/deploy.svg)
 
-A tag named `v*` builds the release (`.github/workflows/release.yml`) and uploads it to GitHub Releases:
+Release archives, when you build them yourself, are named:
 
 - `agentlink-<version>-x86_64-unknown-linux-musl.tar.gz` and the `aarch64` musl archive
 - `agentlink-<version>-x86_64-pc-windows-msvc.zip` and the `aarch64` zip
@@ -488,12 +480,12 @@ Tools:
 - Invoke, cancel, and relay-path transfer control are sealed to the node. The handshake is X25519 plus both ed25519 identities (a Noise-style transcript, not the Noise framework, because file chunks can be 4 MiB). After that, ChaCha20-Poly1305. The relay sees a coarse class (`read`, `write`, `exec`, `desktop`, `meta`) and routes on the request id. It does not see paths, command lines, or file bytes.
 - Binary file frames keep the 40-byte header in the clear, including the request id and the file offset, so the relay can route them. The payload is encrypted. Set `FLAG_E2E` on those frames. QUIC copies are encrypted to the node certificate the node's ed25519 key signed; they are not wrapped a second time.
 - Pin the node id when it matters. A relay that lies about which public key belongs to a display name can introduce a different peer. It cannot forge a signature for a key it does not hold. The client pins that mapping by default after the first successful connect, as above.
-- The node is authoritative for the real operation. The relay's class check is a coarse filter. A malicious relay can still mark a session `relay_admin` or invent a grant up to the node ceiling. That is the same trust the admin token already required of the relay.
+- The node is authoritative for the real operation. The relay's class check is a coarse filter. A malicious relay can stamp `relay_admin` or invent a grant name. The node ignores those stamps. Control requires a signature from a key in the node's `owner-keys.json`, over the E2E peer that opened the sealed body.
 - Approval summaries and node-authored audit batches are cleartext on purpose. A person, and the relay query API, have to read them. Turn off `forward.central` when the relay must not store audit records. The node still writes its local chain.
 - `--root` confines file paths and the working directory of exec, background processes, and PTY sessions. Command allow and deny globs (`--allow-cmd`, `--deny-cmd`, or `limits.json`) match the program name and the shell line. Deny wins. A missing `limits.json` is an empty allow list plus a deny preset for disk format, `dd` onto disks, shutdown, and shred. This is not an OS sandbox: there is no chroot, seccomp, Seatbelt, or Job Object. An allowed shell can run anything that user can run. Bubblewrap, seccomp, or a platform sandbox would be a separate program.
 - `confirm.toml` can hold exec, remove, write, pty, or transfer until `agentlink approve allow` or `deny`. The timeout denies the operation. A missing file uses a baseline that holds `rm -rf`, `mkfs`, `dd` onto a disk, and power commands. Those holds are globs on the command summary, not a jail. Disk format and power commands are also on the default deny list, so approval does not make them run.
 - WebRTC picture and audio bytes are DTLS-SRTP between the viewer and the node. They are not sealed with the agentlink payload key. JPEG screenshots stay on the sealed `screenshot` invoke. Force TURN is the viewer's Relay only mode.
-- Shareable desktop links are view-only unless the mint sets `control`. The first redeem binds the ticket to a browser session. A second bare redeem is rejected. The bound session can reconnect until the ticket expires. `POST /api/view-ticket/revoke` drops outstanding tickets.
+- Browser view tickets are not issued. `GET /view` does not open a desktop.
 - Login, refresh, signup, websocket connect, view-ticket mint, and `POST /api/ice` are limited per client IP.
 - Desktop and WebRTC permissions exist on the policy struct and are denied unless both sides opt in.
 
@@ -602,7 +594,7 @@ cargo test
 - `crates/agentlink-node/tests/integration.rs` starts a relay and nodes in-process: pair, exec, write/read, PTY, reconnect, read-only denial, and the phase-2 extension hook.
 - `crates/agentlink-node/tests/capabilities.rs` covers search, edit, patch, watch, background processes, sysinfo, audit hashes, and process-group kill on exec timeout.
 - `crates/agentlink-node/tests/desktop.rs` uses the mock desktop: the `desktop` preset allows a PNG capture, the tree, and element actions, and a phase-1 ceiling still denies them. Linux CI also captures an Xvfb root when `DISPLAY` is set.
-- `agentlink-desktop` tests cover tile damage, the minih264 Annex-B keyframe, view-only input rejection, consent, the frame tap, and a synthetic static/typing/video encode. The relay test checks that `GET /view` contains the stats element ids.
+- `agentlink-desktop` tests cover tile damage, the minih264 Annex-B keyframe, view-only input rejection, consent, the frame tap, and a synthetic static/typing/video encode. The relay test checks that `GET /view` says browser control is not available.
 - `crates/agentlink-node/tests/transfer.rs` covers binary copy, resume, BLAKE3 skip, block delta, zstd, directory tar, the relay path, QUIC, node-to-node copy, and streamed cat/write (short reads, a bounded range, empty input).
 - `crates/agentlink-node/tests/security.rs` checks that a secret command and secret file bytes stay out of the relay capture, that a read-only agent cannot exec, that the command deny list blocks `rm`, that an approval hold can be allowed, and that the local hash chain verifies.
 - `crates/agentlink-node/tests/bench.rs` is ignored. `cargo test --release -p agentlink-node --test bench -- --ignored --nocapture` compares a 1 GiB file and a directory of 10k small files with the old 64 KiB path.

@@ -47,9 +47,9 @@ async fn web_socket_requires_the_dashboard_session_and_only_file_or_pty_ops() {
     )
     .await;
     let html = body_of(&page);
-    assert!(html.contains("\"Terminal\""), "{html}");
-    assert!(html.contains("\"Files\""), "{html}");
-    assert!(html.contains("\"Desktop\""), "{html}");
+    assert!(html.contains("not available in the browser"), "{html}");
+    assert!(!html.contains("openSession(\"terminal\""), "{html}");
+    assert!(!html.contains("t(\"card.desktop\")"), "{html}");
     assert!(html.contains("/v1/web?csrf="), "{html}");
     assert!(!html.contains("<script src"), "{html}");
 
@@ -107,7 +107,7 @@ async fn web_socket_requires_the_dashboard_session_and_only_file_or_pty_ops() {
         denied["error"]
             .as_str()
             .unwrap_or("")
-            .contains("browse files"),
+            .contains("browser control is disabled"),
         "{denied}"
     );
 

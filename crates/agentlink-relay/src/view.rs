@@ -4,8 +4,22 @@
 
 use serde_json::json;
 
-const PAGE: &str = include_str!("view.html");
-const POINTER_JS: &str = include_str!("pointer.js");
+const PAGE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentlink</title>
+</head>
+<body>
+  <main>
+    <h1>Browser control is not available</h1>
+    <p>This page does not open a shell, files, or a desktop. The relay would see that traffic, and a web login is not a grant on the machine.</p>
+    <p>Use a sealed client after the node operator has issued a grant for that client's key.</p>
+  </main>
+</body>
+</html>
+"#;
 
 pub fn response_for(head: &str) -> Option<Vec<u8>> {
     let mut lines = head.lines();
@@ -21,7 +35,6 @@ pub fn response_for(head: &str) -> Option<Vec<u8>> {
         "/view" | "/view/" | "/view/index.html" => {
             ("text/html; charset=utf-8", PAGE.as_bytes().to_vec())
         }
-        "/view/pointer.js" => ("application/javascript", POINTER_JS.as_bytes().to_vec()),
         "/view/config.json" => ("application/json", config_json().into_bytes()),
         _ => return None,
     };
@@ -148,10 +161,6 @@ fn split_env(name: &str) -> Vec<String> {
         .collect()
 }
 
-fn http_ok(content_type: &str, body: &[u8]) -> Vec<u8> {
-    http_ok_for(content_type, body, false)
-}
-
 fn http_ok_for(content_type: &str, body: &[u8], head: bool) -> Vec<u8> {
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
@@ -164,86 +173,20 @@ fn http_ok_for(content_type: &str, body: &[u8], head: bool) -> Vec<u8> {
     out
 }
 
-pub fn looks_like_http(head: &[u8]) -> bool {
-    head.starts_with(b"GET ") || head.starts_with(b"HEAD ") || head.starts_with(b"POST ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn viewer_page_exposes_stats() {
+    fn viewer_page_does_not_offer_control() {
         let bytes = response_for("GET /view HTTP/1.1").unwrap();
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("stat-fps"));
-        assert!(text.contains("stat-latency"));
-        assert!(text.contains("stat-bitrate"));
-        assert!(text.contains("stat-codec"));
-        assert!(text.contains("stat-encoder"));
-        assert!(text.contains("/v1/webrtc"));
-        assert!(text.contains("login-user"));
-        assert!(text.contains("login-pass"));
-        assert!(text.contains("id=\"login-totp-field\" hidden"));
-        assert!(text.contains("login-totp"));
-        assert!(text.contains("id=\"shot\""));
-        assert!(text.contains("id=\"banner\""));
-        assert!(text.contains("screenshot fallback"));
-        assert!(text.contains("/api/ice"));
-        assert!(text.contains("view_session"));
-        assert!(text.contains("DTLS-SRTP"));
-        assert!(text.contains("iceTransportPolicy to relay"));
-        assert!(text.contains("data_b64"));
-        assert!(text.contains("name: \"screenshot\""));
-        assert!(text.contains("id=\"ice-mode\""));
-        assert!(text.contains("id=\"link-mode\""));
-        assert!(text.contains("agentlink.viewer.ice"));
-        assert!(text.contains("Relay only"));
-        assert!(text.contains("ice_path"));
-        assert!(text.contains("action: \"keyframe\""));
-        assert!(text.contains("attempt.banner"));
-        assert!(text.contains("screenshot"));
-    }
-
-    #[test]
-    fn viewer_page_has_progressive_first_paint() {
-        let bytes = response_for("GET /view HTTP/1.1").unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        // Early non-blocking preview while WebRTC negotiates.
-        assert!(text.contains("previewShot"));
-        // Cold ladder: preview → steady (enhance rung retained but skipped).
-        assert!(text.contains("shotPhase"));
-        assert!(text.contains("quality: 28"));
-        assert!(text.contains("scale: 0.25"));
-        assert!(text.contains("quality: 50"));
-        assert!(text.contains("scale: 0.5"));
-        assert!(text.contains("quality: 70"));
-        assert!(text.contains("scale: 1.0"));
-        // After a cold preview paints, advance straight to steady (skip enhance).
-        assert!(text.contains("if (phase === \"preview\") { shotPhase = \"steady\"; advance = true; }"));
-        // Late preview results must be dropped when the session generation moved.
-        assert!(text.contains("gen !== connectGen"));
-    }
-
-    #[test]
-    fn jpeg_clicks_send_normalized_fractions() {
-        let text = String::from_utf8(response_for("GET /view HTTP/1.1").unwrap()).unwrap();
-        // Letterboxed object-fit:contain math lives in pointer.js; both live
-        // and JPEG paths send 0–1 fractions (preview scale must not matter).
-        assert!(text.contains("/view/pointer.js"));
-        assert!(text.contains("AgentlinkPointer.toFraction"));
-        assert!(text.contains("monitor: selectedMonitor()"));
-        assert!(!text.contains("Math.round(((ev.clientX - rect.left)"));
-    }
-
-    #[test]
-    fn pointer_script_is_served() {
-        let bytes = response_for("GET /view/pointer.js HTTP/1.1").unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("application/javascript"));
-        assert!(text.contains("AgentlinkPointer"));
-        assert!(text.contains("contentRect"));
-        assert!(text.contains("toFraction"));
+        assert!(text.contains("Browser control is not available"));
+        assert!(text.contains("grant for that client's key"));
+        assert!(!text.contains("login-pass"));
+        assert!(!text.contains("screenshot"));
+        assert!(!text.contains("/v1/webrtc"));
+        assert!(response_for("GET /view/pointer.js HTTP/1.1").is_none());
     }
 
     #[test]
