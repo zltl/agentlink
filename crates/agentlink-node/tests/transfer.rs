@@ -89,6 +89,20 @@ async fn flow() -> anyhow::Result<()> {
         ro_stop.clone(),
     );
     wait_online(&admin, &["box", "other", "ro"]).await;
+    for (name, data) in [
+        ("box", dir.path().join("box")),
+        ("other", dir.path().join("other")),
+        ("ro", dir.path().join("ro")),
+    ] {
+        let id = admin
+            .list_nodes()
+            .await?
+            .into_iter()
+            .find(|node| node.name == name)
+            .unwrap()
+            .id;
+        admin.install_local_grant(&data, &id)?;
+    }
 
     let opts = XferOpts {
         chunk_size: 64 * 1024,

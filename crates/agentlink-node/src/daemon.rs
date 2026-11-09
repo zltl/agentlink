@@ -160,6 +160,7 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
         sessions: Arc::new(Sessions::default()),
         pty: PtyManager::default(),
         cancels: Arc::new(Mutex::new(HashMap::new())),
+        grant_sessions: Mutex::new(HashMap::new()),
     });
     pipeline::spawn_recorder(service.clone(), config.capture.clone());
 
@@ -279,11 +280,8 @@ struct Live {
     /// Node data dir. Owner keys are reloaded from here before each authz
     /// decision so `grant trust-owner` applies without a restart.
     data_dir: PathBuf,
-    /// Last good trusted owner issuer keys. Non-empty requires a signed grant
-    /// only when the relay did not authenticate an account session for this
-    /// node. A relay-authenticated owner, admin, share, or same-owner peer is
-    /// full access (`relay_grant` / `relay_admin`). That stamp is trusted
-    /// because the relay binds it to the node on the open route.
+    /// Local issuer keys. Remote control is denied until one of these keys
+    /// has signed a grant for the end-to-end peer. Relay stamps are not read.
     owner_keys: RwLock<std::collections::BTreeSet<String>>,
     /// Last good revoked-jti deny-list, reloaded from the data dir before each
     /// authz decision so `grant revoke --data-dir` applies without a restart.
@@ -298,6 +296,8 @@ struct Live {
     sessions: Arc<Sessions>,
     pty: PtyManager,
     cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// jti -> in-flight request ids. A local revoke closes these.
+    grant_sessions: Mutex<HashMap<String, Vec<(String, CancellationToken)>>>,
 }
 
 impl Live {
@@ -713,6 +713,7 @@ async fn handle_env(
     host: &Arc<TransferHost>,
     live: &Arc<Live>,
 ) {
+    sweep_revoked_sessions(live);
     if let Envelope::E2eWelcome { request_id, .. } = &env {
         if let Some(waiter) = live
             .pending
@@ -907,73 +908,31 @@ async fn handle_env(
                 extra,
                 log,
             };
-            // Remote grant revoke is authenticated by the issuer-signed
-            // SignedRevoke itself, not by the caller's grant policy. Handle it
-            // before resolve_e2e_policy / confirm so a narrow authz cannot
-            // block an owner revoke.
-            if let agentlink_core::protocol::Op::RevokeGrant { revoke } = &op {
-                if seal.is_none() {
-                    let _ = resp.err("revoke_grant requires an E2E session").await;
-                    if let Ok(mut map) = cancels.lock() {
-                        map.remove(&request_id);
-                    }
-                    return;
-                }
-                // Reload owner-keys.json so `grant trust-owner` applies here too.
-                let owner_keys = live.current_owner_keys();
-                if let Err(err) =
-                    revoke.authorize(&owner_keys, &live.node_id, agentlink_core::util::unix_now())
-                {
-                    tracing::warn!(error = %err, "e2e revoke rejected");
-                    let _ = resp.err(err.to_string()).await;
-                    if let Ok(mut map) = cancels.lock() {
-                        map.remove(&request_id);
-                    }
-                    return;
-                }
-                match agentlink_core::grant::add_revoked_jti_until(
-                    &live.data_dir,
-                    &revoke.jti,
-                    revoke.grant_exp_unix,
-                ) {
-                    Ok(jtis) => {
-                        if let Ok(mut guard) = live.revoked_jtis.write() {
-                            *guard = jtis;
-                        }
-                        live.service.submit(audit::event_for(
-                            "permission",
-                            "grant",
-                            &client_id,
-                            &revoke.jti,
-                            serde_json::json!({"detail": revoke.jti, "revoke": "grant"}),
-                            true,
-                            None,
-                            Duration::ZERO,
-                        ));
-                        let _ = resp
-                            .ok(serde_json::json!({
-                                "revoked": true,
-                                "jti": revoke.jti.trim().to_ascii_lowercase(),
-                            }))
-                            .await;
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "could not persist revoked grant");
-                        let _ = resp
-                            .err(format!("could not update the node deny-list: {err}"))
-                            .await;
-                    }
-                }
+            // The deny-list is a file on this machine. A remote revoke, even
+            // inside a sealed session, would let a controller edit that list.
+            if let agentlink_core::protocol::Op::RevokeGrant { .. } = &op {
+                let _ = resp
+                    .err("grant list is local to this node; revoke on the node host")
+                    .await;
                 if let Ok(mut map) = cancels.lock() {
                     map.remove(&request_id);
                 }
                 return;
             }
+            let Some(seal_ref) = seal.as_ref() else {
+                let _ = resp
+                    .err("control requires an end-to-end session; plaintext relay invokes are disabled")
+                    .await;
+                if let Ok(mut map) = cancels.lock() {
+                    map.remove(&request_id);
+                }
+                return;
+            };
+            // The peer is the key that opened the sealed body, not the
+            // client_id the relay wrote on the outer envelope.
+            let grantee = seal_ref.peer.clone();
+            let _relay_says = (&client_id, relay_admin, relay_grant);
             let ceiling = policy.read().map(|g| *g).unwrap_or(NodePolicy::full());
-            // Account owner/admin/share sessions are full. A signed grant is
-            // required only when owner keys are set and the relay did not
-            // authenticate the caller. Reload owner keys so trust-owner applies
-            // without a restart. A per-call grant (view ticket) can still narrow.
             let owner_keys = live.current_owner_keys();
             let revoked_jtis = live.current_revoked_jtis();
             let policy_now = match agentlink_core::grant::resolve_e2e_policy(
@@ -981,11 +940,11 @@ async fn handle_env(
                 &revoked_jtis,
                 authz.as_ref(),
                 &live.node_id,
-                &client_id,
+                &grantee,
                 agentlink_core::util::unix_now(),
                 ceiling,
-                relay_admin,
-                relay_grant,
+                false,
+                None,
                 grant,
             ) {
                 Ok(policy) => policy,
@@ -1003,6 +962,14 @@ async fn handle_env(
                     return;
                 }
             };
+            if let Some(jti) = authz.as_ref().map(|grant| grant.jti.clone()) {
+                if let Ok(mut sessions) = live.grant_sessions.lock() {
+                    sessions
+                        .entry(jti)
+                        .or_default()
+                        .push((request_id.clone(), token.clone()));
+                }
+            }
             let confirm_category = live.confirm.matching(&op).map(|rule| rule.category.clone());
             let root = config.root.clone();
             let audit_path = config.data_dir.join("audit.log");
@@ -1111,12 +1078,21 @@ async fn handle_env(
             authz,
             ..
         } => {
-            let session = seal.as_ref().map(|s| s.session.clone());
-            // Account sessions are full without a grant file. A sealed transfer
-            // from a caller the relay did not authenticate still needs a signed
-            // grant when owner keys are set. Reload keys so trust-owner is live.
+            let Some(seal_ref) = seal.as_ref() else {
+                let deny = Envelope::result_err(
+                    request_id,
+                    "control requires an end-to-end session; plaintext relay transfers are disabled",
+                );
+                if let Ok(out) = ws::encode(&deny) {
+                    let _ = tx.send(out).await;
+                }
+                return;
+            };
+            let session = Some(seal_ref.session.clone());
+            let grantee = seal_ref.peer.clone();
+            let _relay_says = (&client_id, relay_admin, relay_grant);
             let owner_keys = live.current_owner_keys();
-            let policy_now = if seal.is_some() && !owner_keys.is_empty() {
+            let policy_now = {
                 let ceiling = policy.read().map(|g| *g).unwrap_or(NodePolicy::full());
                 let revoked_jtis = live.current_revoked_jtis();
                 match agentlink_core::grant::resolve_e2e_policy(
@@ -1124,11 +1100,11 @@ async fn handle_env(
                     &revoked_jtis,
                     authz.as_ref(),
                     &live.node_id,
-                    &client_id,
+                    &grantee,
                     agentlink_core::util::unix_now(),
                     ceiling,
-                    relay_admin,
-                    relay_grant,
+                    false,
+                    None,
                     None,
                 ) {
                     Ok(policy) => Some(policy),
@@ -1146,8 +1122,6 @@ async fn handle_env(
                         return;
                     }
                 }
-            } else {
-                None
             };
             transfer::on_transfer(
                 host.clone(),
@@ -1165,6 +1139,26 @@ async fn handle_env(
             tracing::debug!(?other, "ignoring envelope");
         }
     }
+}
+
+fn sweep_revoked_sessions(live: &Live) {
+    let revoked = live.current_revoked_jtis();
+    let Some(mut sessions) = live.grant_sessions.lock().ok() else {
+        return;
+    };
+    sessions.retain(|jti, inflight| {
+        let dead = revoked
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(jti.trim()));
+        if !dead {
+            return true;
+        }
+        for (request_id, token) in inflight.drain(..) {
+            token.cancel();
+            live.pty.close(&request_id).ok();
+        }
+        false
+    });
 }
 
 async fn replay_log(

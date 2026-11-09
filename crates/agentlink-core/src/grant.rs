@@ -418,15 +418,20 @@ pub fn ensure_grant(
     }
 }
 
-/// True unless `AGENTLINK_AUTO_GRANT` is `0`/`false`/`no`/`off`.
+/// True only when `AGENTLINK_AUTO_GRANT` is `1`/`true`/`yes`/`on`.
+///
+/// Unset means off. The client must not mint a grant just because an account
+/// session exists. Issuing still requires a local issuer key the operator
+/// already has; the node accepts it only if that key is in `owner-keys.json`.
 pub fn auto_grant_enabled() -> bool {
-    match std::env::var(AUTO_GRANT_ENV) {
-        Ok(raw) => !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => true,
-    }
+    matches!(
+        std::env::var(AUTO_GRANT_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// `AGENTLINK_AUTO_GRANT_TTL` in raw seconds; invalid or non-positive values
@@ -730,6 +735,34 @@ pub fn bootstrap_issuer(data_dir: &Path) -> Result<Option<Identity>> {
     bootstrap_issuer_with_mode(data_dir, legacy_relay_auth_enabled())
 }
 
+/// Sign a full grant with the issuer stored in `node_data`.
+///
+/// This writes nothing to the relay. The caller stores the result wherever
+/// the controller reads grants. The node accepts it only when that issuer is
+/// already in `owner-keys.json` (bootstrap creates both on a fresh data dir).
+pub fn issue_local_grant(node_data: &Path, node_id: &str, grantee_id: &str) -> Result<SignedGrant> {
+    if load_owner_keys(node_data)?.is_empty() {
+        bootstrap_issuer_with_mode(node_data, false)?;
+    }
+    let issuer = load_issuer(node_data)?.ok_or_else(|| {
+        Error::Message(
+            "node data dir has trusted issuers but no grant-issuer.json; \
+             issue from the key that was enrolled with grant trust-owner"
+                .into(),
+        )
+    })?;
+    let now = util::unix_now();
+    SignedGrant::sign(
+        &issuer,
+        grantee_id,
+        node_id,
+        NodePolicy::full(),
+        now.saturating_sub(30),
+        now.saturating_add(24 * 3600),
+        uuid::Uuid::new_v4().to_string(),
+    )
+}
+
 /// Add one issuer without dropping the others.
 pub fn add_owner_key(dir: &Path, issuer_hex: &str) -> Result<BTreeSet<String>> {
     let mut keys = load_owner_keys(dir)?;
@@ -747,12 +780,9 @@ pub fn add_owner_key(dir: &Path, issuer_hex: &str) -> Result<BTreeSet<String>> {
     Ok(keys)
 }
 
-/// The relay already authenticated this caller for the node.
+/// True when the relay stamped an account session on the outer envelope.
 ///
-/// Admins set `relay_admin`. Owners, sharees, and same-owner peers set a
-/// grant other than [`NodePolicy::none`]. Account membership lives on the
-/// relay. Operation payloads stay in the sealed body, which the relay cannot
-/// read. `NodePolicy::none()` is an explicit deny, not a narrow preset.
+/// This is not a local approval. The node does not authorize from it.
 pub fn relay_account_connected(relay_admin: bool, relay_grant: Option<NodePolicy>) -> bool {
     if relay_admin {
         return true;
@@ -772,17 +802,14 @@ fn connected_capability(invoke_grant: Option<NodePolicy>) -> NodePolicy {
     policy
 }
 
-/// Effective capability for one invoke or transfer.
+/// Effective capability for one sealed invoke or transfer.
 ///
-/// A relay-authenticated owner, admin, share, or same-owner peer is **full**.
-/// A signed grant is not required for that session, and a stored preset or
-/// node ceiling does not clip it. A per-call `invoke_grant` can still narrow
-/// one call (view tickets).
-///
-/// When owner keys are configured and this is not an account session, a valid
-/// signed grant still authorizes full use. A missing or rejected grant is an
-/// error. With no owner keys and no account session, the result is empty
-/// unless a per-call grant narrows the ceiling.
+/// The only approval is a signature the node can check against its own
+/// `owner-keys.json`. `relay_admin` and `relay_grant` are cleartext stamps
+/// the relay can set; they are ignored. A missing issuer list, a missing
+/// grant, a bad signature, the wrong node or grantee, a time window miss, or
+/// a revoked jti is a denial. A grant the node accepts is full use. A
+/// per-call cap can only narrow that.
 pub fn resolve_e2e_policy(
     trusted_issuers: &BTreeSet<String>,
     revoked_jtis: &BTreeSet<String>,
@@ -795,33 +822,28 @@ pub fn resolve_e2e_policy(
     relay_grant: Option<NodePolicy>,
     invoke_grant: Option<NodePolicy>,
 ) -> Result<NodePolicy> {
-    if relay_account_connected(relay_admin, relay_grant) {
-        return Ok(connected_capability(invoke_grant));
+    let _untrusted_relay = (relay_admin, relay_grant, ceiling);
+    if trusted_issuers.is_empty() {
+        return Err(Error::Auth(
+            "signed grant required; this node has no local issuer in owner-keys.json. \
+             On the node host run `agentlink grant trust-owner <issuer> --data-dir <node-data-dir>` \
+             and issue a grant. A relay login, admin bit, owner, or share is not a grant."
+                .into(),
+        ));
     }
-
-    if !trusted_issuers.is_empty() {
-        let Some(grant) = authz else {
-            return Err(Error::Auth(format!(
-                "signed grant required (owner keys configured); this connection is not signed in as the owner or an admin of node {expected_node_id}; the controller public key is {expected_grantee_id}"
-            )));
-        };
-        // The signature, peer, expiry, and revoke list still bind the key.
-        // The grant's preset does not clip; a valid grant is full use.
-        grant.authorize(
-            trusted_issuers,
-            revoked_jtis,
-            expected_node_id,
-            expected_grantee_id,
-            now_unix,
-        )?;
-        return Ok(connected_capability(invoke_grant));
-    }
-
-    let mut policy = NodePolicy::none();
-    if let Some(extra) = invoke_grant {
-        policy = ceiling.intersect(extra);
-    }
-    Ok(policy)
+    let Some(grant) = authz else {
+        return Err(Error::Auth(format!(
+            "signed grant required (owner keys configured); this connection is not signed in as the owner or an admin of node {expected_node_id}; the controller public key is {expected_grantee_id}"
+        )));
+    };
+    grant.authorize(
+        trusted_issuers,
+        revoked_jtis,
+        expected_node_id,
+        expected_grantee_id,
+        now_unix,
+    )?;
+    Ok(connected_capability(invoke_grant))
 }
 
 /// One grant file on disk.
@@ -1032,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn account_session_is_full_without_a_grant_file() {
+    fn account_session_is_not_a_local_grant() {
         let trusted = BTreeSet::from(["ab".repeat(32)]);
         let node = "cd".repeat(32);
         let owner = resolve_e2e_policy(
@@ -1044,12 +1066,12 @@ mod tests {
             1,
             NodePolicy::exec(),
             false,
-            Some(NodePolicy::exec()),
+            Some(NodePolicy::full()),
             None,
         )
-        .unwrap();
-        assert_eq!(owner, NodePolicy::full());
-        assert!(owner.allow_desktop && owner.allows_remote_control());
+        .unwrap_err()
+        .to_string();
+        assert!(owner.contains("signed grant required"), "{owner}");
 
         let admin = resolve_e2e_policy(
             &trusted,
@@ -1061,28 +1083,11 @@ mod tests {
             NodePolicy::read_only(),
             true,
             None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(admin, NodePolicy::full());
-
-        // A view ticket can still narrow this one call.
-        let watch = resolve_e2e_policy(
-            &trusted,
-            &BTreeSet::new(),
-            None,
-            &node,
-            &"ef".repeat(32),
-            1,
-            NodePolicy::full(),
-            true,
-            None,
             Some(NodePolicy::remote_view()),
         )
-        .unwrap();
-        assert!(watch.allows_remote_view());
-        assert!(!watch.allows_remote_control());
-        assert!(!watch.allow_exec);
+        .unwrap_err()
+        .to_string();
+        assert!(admin.contains("signed grant required"), "{admin}");
     }
 
     #[test]
@@ -1112,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn connected_session_is_full_and_an_anonymous_one_is_empty() {
+    fn relay_stamp_without_a_local_issuer_is_denied() {
         let empty = BTreeSet::new();
         let policy = resolve_e2e_policy(
             &empty,
@@ -1126,8 +1131,9 @@ mod tests {
             Some(NodePolicy::exec()),
             None,
         )
-        .unwrap();
-        assert_eq!(policy, NodePolicy::full());
+        .unwrap_err()
+        .to_string();
+        assert!(policy.contains("no local issuer"), "{policy}");
 
         let denied = resolve_e2e_policy(
             &empty,
@@ -1137,12 +1143,13 @@ mod tests {
             "peer",
             1,
             NodePolicy::full(),
-            false,
+            true,
             None,
             None,
         )
-        .unwrap();
-        assert_eq!(denied, NodePolicy::none());
+        .unwrap_err()
+        .to_string();
+        assert!(denied.contains("no local issuer"), "{denied}");
     }
 
     #[test]
@@ -1847,6 +1854,69 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("revoked"), "{err}");
+
+        let relay_full = resolve_e2e_policy(
+            &trusted,
+            &BTreeSet::new(),
+            None,
+            node.public_hex(),
+            grantee.public_hex(),
+            now,
+            NodePolicy::full(),
+            true,
+            Some(NodePolicy::full()),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(relay_full.contains("signed grant required"), "{relay_full}");
+
+        let mut forged = grant.clone();
+        forged.sig_hex = "00".repeat(64);
+        let forged_err = resolve_e2e_policy(
+            &trusted,
+            &BTreeSet::new(),
+            Some(&forged),
+            node.public_hex(),
+            grantee.public_hex(),
+            now,
+            NodePolicy::full(),
+            true,
+            Some(NodePolicy::full()),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            forged_err.contains("signature") || forged_err.contains("grant"),
+            "{forged_err}"
+        );
+
+        let expired = SignedGrant::sign(
+            &owner,
+            grantee.public_hex(),
+            node.public_hex(),
+            NodePolicy::full(),
+            now - 100,
+            now - 10,
+            "resolve-expired",
+        )
+        .unwrap();
+        let expired_err = resolve_e2e_policy(
+            &trusted,
+            &BTreeSet::new(),
+            Some(&expired),
+            node.public_hex(),
+            grantee.public_hex(),
+            now,
+            NodePolicy::full(),
+            false,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(expired_err.contains("expired"), "{expired_err}");
 
         assert_eq!(
             resolve_e2e_policy(

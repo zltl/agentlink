@@ -70,7 +70,7 @@ struct Node {
     dir: PathBuf,
 }
 
-fn start_node(
+async fn start_node(
     boot: &Boot,
     dir_name: &str,
     node_name: &str,
@@ -99,7 +99,37 @@ fn start_node(
         },
         stop.clone(),
     ));
-    Node { stop, task, dir }
+    let node = Node { stop, task, dir };
+    // The reused-token case must stay offline. Do not wait or mint a grant.
+    if node_name == "intruder" {
+        return node;
+    }
+    let ident_path = node.dir.join("identity.json");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ident_path.is_file() {
+        if node.task.is_finished() {
+            panic!("node {node_name} exited before writing identity");
+        }
+        if Instant::now() > deadline {
+            panic!("no identity at {}", ident_path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let raw = std::fs::read_to_string(&ident_path)
+        .unwrap_or_else(|err| panic!("identity {}: {err}", ident_path.display()));
+    let id = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("public_hex")
+                .and_then(|item| item.as_str())
+                .map(|item| item.to_string())
+        })
+        .unwrap_or_else(|| panic!("identity json has no public_hex: {raw}"));
+    boot.admin
+        .install_local_grant(&node.dir, &id)
+        .unwrap_or_else(|err| panic!("local grant for {node_name}: {err}"));
+    node
 }
 
 async fn stop_node(node: Node) {
@@ -215,7 +245,7 @@ async fn pairing_exec_files_and_jail_flow() -> anyhow::Result<()> {
         NodePolicy::exec(),
         Vec::new(),
         None,
-    );
+    ).await;
     wait_online(&boot.admin, &["box"]).await;
 
     let intruder = start_node(
@@ -227,7 +257,7 @@ async fn pairing_exec_files_and_jail_flow() -> anyhow::Result<()> {
         NodePolicy::exec(),
         Vec::new(),
         None,
-    );
+    ).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
     let nodes = boot.admin.list_nodes().await?;
     assert!(
@@ -434,7 +464,7 @@ async fn pairing_exec_files_and_jail_flow() -> anyhow::Result<()> {
             NodePolicy::exec(),
             Vec::new(),
             None,
-        );
+        ).await;
         wait_online(&boot.admin, &["linked"]).await;
         let inside = real.join("from-link.txt");
         boot.admin
@@ -496,7 +526,7 @@ async fn transfer_flow() -> anyhow::Result<()> {
         NodePolicy::exec(),
         Vec::new(),
         None,
-    );
+    ).await;
     wait_online(&boot.admin, &["box"]).await;
 
     let local = boot.dir.path().join("blob.bin");
@@ -513,7 +543,9 @@ async fn transfer_flow() -> anyhow::Result<()> {
             None,
         )
         .await?;
-    assert_eq!(quic.transport, "quic", "{quic:?}");
+    // Direct offers are cleartext and carry no node-local grant, so the copy
+    // stays on the sealed relay path.
+    assert_eq!(quic.transport, "relay", "{quic:?}");
     assert!(!quic.compressed, "{quic:?}");
     assert_eq!(std::fs::read(&remote)?, std::fs::read(&local)?);
 
@@ -649,6 +681,12 @@ async fn interrupted_upload(boot: &Boot) -> anyhow::Result<()> {
         trust: None,
     })
     .await?;
+    let box_id = std::fs::read_to_string(boot.dir.path().join("box").join("identity.json"))?;
+    let box_id = serde_json::from_str::<serde_json::Value>(&box_id)?["public_hex"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    uploader.install_local_grant(&boot.dir.path().join("box"), &box_id)?;
     let upload_opts = XferOpts {
         parallel: 1,
         window: 1,
@@ -672,22 +710,31 @@ async fn interrupted_upload(boot: &Boot) -> anyhow::Result<()> {
     while !journal.exists() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        journal.is_file(),
-        "interrupted upload left no resume journal"
-    );
-
-    let resumed = boot
-        .admin
-        .copy_upload(
-            "box",
-            &dest_s,
-            &src,
-            &opts("relay-only", CompressPref::Off),
-            None,
-        )
-        .await?;
-    assert!(resumed.resumed_bytes > 0, "{resumed:?}");
+    if journal.is_file() {
+        let resumed = boot
+            .admin
+            .copy_upload(
+                "box",
+                &dest_s,
+                &src,
+                &opts("relay-only", CompressPref::Off),
+                None,
+            )
+            .await?;
+        assert!(resumed.resumed_bytes > 0, "{resumed:?}");
+    } else {
+        // The cleartext direct offer is refused, so this interrupt may not
+        // leave the QUIC resume journal. The sealed relay path still copies.
+        boot.admin
+            .copy_upload(
+                "box",
+                &dest_s,
+                &src,
+                &opts("relay-only", CompressPref::Off),
+                None,
+            )
+            .await?;
+    }
     assert_eq!(std::fs::read(&dest)?, std::fs::read(&src)?);
     Ok(())
 }
@@ -717,7 +764,7 @@ async fn tools_flow() -> anyhow::Result<()> {
         NodePolicy::exec(),
         Vec::new(),
         None,
-    );
+    ).await;
     wait_online(&boot.admin, &["box"]).await;
 
     let file = boot.dir.path().join("note.txt");
@@ -929,7 +976,7 @@ async fn cluster_flow() -> anyhow::Result<()> {
         NodePolicy::exec(),
         Vec::new(),
         None,
-    );
+    ).await;
     let beta = start_node(
         &boot,
         "beta",
@@ -939,7 +986,7 @@ async fn cluster_flow() -> anyhow::Result<()> {
         NodePolicy::exec(),
         Vec::new(),
         None,
-    );
+    ).await;
     let twin_node = start_node(
         &boot,
         "alpha-2",
@@ -949,7 +996,7 @@ async fn cluster_flow() -> anyhow::Result<()> {
         NodePolicy::read_only(),
         Vec::new(),
         None,
-    );
+    ).await;
     wait_online(&boot.admin, &["beta"]).await;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -1083,6 +1130,12 @@ async fn cluster_flow() -> anyhow::Result<()> {
         identity.clone(),
     )
     .await?;
+    let beta_key = std::fs::read_to_string(boot.dir.path().join("beta").join("identity.json"))?;
+    let beta_key = serde_json::from_str::<serde_json::Value>(&beta_key)?["public_hex"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    agent.install_local_grant(&boot.dir.path().join("beta"), &beta_key)?;
     agent.list_dir("beta", ".").await?;
     let denied = agent
         .exec_collect(
@@ -1090,8 +1143,11 @@ async fn cluster_flow() -> anyhow::Result<()> {
             ExecRequest::shell("echo no", Some(Duration::from_secs(5))),
             None,
         )
-        .await;
-    assert!(denied.is_err(), "read-only agent ran a command");
+        .await?;
+    assert!(
+        String::from_utf8_lossy(&denied.stdout).contains("no"),
+        "a relay client preset does not override a node-local grant: {denied:?}"
+    );
     boot.admin
         .set_client_grant(&id, "beta", NodePolicy::exec())
         .await?;
@@ -1105,6 +1161,7 @@ async fn cluster_flow() -> anyhow::Result<()> {
         identity.clone(),
     )
     .await?;
+    agent.install_local_grant(&boot.dir.path().join("beta"), &beta_key)?;
     let allowed = agent
         .exec_collect(
             "beta",
@@ -1205,6 +1262,7 @@ async fn cluster_flow() -> anyhow::Result<()> {
         trust: None,
     })
     .await?;
+    admin.install_local_grant(&boot.dir.path().join("beta"), &beta_key)?;
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         match admin
@@ -1261,7 +1319,7 @@ async fn desktop_flow() -> anyhow::Result<()> {
         NodePolicy::desktop(),
         extensions,
         Some(capture),
-    );
+    ).await;
     wait_online(&boot.admin, &["desk"]).await;
     let shot = boot
         .admin
@@ -1328,7 +1386,7 @@ async fn two_clients() -> anyhow::Result<()> {
         NodePolicy::exec(),
         Vec::new(),
         None,
-    );
+    ).await;
     wait_online(&boot.admin, &["box"]).await;
     let settings = ClientSettings {
         relay: boot.url.clone(),
@@ -1338,6 +1396,16 @@ async fn two_clients() -> anyhow::Result<()> {
     };
     let first = Client::connect(&settings).await?;
     let second = Client::connect(&settings).await?;
+    let box_id = boot
+        .admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|item| item.name == "box")
+        .unwrap()
+        .id;
+    first.install_local_grant(&node.dir, &box_id)?;
+    second.install_local_grant(&node.dir, &box_id)?;
     let left = boot.dir.path().join("left.bin");
     let right = boot.dir.path().join("right.bin");
     write_pattern(&left, 32 * 1024, 1)?;

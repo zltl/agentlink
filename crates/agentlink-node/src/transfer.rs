@@ -537,31 +537,12 @@ pub fn on_binary(host: &TransferHost, bytes: Vec<u8>) {
 }
 
 pub async fn on_direct_offer(host: &TransferHost, env: Envelope) {
-    let Envelope::DirectOffer {
-        request_id,
-        public_key,
-        ..
-    } = env
-    else {
+    // The offer is cleartext and carries no node-local grant. Accepting it
+    // would let the relay introduce a peer. File bytes stay on the sealed path.
+    let Envelope::DirectOffer { request_id, .. } = env else {
         return;
     };
-    if let Ok(mut allowed) = host.allowed.lock() {
-        allowed.insert(public_key, Instant::now());
-    }
-    let Some(peer) = &host.quic else {
-        return;
-    };
-    let answer = Envelope::DirectAnswer {
-        request_id,
-        public_key: peer.public_key.clone(),
-        cert_fp: peer.cert_fp.clone(),
-        cert_sig: peer.cert_sig.clone(),
-        local_addrs: peer.local_addrs(None),
-        reflexive: None,
-    };
-    if let Ok(out) = ws::encode(&answer) {
-        let _ = host.tx.send(out).await;
-    }
+    let _ = (host, request_id);
 }
 
 pub fn on_direct_answer(host: &TransferHost, env: Envelope) {

@@ -2408,6 +2408,16 @@ async fn handle_client(
             op,
             ..
         } => {
+            if principal.web || principal.view.is_some() {
+                return send_out(
+                    tx,
+                    &Envelope::result_err(
+                        request_id,
+                        "browser and view-ticket control is disabled: that path is plaintext at the relay, and a web login is not a node-local grant",
+                    ),
+                )
+                .await;
+            }
             let resolved = if principal.operator || principal.admin {
                 hub.db
                     .access_to(&caller_of(principal), &node_id)
@@ -3282,14 +3292,13 @@ async fn route_e2e(
     } else {
         NodePolicy::none()
     };
-    // Including E2eHello. A handshake to a node the caller cannot use must not
-    // create a route; a later frame could otherwise reuse it.
-    if !agentlink_core::e2e::class_allowed(allowed, &class) {
-        let message = if agentlink_core::e2e::class_allowed(allowed, "meta") {
-            format!("{class} is not allowed on this node")
-        } else {
-            "no grant on this node".to_string()
-        };
+    // A caller who cannot address the node must not create a route. The
+    // operation class is not a grant: the node accepts or rejects the sealed
+    // body. A relay preset must not be the thing that allows exec.
+    if !agentlink_core::e2e::class_allowed(allowed, "meta")
+        && !agentlink_core::e2e::class_allowed(allowed, &class)
+    {
+        let message = "no grant on this node".to_string();
         return send_out(from_tx, &Envelope::result_err(request_id, message)).await;
     }
     let online_tx = {

@@ -110,6 +110,25 @@ async fn flow() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let box_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "box")
+        .unwrap()
+        .id;
+    admin.install_local_grant(&node_dir, &box_id)?;
+    let grant_file = node_dir
+        .join(format!(
+            "controller-grants-{}",
+            admin.public_id().chars().take(16).collect::<String>()
+        ))
+        .join("grants")
+        .join(format!("{}.json", box_id.to_ascii_lowercase()));
+    assert!(
+        grant_file.is_file(),
+        "missing {grant_file:?} for {box_id}"
+    );
 
     let exec = admin
         .exec_collect(
@@ -117,7 +136,8 @@ async fn flow() -> anyhow::Result<()> {
             ExecRequest::shell("echo hello-agentlink", Some(Duration::from_secs(15))),
             None,
         )
-        .await?;
+        .await
+        .unwrap_or_else(|err| panic!("box_id={box_id} err={err}"));
     assert_eq!(
         exec.exit_code,
         Some(0),
@@ -253,6 +273,14 @@ async fn flow() -> anyhow::Result<()> {
             .unwrap_or(false)
     })
     .await;
+    let reader_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "reader")
+        .unwrap()
+        .id;
+    admin.install_local_grant(&dir.path().join("reader"), &reader_id)?;
     let read_only = admin.read_file("reader", &file_str, 0, 64).await?;
     assert_eq!(read_only, b"hello from agentlink");
     let exec_ok = admin
@@ -297,6 +325,14 @@ async fn flow() -> anyhow::Result<()> {
             .unwrap_or(false)
     })
     .await;
+    let screen_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "screen")
+        .unwrap()
+        .id;
+    admin.install_local_grant(&dir.path().join("screen"), &screen_id)?;
     let shot = admin
         .call_op(
             "screen",

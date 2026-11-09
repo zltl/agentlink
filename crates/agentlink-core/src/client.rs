@@ -117,16 +117,7 @@ impl ClientInner {
             Ok(None) => self.ensure_auto_grant(node_id),
             Err(err) => match self.ensure_auto_grant(node_id)? {
                 Some(grant) => Ok(Some(grant)),
-                // A stale or mismatched file must not block an account session.
-                // The node authorizes the signed-in owner without this file.
-                None => {
-                    tracing::warn!(
-                        error = %err,
-                        node_id,
-                        "ignoring unusable local grant; the account session authorizes the owner"
-                    );
-                    Ok(None)
-                }
+                None => Err(err),
             },
         }
     }
@@ -583,6 +574,27 @@ impl Client {
         if let Ok(mut slot) = self.pin_dir.lock() {
             *slot = Some(dir.into());
         }
+    }
+
+    /// Sign a full grant with the node data dir's local issuer and remember it.
+    ///
+    /// The file stays on disk next to that data dir. The relay is not asked.
+    pub fn install_local_grant(&self, node_data: &std::path::Path, node_id: &str) -> Result<()> {
+        let grant = crate::grant::issue_local_grant(node_data, node_id, self.public_id())?;
+        let dir = self
+            .inner
+            .grant_dir
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| {
+                let prefix: String = self.public_id().chars().take(16).collect();
+                node_data.join(format!("controller-grants-{prefix}"))
+            });
+        let path = crate::grant::save_grant(&dir, &grant)?;
+        self.remember_grants(&dir);
+        let _ = path;
+        Ok(())
     }
 
     /// Look for grants in `dir/grants/<node_id>.json` (usually the config dir).

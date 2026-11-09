@@ -80,6 +80,14 @@ async fn flow() -> anyhow::Result<()> {
         stop.clone(),
     ));
     wait_online(&admin, "box").await;
+    let box_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "box")
+        .unwrap()
+        .id;
+    admin.install_local_grant(&node_dir, &box_id)?;
 
     let secret_cmd = "echo SECRETCOMMANDVALUE";
     let output = admin

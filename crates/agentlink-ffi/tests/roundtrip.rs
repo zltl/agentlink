@@ -216,6 +216,14 @@ async fn flow() -> anyhow::Result<()> {
     })
     .await;
 
+    let phone_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "phone")
+        .unwrap()
+        .id;
+    admin.install_local_grant(&dir.path().join("node"), &phone_id)?;
     let exec = admin
         .exec_collect(
             "phone",

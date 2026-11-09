@@ -675,46 +675,49 @@ async fn handle_env(
                 seal: seal.clone(),
                 log,
             };
+            if let agentlink_core::protocol::Op::RevokeGrant { .. } = &op {
+                let _ = resp
+                    .err("grant list is local to this node; revoke on the node host")
+                    .await;
+                return;
+            }
+            let Some(seal_ref) = seal.as_ref() else {
+                let deny = Envelope::result_err(
+                    request_id.clone(),
+                    "control requires an end-to-end session; plaintext relay invokes are disabled",
+                );
+                if let Ok(out) = ws::encode(&deny) {
+                    let _ = tx.send(out).await;
+                }
+                return;
+            };
+            let grantee = seal_ref.peer.clone();
+            let _relay_says = (&client_id, relay_admin, relay_grant);
             let ceiling = policy.read().map(|g| *g).unwrap_or(config.ceiling);
-            let policy_now = if seal.is_some() {
-                let owner_keys = live.current_owner_keys();
-                let revoked_jtis = live.current_revoked_jtis();
-                match agentlink_core::grant::resolve_e2e_policy(
-                    &owner_keys,
-                    &revoked_jtis,
-                    authz.as_ref(),
-                    &live.node_id,
-                    &client_id,
-                    agentlink_core::util::unix_now(),
-                    ceiling,
-                    relay_admin,
-                    relay_grant,
-                    grant,
-                ) {
-                    // Phone consent (the local ceiling) still caps this device.
-                    // A desktop node does not apply that cap; see the daemon.
-                    Ok(policy) => policy.intersect(config.ceiling),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "e2e authz rejected");
-                        let deny = Envelope::result_err(request_id.clone(), err.to_string());
-                        if let Ok(out) = ws::encode(&deny) {
-                            let _ = tx.send(out).await;
-                        }
-                        return;
+            let owner_keys = live.current_owner_keys();
+            let revoked_jtis = live.current_revoked_jtis();
+            let policy_now = match agentlink_core::grant::resolve_e2e_policy(
+                &owner_keys,
+                &revoked_jtis,
+                authz.as_ref(),
+                &live.node_id,
+                &grantee,
+                agentlink_core::util::unix_now(),
+                ceiling,
+                false,
+                None,
+                grant,
+            ) {
+                // Phone consent (the local ceiling) still caps this device.
+                Ok(policy) => policy.intersect(config.ceiling),
+                Err(err) => {
+                    tracing::warn!(error = %err, "e2e authz rejected");
+                    let deny = Envelope::result_err(request_id.clone(), err.to_string());
+                    if let Ok(out) = ws::encode(&deny) {
+                        let _ = tx.send(out).await;
                     }
+                    return;
                 }
-            } else {
-                let mut policy_now = ceiling;
-                if !relay_admin {
-                    policy_now = match relay_grant {
-                        Some(grant) => policy_now.intersect(grant).intersect(config.ceiling),
-                        None => NodePolicy::none(),
-                    };
-                }
-                if let Some(grant) = grant {
-                    policy_now = policy_now.intersect(grant);
-                }
-                policy_now
             };
             let paths = transfer_host.paths.clone();
             let host_cb = host_cb.clone();

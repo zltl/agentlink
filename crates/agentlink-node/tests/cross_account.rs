@@ -117,6 +117,12 @@ async fn flow() -> anyhow::Result<()> {
     );
     wait_online(&admin, &["alice-box", "bob-box"]).await;
     let nodes = admin.list_nodes().await?;
+    let alice_id = nodes
+        .iter()
+        .find(|node| node.name == "alice-box")
+        .unwrap()
+        .id
+        .clone();
     let bob_id = nodes
         .iter()
         .find(|node| node.name == "bob-box")
@@ -130,9 +136,49 @@ async fn flow() -> anyhow::Result<()> {
             ExecRequest::shell("echo owner-ok", Some(Duration::from_secs(10))),
             None,
         )
+        .await;
+    let own_err = match own {
+        Ok(done) => format!("exit {:?} stdout {}", done.exit_code, String::from_utf8_lossy(&done.stdout)),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        own_err.contains("signed grant required"),
+        "same-owner login must not skip a local grant: {own_err}"
+    );
+    let grant = agentlink_core::grant::issue_local_grant(
+        &dir.path().join("alice"),
+        &alice_id,
+        alice.public_id(),
+    )?;
+    let jti = grant.jti.clone();
+    let grant_dir = dir.path().join("alice-controller-grants");
+    agentlink_core::grant::save_grant(&grant_dir, &grant)?;
+    alice.remember_grants(&grant_dir);
+    let own = alice
+        .exec_collect(
+            "alice-box",
+            ExecRequest::shell("echo owner-ok", Some(Duration::from_secs(10))),
+            None,
+        )
         .await?;
     assert_eq!(own.exit_code, Some(0));
     assert!(String::from_utf8_lossy(&own.stdout).contains("owner-ok"));
+    agentlink_core::grant::add_revoked_jti(&dir.path().join("alice"), &jti)?;
+    let revoked = alice
+        .exec_collect(
+            "alice-box",
+            ExecRequest::shell("echo revoked", Some(Duration::from_secs(10))),
+            None,
+        )
+        .await;
+    let revoked_err = match revoked {
+        Ok(done) => format!("exit {:?}", done.exit_code),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        revoked_err.contains("revoked"),
+        "local revoke must block the next command: {revoked_err}"
+    );
     let foreign = alice
         .exec_collect(
             "bob-box",
@@ -140,7 +186,14 @@ async fn flow() -> anyhow::Result<()> {
             None,
         )
         .await;
-    assert!(foreign.is_err(), "alice ran a command on bob's node");
+    let foreign_err = match &foreign {
+        Ok(done) => format!("exit {:?}", done.exit_code),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        foreign.is_err() || foreign_err.contains("signed grant required"),
+        "alice ran a command on bob's node: {foreign_err}"
+    );
 
     let mut ws = dial(
         &url,
@@ -191,10 +244,33 @@ async fn flow() -> anyhow::Result<()> {
             ExecRequest::shell("echo shared-ok", Some(Duration::from_secs(10))),
             None,
         )
+        .await;
+    let shared_err = match &shared {
+        Ok(done) => format!("exit {:?}", done.exit_code),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        shared.is_err(),
+        "a relay share is not a local grant: {shared_err}"
+    );
+    let bob_grant = agentlink_core::grant::issue_local_grant(
+        &dir.path().join("bob"),
+        &bob_id,
+        alice.public_id(),
+    )?;
+    let bob_grants = dir.path().join("bob-controller-grants");
+    agentlink_core::grant::save_grant(&bob_grants, &bob_grant)?;
+    alice.remember_grants(&bob_grants);
+    let shared = alice
+        .exec_collect(
+            "bob-box",
+            ExecRequest::shell("echo shared-ok", Some(Duration::from_secs(10))),
+            None,
+        )
         .await?;
     assert!(
         String::from_utf8_lossy(&shared.stdout).contains("shared-ok"),
-        "a share is full use of that node"
+        "a grant issued on bob's node allows alice"
     );
 
     alice_stop.cancel();

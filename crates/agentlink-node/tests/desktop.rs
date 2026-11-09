@@ -69,6 +69,14 @@ async fn flow() -> anyhow::Result<()> {
         denied_shutdown.clone(),
     ));
     wait_online(&admin, "ceiling").await;
+    let ceiling_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "ceiling")
+        .unwrap()
+        .id;
+    admin.install_local_grant(&dir.path().join("ceiling"), &ceiling_id)?;
     let shot = admin
         .call_op(
             "ceiling",
@@ -106,6 +114,14 @@ async fn flow() -> anyhow::Result<()> {
         shutdown.clone(),
     ));
     wait_online(&admin, "desk").await;
+    let desk_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "desk")
+        .unwrap()
+        .id;
+    admin.install_local_grant(&node_dir, &desk_id)?;
 
     let shot = admin
         .call_op(

@@ -5,25 +5,32 @@ That part is unchanged: the relay routes ciphertext and does not read it.
 
 ## Current rule
 
-A signed-in **owner**, **admin**, or **sharee** has full use of the machine:
-read, write, exec, desktop, live stream, and remote control. They do not issue
-a signed grant, paste grant JSON, or pick a preset (`read-only`, `exec`,
-`desktop`, `remote-control`, …). Enrollment and sharing are full access.
-A headless machine still has no screen; the node reports that, and the
-dashboard leaves Desktop off for it.
+Remote control is denied unless the node has a signed grant in its own check.
+The grant file and `owner-keys.json` live on the node. The relay and the web
+dashboard cannot add, delete, refresh, or approve that list. A relay login,
+admin bit, owner row, or share is not a grant.
 
-The relay is the account directory, so it is what decides that this login owns
-the node. A malicious relay can already route a connection. It still cannot
-read the sealed body. A signed grant is only for a key that is **not** an
-account session. A browser view ticket can still open watch-only until the
-owner takes control; that is a session mode, not a permission preset.
+The controller proves its key inside the sealed session. The node checks that
+key, the node id, the issuer, the time window, and the local revoke list.
+A grant the node accepts is full use of that machine. Revoke by editing the
+deny-list on the node host (`agentlink grant revoke-local` removes the
+controller's copy; the node deny-list is `revoked-grants.json` on the node).
+A remote `revoke_grant` invoke is rejected. New calls fail as soon as the
+file is visible; in-flight terminal sessions recorded for that jti are closed
+on the next message the node reads.
 
-An updated node treats that signed-in session as full access. Do not turn
-owner-key checks off to make an older node accept the phone. A node that still
-answers `signed grant required` is checking a signature for the phone's
-controller public key, which is the same Ed25519 key as the account device.
-On that node's host, issue a grant for that key and import the JSON on the
-phone. The phone's separate node service is not the control session.
+The dashboard and view-ticket sockets send plaintext invokes. The relay can
+read them, and the page JavaScript is served by the relay, so an untrusted
+relay is not a confidential web controller. Those paths are disabled. Use a
+CLI or phone client that seals with its device key, after the node operator
+has issued a grant for that key.
+
+A full shell on the machine can edit the grant files. That is the trust
+boundary of exec, not a separate sealed store.
+
+`AGENTLINK_AUTO_GRANT` defaults off. Set it to `1` only when this client
+already holds an issuer key the node has trusted. Nothing is minted from an
+account session alone.
 
 ## Findings (current code)
 

@@ -66,6 +66,14 @@ async fn flow() -> anyhow::Result<()> {
         shutdown.clone(),
     ));
     wait_online(&admin, "box").await;
+    let box_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "box")
+        .unwrap()
+        .id;
+    admin.install_local_grant(&node_dir, &box_id)?;
 
     let tree = dir.path().join("tree");
     std::fs::create_dir(&tree)?;
@@ -224,7 +232,15 @@ async fn flow() -> anyhow::Result<()> {
         ro_shutdown.clone(),
     ));
     wait_online(&admin, "reader").await;
-    // A connected admin is full. The enrollment preset does not clip them.
+    let reader_id = admin
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == "reader")
+        .unwrap()
+        .id;
+    admin.install_local_grant(dir.path().join("reader").as_path(), &reader_id)?;
+    // A local grant is full. The enrollment preset does not clip it.
     admin
         .replace(
             "reader",

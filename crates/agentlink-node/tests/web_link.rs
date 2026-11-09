@@ -150,7 +150,7 @@ async fn flow() -> anyhow::Result<()> {
     let hello = recv_json(&mut ws).await?;
     assert_eq!(hello["type"], "hello_ok");
 
-    let entries = call(
+    let denied = call(
         &mut ws,
         &serde_json::json!({
             "type": "invoke",
@@ -161,49 +161,20 @@ async fn flow() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    let names: Vec<_> = entries["body"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|entry| entry["name"].as_str())
-        .collect();
-    assert!(names.contains(&"seed.txt"), "{entries}");
-
-    let wrote = call(
-        &mut ws,
-        &serde_json::json!({
-            "type": "invoke",
-            "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
-            "node_id": box_id,
-            "client_id": "",
-            "op": {
-                "op": "write_file",
-                "path": "from-web.txt",
-                "offset": 0,
-                "data_b64": util::b64_encode(b"hello from the dashboard"),
-                "truncate": true
-            }
-        }),
-    )
-    .await?;
-    assert_eq!(wrote["ok"], true, "{wrote}");
-    assert_eq!(
-        std::fs::read(box_root.join("from-web.txt"))?,
-        b"hello from the dashboard"
+    let text = denied.to_string();
+    assert!(
+        denied["ok"] == false || text.contains("disabled") || text.contains("plaintext"),
+        "web control must fail closed: {denied}"
     );
-
-    let read = read_file(
-        &mut ws,
-        &box_id,
-        "from-web.txt",
-        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1",
-    )
-    .await?;
-    assert_eq!(read, b"hello from the dashboard");
+    let err = denied["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("disabled") || err.contains("plaintext") || err.contains("grant"),
+        "{denied}"
+    );
 
     let mut shell = connect_web(&relay, &alice_web.session, &alice_web.csrf).await?;
     let _ = recv_json(&mut shell).await?;
-    send_json(
+    let shell_denied = call(
         &mut shell,
         &serde_json::json!({
             "type": "invoke",
@@ -214,105 +185,11 @@ async fn flow() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    let opened = recv_json(&mut shell).await?;
-    assert_eq!(opened["ok"], true, "{opened}");
-    assert_eq!(opened["terminal"], false, "{opened}");
-    let session_id = opened["body"]["session_id"].as_str().unwrap().to_string();
-    send_json(
-        &mut shell,
-        &serde_json::json!({
-            "type": "invoke",
-            "request_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
-            "node_id": box_id,
-            "client_id": "",
-            "op": {
-                "op": "pty_input",
-                "session_id": session_id,
-                "data_b64": util::b64_encode(b"printf '\\160ty-ran-ok'\r")
-            }
-        }),
-    )
-    .await?;
-    let output = collect_until(&mut shell, "pty-ran-ok", Duration::from_secs(15)).await?;
+    let shell_err = shell_denied["error"].as_str().unwrap_or("");
     assert!(
-        String::from_utf8_lossy(&output).contains("pty-ran-ok"),
-        "pty output was {}",
-        String::from_utf8_lossy(&output)
+        shell_err.contains("disabled") || shell_err.contains("plaintext"),
+        "{shell_denied}"
     );
-
-    let locked_id = nodes
-        .iter()
-        .find(|node| node.name == "locked")
-        .unwrap()
-        .id
-        .clone();
-    // The enrollment preset is not a cap. The owner can open a shell and write.
-    let owner_exec = call(
-        &mut ws,
-        &serde_json::json!({
-            "type": "invoke",
-            "request_id": "cccccccc-cccc-4ccc-8ccc-ccccccccccc1",
-            "node_id": locked_id,
-            "client_id": "",
-            "op": { "op": "pty_open", "rows": 24, "cols": 80 }
-        }),
-    )
-    .await?;
-    assert_eq!(owner_exec["ok"], true, "{owner_exec}");
-    let owner_write = call(
-        &mut ws,
-        &serde_json::json!({
-            "type": "invoke",
-            "request_id": "cccccccc-cccc-4ccc-8ccc-ccccccccccc2",
-            "node_id": locked_id,
-            "client_id": "",
-            "op": {
-                "op": "write_file",
-                "path": "from-owner.txt",
-                "offset": 0,
-                "data_b64": util::b64_encode(b"owner"),
-                "truncate": true
-            }
-        }),
-    )
-    .await?;
-    assert_eq!(owner_write["ok"], true, "{owner_write}");
-    let locked_read = read_file(
-        &mut ws,
-        &locked_id,
-        "seed.txt",
-        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2",
-    )
-    .await?;
-    assert_eq!(locked_read, b"locked-seed");
-
-    let bob_web = web_login(&relay, "bob", "password-bob").await?;
-    let mut bob = connect_web(&relay, &bob_web.session, &bob_web.csrf).await?;
-    let _ = recv_json(&mut bob).await?;
-    let shared = call(
-        &mut bob,
-        &serde_json::json!({
-            "type": "invoke",
-            "request_id": "dddddddd-dddd-4ddd-8ddd-ddddddddddd1",
-            "node_id": box_id,
-            "client_id": "",
-            "op": { "op": "list_dir", "path": "." }
-        }),
-    )
-    .await?;
-    assert_eq!(shared["ok"], true, "{shared}");
-    let shared_pty = call(
-        &mut bob,
-        &serde_json::json!({
-            "type": "invoke",
-            "request_id": "dddddddd-dddd-4ddd-8ddd-ddddddddddd2",
-            "node_id": box_id,
-            "client_id": "",
-            "op": { "op": "pty_open", "rows": 24, "cols": 80 }
-        }),
-    )
-    .await?;
-    assert_eq!(shared_pty["ok"], true, "{shared_pty}");
 
     box_stop.cancel();
     locked_stop.cancel();
