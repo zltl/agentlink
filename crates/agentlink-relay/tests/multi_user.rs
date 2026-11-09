@@ -139,8 +139,9 @@ async fn users_are_isolated_until_shared_and_revocation_is_immediate() {
         ),
     )
     .await;
-    assert!(page.contains("login-user"), "{page}");
-    assert!(page.contains("stat-fps"), "{page}");
+    assert!(page.contains("Browser control is not available"), "{page}");
+    assert!(!page.contains("stat-fps"), "{page}");
+    assert!(!page.contains("login-user"), "{page}");
 
     let refresh = alice_session.refresh_token.clone();
     let fingerprint = relay.fingerprint.clone();

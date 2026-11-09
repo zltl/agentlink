@@ -474,7 +474,11 @@ fn transfers_search_watch_and_processes(world: &World) {
     std::fs::write(&direct_local, b"direct-bytes").unwrap();
     let direct_remote = world.jail.join("direct.bin");
     let direct = cp(world, &direct_local, &direct_remote, &[]);
-    assert_eq!(direct["stats"]["transport"], "quic", "{direct}");
+    assert_eq!(direct["stats"]["transport"], "relay", "{direct}");
+    assert_eq!(
+        std::fs::read(&direct_remote).unwrap(),
+        b"direct-bytes"
+    );
 
     let tree = world._root.path().join("tree");
     std::fs::create_dir_all(tree.join("子")).unwrap();

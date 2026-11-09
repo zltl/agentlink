@@ -240,8 +240,8 @@ async fn flow() -> anyhow::Result<()> {
         .unwrap()
         .id;
     admin.install_local_grant(dir.path().join("reader").as_path(), &reader_id)?;
-    // A local grant is full. The enrollment preset does not clip it.
-    admin
+    // A local grant cannot raise this node's --max-access ceiling.
+    let write = admin
         .replace(
             "reader",
             &tree.join("hello.txt").to_string_lossy(),
@@ -249,7 +249,12 @@ async fn flow() -> anyhow::Result<()> {
             "nope",
             false,
         )
-        .await?;
+        .await;
+    let write_err = write.expect_err("read-only ceiling must refuse a write").to_string();
+    assert!(
+        write_err.contains("not allowed") && write_err.contains("read-only"),
+        "{write_err}"
+    );
     let started = admin
         .bg_start(
             "reader",
@@ -260,8 +265,12 @@ async fn flow() -> anyhow::Result<()> {
             true,
             None,
         )
-        .await?;
-    assert!(started["id"].as_str().is_some(), "{started}");
+        .await;
+    let exec_err = started.expect_err("read-only ceiling must refuse exec").to_string();
+    assert!(
+        exec_err.contains("not allowed") && exec_err.contains("read-only"),
+        "{exec_err}"
+    );
 
     kill_grandchild(&admin, &dir.path().join("leak")).await?;
 
