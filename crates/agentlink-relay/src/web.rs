@@ -1039,10 +1039,11 @@ mod tests {
         assert!(!text.contains("type=\"checkbox\""));
         assert!(text.contains("has_display"));
         assert!(text.contains("id=\"refresh-btn\""));
-        assert!(text.contains("Terminal"));
-        assert!(text.contains("Files"));
+        assert!(!text.contains("id=\"session-view\""));
+        assert!(!text.contains("id=\"term-screen\""));
+        assert!(!text.contains("id=\"term-input\""));
+        assert!(!text.contains("id=\"files-pane\""));
         assert!(text.contains("/v1/web"));
-        assert!(text.contains("id=\"session-view\""));
         assert!(text.contains("overscroll-behavior: contain"));
         assert!(text.contains("touch-action: pan-x pan-y"));
         assert!(text.contains("const SCROLLBACK = 1000"));

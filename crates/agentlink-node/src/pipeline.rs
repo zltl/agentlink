@@ -129,6 +129,27 @@ impl AuditService {
         service
     }
 
+    /// Same files as [`Self::open`] without the flush task, for tests that
+    /// must return.
+    #[cfg(test)]
+    pub fn open_quiet(data_dir: &Path, node_id: &str, node_name: &str) -> Arc<Self> {
+        let root = data_dir.join("audit");
+        let _ = fs::create_dir_all(root.join("logs"));
+        let policy = load_policy(data_dir);
+        let chain = load_chain(&root);
+        Arc::new(Self {
+            node_id: node_id.to_string(),
+            node_name: node_name.to_string(),
+            root,
+            policy: RwLock::new(policy),
+            chain: Mutex::new(chain),
+            tx: Mutex::new(None),
+            batch: Mutex::new(Vec::new()),
+            activity: AtomicI64::new(0),
+            gui_until: AtomicI64::new(0),
+        })
+    }
+
     pub fn set_tx(&self, tx: Option<mpsc::Sender<Outbound>>) {
         if let Ok(mut guard) = self.tx.lock() {
             *guard = tx;

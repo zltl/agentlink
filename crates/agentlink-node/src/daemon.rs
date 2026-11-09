@@ -157,8 +157,9 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
     });
     pipeline::spawn_recorder(service.clone(), config.capture.clone());
 
-    // Connected owners are not clipped by a saved --max-access preset.
-    let policy = Arc::new(RwLock::new(NodePolicy::full()));
+    // `--max-access` is this machine's ceiling. A grant cannot raise it,
+    // and a relay policy update cannot either.
+    let policy = Arc::new(RwLock::new(config.max_policy));
     let allowed = Arc::new(Mutex::new(HashMap::new()));
     let relay_udp = agentlink_core::p2p::relay_addr_from_url(&config.relay_url).ok();
     let quic = match QuicPeer::bind(&identity, relay_udp) {
@@ -525,9 +526,10 @@ async fn connect_once(
             heartbeat_secs,
             ..
         } => {
-            // The relay's stored preset is not a cap. A connected session is full.
+            // The relay's stored preset is not a cap and cannot raise the
+            // local ceiling.
             let _pushed = policy;
-            (NodePolicy::full(), heartbeat_secs)
+            (config.max_policy, heartbeat_secs)
         }
         Envelope::HelloErr { message, fatal } => {
             return if fatal {
@@ -839,7 +841,7 @@ async fn handle_env(
         }
         Envelope::PolicyUpdate { policy: next } => {
             let _pushed = next;
-            let effective = NodePolicy::full();
+            let effective = config.max_policy;
             if let Ok(mut guard) = policy.write() {
                 *guard = effective;
             }
@@ -940,7 +942,7 @@ async fn handle_env(
                 None,
                 grant,
             ) {
-                Ok(policy) => policy,
+                    Ok(policy) => policy.intersect(config.max_policy),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -1100,7 +1102,7 @@ async fn handle_env(
                     None,
                     None,
                 ) {
-                    Ok(policy) => Some(policy),
+                    Ok(policy) => Some(policy.intersect(config.max_policy)),
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
@@ -1120,6 +1122,7 @@ async fn handle_env(
                 host.clone(),
                 request_id,
                 client_id,
+                grantee,
                 msg,
                 session,
                 policy_now,

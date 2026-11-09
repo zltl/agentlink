@@ -866,52 +866,6 @@
       </section>
     </div>
 
-    <section id="session-view" class="session" hidden>
-      <div class="session-bar">
-        <button class="ghost" id="session-back" type="button">Machines</button>
-        <h2 id="session-title">Session</h2>
-      </div>
-      <p id="session-status" class="muted session-status" role="status"></p>
-      <p id="session-error" class="error" role="alert"></p>
-
-      <div id="term-pane" hidden>
-        <div id="term-screen" class="term-screen" tabindex="0" role="log" aria-label="Terminal"></div>
-        <span id="term-probe" class="term-probe" aria-hidden="true">M</span>
-        <div class="composer">
-          <button id="term-ctrl" type="button" aria-pressed="false">Ctrl</button>
-          <input id="term-input" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="send" aria-label="Terminal input">
-        </div>
-      </div>
-
-      <div id="files-pane" hidden>
-        <form id="path-form" class="path-form">
-          <input id="path-input" aria-label="Remote path" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off">
-          <button type="submit">Go</button>
-        </form>
-        <div class="file-tools">
-          <button class="ghost" id="file-up" type="button">Up</button>
-          <button class="ghost" id="file-refresh" type="button">Refresh</button>
-          <button class="ghost" id="file-mkdir" type="button">New folder</button>
-          <button id="file-upload" type="button">Upload</button>
-          <input id="file-pick" type="file" hidden>
-        </div>
-        <form id="mkdir-form" class="path-form" hidden>
-          <input id="mkdir-name" aria-label="Folder name" placeholder="folder name" autocomplete="off">
-          <button type="submit">Create</button>
-        </form>
-        <p id="file-progress" class="muted" role="status"></p>
-        <div id="file-list" class="file-list"></div>
-        <div id="file-editor" class="file-editor" hidden>
-          <p id="editor-path" class="facts"></p>
-          <textarea id="editor-text" spellcheck="false" aria-label="File contents"></textarea>
-          <div class="file-tools">
-            <button class="ghost" id="editor-close" type="button">Close file</button>
-            <button id="editor-save" type="button">Save</button>
-            <button class="ghost" id="editor-download" type="button">Download</button>
-          </div>
-        </div>
-      </div>
-    </section>
   </main>
 </div>
 <script>
@@ -2415,6 +2369,7 @@
     ptySend(new TextEncoder().encode(text));
   }
   const termInput = document.getElementById("term-input");
+  if (termInput && document.getElementById("term-ctrl")) {
   document.getElementById("term-ctrl").addEventListener("click", () => {
     ctrlArmed = !ctrlArmed;
     document.getElementById("term-ctrl").setAttribute("aria-pressed", ctrlArmed ? "true" : "false");
@@ -2556,6 +2511,7 @@
     if (path) downloadFile(path);
   });
 
+  }
   api("/auth/session").then((session) => {
     return showApp(session.user + (session.role === "admin" ? " · admin" : ""));
   }).catch(() => {});

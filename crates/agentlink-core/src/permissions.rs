@@ -115,8 +115,8 @@ impl NodePolicy {
 
     /// Screenshots, input, and the accessibility tree, plus read, write, and exec.
     ///
-    /// `allow_desktop_stream` stays off. Desktop is denied until this preset
-    /// (or an equivalent flag set) is on both the relay policy and the node ceiling.
+    /// `allow_desktop_stream` stays off. Desktop still needs the node ceiling
+    /// to allow it. A relay preset does not.
     pub fn desktop() -> Self {
         Self {
             allow_read: true,

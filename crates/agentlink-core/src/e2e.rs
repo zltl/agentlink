@@ -266,7 +266,9 @@ impl Endpoint {
 
     pub fn open_frame(&self, peer: &str, frame: &[u8]) -> Result<Vec<u8>> {
         if !crate::frame::is_e2e(frame) {
-            return Ok(frame.to_vec());
+            return Err(Error::Protocol(
+                "file frame is not end-to-end; plaintext file bytes are refused".into(),
+            ));
         }
         let decoded = crate::frame::decode(frame)?;
         let aad = frame_aad(&decoded.request_id, decoded.offset);
@@ -387,26 +389,18 @@ pub fn open_sealed(endpoint: &Endpoint, peer: &str, env: Envelope) -> Result<Env
     Ok(serde_json::from_slice(&plain)?)
 }
 
-/// Open a binary frame, trying `prefer` and then every session.
-pub fn open_frame_any(endpoint: &Endpoint, prefer: Option<&str>, frame: &[u8]) -> Vec<u8> {
-    if !crate::frame::is_e2e(frame) {
-        return frame.to_vec();
+/// Open a file frame only with the peer bound to this transfer.
+///
+/// A missing flag, a tag failure, a replay, or a request id that does not
+/// match the ciphertext is an error. The frame is not accepted as plaintext,
+/// and another live session is not tried.
+pub fn open_bound_frame(endpoint: &Endpoint, peer: &str, frame: &[u8]) -> Result<Vec<u8>> {
+    if peer.is_empty() {
+        return Err(Error::Protocol(
+            "file frame has no end-to-end peer".into(),
+        ));
     }
-    let mut peers = Vec::new();
-    if let Some(peer) = prefer {
-        peers.push(peer.to_string());
-    }
-    for peer in endpoint.peer_ids() {
-        if !peers.iter().any(|have| have == &peer) {
-            peers.push(peer);
-        }
-    }
-    for peer in peers {
-        if let Ok(opened) = endpoint.open_frame(&peer, frame) {
-            return opened;
-        }
-    }
-    frame.to_vec()
+    endpoint.open_frame(peer, frame)
 }
 
 fn frame_aad(request_id: &str, offset: u64) -> Vec<u8> {

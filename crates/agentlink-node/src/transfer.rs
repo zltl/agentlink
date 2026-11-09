@@ -98,6 +98,7 @@ pub async fn on_transfer(
     host: Arc<TransferHost>,
     request_id: String,
     client_id: String,
+    peer: String,
     msg: TransferMsg,
     session: Option<std::sync::Arc<Direction>>,
     policy: Option<NodePolicy>,
@@ -115,7 +116,11 @@ pub async fn on_transfer(
         seals.insert(
             request_id.clone(),
             SealTarget {
-                peer: client_id.clone(),
+                peer: if peer.is_empty() {
+                    client_id.clone()
+                } else {
+                    peer
+                },
                 node_id: host.node_id.clone(),
                 client_id: client_id.clone(),
                 session,
@@ -502,37 +507,36 @@ pub fn fail_session(host: &TransferHost, request_id: &str, message: String) {
 }
 
 pub fn on_binary(host: &TransferHost, bytes: Vec<u8>) {
-    let id = frame::request_id(&bytes);
-    let bytes = if frame::is_e2e(&bytes) {
-        let peer = id.as_ref().and_then(|id| {
-            host.seals
-                .lock()
-                .ok()
-                .and_then(|map| map.get(id).map(|seal| seal.peer.clone()))
-        });
-        let opened = e2e::open_frame_any(&host.e2e, peer.as_deref(), &bytes);
-        // A second handshake for the same identity rotates keys. Dropping the
-        // ciphertext makes serve_push wait forever; fail the transfer instead.
-        if frame::is_e2e(&opened) {
-            if let Some(id) = id {
-                fail_session(host, &id, "e2e frame could not be opened".into());
-            }
-            return;
-        }
-        opened
-    } else {
-        bytes
-    };
     let Some(id) = frame::request_id(&bytes) else {
         return;
     };
-    if let Some(tx) = host
-        .sessions
+    let peer = host
+        .seals
         .lock()
         .ok()
-        .and_then(|map| map.get(&id).cloned())
-    {
-        let _ = tx.send(Wire::Frame(bytes));
+        .and_then(|map| map.get(&id).map(|seal| seal.peer.clone()));
+    let Some(peer) = peer.filter(|peer| !peer.is_empty()) else {
+        fail_session(
+            host,
+            &id,
+            "file frame has no end-to-end peer".into(),
+        );
+        return;
+    };
+    // Only the handshake peer for this request. A relay cannot strip the
+    // flag, swap the request id, or present another session's ciphertext.
+    match e2e::open_bound_frame(&host.e2e, &peer, &bytes) {
+        Ok(opened) => {
+            if let Some(tx) = host
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&id).cloned())
+            {
+                let _ = tx.send(Wire::Frame(opened));
+            }
+        }
+        Err(err) => fail_session(host, &id, err.to_string()),
     }
 }
 
@@ -648,34 +652,36 @@ async fn forward_wire(
                 msg,
                 authz: None,
             };
-            if let Some(seal) = seal.filter(|seal| ctx.e2e.has(&seal.peer)) {
-                let wrapped = if let Some(session) = &seal.session {
-                    e2e::seal_envelope_session(session, &seal.node_id, &seal.client_id, &env)?
-                } else {
-                    e2e::seal_envelope(
-                        &ctx.e2e,
-                        &seal.peer,
-                        &seal.node_id,
-                        &seal.client_id,
-                        &env,
-                    )?
-                };
-                ws::encode(&wrapped)?
+            let Some(seal) = seal.filter(|seal| ctx.e2e.has(&seal.peer)) else {
+                return Err(Error::Message(
+                    "transfer control has no end-to-end session".into(),
+                ));
+            };
+            let wrapped = if let Some(session) = &seal.session {
+                e2e::seal_envelope_session(session, &seal.node_id, &seal.client_id, &env)?
             } else {
-                ws::encode(&env)?
-            }
+                e2e::seal_envelope(
+                    &ctx.e2e,
+                    &seal.peer,
+                    &seal.node_id,
+                    &seal.client_id,
+                    &env,
+                )?
+            };
+            ws::encode(&wrapped)?
         }
         Wire::Frame(bytes) => {
-            if let Some(seal) = seal.filter(|seal| ctx.e2e.has(&seal.peer)) {
-                let sealed = if let Some(session) = &seal.session {
-                    session.seal_frame(&bytes).unwrap_or(bytes)
-                } else {
-                    ctx.e2e.seal_frame(&seal.peer, &bytes).unwrap_or(bytes)
-                };
-                Outbound::Binary(sealed)
+            let Some(seal) = seal.filter(|seal| ctx.e2e.has(&seal.peer)) else {
+                return Err(Error::Message(
+                    "file frame has no end-to-end session".into(),
+                ));
+            };
+            let sealed = if let Some(session) = &seal.session {
+                session.seal_frame(&bytes)?
             } else {
-                Outbound::Binary(bytes)
-            }
+                ctx.e2e.seal_frame(&seal.peer, &bytes)?
+            };
+            Outbound::Binary(sealed)
         }
     };
     ctx.tx
@@ -862,20 +868,10 @@ async fn peer_copy(
         let dest = paths::resolve_lexical(host.root.as_deref(), dst_path)?;
         return local_fs_copy(&src, &dest);
     }
-    if direct {
-        if let Ok(mut link) = negotiate(host, dst_node).await {
-            let opts = xfer_opts(chunk_size, window, parallel, compress, "quic");
-            let id = Uuid::new_v4().to_string();
-            return if dir {
-                engine::perform_push_dir(&src, dst_path, &mut link, &id, &opts, &None).await
-            } else {
-                engine::perform_push(&src, dst_path, &mut link, &id, &opts, &None).await
-            };
-        }
-    }
+    let _direct = direct;
     let request_id = Uuid::new_v4().to_string();
-    // Best-effort node-to-node e2e. A failure must not block the copy: the relay
-    // can forward plaintext Transfer frames between same-owner nodes.
+    // Node-to-node bytes stay sealed. If the peer handshake fails, the copy
+    // still uses the relay, and each frame is sealed to that peer.
     if let Err(err) = ensure_peer(host, dst_node).await {
         tracing::warn!(error = %err, peer = %dst_node, "peer e2e unavailable; using relay cleartext");
     }
@@ -936,48 +932,7 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(u64, u32)> {
     }
 }
 
-async fn negotiate(host: &TransferHost, dst_node: &str) -> Result<Link> {
-    let peer = host
-        .quic
-        .clone()
-        .ok_or_else(|| Error::Message("direct path is not bound".into()))?;
-    let request_id = Uuid::new_v4().to_string();
-    let (tx, rx) = oneshot::channel();
-    host.direct_wait
-        .lock()
-        .map_err(|_| Error::Message("direct waiters poisoned".into()))?
-        .insert(request_id.clone(), tx);
-    let offer = Envelope::DirectOffer {
-        request_id: request_id.clone(),
-        node_id: dst_node.to_string(),
-        public_key: peer.public_key.clone(),
-        cert_fp: peer.cert_fp.clone(),
-        cert_sig: peer.cert_sig.clone(),
-        local_addrs: peer.local_addrs(None),
-        reflexive: None,
-    };
-    if host.tx.send(ws::encode(&offer)?).await.is_err() {
-        let _ = host
-            .direct_wait
-            .lock()
-            .map(|mut map| map.remove(&request_id));
-        return Err(Error::Message("connection closed".into()));
-    }
-    let reply = tokio::time::timeout(Duration::from_secs(2), rx).await;
-    let reply = match reply {
-        Ok(Ok(reply)) => reply,
-        _ => {
-            let _ = host
-                .direct_wait
-                .lock()
-                .map(|mut map| map.remove(&request_id));
-            return Err(Error::Timeout);
-        }
-    };
-    let addrs = p2p::parse_addrs(&reply.local_addrs, reply.reflexive.as_deref());
-    peer.dial(&addrs, &reply.cert_fp, &reply.public_key, &reply.cert_sig)
-        .await
-}
+
 
 async fn serve_quic(
     mut link: Link,
@@ -986,119 +941,11 @@ async fn serve_quic(
     root: Option<&Path>,
     audit: &AuditService,
 ) -> Result<()> {
-    let first = link.recv().await?;
-    let Wire::Msg(msg) = first else {
-        return Err(Error::Protocol(
-            "direct transfer must start with a control message".into(),
-        ));
-    };
-    let id = Uuid::new_v4().to_string();
-    let outcome = match msg {
-        TransferMsg::Push {
-            path,
-            size,
-            hash,
-            resume,
-            mode,
-            mtime_unix,
-            ..
-        } => {
-            ensure_policy(policy, max_policy, true)?;
-            let dest = paths::resolve_lexical(root, &path)?;
-            let result = engine::serve_push(
-                &dest,
-                Path::new(&path),
-                size,
-                hash,
-                0,
-                agentlink_core::protocol::CompressPref::Auto,
-                resume,
-                &mut link,
-                "quic",
-                mode,
-                mtime_unix,
-            )
-            .await;
-            audit_result(audit, "push", &path, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::PushDir { dest, entries, .. } => {
-            ensure_policy(policy, max_policy, true)?;
-            let path = paths::resolve_lexical(root, &dest)?;
-            let result = engine::serve_push_dir(&path, entries, &mut link, "quic").await;
-            audit_result(audit, "push_dir", &dest, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::Pull {
-            path,
-            have_hash,
-            have_ranges,
-            chunk_size,
-            compress,
-            sigs,
-        } => {
-            ensure_policy(policy, max_policy, false)?;
-            let src = paths::resolve_lexical(root, &path)?;
-            let opts = xfer_opts(chunk_size, 8, 4, compress, "quic");
-            let result =
-                engine::serve_pull(&src, have_hash, have_ranges, sigs, &mut link, &id, &opts).await;
-            audit_result(audit, "pull", &path, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::PullDir {
-            path,
-            have,
-            chunk_size,
-            compress,
-        } => {
-            ensure_policy(policy, max_policy, false)?;
-            let src = paths::resolve_lexical(root, &path)?;
-            let opts = xfer_opts(chunk_size, 8, 4, compress, "quic");
-            let result = engine::serve_pull_dir(&src, have, &mut link, &id, &opts).await;
-            audit_result(audit, "pull_dir", &path, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::PushStream { path, .. } => {
-            ensure_policy(policy, max_policy, true)?;
-            if paths::path_trailing_sep(&path) {
-                return Err(Error::Message(format!(
-                    "write destination `{path}` ends with a slash; pass a file path (use mkdir if you need a directory)"
-                )));
-            }
-            let dest = paths::resolve_lexical(root, &path)?;
-            let result = engine::serve_push_stream(&dest, &mut link, "quic").await;
-            audit_result(audit, "push_stream", &path, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::PullStream {
-            path,
-            offset,
-            max_bytes,
-            chunk_size,
-            window,
-            compress,
-        } => {
-            ensure_policy(policy, max_policy, false)?;
-            let src = paths::resolve_lexical(root, &path)?;
-            let result = engine::serve_pull_stream(
-                &src, offset, max_bytes, chunk_size, window, compress, &mut link, &id, "quic",
-            )
-            .await;
-            audit_result(audit, "pull_stream", &path, &result);
-            result.map(|_| ())
-        }
-        other => Err(Error::Protocol(format!(
-            "direct path cannot start with {other:?}"
-        ))),
-    };
-    if let Err(err) = outcome {
-        let _ = link
-            .send_msg(TransferMsg::Failed {
-                message: err.to_string(),
-            })
-            .await;
-    }
-    Ok(())
+    drop(link);
+    let _ = (policy, max_policy, root, audit);
+    Err(Error::Message(
+        "direct file transfer is disabled; file bytes stay on the sealed relay session".into(),
+    ))
 }
 
 fn audit_result(audit: &AuditService, op: &str, detail: &str, result: &Result<TransferStats>) {
@@ -1185,6 +1032,7 @@ fn xfer_opts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     #[test]
     #[cfg(unix)]
@@ -1214,5 +1062,119 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    fn plaintext_frame(request_id: &str, payload: &[u8]) -> Vec<u8> {
+        frame::encode(&frame::DataFrame {
+            request_id: request_id.to_string(),
+            offset: 0,
+            raw_len: payload.len() as u32,
+            compressed: false,
+            hole: false,
+            tar: false,
+            payload: payload.to_vec(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn relay_plaintext_tamper_replay_and_wrong_peer_are_refused() {
+        let client_key = agentlink_core::identity::Identity::generate();
+        let node_key = agentlink_core::identity::Identity::generate();
+        let client = Endpoint::new(client_key.clone());
+        let node = Endpoint::new(node_key.clone());
+        let pending = client.client_hello(node.peer_id()).unwrap();
+        let (_peer, welcome) = node.accept(Endpoint::hello_bytes(&pending)).unwrap();
+        client.complete(pending, &welcome).unwrap();
+
+        let request_id = Uuid::new_v4().to_string();
+        let (session_tx, mut rx) = mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let host = TransferHost {
+            sessions: Arc::new(Mutex::new(HashMap::from([(
+                request_id.clone(),
+                session_tx.clone(),
+            )]))),
+            direct_wait: Arc::new(Mutex::new(HashMap::new())),
+            allowed: Arc::new(Mutex::new(HashMap::new())),
+            quic: None,
+            tx: out_tx,
+            policy: Arc::new(RwLock::new(NodePolicy::full())),
+            max_policy: NodePolicy::full(),
+            root: None,
+            e2e: node,
+            node_id: node_key.public_hex().to_string(),
+            seals: Arc::new(Mutex::new(HashMap::from([(
+                request_id.clone(),
+                SealTarget {
+                    peer: client_key.public_hex().to_string(),
+                    node_id: node_key.public_hex().to_string(),
+                    client_id: client_key.public_hex().to_string(),
+                    session: None,
+                },
+            )]))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            audit: crate::pipeline::AuditService::open_quiet(dir.path(), "node", "node"),
+        };
+        std::mem::forget(dir);
+
+        on_binary(&host, plaintext_frame(&request_id, b"PLAINTEXT-BYTES"));
+        match rx.try_recv() {
+            Ok(Wire::Msg(TransferMsg::Failed { message })) => {
+                assert!(
+                    message.contains("not end-to-end") || message.contains("plaintext"),
+                    "{message}"
+                );
+            }
+            other => panic!("plaintext frame was accepted: {other:?}"),
+        }
+
+        let raw = plaintext_frame(&request_id, b"FILEBYTES-secret");
+        let sealed = client.seal_frame(node_key.public_hex(), &raw).unwrap();
+        assert!(!sealed.windows(12).any(|window| window == b"FILEBYTES-se"));
+        on_binary(&host, sealed.clone());
+        match rx.try_recv() {
+            Ok(Wire::Frame(opened)) => {
+                assert_eq!(frame::decode(&opened).unwrap().payload, b"FILEBYTES-secret");
+            }
+            other => panic!("legitimate frame was refused: {other:?}"),
+        }
+
+        on_binary(&host, sealed);
+        match rx.try_recv() {
+            Ok(Wire::Msg(TransferMsg::Failed { message })) => {
+                assert!(message.contains("replay"), "{message}");
+            }
+            other => panic!("replayed frame was accepted: {other:?}"),
+        }
+
+        let mut tampered = client.seal_frame(node_key.public_hex(), &raw).unwrap();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x5a;
+        on_binary(&host, tampered);
+        match rx.try_recv() {
+            Ok(Wire::Msg(TransferMsg::Failed { message })) => {
+                assert!(message.contains("open") || message.contains("e2e"), "{message}");
+            }
+            other => panic!("tampered frame was accepted: {other:?}"),
+        }
+
+        let mut swapped = client.seal_frame(node_key.public_hex(), &raw).unwrap();
+        let other_id = Uuid::new_v4();
+        swapped[12..28].copy_from_slice(other_id.as_bytes());
+        let bound = host.seals.lock().unwrap().get(&request_id).unwrap().clone();
+        host.seals.lock().unwrap().insert(other_id.to_string(), bound);
+        host.sessions
+            .lock()
+            .unwrap()
+            .insert(other_id.to_string(), session_tx);
+        on_binary(&host, swapped);
+        match rx.try_recv() {
+            Ok(Wire::Msg(TransferMsg::Failed { message })) => {
+                assert!(message.contains("open") || message.contains("e2e"), "{message}");
+            }
+            other => panic!("request id swap was accepted: {other:?}"),
+        }
     }
 }

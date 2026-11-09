@@ -183,7 +183,10 @@ pub fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
             ensure_dir(parent)?;
         }
     }
-    let tmp = path.with_extension("tmp");
+    // A shared `*.tmp` name lets two writers rename the same file and then
+    // delete the winner (`No such file or directory` on the loser).
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("secret");
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", random_hex(8)));
     // The bytes are written only after the destination DACL/mode is set, so a
     // permissive inherited ACL cannot cover the secret even briefly.
     write_private_bytes(&tmp, bytes)?;

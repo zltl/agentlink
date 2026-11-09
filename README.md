@@ -180,7 +180,7 @@ agentlink pair --name laptop --access exec
 
 `access` is `read-only` (the CLI default), `read-write`, `exec`, `desktop`, `remote-view`, `remote-control`, or `full`. `exec` includes read and write and leaves screenshots and the stream off. `desktop` adds screenshots, input, and the accessibility tree on top of `exec`. It does not enable `allow_desktop_stream`. `full` is shell, files, and remote desktop together. The browser form defaults to `exec` for a machine whose screen is not known yet.
 
-Desktop stays denied until both sides opt in: `agentlink pair --access desktop` (or `agentlink perm <node> desktop`) and `agentlink node --max-access desktop`. The effective policy is the intersection. A relay that asks for desktop cannot override a node whose ceiling is `exec`.
+A signed grant is full use only up to the node's own `--max-access` ceiling. `agentlink node --max-access exec` still refuses screenshots and desktop input after a grant. The relay pairing preset does not authorize the machine and cannot raise that ceiling.
 
 On the machine you want to control:
 
@@ -196,10 +196,10 @@ The node writes an ed25519 key into its data directory and reconnects with that 
 
 Optional limits on the node:
 
-- `--max-access read-only` is a ceiling. The effective policy is the intersection of this ceiling and the relay preset, so a relay cannot grant more than the machine allows.
+- `--max-access read-only` is the node's ceiling. A signed grant is intersected with it. The relay cannot raise it.
 - `--root /path` confines file operations to that directory, including a check that symlinks do not escape it. The same root is the default working directory for exec, background processes, and PTY sessions, and an explicit cwd is resolved inside it. It is not an OS sandbox: a program still runs as the user who launched the node.
 
-`agentlink perm laptop read-only` changes the relay preset later. The node applies it on the next operation.
+`agentlink perm laptop read-only` changes only the relay's routing preset. It does not change what the node will run.
 
 ## Install a node
 

@@ -3010,7 +3010,7 @@ async fn route_e2e(
     if !agentlink_core::e2e::class_allowed(allowed, "meta")
         && !agentlink_core::e2e::class_allowed(allowed, &class)
     {
-        let message = "no grant on this node".to_string();
+        let message = "this login cannot route to that node".to_string();
         return send_out(from_tx, &Envelope::result_err(request_id, message)).await;
     }
     let online_tx = {
@@ -3555,7 +3555,9 @@ async fn open_direct(
                     .filter(|record| !record.revoked)
                     .and_then(|record| record.grants.get(&node.id).copied());
                 if grant.is_none() {
-                    return Err(Error::PermissionDenied("no grant on this node".into()));
+                    return Err(Error::PermissionDenied(
+                        "this login cannot route to that node".into(),
+                    ));
                 }
             }
         }

@@ -410,53 +410,39 @@ pub async fn on_transfer(
 }
 
 pub fn on_binary(host: &TransferHost, bytes: Vec<u8>) {
-    let id = frame::request_id(&bytes);
-    let peer = id.as_ref().and_then(|id| {
-        host.seals
-            .lock()
-            .ok()
-            .and_then(|map| map.get(id).map(|seal| seal.peer.clone()))
-    });
-    let bytes = e2e::open_frame_any(&host.e2e, peer.as_deref(), &bytes);
     let Some(id) = frame::request_id(&bytes) else {
         return;
     };
-    if let Some(tx) = host
-        .sessions
+    let peer = host
+        .seals
         .lock()
         .ok()
-        .and_then(|map| map.get(&id).cloned())
-    {
-        let _ = tx.send(Wire::Frame(bytes));
+        .and_then(|map| map.get(&id).map(|seal| seal.peer.clone()));
+    let Some(peer) = peer.filter(|peer| !peer.is_empty()) else {
+        fail_session(host, &id, "file frame has no end-to-end peer".into());
+        return;
+    };
+    match e2e::open_bound_frame(&host.e2e, &peer, &bytes) {
+        Ok(opened) => {
+            if let Some(tx) = host
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&id).cloned())
+            {
+                let _ = tx.send(Wire::Frame(opened));
+            }
+        }
+        Err(err) => fail_session(host, &id, err.to_string()),
     }
 }
 
 pub async fn on_direct_offer(host: &TransferHost, env: Envelope) {
-    let Envelope::DirectOffer {
-        request_id,
-        public_key,
-        ..
-    } = env
-    else {
+    // Cleartext offers are not a file-transfer channel.
+    let Envelope::DirectOffer { request_id, .. } = env else {
         return;
     };
-    if let Ok(mut allowed) = host.allowed.lock() {
-        allowed.insert(public_key, Instant::now());
-    }
-    let Some(peer) = &host.quic else {
-        return;
-    };
-    let answer = Envelope::DirectAnswer {
-        request_id,
-        public_key: peer.public_key.clone(),
-        cert_fp: peer.cert_fp.clone(),
-        cert_sig: peer.cert_sig.clone(),
-        local_addrs: peer.local_addrs(None),
-        reflexive: None,
-    };
-    if let Ok(out) = ws::encode(&answer) {
-        let _ = host.tx.send(out).await;
-    }
+    let _ = (host, request_id);
 }
 
 pub fn on_direct_answer(host: &TransferHost, env: Envelope) {
@@ -562,34 +548,36 @@ async fn forward_wire(
                 msg,
                 authz: None,
             };
-            if let Some(seal) = seal.filter(|seal| ctx.e2e.has(&seal.peer)) {
-                let wrapped = if let Some(session) = &seal.session {
-                    e2e::seal_envelope_session(session, &seal.node_id, &seal.client_id, &env)?
-                } else {
-                    e2e::seal_envelope(
-                        &ctx.e2e,
-                        &seal.peer,
-                        &seal.node_id,
-                        &seal.client_id,
-                        &env,
-                    )?
-                };
-                ws::encode(&wrapped)?
+            let Some(seal) = seal.filter(|seal| ctx.e2e.has(&seal.peer)) else {
+                return Err(Error::Message(
+                    "transfer control has no end-to-end session".into(),
+                ));
+            };
+            let wrapped = if let Some(session) = &seal.session {
+                e2e::seal_envelope_session(session, &seal.node_id, &seal.client_id, &env)?
             } else {
-                ws::encode(&env)?
-            }
+                e2e::seal_envelope(
+                    &ctx.e2e,
+                    &seal.peer,
+                    &seal.node_id,
+                    &seal.client_id,
+                    &env,
+                )?
+            };
+            ws::encode(&wrapped)?
         }
         Wire::Frame(bytes) => {
-            if let Some(seal) = seal.filter(|seal| ctx.e2e.has(&seal.peer)) {
-                let sealed = if let Some(session) = &seal.session {
-                    session.seal_frame(&bytes).unwrap_or(bytes)
-                } else {
-                    ctx.e2e.seal_frame(&seal.peer, &bytes).unwrap_or(bytes)
-                };
-                Outbound::Binary(sealed)
+            let Some(seal) = seal.filter(|seal| ctx.e2e.has(&seal.peer)) else {
+                return Err(Error::Message(
+                    "file frame has no end-to-end session".into(),
+                ));
+            };
+            let sealed = if let Some(session) = &seal.session {
+                session.seal_frame(&bytes)?
             } else {
-                Outbound::Binary(bytes)
-            }
+                ctx.e2e.seal_frame(&seal.peer, &bytes)?
+            };
+            Outbound::Binary(sealed)
         }
     };
     ctx.tx
@@ -850,17 +838,7 @@ async fn peer_copy(
     ensure(host, false)?;
     let staged = host.paths.stage(src_path, false).await?;
     let dir = staged.real.is_dir();
-    if direct {
-        if let Ok(mut link) = negotiate(host, dst_node).await {
-            let opts = xfer_opts(chunk_size, window, parallel, compress, "quic");
-            let id = Uuid::new_v4().to_string();
-            return if dir {
-                engine::perform_push_dir(&staged.real, dst_path, &mut link, &id, &opts, &None).await
-            } else {
-                engine::perform_push(&staged.real, dst_path, &mut link, &id, &opts, &None).await
-            };
-        }
-    }
+    let _direct = direct;
     let request_id = Uuid::new_v4().to_string();
     let mut link = attach(host, &request_id, dst_node);
     let opts = xfer_opts(chunk_size, window, parallel, compress, "relay");
@@ -871,48 +849,7 @@ async fn peer_copy(
     }
 }
 
-async fn negotiate(host: &TransferHost, dst_node: &str) -> Result<Link> {
-    let peer = host
-        .quic
-        .clone()
-        .ok_or_else(|| Error::Message("direct path is not bound".into()))?;
-    let request_id = Uuid::new_v4().to_string();
-    let (tx, rx) = oneshot::channel();
-    host.direct_wait
-        .lock()
-        .map_err(|_| Error::Message("direct waiters poisoned".into()))?
-        .insert(request_id.clone(), tx);
-    let offer = Envelope::DirectOffer {
-        request_id: request_id.clone(),
-        node_id: dst_node.to_string(),
-        public_key: peer.public_key.clone(),
-        cert_fp: peer.cert_fp.clone(),
-        cert_sig: peer.cert_sig.clone(),
-        local_addrs: peer.local_addrs(None),
-        reflexive: None,
-    };
-    if host.tx.send(ws::encode(&offer)?).await.is_err() {
-        let _ = host
-            .direct_wait
-            .lock()
-            .map(|mut map| map.remove(&request_id));
-        return Err(Error::Message("connection closed".into()));
-    }
-    let reply = tokio::time::timeout(Duration::from_secs(2), rx).await;
-    let reply = match reply {
-        Ok(Ok(reply)) => reply,
-        _ => {
-            let _ = host
-                .direct_wait
-                .lock()
-                .map(|mut map| map.remove(&request_id));
-            return Err(Error::Timeout);
-        }
-    };
-    let addrs = p2p::parse_addrs(&reply.local_addrs, reply.reflexive.as_deref());
-    peer.dial(&addrs, &reply.cert_fp, &reply.public_key, &reply.cert_sig)
-        .await
-}
+
 
 async fn serve_quic(
     mut link: Link,
@@ -921,118 +858,11 @@ async fn serve_quic(
     paths: &PathMap,
     audit: &AuditHub,
 ) -> Result<()> {
-    let first = link.recv().await?;
-    let Wire::Msg(msg) = first else {
-        return Err(Error::Protocol(
-            "direct transfer must start with a control message".into(),
-        ));
-    };
-    let id = Uuid::new_v4().to_string();
-    let outcome = match msg {
-        TransferMsg::Push {
-            path,
-            size,
-            hash,
-            resume,
-            mode,
-            mtime_unix,
-            ..
-        } => {
-            ensure_policy(policy, max_policy, true)?;
-            let staged = paths.stage(&path, true).await?;
-            let result =
-                push_file(paths, &mut link, &staged, &path, size, hash, resume, "quic", mode, mtime_unix).await;
-            audit_result(audit, "push", &path, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::PushDir { dest, entries, .. } => {
-            ensure_policy(policy, max_policy, true)?;
-            let staged = paths.stage(&dest, true).await?;
-            let result = push_dir(paths, &mut link, &staged, entries, "quic").await;
-            audit_result(audit, "push_dir", &dest, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::Pull {
-            path,
-            have_hash,
-            have_ranges,
-            chunk_size,
-            compress,
-            sigs,
-        } => {
-            ensure_policy(policy, max_policy, false)?;
-            let staged = paths.stage(&path, false).await?;
-            let opts = xfer_opts(chunk_size, 8, 4, compress, "quic");
-            let result = engine::serve_pull(
-                &staged.real,
-                have_hash,
-                have_ranges,
-                sigs,
-                &mut link,
-                &id,
-                &opts,
-            )
-            .await;
-            audit_result(audit, "pull", &path, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::PullDir {
-            path,
-            have,
-            chunk_size,
-            compress,
-        } => {
-            ensure_policy(policy, max_policy, false)?;
-            let staged = paths.stage(&path, false).await?;
-            let opts = xfer_opts(chunk_size, 8, 4, compress, "quic");
-            let result = engine::serve_pull_dir(&staged.real, have, &mut link, &id, &opts).await;
-            audit_result(audit, "pull_dir", &path, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::PushStream { path, .. } => {
-            ensure_policy(policy, max_policy, true)?;
-            let staged = paths.stage(&path, true).await?;
-            let result = push_stream(paths, &mut link, &staged, "quic").await;
-            audit_result(audit, "push_stream", &path, &result);
-            result.map(|_| ())
-        }
-        TransferMsg::PullStream {
-            path,
-            offset,
-            max_bytes,
-            chunk_size,
-            window,
-            compress,
-        } => {
-            ensure_policy(policy, max_policy, false)?;
-            let staged = paths.stage(&path, false).await?;
-            let result = engine::serve_pull_stream(
-                &staged.real,
-                offset,
-                max_bytes,
-                chunk_size,
-                window,
-                compress,
-                &mut link,
-                &id,
-                "quic",
-            )
-            .await;
-            audit_result(audit, "pull_stream", &path, &result);
-            result.map(|_| ())
-        }
-        other => Err(Error::Protocol(format!(
-            "direct path cannot start with {other:?}"
-        ))),
-    };
-    if let Err(err) = outcome {
-        let _ = link
-            .send_msg(TransferMsg::Failed {
-                message: err.to_string(),
-            })
-            .await;
-    }
-    Ok(())
+    drop(link);
+    let _ = (policy, max_policy, paths, audit);
+    Err(Error::Message(
+        "direct file transfer is disabled; file bytes stay on the sealed relay session".into(),
+    ))
 }
 
 fn audit_result(hub: &AuditHub, op: &str, detail: &str, result: &Result<TransferStats>) {

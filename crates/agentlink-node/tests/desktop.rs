@@ -87,8 +87,8 @@ async fn flow() -> anyhow::Result<()> {
         )
         .await;
     assert!(
-        shot.is_ok(),
-        "a connected admin is not clipped by the old exec ceiling: {shot:?}"
+        shot.is_err(),
+        "a local grant cannot raise --max-access above phase1: {shot:?}"
     );
 
     let token = admin

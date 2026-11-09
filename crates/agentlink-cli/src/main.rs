@@ -886,24 +886,26 @@ enum GrantCommand {
         #[arg(long)]
         node: String,
     },
-    /// Revoke a grant: sign a remote revoke for the node deny-list, delete the
-    /// local file when it holds the revoked jti, and optionally update a node
-    /// data directory offline.
+    /// Revoke a grant on this machine's node data directory.
+    ///
+    /// Writes `<data-dir>/revoked-grants.json`. The node reads that file. A
+    /// remote revoke is not sent and is not accepted. A command that already
+    /// started is not killed; the next request and any recorded terminal are
+    /// denied.
     Revoke {
-        /// Node name or public id.
+        /// Node name or public id. Used to find the local grant file.
         #[arg(long)]
         node: String,
-        /// Node data directory. Used as an offline fallback when the remote
-        /// revoke is unavailable (older node, no connection): the jti is added
-        /// to `<dir>/revoked-grants.json` (hot-reloaded, no restart).
+        /// Node data directory on this machine. Defaults to
+        /// ~/.local/share/agentlink/node when that directory already holds a
+        /// node identity. The jti is appended to revoked-grants.json there.
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Grant jti to revoke. Defaults to the stored local grant for this node.
         #[arg(long)]
         jti: Option<String>,
-        /// Node data directory holding grant-issuer.json and owner-keys.json for
-        /// signing the remote revoke. Defaults to this CLI's operator identity.
-        #[arg(long)]
+        /// Ignored. Revoke does not sign or send a remote request.
+        #[arg(long, hide = true)]
         issuer_data_dir: Option<PathBuf>,
     },
     /// Trust an additional owner issuer key in a node data directory.
@@ -941,7 +943,10 @@ enum ClientAction {
     },
     /// List registered agents.
     List,
-    /// Grant an agent a permission preset on one node.
+    /// Tell the relay this agent may be routed to a node.
+    ///
+    /// This does not authorize the machine. The node still requires a signed
+    /// grant for the agent's key, clipped by --max-access.
     Grant {
         client: String,
         node: String,
@@ -18580,6 +18585,33 @@ fn write_grant_result(
     Ok(())
 }
 
+fn revoke_data_dir(explicit: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    if let Some(dir) = explicit {
+        if !dir.is_dir() {
+            return Err(anyhow!(
+                "node data directory {} does not exist. grant revoke writes revoked-grants.json \
+                 on this machine; it does not send a remote revoke.",
+                dir.display()
+            ));
+        }
+        return Ok(dir.to_path_buf());
+    }
+    let dir = agentlink_core::config::default_data_dir("node")
+        .map_err(|err| anyhow!(err.to_string()))?;
+    let looks_like_node = dir.join("identity.json").is_file()
+        || dir.join(agentlink_core::grant::OWNER_KEYS_FILE).is_file()
+        || dir.join(agentlink_core::grant::GRANT_ISSUER_FILE).is_file();
+    if looks_like_node {
+        return Ok(dir);
+    }
+    Err(anyhow!(
+        "grant revoke writes {}/revoked-grants.json on the node host. Pass \
+         --data-dir <node-data-dir>. A remote revoke is not sent and the node \
+         rejects one.",
+        dir.display()
+    ))
+}
+
 async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
     let dir = config_dir(cli)?;
     match action {
@@ -18910,72 +18942,24 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             let node_id = target.as_ref().map(|target| target.node_id.clone());
             let label = node_id.clone().unwrap_or_else(|| node.clone());
 
-            // Remote-first: sign an issuer revoke for the target node and send
-            // it over the sealed E2E session. The node owns the deny-list.
-            let mut remote_ok = false;
-            let mut remote_err: Option<String> = None;
-            if let Some(node_id) = node_id.as_deref() {
-                let issuer = Identity::load_or_create(&operator_identity_path(cli)?)
-                    .map_err(|err| err.to_string())
-                    .and_then(|operator| {
-                        grant_issuer_for_revoke(
-                            issuer_data_dir.as_deref(),
-                            &operator,
-                            stored_grant.as_ref(),
-                        )
-                        .map_err(|err| err.to_string())
-                    });
-                match issuer {
-                    Ok(issuer) => {
-                        let now = agentlink_core::util::unix_now();
-                        let mut revoke = agentlink_core::grant::SignedRevoke::sign(
-                            &issuer,
-                            node_id,
-                            &jti,
-                            now.saturating_sub(60),
-                            now.saturating_add(300),
-                        )
-                        .map_err(|err| anyhow!(err.to_string()))?;
-                        revoke.grant_exp_unix = grant_exp;
-                        let attempt = match connect_client(cli, "grant").await {
-                            Ok(client) => client
-                                .revoke_grant(node_id, &revoke)
-                                .await
-                                .map(|_| ())
-                                .map_err(|err| err.to_string()),
-                            Err(err) => Err(err.to_string()),
-                        };
-                        match attempt {
-                            Ok(()) => remote_ok = true,
-                            Err(err) => remote_err = Some(err),
-                        }
-                    }
-                    Err(err) => remote_err = Some(format!("no issuer to sign a revoke: {err:#}")),
+            let _ = issuer_data_dir;
+            let data_dir = match revoke_data_dir(data_dir.as_deref()) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    return Err(anyhow!(
+                        "{err} `grant revoke-local` only deletes the controller's copy and does \
+                         not revoke the node."
+                    ));
                 }
-            } else {
-                remote_err = Some("could not resolve the node id for a remote revoke".into());
-            }
-
-            let denied = if remote_ok {
-                None
-            } else if let Some(data_dir) = &data_dir {
-                let denied = match grant_exp {
-                    Some(exp) => agentlink_core::grant::add_revoked_jti_until(
-                        data_dir, &jti, Some(exp),
-                    ),
-                    None => agentlink_core::grant::add_revoked_jti(data_dir, &jti),
-                };
-                Some(denied.map_err(|err| anyhow!(err.to_string()))?)
-            } else {
-                return Err(anyhow!(
-                    "remote revoke failed: {}; pass `--issuer-data-dir <node-data-dir>` so the \
-                     node's own issuer signs, or `--data-dir <node-data-dir>` to update the \
-                     deny-list offline (older node or no connection), or use \
-                     `agentlink grant revoke-local --node {label}` to clear only the local grant \
-                     file. The local grant was left in place so you can retry.",
-                    remote_err.unwrap_or_else(|| "unknown error".into())
-                ));
             };
+            let denied = match grant_exp {
+                Some(exp) => agentlink_core::grant::add_revoked_jti_until(
+                    &data_dir, &jti, Some(exp),
+                ),
+                None => agentlink_core::grant::add_revoked_jti(&data_dir, &jti),
+            }
+            .map_err(|err| anyhow!(err.to_string()))?;
+            let deny_file = data_dir.join(agentlink_core::grant::REVOKED_GRANTS_FILE);
 
             let removed = if keep_local_grant {
                 false
@@ -18999,33 +18983,21 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                 json!({
                     "node": label.clone(),
                     "jti": jti,
-                    "remote": remote_ok,
+                    "remote": false,
                     "data_dir": data_dir,
-                    "revoked": remote_ok || denied.is_some(),
+                    "deny_file": deny_file,
+                    "revoked": true,
                     "deny_list": denied,
-                    "remote_error": remote_err,
                     "removed": removed,
                     "kept_local_grant": keep_local_grant,
                 }),
                 || {
-                    if remote_ok {
-                        eprintln!(
-                            "revoked jti {jti} on {label} over E2E; the node deny-list was \
-                             updated remotely (hot reload, no restart)"
-                        );
-                    } else {
-                        if let Some(err) = &remote_err {
-                            eprintln!("remote revoke failed ({err}); fell back to the node data dir");
-                        }
-                        if let Some(dir) = &data_dir {
-                            eprintln!(
-                                "added jti {jti} to {}/{}; the node rejects that grant on the \
-                                 next request (hot reload, no restart)",
-                                dir.display(),
-                                agentlink_core::grant::REVOKED_GRANTS_FILE
-                            );
-                        }
-                    }
+                    eprintln!(
+                        "added jti {jti} to {}; the node rejects that grant on the next request. \
+                         A command that already started is not killed. A recorded terminal closes \
+                         on its next message.",
+                        deny_file.display()
+                    );
                     if keep_local_grant {
                         eprintln!(
                             "kept local grant for {label}: `--jti {jti}` does not match the \

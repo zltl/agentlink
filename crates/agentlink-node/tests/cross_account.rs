@@ -221,7 +221,7 @@ async fn flow() -> anyhow::Result<()> {
         } => {
             let error = error.unwrap_or_default();
             assert!(
-                error.contains("no grant") || error.contains("not allowed"),
+                error.contains("cannot route") || error.contains("not allowed") || error.contains("signed grant"),
                 "{error}"
             );
         }

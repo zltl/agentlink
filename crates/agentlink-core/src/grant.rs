@@ -648,7 +648,15 @@ pub fn bootstrap_issuer_with_mode(data_dir: &Path) -> Result<Option<Identity>> {
     if !load_owner_keys(data_dir)?.is_empty() {
         return Ok(None);
     }
-    let issuer = Identity::load_or_create(&data_dir.join(GRANT_ISSUER_FILE))?;
+    let path = data_dir.join(GRANT_ISSUER_FILE);
+    // Two starters (the daemon and a local `grant` command) can both see an
+    // empty owner-keys file. Create, then read back the key that landed.
+    if let Err(err) = Identity::load_or_create(&path) {
+        if !path.is_file() {
+            return Err(err);
+        }
+    }
+    let issuer = Identity::load_or_create(&path)?;
     add_owner_key(data_dir, issuer.public_hex())?;
     Ok(Some(issuer))
 }

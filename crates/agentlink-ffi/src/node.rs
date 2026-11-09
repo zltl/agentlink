@@ -378,7 +378,7 @@ async fn connect_once(
     let welcome = next_env(&mut ws).await?;
     let (policy_now, heartbeat_secs) = match welcome {
         Envelope::HelloOk {
-            policy,
+            policy: _policy,
             heartbeat_secs,
             ..
         } => {
@@ -386,7 +386,8 @@ async fn connect_once(
                 *token = None;
             }
             (
-                policy.unwrap_or(config.ceiling).intersect(config.ceiling),
+                // The relay preset cannot raise or replace this phone's ceiling.
+                config.ceiling,
                 heartbeat_secs,
             )
         }
@@ -630,7 +631,8 @@ async fn handle_env(
             ));
         }
         Envelope::PolicyUpdate { policy: next } => {
-            let effective = next.intersect(config.ceiling);
+            let _pushed = next;
+            let effective = config.ceiling;
             if let Ok(mut guard) = policy.write() {
                 *guard = effective;
             }
@@ -752,8 +754,51 @@ async fn handle_env(
             request_id,
             client_id,
             msg,
+            authz,
             ..
-        } => transfer::on_transfer(transfer_host.clone(), request_id, client_id, msg, seal.as_ref().map(|s| s.session.clone())).await,
+        } => {
+            let Some(seal_ref) = seal.as_ref() else {
+                let deny = Envelope::result_err(
+                    request_id,
+                    "control requires an end-to-end session; plaintext relay transfers are disabled",
+                );
+                if let Ok(out) = ws::encode(&deny) {
+                    let _ = tx.send(out).await;
+                }
+                return;
+            };
+            let grantee = seal_ref.peer.clone();
+            let _relay_says = (&client_id, relay_admin, relay_grant);
+            let ceiling = policy.read().map(|g| *g).unwrap_or(config.ceiling);
+            let owner_keys = live.current_owner_keys();
+            let revoked_jtis = live.current_revoked_jtis();
+            if let Err(err) = agentlink_core::grant::resolve_e2e_policy(
+                &owner_keys,
+                &revoked_jtis,
+                authz.as_ref(),
+                &live.node_id,
+                &grantee,
+                agentlink_core::util::unix_now(),
+                ceiling,
+                false,
+                None,
+                None,
+            ) {
+                let deny = Envelope::result_err(request_id, err.to_string());
+                if let Ok(out) = ws::encode(&deny) {
+                    let _ = tx.send(out).await;
+                }
+                return;
+            }
+            transfer::on_transfer(
+                transfer_host.clone(),
+                request_id,
+                grantee.clone(),
+                msg,
+                Some(seal_ref.session.clone()),
+            )
+            .await;
+        }
         offer @ Envelope::DirectOffer { .. } => {
             transfer::on_direct_offer(transfer_host, offer).await
         }

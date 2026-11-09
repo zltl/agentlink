@@ -2508,11 +2508,38 @@ async fn run_socket(
                             }
                         }
                         Ok(Incoming::Binary(bytes)) => {
-                            let peer = crate::frame::request_id(&bytes).and_then(|id| {
-                                inner.routes.lock().ok().and_then(|map| map.get(&id).cloned())
+                            let id = crate::frame::request_id(&bytes);
+                            let peer = id.as_ref().and_then(|id| {
+                                inner.routes.lock().ok().and_then(|map| map.get(id).cloned())
                             });
-                            let bytes = crate::e2e::open_frame_any(&inner.e2e, peer.as_deref(), &bytes);
-                            dispatch_binary(&inner.binary, bytes);
+                            match peer {
+                                Some(peer) => {
+                                    match crate::e2e::open_bound_frame(&inner.e2e, &peer, &bytes) {
+                                        Ok(opened) => dispatch_binary(&inner.binary, opened),
+                                        Err(err) => {
+                                            if let Some(id) = id {
+                                                dispatch(
+                                                    &inner.pending,
+                                                    &inner.binary,
+                                                    Envelope::result_err(id, err.to_string()),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                None => {
+                                    if let Some(id) = id {
+                                        dispatch(
+                                            &inner.pending,
+                                            &inner.binary,
+                                            Envelope::result_err(
+                                                id,
+                                                "file frame has no end-to-end peer",
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Ok(Incoming::Ping(payload)) => {
                             let _ = sock_tx.try_send(Outbound::Pong(payload));

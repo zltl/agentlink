@@ -10,8 +10,6 @@ use uuid::Uuid;
 use crate::client::{Client, ClientInner, TransferInbound};
 use crate::engine::{self, Link, Wire, XferOpts};
 use crate::error::{Error, Result};
-use crate::identity::Identity;
-use crate::p2p::{self, QuicPeer};
 use crate::protocol::{Envelope, TransferMsg, TransferStats};
 use crate::ws::{self, Outbound};
 
@@ -285,20 +283,9 @@ impl Client {
     ) -> Result<(Link, String, XferOpts)> {
         let node = self.online_id(node).await?;
         let mut opts = opts.clone().normalized();
-        let want_direct = opts.transport != "relay-only";
-        tracing::debug!(%node, want_direct, "opening data link");
-        if want_direct {
-            match try_direct(&self.inner, &node).await {
-                Ok(link) => {
-                    tracing::debug!("direct path ready");
-                    opts.transport = "quic".into();
-                    return Ok((link, Uuid::new_v4().to_string(), opts));
-                }
-                Err(err) => {
-                    tracing::debug!(error = %err, "direct path unavailable; using the relay");
-                }
-            }
-        }
+        // Direct QUIC offers are cleartext and carry no grant. File bytes
+        // stay on the sealed relay session.
+        opts.transport = "relay".into();
         let request_id = Uuid::new_v4().to_string();
         let link = open_relay_link(&self.inner, &node, &request_id).await?;
         opts.transport = "relay".into();
@@ -308,8 +295,8 @@ impl Client {
     /// Upload from `reader` without knowing the length first.
     ///
     /// Reads are capped at one chunk and gated by `opts.window`, so a pipe is
-    /// not buffered. zstd follows the remote path's extension. QUIC is tried
-    /// first unless `opts.transport` is `relay-only`.
+    /// not buffered. zstd follows the remote path's extension. Bytes stay on
+    /// the sealed relay session.
     pub async fn stream_upload<R: std::io::Read>(
         &self,
         node: &str,
@@ -431,7 +418,13 @@ pub(crate) async fn open_relay_link(
                             }
                         }
                         Wire::Frame(bytes) => {
-                            let sealed = endpoint.seal_frame(&node_id, &bytes).unwrap_or(bytes);
+                            let sealed = match endpoint.seal_frame(&node_id, &bytes) {
+                                Ok(sealed) => sealed,
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "refusing to send a plaintext file frame");
+                                    break;
+                                }
+                            };
                             Outbound::Binary(sealed)
                         }
                     };
@@ -467,70 +460,6 @@ fn register(
         .map_err(|_| Error::Message("client transfer set poisoned".into()))?
         .insert(request_id.to_string());
     Ok(())
-}
-
-async fn try_direct(inner: &Arc<ClientInner>, node: &str) -> Result<Link> {
-    let peer = peer_for(inner)?;
-    let request_id = Uuid::new_v4().to_string();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    inner
-        .pending
-        .lock()
-        .map_err(|_| Error::Message("client pending map poisoned".into()))?
-        .insert(request_id.clone(), tx);
-    let offer = Envelope::DirectOffer {
-        request_id: request_id.clone(),
-        node_id: node.to_string(),
-        public_key: peer.public_key.clone(),
-        cert_fp: peer.cert_fp.clone(),
-        cert_sig: peer.cert_sig.clone(),
-        local_addrs: peer.local_addrs(inner.relay_addr),
-        reflexive: None,
-    };
-    if inner.tx.send(ws::encode(&offer)?).await.is_err() {
-        let _ = inner.pending.lock().map(|mut map| map.remove(&request_id));
-        return Err(Error::Message("connection closed".into()));
-    }
-    let env = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
-    let _ = inner.pending.lock().map(|mut map| map.remove(&request_id));
-    let env = env
-        .map_err(|_| Error::Timeout)?
-        .ok_or_else(|| Error::Message("direct offer closed".into()))?;
-    let Envelope::DirectAnswer {
-        public_key,
-        cert_fp,
-        cert_sig,
-        local_addrs,
-        reflexive,
-        ..
-    } = env
-    else {
-        return Err(Error::Protocol("expected direct_answer".into()));
-    };
-    let addrs = p2p::parse_addrs(&local_addrs, reflexive.as_deref());
-    peer.dial(&addrs, &cert_fp, &public_key, &cert_sig).await
-}
-
-fn peer_for(inner: &ClientInner) -> Result<Arc<QuicPeer>> {
-    if let Some(peer) = inner
-        .quic
-        .lock()
-        .map_err(|_| Error::Message("quic lock poisoned".into()))?
-        .clone()
-    {
-        return Ok(peer);
-    }
-    let identity = inner.direct_id.get_or_init(Identity::generate);
-    let peer = Arc::new(QuicPeer::bind(identity, inner.relay_addr)?);
-    let mut guard = inner
-        .quic
-        .lock()
-        .map_err(|_| Error::Message("quic lock poisoned".into()))?;
-    if let Some(existing) = guard.clone() {
-        return Ok(existing);
-    }
-    *guard = Some(peer.clone());
-    Ok(peer)
 }
 
 #[cfg(test)]

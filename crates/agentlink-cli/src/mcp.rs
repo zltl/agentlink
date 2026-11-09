@@ -93,7 +93,7 @@ pub(crate) async fn handle(state: &mut Mcp, message: Value) -> Option<Value> {
                         "name": "agentlink",
                         "version": crate::version::current(),
                     },
-                    "instructions": "Call list_machines, then address a node by name or id. File tools include read_file, write_file, list_dir, stat_path, mkdir, remove_path, move_path, copy_path, search_content, search_files, replace_text, edit_lines, and apply_patch. copy_path moves whole files and directories. run_command and process_* need exec permission. terminal_* is a poll-based PTY because this server uses stdio. screenshot, click, type, key, scroll, get_ui_tree, and act_on_element need the desktop permission preset on both the relay and the node."
+                    "instructions": "Call list_machines, then address a node by name or id. File tools include read_file, write_file, list_dir, stat_path, mkdir, remove_path, move_path, copy_path, search_content, search_files, replace_text, edit_lines, and apply_patch. copy_path moves whole files and directories. Every control call needs a signed grant for this client's key on the node. The node's --max-access ceiling can still narrow that grant. A relay login or client preset does not authorize the machine. terminal_* is a poll-based PTY because this server uses stdio. screenshot, click, type, key, scroll, get_ui_tree, and act_on_element also need the node ceiling to allow desktop."
                 }),
             ))
         }
