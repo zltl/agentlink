@@ -77,7 +77,7 @@ Live isolated node `sufa-t417-9bf95e3-test` on 127.0.0.1:18443, binary
   (`T417-ISO-INPUT-OK-9bf95e3` / `Hello, world! 123; --path=/tmp`). IME remained
   `libpinyin` afterward. CJK `中文输入测试：你好。` reported "typed 11 characters"
   but did not appear. Cause: `InsertText` passed `text.len()` (UTF-8 bytes) as the
-  AT-SPI character `length` (11 scalars vs 33 bytes). ASCII was accidentally correct.
+  AT-SPI character `length` (10 scalars vs 30 bytes). ASCII was accidentally correct.
   Fixed to `text.chars().count()`.
 - **window screenshot**: Full-screen capture still works (2736×1824). Window capture
   returns an honest capability error: `Shell.GetWindows` is AccessDenied to regular

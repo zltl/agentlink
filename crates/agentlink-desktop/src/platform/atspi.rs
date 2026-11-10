@@ -507,8 +507,8 @@ mod tests {
     fn insert_text_length_uses_unicode_scalars_not_utf8_bytes() {
         assert_eq!(insert_text_length("ABC"), 3);
         let cjk = "中文输入测试：你好。";
-        assert_eq!(cjk.chars().count(), 11);
-        assert!(cjk.len() > 11, "the CJK fixture must be multi-byte UTF-8");
-        assert_eq!(insert_text_length(cjk), 11);
+        assert_eq!(cjk.chars().count(), 10);
+        assert!(cjk.len() > 10, "the CJK fixture must be multi-byte UTF-8");
+        assert_eq!(insert_text_length(cjk), 10);
     }
 }
