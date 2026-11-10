@@ -13,9 +13,9 @@ mod linux;
 #[cfg(all(target_os = "linux", pipewire_headers))]
 mod mutter;
 #[cfg(target_os = "linux")]
-mod portal_window;
-#[cfg(target_os = "linux")]
 mod portal_persist;
+#[cfg(target_os = "linux")]
+pub(crate) mod portal_window;
 #[cfg(target_os = "linux")]
 mod shell_windows;
 #[cfg(target_os = "linux")]

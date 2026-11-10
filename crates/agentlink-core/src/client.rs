@@ -1237,8 +1237,15 @@ impl Client {
 
     /// Invoke a unary operation by name or id. Streaming ops should use the dedicated methods.
     pub async fn call_op(&self, node: &str, op: Op) -> Result<Value> {
+        self.call_op_timeout(node, op, UNARY_TIMEOUT).await
+    }
+
+    /// Unary invoke with an explicit wait (used for official window capture
+    /// so the client wait matches `AGENTLINK_PORTAL_PICKER_TIMEOUT_SECS`).
+    pub async fn call_op_timeout(&self, node: &str, op: Op, limit: Duration) -> Result<Value> {
         let id = self.online_id(node).await?;
-        self.unary(&id, op).await
+        let authz = self.inner.authz_for(&id)?;
+        self.unary_with_authz_limit(&id, op, authz, limit).await
     }
 
     async fn write_all_id(&self, node_id: &str, path: &str, data: &[u8]) -> Result<()> {
@@ -1320,7 +1327,8 @@ impl Client {
 
     async fn unary(&self, node_id: &str, op: Op) -> Result<Value> {
         let authz = self.inner.authz_for(node_id)?;
-        self.unary_with_authz(node_id, op, authz).await
+        self.unary_with_authz_limit(node_id, op, authz, UNARY_TIMEOUT)
+            .await
     }
 
     async fn unary_with_authz(
@@ -1328,6 +1336,17 @@ impl Client {
         node_id: &str,
         op: Op,
         authz: Option<crate::grant::SignedGrant>,
+    ) -> Result<Value> {
+        self.unary_with_authz_limit(node_id, op, authz, UNARY_TIMEOUT)
+            .await
+    }
+
+    async fn unary_with_authz_limit(
+        &self,
+        node_id: &str,
+        op: Op,
+        authz: Option<crate::grant::SignedGrant>,
+        limit: Duration,
     ) -> Result<Value> {
         let client_id = self.client_id.clone();
         let node_id = node_id.to_string();
@@ -1347,7 +1366,7 @@ impl Client {
         };
         self.send(&Envelope::Invoke {
             request_id: request_id.clone(),
-            node_id,
+            node_id: node_id.clone(),
             client_id,
             op,
             grant: None,
@@ -1356,17 +1375,22 @@ impl Client {
             device_id: None,
         })
         .await?;
-        let deadline = Instant::now() + UNARY_TIMEOUT;
+        let deadline = Instant::now() + limit;
         let mut seen_approvals = HashSet::new();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                let _ = self.cancel(&node_id, &request_id).await;
                 return Err(Error::Timeout);
             }
-            let env = timeout(left, rx.recv())
-                .await
-                .map_err(|_| Error::Timeout)?
-                .ok_or_else(|| Error::Message("connection closed".into()))?;
+            let env = match timeout(left, rx.recv()).await {
+                Ok(Some(env)) => env,
+                Ok(None) => return Err(Error::Message("connection closed".into())),
+                Err(_) => {
+                    let _ = self.cancel(&node_id, &request_id).await;
+                    return Err(Error::Timeout);
+                }
+            };
             match env {
                 Envelope::ApprovalRequest {
                     approval_id,
@@ -2195,7 +2219,10 @@ mod tests {
         assert_eq!(env.request_id(), Some("dev-1"));
         dispatch(&pending, &transfers, env);
         match rx.try_recv() {
-            Ok(Envelope::DeviceList { request_id, devices }) => {
+            Ok(Envelope::DeviceList {
+                request_id,
+                devices,
+            }) => {
                 assert_eq!(request_id, "dev-1");
                 assert_eq!(devices.len(), 1);
                 assert_eq!(devices[0].id, "ab".repeat(32));

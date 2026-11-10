@@ -107,13 +107,13 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
     let endpoint = Endpoint::new(identity.clone());
     let service = AuditService::open(&config.data_dir, identity.node_id(), &config.name);
     match agentlink_core::grant::bootstrap_issuer_with_mode(&config.data_dir) {
-            Ok(Some(issuer)) => tracing::info!(
-                issuer = issuer.public_hex(),
-                path = %config.data_dir.join(agentlink_core::grant::GRANT_ISSUER_FILE).display(),
-                "created grant issuer; this node now requires owner-signed grants"
-            ),
-            Ok(None) => {}
-            Err(err) => tracing::warn!(error = %err, "could not bootstrap grant issuer"),
+        Ok(Some(issuer)) => tracing::info!(
+            issuer = issuer.public_hex(),
+            path = %config.data_dir.join(agentlink_core::grant::GRANT_ISSUER_FILE).display(),
+            "created grant issuer; this node now requires owner-signed grants"
+        ),
+        Ok(None) => {}
+        Err(err) => tracing::warn!(error = %err, "could not bootstrap grant issuer"),
     }
     let owner_keys = agentlink_core::grant::refresh_owner_keys(
         &config.data_dir,
@@ -863,6 +863,10 @@ async fn handle_env(
                     token.cancel();
                 }
             }
+            // Screenshot / window capture waits on a separate desktop runtime,
+            // so the op CancellationToken alone will not close the official
+            // picker. Ask the portal wait to Close the Request immediately.
+            agentlink_desktop::abort_live_portal_pickers();
         }
         Envelope::Invoke {
             request_id,
@@ -942,7 +946,7 @@ async fn handle_env(
                 None,
                 grant,
             ) {
-                    Ok(policy) => policy.intersect(config.max_policy),
+                Ok(policy) => policy.intersect(config.max_policy),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -983,9 +987,11 @@ async fn handle_env(
                 if let Ok(mut map) = live.approvals.lock() {
                     map.insert(approval_id.clone(), wait_tx);
                 }
-                let summary = live.service.policy().redact.apply(
-                    &agentlink_core::confirm::ConfirmPolicy::summary(&op),
-                );
+                let summary = live
+                    .service
+                    .policy()
+                    .redact
+                    .apply(&agentlink_core::confirm::ConfirmPolicy::summary(&op));
                 let expires = agentlink_core::util::unix_now() + live.confirm.timeout_secs as i64;
                 let note = Envelope::ApprovalRequest {
                     request_id: request_id.clone(),

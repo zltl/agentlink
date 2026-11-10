@@ -19056,12 +19056,25 @@ fn grant_paste_card(
             let issuer = agentlink_core::grant::load_issuer(&dir)
                 .map_err(|err| anyhow!(err.to_string()))?
                 .ok_or_else(|| anyhow!("no grant-issuer.json in {}", dir.display()))?;
+            let requested_name = req.policy.preset_name().to_string();
+            let shrink = grant_local::shrink_grant_prompt(
+                &requested_name,
+                req.ttl_secs,
+                policy.clone(),
+                ttl.clone(),
+            )?;
+            let Some((shrink_policy, shrink_ttl)) = shrink else {
+                eprintln!("已取消签发，待批请求 {} 仍保留（粘贴身份码本身未授权）", req.request_id);
+                return Ok(0);
+            };
+            let policy = shrink_policy.as_deref().map(parse_access).transpose()?;
+            let ttl_secs = shrink_ttl;
             let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
                 &dir,
                 &req.request_id,
                 now,
-                None,
-                None,
+                policy,
+                ttl_secs,
             )
             .map_err(|err| anyhow!(err.to_string()))?;
             let _ = agentlink_core::grant_request::save_issued_grant(&dir, &grant);
@@ -19623,8 +19636,18 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                 let issuer = agentlink_core::grant::load_issuer(&dir)
                     .map_err(|err| anyhow!(err.to_string()))?
                     .ok_or_else(|| anyhow!("no grant-issuer.json in {}", dir.display()))?;
-                let policy = policy.as_deref().map(parse_access).transpose()?;
-                let ttl_secs = ttl.as_deref().map(parse_ttl).transpose()?.map(|v| v as u64);
+                let shrink = grant_local::shrink_grant_prompt(
+                    req.policy.preset_name(),
+                    req.ttl_secs,
+                    policy.clone(),
+                    ttl.clone(),
+                )?;
+                let Some((shrink_policy, shrink_ttl)) = shrink else {
+                    eprintln!("已取消签发，待批请求 {} 仍保留（粘贴身份码本身未授权）", req.request_id);
+                    return Ok(0);
+                };
+                let policy = shrink_policy.as_deref().map(parse_access).transpose()?;
+                let ttl_secs = shrink_ttl;
                 let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
                     &dir,
                     &req.request_id,
@@ -20016,14 +20039,27 @@ fn write_node_policy_files(
     Ok(())
 }
 
+/// Client wait for official window capture: same env as the node picker,
+/// plus 15s slack so a sitting picker is not abandoned by the 120s unary
+/// default while the node is still waiting (and so Cancel can be sent).
+fn desktop_unary_timeout() -> std::time::Duration {
+    let secs = std::env::var("AGENTLINK_PORTAL_PICKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(90)
+        .clamp(5, 600);
+    std::time::Duration::from_secs(secs.saturating_add(15))
+}
+
 async fn desktop_call(client: &Client, node: &str, name: &str, payload: Value) -> Result<Value> {
     client
-        .call_op(
+        .call_op_timeout(
             node,
             Op::Extension {
                 name: name.to_string(),
                 payload,
             },
+            desktop_unary_timeout(),
         )
         .await
         .map_err(|err| anyhow!(err))

@@ -1,15 +1,21 @@
 //! Target-local grant paste / approve UI helpers.
 //!
-//! These dialogs and the remote-exec guard must run on the target machine as
-//! the local user. They are not `approve allow/deny` (held destructive ops)
-//! and must not be reachable via `agentlink exec` / pty.
+//! These dialogs run on the target machine as the local user. They are not
+//! `approve allow/deny` (held destructive ops).
+//!
+//! `refuse_if_remote_exec` is only a misuse guard: the CLI refuses mutating
+//! grant commands while `AGENTLINK_REMOTE_EXEC` is set (the node injects it
+//! on exec/pty/shell). It is not a self-authorization boundary. A controller
+//! that already has exec/full as this OS user can clear the variable, spawn
+//! detached, read `grant-issuer.json`, or write grant-authority directories.
+//! See `docs/grant-authorization-boundary.md`.
 
 use anyhow::{anyhow, Result};
 
 /// Set by the node on every exec / pty / shell it spawns.
 pub const REMOTE_EXEC_ENV: &str = "AGENTLINK_REMOTE_EXEC";
 
-pub const REMOTE_EXEC_REFUSAL: &str = "此 grant 操作必须在目标机由本地用户执行（本机 CLI、图形粘贴入口、或已授权的独立 SSH/Cursor 代执行本地 grant）。不能通过 agentlink exec/pty 远程代签、粘贴身份码或扩大授权。身份码不是 bearer，签名只证明私钥。";
+pub const REMOTE_EXEC_REFUSAL: &str = "已拒绝：检测到 AGENTLINK_REMOTE_EXEC。这只是 CLI 防误用，不是防自授权边界。已有 exec/full 的控制端与本机同 UID，可清除该变量、读取 issuer 私钥或改写 grant 目录。未获准控制端仍不能 exec。请在目标机本地（或已授权的独立 SSH/Cursor，而非 agentlink exec）签发。说明见 docs/grant-authorization-boundary.md。身份码不是 bearer。";
 
 pub const SIGNATURE_DISCLAIMER: &str = "签名只证明控制端持有对应私钥，不证明屏幕上的名称或人员真实性。请用带外渠道核对该 SHA256 指纹后再批准。";
 
@@ -154,14 +160,177 @@ pub fn decision_prompt(body: &str) -> Result<bool> {
     }
 }
 
+/// After an Allow decision, let the local user shrink policy/ttl.
+///
+/// Returns `Ok(None)` if the user cancels this step (request stays pending;
+/// pasting a card alone never authorizes). `policy`/`ttl` CLI values become
+/// the form defaults; empty fields keep the requested values. The allow path
+/// still rejects any silent increase.
+pub fn shrink_grant_prompt(
+    requested_policy: &str,
+    requested_ttl_secs: u64,
+    policy_default: Option<String>,
+    ttl_default: Option<String>,
+) -> Result<Option<(Option<String>, Option<u64>)>> {
+    let default_policy = policy_default
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(requested_policy);
+    let default_ttl = ttl_default
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| requested_ttl_secs.to_string());
+    let hint = format!(
+        "可缩小权限或缩短有效期，不能加大。\n请求权限: {requested_policy}\n请求 ttl: {requested_ttl_secs} 秒\n默认将签发: {default_policy} / {default_ttl}"
+    );
+    if display_ok() && command_exists("zenity") {
+        let out = std::process::Command::new("zenity")
+            .args([
+                "--forms",
+                "--title",
+                "缩小权限后批准",
+                "--ok-label",
+                "签发",
+                "--cancel-label",
+                "取消签发",
+                "--text",
+                &hint,
+                "--add-combo",
+                "权限（只能缩小）",
+                "--combo-values",
+                "read-only|read-write|exec|desktop|remote-view|remote-control|full",
+                "--add-entry",
+                "有效期（秒或 5m/1h，只能缩短）",
+            ])
+            .output()?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return parse_shrink_form(&line, default_policy, &default_ttl);
+    }
+    if display_ok() && command_exists("kdialog") {
+        let policy_out = std::process::Command::new("kdialog")
+            .args([
+                "--title",
+                "缩小权限后批准",
+                "--inputbox",
+                &format!("{hint}\n权限（只能缩小，默认 {default_policy}）"),
+                default_policy,
+            ])
+            .output()?;
+        if !policy_out.status.success() {
+            return Ok(None);
+        }
+        let ttl_out = std::process::Command::new("kdialog")
+            .args([
+                "--title",
+                "缩小权限后批准",
+                "--inputbox",
+                &format!("有效期（只能缩短，默认 {default_ttl}）"),
+                &default_ttl,
+            ])
+            .output()?;
+        if !ttl_out.status.success() {
+            return Ok(None);
+        }
+        let policy_s = String::from_utf8_lossy(&policy_out.stdout)
+            .trim()
+            .to_string();
+        let ttl_s = String::from_utf8_lossy(&ttl_out.stdout).trim().to_string();
+        return parse_shrink_form(&format!("{policy_s}|{ttl_s}"), default_policy, &default_ttl);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) && !display_ok() {
+        // Headless: honor CLI defaults without a dialog. The allow path still
+        // rejects increases. Graphical tests must run on the seat.
+        return parse_shrink_form(
+            &format!("{default_policy}|{default_ttl}"),
+            default_policy,
+            &default_ttl,
+        );
+    }
+    eprint!("{hint}\n权限（回车=默认 {default_policy}）: ");
+    let mut policy_line = String::new();
+    std::io::stdin().read_line(&mut policy_line)?;
+    eprint!("有效期（回车=默认 {default_ttl}）: ");
+    let mut ttl_line = String::new();
+    std::io::stdin().read_line(&mut ttl_line)?;
+    parse_shrink_form(
+        &format!("{}|{}", policy_line.trim(), ttl_line.trim()),
+        default_policy,
+        &default_ttl,
+    )
+}
+
+/// Parse `policy|ttl` form output. Empty fields fall back to the supplied defaults.
+pub fn parse_shrink_form(
+    line: &str,
+    default_policy: &str,
+    default_ttl: &str,
+) -> Result<Option<(Option<String>, Option<u64>)>> {
+    let line = line.trim();
+    let (policy_raw, ttl_raw) = match line.split_once('|') {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (line, ""),
+    };
+    let policy = if policy_raw.is_empty() {
+        default_policy.to_string()
+    } else {
+        policy_raw.to_string()
+    };
+    let ttl_field = if ttl_raw.is_empty() {
+        default_ttl
+    } else {
+        ttl_raw
+    };
+    let ttl_secs = parse_shrink_ttl(ttl_field)?;
+    Ok(Some((Some(policy), Some(ttl_secs))))
+}
+
+fn parse_shrink_ttl(raw: &str) -> Result<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("有效期不能为空"));
+    }
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Ok(secs);
+    }
+    // 5m / 1h / 30s style, same letters the CLI accepts.
+    let (num, unit) = raw.split_at(raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len()));
+    let n: u64 = num.parse().map_err(|_| anyhow!("无法解析有效期 `{raw}`"))?;
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => Ok(n),
+        "m" | "min" | "mins" | "minute" | "minutes" => Ok(n.saturating_mul(60)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Ok(n.saturating_mul(3600)),
+        "d" | "day" | "days" => Ok(n.saturating_mul(86400)),
+        _ => Err(anyhow!("无法解析有效期 `{raw}`（用秒，或 5m / 1h）")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn remote_exec_refusal_mentions_local_only() {
-        assert!(REMOTE_EXEC_REFUSAL.contains("不能通过 agentlink exec"));
+    fn remote_exec_refusal_is_honest_about_the_guard() {
+        assert!(REMOTE_EXEC_REFUSAL.contains("AGENTLINK_REMOTE_EXEC"));
+        assert!(REMOTE_EXEC_REFUSAL.contains("不是防自授权"));
         assert!(SIGNATURE_DISCLAIMER.contains("不证明"));
         assert!(SCOPE_NOTE.contains("不能无声加大"));
+    }
+
+    #[test]
+    fn shrink_form_defaults_and_values() {
+        let got = parse_shrink_form("", "full", "3600").unwrap().unwrap();
+        assert_eq!(got, (Some("full".into()), Some(3600)));
+        let got = parse_shrink_form("exec|5m", "full", "3600")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, (Some("exec".into()), Some(300)));
+        let got = parse_shrink_form("|60", "exec", "300").unwrap().unwrap();
+        assert_eq!(got, (Some("exec".into()), Some(60)));
     }
 }

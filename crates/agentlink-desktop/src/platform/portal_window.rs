@@ -4,11 +4,17 @@
 //! regular clients. The official GNOME picker authorizes a single window;
 //! pixels come from that PipeWire stream only — never a cropped monitor.
 //!
-//! Official persist: `persist_mode=2` with `org.agentlink.Node` after
-//! `Registry.Register`. Restore tokens are stored mode 0600, bound to the
-//! authorized window identity, and never widen an agentlink grant. Tokens
-//! without a disclosed window identity are discarded so persist cannot become
-//! silent any-window access. `AGENTLINK_PORTAL_PERSIST=0` forces one-shot.
+//! Official persist attempt: `persist_mode=2` with `org.agentlink.Node` after
+//! `Registry.Register`. A `Registry.Register` `UnknownMethod` (or other
+//! error) only means that call failed in this session — it does not prove
+//! GNOME lacks app identity or persistent restore in general. Restore tokens
+//! are stored mode 0600 only when bound to a disclosed window identity, and
+//! never widen an agentlink grant. Tokens without a disclosed window identity
+//! are discarded so persist cannot become silent any-window access. That is a
+//! conservative safety choice; the official-trust / persistent-restore vision
+//! is not complete until the portal discloses window identity and a supported
+//! registration path is confirmed on the host. `AGENTLINK_PORTAL_PERSIST=0`
+//! forces one-shot.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -37,6 +43,24 @@ pub fn picker_timeout() -> Duration {
         }
         Err(_) => Duration::from_secs(90),
     }
+}
+
+/// Generation + notify so `call_and_wait` can abort a live picker when the
+/// client sends `Cancel` (including unary timeout) and close the portal request.
+fn portal_abort_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+fn portal_abort_gen() -> &'static std::sync::atomic::AtomicU64 {
+    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &GEN
+}
+
+/// Ask every in-flight ScreenCast `call_and_wait` to close its Request.
+pub fn request_portal_cleanup() {
+    portal_abort_gen().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    portal_abort_notify().notify_waiters();
 }
 
 /// Identity of one PipeWire stream from `ScreenCast.Start` results.
@@ -664,23 +688,39 @@ async fn call_and_wait(
         .await
         .map_err(|err| msg(format!("portal signal: {err}")))?;
     invoke.await?;
-    let message = match tokio::time::timeout(timeout, signals.next()).await {
-        Ok(Some(message)) => message,
-        Ok(None) => {
-            close_portal_request(conn, path).await;
-            return Err(msg(
-                "desktop portal closed the ScreenCast request before responding",
-            ));
+    let start_gen = portal_abort_gen().load(std::sync::atomic::Ordering::SeqCst);
+    let abort = async {
+        loop {
+            if portal_abort_gen().load(std::sync::atomic::Ordering::SeqCst) != start_gen {
+                break;
+            }
+            portal_abort_notify().notified().await;
         }
-        Err(_) => {
+    };
+    let message = tokio::select! {
+        message = signals.next() => {
+            match message {
+                Some(message) => message,
+                None => {
+                    close_portal_request(conn, path).await;
+                    return Err(msg(
+                        "desktop portal closed the ScreenCast request before responding",
+                    ));
+                }
+            }
+        }
+        _ = tokio::time::sleep(timeout) => {
             close_portal_request(conn, path).await;
             return Err(msg(format!(
-                "xdg-desktop-portal ScreenCast timed out after {}s waiting for the \
-                 window picker. Cancelled the request and released the session. \
-                 On the GNOME seat, select the target window in the Share dialog and Allow, \
-                 then retry.",
+                "xdg-desktop-portal ScreenCast timed out after {}s waiting for the                  window picker. Cancelled the request and released the session.                  On the GNOME seat, select the target window in the Share dialog and Allow,                  then retry.",
                 timeout.as_secs()
             )));
+        }
+        _ = abort => {
+            close_portal_request(conn, path).await;
+            return Err(msg(
+                "xdg-desktop-portal ScreenCast request cancelled; closed the portal request"
+            ));
         }
     };
     let (response, results): (u32, HashMap<String, OwnedValue>) = message
@@ -741,7 +781,7 @@ async fn register_portal_app(conn: &Connection) {
         Err(err) => tracing::info!(
             error = %err,
             app_id = crate::platform::portal_persist::PORTAL_APP_ID,
-            "portal Registry.Register not supported or rejected; continuing without a host app_id"
+            "Registry.Register failed in this session (e.g. UnknownMethod). That only means this call is unavailable here, not that GNOME lacks app identity or persistent restore. Continuing without a host app_id."
         ),
     }
 }

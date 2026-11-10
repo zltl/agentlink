@@ -43,9 +43,9 @@ pub use capture::{
     drive_frames, CaptureBackend as ScreenCapture, CaptureRequest, CaptureTarget, Frame,
     FrameSource, MonitorInfo, PixelFormat, Rect, StreamMode,
 };
+pub use control_indicator::{note_control_session, note_inject_input};
 pub use error::{DesktopError, Result};
 pub use input::{HidBackend as InputInjector, InputAction, MouseButton};
-pub use control_indicator::{note_control_session, note_inject_input};
 pub use mock::MockDesktop;
 pub use session::{display_from_signals, has_display, DisplaySignals};
 pub use stream::{
@@ -123,4 +123,10 @@ fn bind(desktop: Arc<Desktop>) -> Vec<Arc<dyn NodeExtension>> {
         Arc::new(InjectHandler::new(desktop.clone())),
         Arc::new(StreamHandler::new(desktop)),
     ]
+}
+
+/// Close in-flight official ScreenCast pickers when the client cancels or times out.
+pub fn abort_live_portal_pickers() {
+    #[cfg(target_os = "linux")]
+    crate::platform::portal_window::request_portal_cleanup();
 }
