@@ -910,6 +910,61 @@ enum GrantCommand {
         #[arg(long, hide = true)]
         issuer_data_dir: Option<PathBuf>,
     },
+    /// List grant *requests* stored on this node. A request is not a grant.
+    /// Local only: does not contact the relay.
+    Pending {
+        /// Node data directory holding grant-requests/. Defaults to the local node dir.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Approve a pending request by signing a grant with this node's issuer.
+    ///
+    /// Local only. This is not `approve allow` (held destructive ops) and it
+    /// is not a remote RPC.
+    Allow {
+        /// Pending request id.
+        request_id: String,
+        /// Node data directory on this machine.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Write the signed grant JSON here (`-` prints it) in addition to storing it.
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Deny a pending grant request on this node. Local only.
+    Deny {
+        request_id: String,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Show a local Allow / Deny prompt for a pending request on this node.
+    ///
+    /// Uses a desktop dialog when DISPLAY is set, otherwise a tty prompt.
+    /// This is not `approve allow` and cannot be invoked as a remote grant.
+    Prompt {
+        /// Pending request id. Defaults to the oldest still-pending request.
+        request_id: Option<String>,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Record a pending request on this node without signing a grant.
+    ///
+    /// The request cannot be used for control until `grant allow` is run
+    /// locally as the node user.
+    Request {
+        /// Grantee (controller) public key hex.
+        #[arg(long)]
+        grantee: String,
+        /// Access preset. See the printed capability list; `desktop` includes exec.
+        #[arg(long, default_value = "desktop")]
+        policy: String,
+        /// Lifetime of the grant if later allowed (`15m`, `1h`, `7d`).
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+        /// Node data directory. Defaults to the local node dir.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Trust an additional owner issuer key in a node data directory.
     TrustOwner {
         /// Issuer public key hex.
@@ -17460,7 +17515,7 @@ fn format_grant_show(
             "status:",
             grant_status_label(now_unix, grant.exp_unix)
         ),
-        format!("{:<10}{}", "access:", grant.policy.preset_name()),
+        format!("{:<10}{}", "access:", grant.policy.capability_summary()),
         format!(
             "{:<10}{} (unix {})",
             "issued:",
@@ -17724,6 +17779,82 @@ mod grant_ttl_tests {
                 other => panic!("expected grant {verb} as revoke-local, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn grant_pending_allow_deny_prompt_parse_and_are_not_approve() {
+        let pending = Cli::try_parse_from(["agentlink", "grant", "pending", "--data-dir", "/tmp/node"]).unwrap();
+        match pending.command {
+            Command::Grant {
+                action: GrantCommand::Pending { data_dir },
+            } => assert_eq!(data_dir, Some(PathBuf::from("/tmp/node"))),
+            other => panic!("expected grant pending, got {other:?}"),
+        }
+        let allow = Cli::try_parse_from(["agentlink", "grant", "allow", "req-1", "--data-dir", "/tmp/node"]).unwrap();
+        match allow.command {
+            Command::Grant {
+                action: GrantCommand::Allow { request_id, data_dir, out },
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(data_dir, Some(PathBuf::from("/tmp/node")));
+                assert!(out.is_none());
+            }
+            other => panic!("expected grant allow, got {other:?}"),
+        }
+        let deny = Cli::try_parse_from(["agentlink", "grant", "deny", "req-1"]).unwrap();
+        match deny.command {
+            Command::Grant {
+                action: GrantCommand::Deny { request_id, .. },
+            } => assert_eq!(request_id, "req-1"),
+            other => panic!("expected grant deny, got {other:?}"),
+        }
+        let prompt = Cli::try_parse_from(["agentlink", "grant", "prompt"]).unwrap();
+        match prompt.command {
+            Command::Grant {
+                action: GrantCommand::Prompt { request_id, data_dir },
+            } => {
+                assert!(request_id.is_none());
+                assert!(data_dir.is_none());
+            }
+            other => panic!("expected grant prompt, got {other:?}"),
+        }
+        // Held destructive-ops verbs stay on `approve`, not `grant`.
+        let approve = Cli::try_parse_from([
+            "agentlink",
+            "approve",
+            "allow",
+            "hold-1",
+            "sufa",
+        ]);
+        assert!(approve.is_ok(), "{approve:?}");
+        match approve.unwrap().command {
+            Command::Approve { .. } => {}
+            other => panic!("approve allow must stay on Approve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_issuer_node_id_matches_name_and_rejects_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "aa".repeat(32);
+        std::fs::write(
+            dir.path().join("identity.json"),
+            serde_json::json!({"public_hex": id}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("node.json"),
+            serde_json::json!({"name": "sufa-iso"}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            local_issuer_node_id(dir.path(), "sufa-iso").as_deref(),
+            Some(id.as_str())
+        );
+        assert!(local_issuer_node_id(dir.path(), "other-node").is_none());
+        assert!(local_issuer_node_id(dir.path(), id.as_str()).is_none());
+        let empty = tempfile::tempdir().unwrap();
+        assert!(local_issuer_node_id(empty.path(), "sufa-iso").is_none());
     }
 
     fn store_grant(dir: &Path, node_id: &str) {
@@ -18628,12 +18759,12 @@ fn write_grant_result(
         grant_result_json(grant, path, issuer, trust_owner_cmd),
         || {
             eprintln!(
-                "grant {} on node {} ({}) expires unix {}",
+                "grant {} on node {} expires unix {}",
                 grant.grantee_id,
                 grant.node_id,
-                grant.policy.preset_name(),
                 grant.exp_unix
             );
+            eprintln!("access: {}", grant.policy.capability_summary());
             eprintln!("issuer: {}", issuer.public_hex());
             eprintln!("jti: {}", grant.jti);
             eprintln!("stored: {}", path.display());
@@ -18671,6 +18802,95 @@ fn revoke_data_dir(explicit: Option<&std::path::Path>) -> Result<std::path::Path
          rejects one.",
         dir.display()
     ))
+}
+
+
+
+fn command_exists(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let p = dir.join(name);
+                p.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Local Allow/Deny UI for a pending grant request. Never talks to the relay.
+fn local_grant_decision_prompt(body: &str) -> Result<bool> {
+    let display_ok = std::env::var_os("DISPLAY")
+        .or_else(|| std::env::var_os("WAYLAND_DISPLAY"))
+        .is_some();
+    if display_ok && command_exists("zenity") {
+        let status = std::process::Command::new("zenity")
+            .args([
+                "--question",
+                "--title",
+                "agentlink grant request",
+                "--ok-label",
+                "Allow",
+                "--cancel-label",
+                "Deny",
+                "--no-wrap",
+                "--width",
+                "520",
+                "--text",
+                body,
+            ])
+            .status()?;
+        return Ok(status.success());
+    }
+    if display_ok && command_exists("kdialog") {
+        let status = std::process::Command::new("kdialog")
+            .args([
+                "--yesno",
+                body,
+                "--yes-label",
+                "Allow",
+                "--no-label",
+                "Deny",
+                "--title",
+                "agentlink grant request",
+            ])
+            .status()?;
+        return Ok(status.success());
+    }
+    eprint!("{body}\nType allow or deny: ");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    match line.trim().to_ascii_lowercase().as_str() {
+        "allow" | "a" | "yes" | "y" => Ok(true),
+        "deny" | "d" | "no" | "n" => Ok(false),
+        other => Err(anyhow!(
+            "expected allow or deny, got `{other}`. This prompt only runs on the node host."
+        )),
+    }
+}
+
+fn grant_node_data_dir(explicit: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    revoke_data_dir(explicit)
+}
+
+fn local_node_public_id(data_dir: &std::path::Path) -> Result<String> {
+    let path = data_dir.join("identity.json");
+    if !path.is_file() {
+        return Err(anyhow!(
+            "no identity.json in {} — pass --data-dir of this node",
+            data_dir.display()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let id = value
+        .get("public_hex")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("identity.json is missing public_hex"))?
+        .trim()
+        .to_ascii_lowercase();
+    if !is_public_key_hex(&id) {
+        return Err(anyhow!("identity.json public_hex is not a 32-byte key"));
+    }
+    Ok(id)
 }
 
 async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
@@ -18808,11 +19028,11 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                 },
                 || {
                     eprintln!(
-                        "grant {action} for node {} ({}) expires unix {}",
+                        "grant {action} for node {} expires unix {}",
                         grant.node_id,
-                        grant.policy.preset_name(),
                         grant.exp_unix
                     );
+                    eprintln!("access: {}", grant.policy.capability_summary());
                     eprintln!("issuer: {}", issuer.public_hex());
                     eprintln!("jti: {}", grant.jti);
                     eprintln!("stored: {}", path.display());
@@ -19077,7 +19297,194 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             );
             Ok(0)
         }
+        GrantCommand::Pending { data_dir } => {
+            let dir = grant_node_data_dir(data_dir.as_deref())?;
+            let now = agentlink_core::util::unix_now();
+            let _ = agentlink_core::grant_request::expire_pending(&dir, now);
+            let reqs = agentlink_core::grant_request::list_requests(&dir)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            emit(
+                cli.json,
+                json!(reqs.iter().map(|r| json!({
+                    "request_id": r.request_id,
+                    "grantee_id": r.grantee_id,
+                    "node_id": r.node_id,
+                    "policy": r.policy,
+                    "access": r.policy.capability_summary(),
+                    "ttl_secs": r.ttl_secs,
+                    "status": r.status,
+                    "created_unix": r.created_unix,
+                    "exp_unix": r.exp_unix,
+                    "grant_jti": r.grant_jti,
+                })).collect::<Vec<_>>()),
+                || {
+                    if reqs.is_empty() {
+                        println!("no grant requests in {}", dir.display());
+                        return;
+                    }
+                    for r in &reqs {
+                        println!(
+                            "{:<10} {}  {}  {}  ttl {}  expires unix {}  {}",
+                            format!("{:?}:", r.status).to_lowercase(),
+                            r.request_id,
+                            &r.grantee_id[..16.min(r.grantee_id.len())],
+                            r.policy.capability_summary(),
+                            r.ttl_secs,
+                            r.exp_unix,
+                            if r.is_pending(now) { "PENDING" } else { "" }
+                        );
+                    }
+                    eprintln!("allow with `agentlink grant allow <request-id> --data-dir {}`", dir.display());
+                    eprintln!("this is not `agentlink approve allow` (held destructive ops).");
+                },
+            );
+            Ok(0)
+        }
+        GrantCommand::Allow {
+            request_id,
+            data_dir,
+            out,
+        } => {
+            let dir = grant_node_data_dir(data_dir.as_deref())?;
+            let now = agentlink_core::util::unix_now();
+            let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
+                &dir,
+                request_id,
+                now,
+            )
+            .map_err(|err| anyhow!(err.to_string()))?;
+            let issuer = agentlink_core::grant::load_issuer(&dir)
+                .map_err(|err| anyhow!(err.to_string()))?
+                .ok_or_else(|| anyhow!("no grant-issuer.json in {}", dir.display()))?;
+            let issued = agentlink_core::grant_request::save_issued_grant(&dir, &grant)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let path = agentlink_core::grant::save_grant(&config_dir(cli)?, &grant)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            write_grant_result(cli, out.as_deref(), &grant, &path, &issuer, None)?;
+            eprintln!(
+                "signed locally on this node; issuer key stayed in {}; issued copy {}",
+                dir.display(),
+                issued.display()
+            );
+            Ok(0)
+        }
+        GrantCommand::Deny {
+            request_id,
+            data_dir,
+        } => {
+            let dir = grant_node_data_dir(data_dir.as_deref())?;
+            let now = agentlink_core::util::unix_now();
+            let req = agentlink_core::grant_request::deny_request(&dir, request_id, now)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            emit(
+                cli.json,
+                json!({"request_id": req.request_id, "status": "denied"}),
+                || eprintln!("denied grant request {}", req.request_id),
+            );
+            Ok(0)
+        }
+        GrantCommand::Prompt {
+            request_id,
+            data_dir,
+        } => {
+            let dir = grant_node_data_dir(data_dir.as_deref())?;
+            let now = agentlink_core::util::unix_now();
+            let _ = agentlink_core::grant_request::expire_pending(&dir, now);
+            let reqs = agentlink_core::grant_request::list_requests(&dir)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let req = if let Some(id) = request_id.as_deref() {
+                reqs.into_iter()
+                    .find(|r| r.request_id == id)
+                    .ok_or_else(|| anyhow!("no grant request {id}"))?
+            } else {
+                reqs.into_iter()
+                    .find(|r| r.is_pending(now))
+                    .ok_or_else(|| anyhow!("no pending grant requests in {}", dir.display()))?
+            };
+            if !req.is_pending(now) {
+                return Err(anyhow!(
+                    "request {} is not pending ({:?})",
+                    req.request_id,
+                    req.status
+                ));
+            }
+            let body = format!(
+                "agentlink grant request\n\nrequest: {}\ncontroller: {}\nnode: {}\naccess: {}\ngrant ttl: {}s\nrequest expires unix: {}\n\nAllow signs a grant with this node's local issuer. Deny stores a refusal. Neither is `agentlink approve allow/deny` (held destructive ops). The issuer key stays on this machine.",
+                req.request_id,
+                req.grantee_id,
+                req.node_id,
+                req.policy.capability_summary(),
+                req.ttl_secs,
+                req.exp_unix,
+            );
+            let allow = local_grant_decision_prompt(&body)?;
+            if allow {
+                let issuer = agentlink_core::grant::load_issuer(&dir)
+                    .map_err(|err| anyhow!(err.to_string()))?
+                    .ok_or_else(|| anyhow!("no grant-issuer.json in {}", dir.display()))?;
+                let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
+                    &dir,
+                    &req.request_id,
+                    now,
+                )
+                .map_err(|err| anyhow!(err.to_string()))?;
+                let _ = agentlink_core::grant_request::save_issued_grant(&dir, &grant);
+                let path = agentlink_core::grant::save_grant(&config_dir(cli)?, &grant)
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                write_grant_result(cli, None, &grant, &path, &issuer, None)?;
+                eprintln!("signed locally on this node; the issuer key was not sent anywhere");
+            } else {
+                let denied = agentlink_core::grant_request::deny_request(&dir, &req.request_id, now)
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                eprintln!("denied grant request {}", denied.request_id);
+            }
+            Ok(0)
+        }
+        GrantCommand::Request {
+            grantee,
+            policy,
+            ttl,
+            data_dir,
+        } => {
+            let dir = grant_node_data_dir(data_dir.as_deref())?;
+            let node_id = local_node_public_id(&dir)?;
+            let policy = parse_access(&policy)?;
+            let ttl_secs = parse_ttl(&ttl)? as u64;
+            let now = agentlink_core::util::unix_now();
+            let draft = agentlink_core::grant_request::draft_request(
+                grantee, &node_id, policy, ttl_secs, now,
+                agentlink_core::grant_request::DEFAULT_REQUEST_TTL_SECS,
+            )
+            .map_err(|err| anyhow!(err.to_string()))?;
+            let stored = agentlink_core::grant_request::submit_request(&dir, &node_id, draft, now)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            emit(
+                cli.json,
+                json!({
+                    "request_id": stored.request_id,
+                    "grantee_id": stored.grantee_id,
+                    "node_id": stored.node_id,
+                    "access": stored.policy.capability_summary(),
+                    "ttl_secs": stored.ttl_secs,
+                    "exp_unix": stored.exp_unix,
+                    "status": "pending",
+                    "note": "not a grant; run grant allow locally to sign",
+                }),
+                || {
+                    eprintln!("recorded pending request {}", stored.request_id);
+                    eprintln!("controller: {}", stored.grantee_id);
+                    eprintln!("access: {}", stored.policy.capability_summary());
+                    eprintln!(
+                        "this is not a grant. On this machine allow with:\n  agentlink grant allow {} --data-dir {}",
+                        stored.request_id,
+                        dir.display()
+                    );
+                },
+            );
+            Ok(0)
+        }
         GrantCommand::TrustOwner { key, data_dir } => {
+
             if !is_public_key_hex(&key) {
                 return Err(anyhow!("owner key must be a 32-byte ed25519 public key hex"));
             }

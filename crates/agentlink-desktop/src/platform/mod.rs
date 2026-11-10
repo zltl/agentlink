@@ -15,6 +15,8 @@ mod mutter;
 #[cfg(target_os = "linux")]
 mod portal_window;
 #[cfg(target_os = "linux")]
+mod portal_persist;
+#[cfg(target_os = "linux")]
 mod shell_windows;
 #[cfg(target_os = "linux")]
 mod wayland;

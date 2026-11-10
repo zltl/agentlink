@@ -4,8 +4,11 @@
 //! regular clients. The official GNOME picker authorizes a single window;
 //! pixels come from that PipeWire stream only — never a cropped monitor.
 //!
-//! Defaults: `persist_mode=0` (do not persist), one stream, transient session.
-//! Restore tokens are ignored and never written to disk.
+//! Official persist: `persist_mode=2` with `org.agentlink.Node` after
+//! `Registry.Register`. Restore tokens are stored mode 0600, bound to the
+//! authorized window identity, and never widen an agentlink grant. Tokens
+//! without a disclosed window identity are discarded so persist cannot become
+//! silent any-window access. `AGENTLINK_PORTAL_PERSIST=0` forces one-shot.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -21,7 +24,7 @@ pub const SOURCE_MONITOR: u32 = 1;
 pub const SOURCE_WINDOW: u32 = 2;
 pub const SOURCE_VIRTUAL: u32 = 4;
 
-/// `SelectSources` persist_mode: do not persist (default / required for us).
+/// `SelectSources` persist_mode: do not persist (one-shot).
 pub const PERSIST_NONE: u32 = 0;
 
 /// How long to wait for the interactive ScreenCast picker (`Start`).
@@ -46,6 +49,8 @@ pub struct PortalStreamSource {
     pub app_id: Option<String>,
     pub mapping_id: Option<String>,
     pub size: Option<(i32, i32)>,
+    /// Top-left of the window inside the PipeWire buffer, when disclosed.
+    pub position: Option<(i32, i32)>,
 }
 
 impl PortalStreamSource {
@@ -65,7 +70,123 @@ pub fn stream_size_matches_monitor(size: (i32, i32), monitors: &[(i32, i32)]) ->
     monitors.iter().any(|&mon| mon == size)
 }
 
+/// Where a tight window crop came from. Never inferred from black pixels
+/// (a black window is a valid source).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCropOrigin {
+    PortalPositionSize,
+    PipewireVideoCrop,
+}
+
+/// How to present a captured portal WINDOW buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowFrameGeometry {
+    /// Crop to this rectangle in the captured frame.
+    Tight {
+        rect: crate::capture::Rect,
+        origin: WindowCropOrigin,
+    },
+    /// Metadata is missing or incomplete. Do not invent a crop width.
+    Letterboxed { reason: &'static str },
+}
+
+fn rect_fits(rect: crate::capture::Rect, frame_w: u32, frame_h: u32) -> bool {
+    if rect.x < 0 || rect.y < 0 || rect.width == 0 || rect.height == 0 {
+        return false;
+    }
+    let x = rect.x as u32;
+    let y = rect.y as u32;
+    x.saturating_add(rect.width) <= frame_w && y.saturating_add(rect.height) <= frame_h
+}
+
+fn portal_size_rect(
+    source: &PortalStreamSource,
+    frame_w: u32,
+    frame_h: u32,
+) -> Option<crate::capture::Rect> {
+    let (w, h) = source.size?;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let (x, y) = source.position.unwrap_or((0, 0));
+    let rect = crate::capture::Rect {
+        x,
+        y,
+        width: w as u32,
+        height: h as u32,
+    };
+    // A size equal to the whole buffer is not a window crop.
+    if rect.x == 0 && rect.y == 0 && rect.width == frame_w && rect.height == frame_h {
+        return None;
+    }
+    rect_fits(rect, frame_w, frame_h).then_some(rect)
+}
+
+/// Decide a crop from PipeWire VideoCrop and/or portal `position`+`size`.
+///
+/// If both disagree, prefer a VideoCrop that fits and log the mismatch.
+/// If neither is a usable tight crop, return [`WindowFrameGeometry::Letterboxed`]
+/// rather than guessing from black borders.
+pub fn resolve_window_frame_geometry(
+    frame_w: u32,
+    frame_h: u32,
+    source: &PortalStreamSource,
+    pw_crop: Option<crate::capture::Rect>,
+) -> WindowFrameGeometry {
+    let pw = pw_crop.filter(|rect| {
+        rect_fits(*rect, frame_w, frame_h)
+            && !(rect.x == 0 && rect.y == 0 && rect.width == frame_w && rect.height == frame_h)
+    });
+    let portal = portal_size_rect(source, frame_w, frame_h);
+    match (pw, portal) {
+        (Some(pw), Some(portal)) if pw == portal => WindowFrameGeometry::Tight {
+            rect: pw,
+            origin: WindowCropOrigin::PipewireVideoCrop,
+        },
+        (Some(pw), Some(portal)) => {
+            tracing::info!(
+                pw_x = pw.x,
+                pw_y = pw.y,
+                pw_w = pw.width,
+                pw_h = pw.height,
+                portal_x = portal.x,
+                portal_y = portal.y,
+                portal_w = portal.width,
+                portal_h = portal.height,
+                "PipeWire VideoCrop and portal position/size disagree; using VideoCrop"
+            );
+            WindowFrameGeometry::Tight {
+                rect: pw,
+                origin: WindowCropOrigin::PipewireVideoCrop,
+            }
+        }
+        (Some(pw), None) => WindowFrameGeometry::Tight {
+            rect: pw,
+            origin: WindowCropOrigin::PipewireVideoCrop,
+        },
+        (None, Some(portal)) => {
+            if source.position.is_none() && portal.x == 0 && portal.y == 0 {
+                // Size was disclosed but not the origin. Cropping at (0,0) would
+                // invent placement; keep the buffer and mark it letterboxed.
+                WindowFrameGeometry::Letterboxed {
+                    reason:
+                        "portal disclosed window size but not position; not inventing a crop origin",
+                }
+            } else {
+                WindowFrameGeometry::Tight {
+                    rect: portal,
+                    origin: WindowCropOrigin::PortalPositionSize,
+                }
+            }
+        }
+        (None, None) => WindowFrameGeometry::Letterboxed {
+            reason: "portal/PipeWire omitted window crop metadata",
+        },
+    }
+}
+
 /// Reject monitor/virtual streams when the CLI asked for a window. Never treat
+
 /// a full-desktop stream as a window capture.
 ///
 /// GNOME 50's `Start` result often omits `source_type` (and sometimes title)
@@ -326,6 +447,7 @@ pub fn parse_portal_streams(
                     app_id: None,
                     mapping_id: None,
                     size: None,
+                    position: None,
                 });
                 continue;
             }
@@ -338,6 +460,7 @@ pub fn parse_portal_streams(
             app_id: None,
             mapping_id: None,
             size: None,
+            position: None,
         };
         for (key, val) in props.iter() {
             let key = match key {
@@ -377,6 +500,13 @@ pub fn parse_portal_streams(
                         source.size = Some(size);
                     } else {
                         tracing::info!(?val, "portal stream size had an unexpected type");
+                    }
+                }
+                "position" => {
+                    if let Some(position) = value_as_i32_pair(val) {
+                        source.position = Some(position);
+                    } else {
+                        tracing::info!(?val, "portal stream position had an unexpected type");
                     }
                 }
                 other => {
@@ -479,11 +609,8 @@ fn session_path(conn: &Connection, token: &str) -> Result<String> {
 
 #[cfg_attr(not(pipewire_headers), allow(dead_code))]
 fn owned_object_path(path: &str) -> Result<OwnedObjectPath> {
-    OwnedObjectPath::try_from(path).map_err(|err| {
-        msg(format!(
-            "portal object path '{path}' is invalid ({err})"
-        ))
-    })
+    OwnedObjectPath::try_from(path)
+        .map_err(|err| msg(format!("portal object path '{path}' is invalid ({err})")))
 }
 
 #[cfg_attr(not(pipewire_headers), allow(dead_code))]
@@ -548,13 +675,88 @@ async fn screencast_proxy(conn: &Connection) -> Result<Proxy<'_>> {
     })
 }
 
-/// CreateSession → SelectSources(WINDOW, persist_mode=0) → Start → first stream.
+/// Best-effort official host-app registration. Missing Registry support is
+/// not fatal: the portal still sees this unique D-Bus name for the session.
+async fn register_portal_app(conn: &Connection) {
+    if let Err(err) = crate::platform::portal_persist::ensure_user_desktop_file() {
+        tracing::info!(error = %err, "could not install per-user org.agentlink.Node.desktop");
+    }
+    let proxy = match Proxy::new(
+        conn,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Registry",
+    )
+    .await
+    {
+        Ok(proxy) => proxy,
+        Err(err) => {
+            tracing::info!(error = %err, "portal Registry proxy unavailable");
+            return;
+        }
+    };
+    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    match proxy
+        .call::<_, _, ()>(
+            "Register",
+            &(crate::platform::portal_persist::PORTAL_APP_ID, options),
+        )
+        .await
+    {
+        Ok(()) => tracing::info!(
+            app_id = crate::platform::portal_persist::PORTAL_APP_ID,
+            "registered official portal app id"
+        ),
+        Err(err) => tracing::info!(
+            error = %err,
+            app_id = crate::platform::portal_persist::PORTAL_APP_ID,
+            "portal Registry.Register not supported or rejected; continuing without a host app_id"
+        ),
+    }
+}
+
+/// CreateSession → SelectSources(WINDOW) → Start → first stream.
 /// Always closes the session on error paths before returning.
 #[cfg_attr(not(pipewire_headers), allow(dead_code))]
 pub async fn authorize_window_stream(
     conn: &Connection,
     query: &str,
 ) -> Result<(PortalSessionCleanup, PortalStreamSource)> {
+    match authorize_window_stream_inner(conn, query, true).await {
+        Err(err) if err.to_string().contains("AGENTLINK_RESTORE_RETRY") => {
+            authorize_window_stream_inner(conn, query, false).await
+        }
+        other => other,
+    }
+}
+
+async fn authorize_window_stream_inner(
+    conn: &Connection,
+    query: &str,
+    allow_restore: bool,
+) -> Result<(PortalSessionCleanup, PortalStreamSource)> {
+    let _ = register_portal_app(conn).await;
+    let persist = crate::platform::portal_persist::persist_enabled();
+    let persist_dir = crate::platform::portal_persist::default_persist_data_dir();
+    let restore_token = if persist && allow_restore {
+        persist_dir.as_ref().and_then(|dir| {
+            crate::platform::portal_persist::load_restore(dir)
+                .ok()
+                .flatten()
+                .and_then(|rec| {
+                    crate::platform::portal_persist::reusable_token(&rec, query).map(str::to_string)
+                })
+        })
+    } else {
+        None
+    };
+    if restore_token.is_some() {
+        tracing::info!(
+            query = %query.trim(),
+            "offering bound ScreenCast restore_token for this window query (OS consent only; not an agentlink grant)"
+        );
+    }
+
     let portal = screencast_proxy(conn).await?;
 
     // Prefer advertising WINDOW only so the picker cannot authorize a monitor
@@ -613,8 +815,15 @@ pub async fn authorize_window_stream(
         options.insert("handle_token", Value::from(select_token.as_str()));
         options.insert("types", Value::from(SOURCE_WINDOW));
         options.insert("multiple", Value::from(false));
-        // persist_mode=0: one-shot / transient. Never request durable restore tokens.
-        options.insert("persist_mode", Value::from(PERSIST_NONE));
+        let persist_mode = if persist {
+            crate::platform::portal_persist::PERSIST_UNTIL_REVOKED
+        } else {
+            PERSIST_NONE
+        };
+        options.insert("persist_mode", Value::from(persist_mode));
+        if let Some(token) = restore_token.as_deref() {
+            options.insert("restore_token", Value::from(token));
+        }
         // Omit cursor_mode (portal default = Hidden) so we do not close the
         // session on older backends that advertise a smaller cursor bitmask.
         // Session handle must be object-path `o`, not string `s`.
@@ -662,22 +871,34 @@ pub async fn authorize_window_stream(
         Ok(pair) => pair,
         Err(err) => {
             cleanup.close(conn).await;
+            if restore_token.is_some() && allow_restore {
+                if let Some(dir) = persist_dir.as_ref() {
+                    let _ = crate::platform::portal_persist::clear_restore(dir);
+                }
+                tracing::info!(
+                    "restore_token Start failed; dropped stored token and reopening the official picker"
+                );
+                return Err(msg("AGENTLINK_RESTORE_RETRY"));
+            }
             return Err(err);
         }
     };
     if response != 0 {
         cleanup.close(conn).await;
+        if restore_token.is_some() && allow_restore {
+            if let Some(dir) = persist_dir.as_ref() {
+                let _ = crate::platform::portal_persist::clear_restore(dir);
+            }
+            tracing::info!(
+                response,
+                "restore_token rejected; dropped stored token and reopening the official picker"
+            );
+            return Err(msg("AGENTLINK_RESTORE_RETRY"));
+        }
         return Err(portal_response_error(
             response,
             "ScreenCast.Start (window picker)",
         ));
-    }
-
-    // Never persist: ignore any restore_token the implementation might still send.
-    if results.contains_key("restore_token") {
-        tracing::info!(
-            "portal returned a restore_token; ignoring it (persist_mode=0, one-shot window capture)"
-        );
     }
 
     let streams = match parse_portal_streams(&results) {
@@ -695,9 +916,68 @@ pub async fn authorize_window_stream(
         )));
     }
     let source = streams.into_iter().next().unwrap();
+    tracing::info!(
+        node_id = source.node_id,
+        source_type = ?source.source_type,
+        size = ?source.size,
+        position = ?source.position,
+        title = ?source.title,
+        app_id = ?source.app_id,
+        "portal ScreenCast Start stream identity"
+    );
     if let Err(err) = match_portal_window_query(query, &source) {
         cleanup.close(conn).await;
         return Err(err);
+    }
+    if let (Some(dir), Some(rec)) = (
+        persist_dir.as_ref(),
+        persist_dir.as_ref().and_then(|dir| {
+            crate::platform::portal_persist::load_restore(dir)
+                .ok()
+                .flatten()
+        }),
+    ) {
+        if restore_token.is_some()
+            && !crate::platform::portal_persist::restored_source_matches(
+                &rec,
+                source.title.as_deref(),
+                source.app_id.as_deref(),
+                source.id.as_deref(),
+            )
+        {
+            let _ = crate::platform::portal_persist::clear_restore(dir);
+            cleanup.close(conn).await;
+            tracing::info!(
+                "restored ScreenCast source no longer matches the bound window; falling back to the official picker"
+            );
+            return Err(msg("AGENTLINK_RESTORE_RETRY"));
+        }
+    }
+    if persist {
+        if let Some(dir) = persist_dir.as_ref() {
+            if let Some(token) = results
+                .get("restore_token")
+                .and_then(|value| value_as_string(value as &Value))
+            {
+                match crate::platform::portal_persist::store_restore(
+                        dir,
+                        &token,
+                        query,
+                        source.title.as_deref(),
+                        source.app_id.as_deref(),
+                        source.id.as_deref(),
+                        agentlink_core::util::unix_now(),
+                    ) {
+                        Ok(Some(_)) => tracing::info!(
+                            "stored ScreenCast restore_token bound to this window (0600); OS consent only"
+                        ),
+                        Ok(None) => tracing::info!(
+                            "portal issued a restore_token but source identity was not disclosed; not persisting (would be any-window)"
+                        ),
+                        Err(err) => tracing::warn!(error = %err, "failed to store portal restore_token"),
+                    }
+            }
+        }
     }
     if query.trim().is_empty() {
         tracing::info!("{}", empty_query_note());
@@ -728,6 +1008,7 @@ pub async fn capture_window(
     query: &str,
     wait_ms: i32,
     max_width: u32,
+    monitors: &[(i32, i32)],
 ) -> Result<crate::capture::Frame> {
     let (mut cleanup, source) = authorize_window_stream(conn, query).await?;
     let fd = match open_pipewire_remote_fd(conn, &cleanup.path).await {
@@ -739,11 +1020,37 @@ pub async fn capture_window(
     };
     let result = consume_one_frame(fd, source.node_id, wait_ms, max_width);
     cleanup.close(conn).await;
-    let mut frame = result?;
-    if let Err(err) = ensure_captured_frame_is_window(&source, frame.width, frame.height, &[]) {
+    let (mut frame, pw_crop) = result?;
+    let geometry = resolve_window_frame_geometry(frame.width, frame.height, &source, pw_crop);
+    match geometry {
+        WindowFrameGeometry::Tight { rect, origin } => {
+            frame = crate::capture::crop_frame(&frame, rect)?;
+            tracing::info!(
+                ?origin,
+                width = frame.width,
+                height = frame.height,
+                x = rect.x,
+                y = rect.y,
+                "cropped portal WINDOW buffer to metadata geometry"
+            );
+            frame.backend = "wayland-portal-window".into();
+        }
+        WindowFrameGeometry::Letterboxed { reason } => {
+            tracing::warn!(
+                %reason,
+                width = frame.width,
+                height = frame.height,
+                portal_size = ?source.size,
+                portal_position = ?source.position,
+                "no reliable window crop metadata; returning the letterboxed buffer without inventing a width"
+            );
+            frame.backend = "wayland-portal-window-letterboxed".into();
+        }
+    }
+    if let Err(err) = ensure_captured_frame_is_window(&source, frame.width, frame.height, monitors)
+    {
         return Err(err);
     }
-    frame.backend = "wayland-portal-window".into();
     Ok(frame)
 }
 
@@ -753,19 +1060,59 @@ fn consume_one_frame(
     node_id: u32,
     wait_ms: i32,
     max_width: u32,
-) -> Result<crate::capture::Frame> {
+) -> Result<(crate::capture::Frame, Option<crate::capture::Rect>)> {
     let mut capture = crate::stream::pipewire::PwCapture::open(fd, node_id)?;
     let target = crate::stream::pipewire::resolve_target_width(max_width);
     capture.set_target_width(target);
     let mut last_err = msg("portal window ScreenCast has not delivered a frame yet");
     for _ in 0..8 {
         match capture.take(wait_ms.max(500)) {
-            Ok(Some((frame, _))) => return Ok(frame),
+            Ok(Some((frame, _))) => {
+                let crop = capture.videocrop().and_then(|rect| {
+                    // Map source-pixel crop onto a downsampled frame.
+                    let (src_w, src_h, out_w, out_h) = capture.geometry();
+                    scale_crop_rect(rect, src_w, src_h, out_w, out_h, frame.width, frame.height)
+                });
+                return Ok((frame, crop));
+            }
             Ok(None) => {}
             Err(err) => last_err = err,
         }
     }
     Err(last_err)
+}
+
+fn scale_crop_rect(
+    rect: crate::capture::Rect,
+    src_w: u32,
+    src_h: u32,
+    out_w: u32,
+    out_h: u32,
+    frame_w: u32,
+    frame_h: u32,
+) -> Option<crate::capture::Rect> {
+    let (out_w, out_h) = if out_w == 0 || out_h == 0 {
+        (frame_w, frame_h)
+    } else {
+        (out_w, out_h)
+    };
+    if src_w == 0 || src_h == 0 {
+        return rect_fits(rect, frame_w, frame_h).then_some(rect);
+    }
+    if src_w == out_w && src_h == out_h {
+        return rect_fits(rect, frame_w, frame_h).then_some(rect);
+    }
+    let x = (rect.x as i64 * out_w as i64 / src_w as i64) as i32;
+    let y = (rect.y as i64 * out_h as i64 / src_h as i64) as i32;
+    let width = (rect.width as u64 * out_w as u64 / src_w as u64).max(1) as u32;
+    let height = (rect.height as u64 * out_h as u64 / src_h as u64).max(1) as u32;
+    let scaled = crate::capture::Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    rect_fits(scaled, frame_w, frame_h).then_some(scaled)
 }
 
 #[cfg(not(pipewire_headers))]
@@ -774,8 +1121,9 @@ pub async fn capture_window(
     query: &str,
     _wait_ms: i32,
     _max_width: u32,
+    monitors: &[(i32, i32)],
 ) -> Result<crate::capture::Frame> {
-    let _ = (conn, query);
+    let _ = (conn, query, monitors);
     Err(msg(
         "window capture via portal ScreenCast needs a build with libpipewire-0.3 headers; \
          this binary fell back to the Screenshot portal which cannot isolate one window",
@@ -786,7 +1134,11 @@ pub async fn capture_window(
 mod tests {
     use super::*;
 
-    fn window_source(title: Option<&str>, app_id: Option<&str>, id: Option<&str>) -> PortalStreamSource {
+    fn window_source(
+        title: Option<&str>,
+        app_id: Option<&str>,
+        id: Option<&str>,
+    ) -> PortalStreamSource {
         PortalStreamSource {
             node_id: 42,
             source_type: Some(SOURCE_WINDOW),
@@ -795,6 +1147,7 @@ mod tests {
             app_id: app_id.map(str::to_string),
             mapping_id: None,
             size: Some((800, 600)),
+            position: None,
         }
     }
 
@@ -808,6 +1161,7 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: Some((2736, 1824)),
+            position: None,
         };
         let err = ensure_window_source(&source).unwrap_err().to_string();
         assert!(err.contains("MONITOR"), "{err}");
@@ -828,6 +1182,7 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: Some((900, 700)),
+            position: None,
         };
         ensure_window_source(&source).unwrap();
         ensure_window_source_against_monitors(&source, &[(2736, 1824)]).unwrap();
@@ -844,6 +1199,7 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: None,
+            position: None,
         };
         ensure_window_source(&source).unwrap();
         ensure_captured_frame_is_window(&source, 900, 700, &[(2736, 1824)]).unwrap();
@@ -864,6 +1220,7 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: Some((2736, 1824)),
+            position: None,
         };
         let err = ensure_window_source_against_monitors(&source, &[(2736, 1824)])
             .unwrap_err()
@@ -919,6 +1276,7 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: Some((2736, 1824)),
+            position: None,
         };
         assert!(ensure_window_source(&monitor).is_err());
         assert!(match_portal_window_query("", &monitor).is_err());
@@ -964,6 +1322,7 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: None,
+            position: None,
         }
         .is_window());
         assert!(PortalStreamSource {
@@ -974,6 +1333,7 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: Some((800, 600)),
+            position: None,
         }
         .is_window());
         assert!(!PortalStreamSource {
@@ -984,7 +1344,122 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: Some((2736, 1824)),
+            position: None,
         }
         .is_window());
+    }
+
+    #[test]
+    fn tight_crop_uses_portal_position_and_size() {
+        let source = PortalStreamSource {
+            node_id: 1,
+            source_type: None,
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: Some((1400, 1040)),
+            position: Some((50, 50)),
+        };
+        match resolve_window_frame_geometry(2736, 1824, &source, None) {
+            WindowFrameGeometry::Tight { rect, origin } => {
+                assert_eq!(origin, WindowCropOrigin::PortalPositionSize);
+                assert_eq!(
+                    rect,
+                    crate::capture::Rect {
+                        x: 50,
+                        y: 50,
+                        width: 1400,
+                        height: 1040
+                    }
+                );
+            }
+            other => panic!("expected tight crop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_without_position_is_letterboxed_not_invented() {
+        let source = PortalStreamSource {
+            node_id: 1,
+            source_type: Some(SOURCE_WINDOW),
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: Some((1400, 1040)),
+            position: None,
+        };
+        match resolve_window_frame_geometry(2736, 1824, &source, None) {
+            WindowFrameGeometry::Letterboxed { reason } => {
+                assert!(reason.contains("position"), "{reason}");
+            }
+            other => panic!("expected letterboxed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_metadata_is_letterboxed() {
+        let source = PortalStreamSource {
+            node_id: 1,
+            source_type: None,
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: None,
+            position: None,
+        };
+        match resolve_window_frame_geometry(2736, 1824, &source, None) {
+            WindowFrameGeometry::Letterboxed { reason } => {
+                assert!(reason.contains("omitted"), "{reason}");
+            }
+            other => panic!("expected letterboxed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn videocrop_wins_over_disagreeing_portal_size() {
+        let source = PortalStreamSource {
+            node_id: 1,
+            source_type: Some(SOURCE_WINDOW),
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: Some((800, 600)),
+            position: Some((0, 0)),
+        };
+        let pw = crate::capture::Rect {
+            x: 50,
+            y: 50,
+            width: 1400,
+            height: 1040,
+        };
+        match resolve_window_frame_geometry(2736, 1824, &source, Some(pw)) {
+            WindowFrameGeometry::Tight { rect, origin } => {
+                assert_eq!(origin, WindowCropOrigin::PipewireVideoCrop);
+                assert_eq!(rect, pw);
+            }
+            other => panic!("expected videocrop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_buffer_size_is_not_a_window_crop() {
+        let source = PortalStreamSource {
+            node_id: 1,
+            source_type: Some(SOURCE_WINDOW),
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: Some((2736, 1824)),
+            position: Some((0, 0)),
+        };
+        match resolve_window_frame_geometry(2736, 1824, &source, None) {
+            WindowFrameGeometry::Letterboxed { .. } => {}
+            other => panic!("expected letterboxed, got {other:?}"),
+        }
     }
 }

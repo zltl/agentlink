@@ -272,6 +272,42 @@ impl NodePolicy {
         }
     }
 
+    /// Human-readable list of what this policy actually allows.
+    ///
+    /// The short [`Self::preset_name`] (`desktop`, `exec`, …) is not enough:
+    /// `desktop` also includes file read, write, and exec, and it does not
+    /// include a live desktop stream.
+    pub fn capability_summary(self) -> String {
+        let mut parts = Vec::new();
+        match (self.allow_read, self.allow_write) {
+            (true, true) => parts.push("file read and write"),
+            (true, false) => parts.push("file read (no write)"),
+            (false, true) => parts.push("file write (no read)"),
+            (false, false) => parts.push("no file access"),
+        }
+        if self.allow_exec {
+            parts.push("exec/shell");
+        } else {
+            parts.push("no exec/shell");
+        }
+        if self.allow_desktop {
+            parts.push("screenshots, input, and accessibility");
+        } else {
+            parts.push("no screenshots/input");
+        }
+        if self.allow_desktop_stream || self.allow_remote_view {
+            parts.push("live desktop stream/view");
+        } else {
+            parts.push("no live desktop stream");
+        }
+        if self.allow_remote_control {
+            parts.push("remote desktop control");
+        } else {
+            parts.push("no remote desktop control");
+        }
+        format!("{} ({})", self.preset_name(), parts.join("; "))
+    }
+
     pub fn preset_name(self) -> &'static str {
         if self == Self::full() {
             return "full";
@@ -474,6 +510,14 @@ mod tests {
         assert!(desktop.allow_desktop);
         assert!(!desktop.allow_desktop_stream);
         assert_eq!(desktop.preset_name(), "desktop");
+        let summary = desktop.capability_summary();
+        assert!(summary.contains("exec/shell"), "{summary}");
+        assert!(summary.contains("file read and write"), "{summary}");
+        assert!(summary.contains("no live desktop stream"), "{summary}");
+        assert!(summary.starts_with("desktop ("), "{summary}");
+        let view = NodePolicy::remote_view().capability_summary();
+        assert!(view.contains("no exec/shell"), "{view}");
+        assert!(view.contains("live desktop stream"), "{view}");
         assert_eq!(NodePolicy::exec().preset_name(), "exec");
         let mut partial = NodePolicy::read_only();
         partial.allow_desktop = true;

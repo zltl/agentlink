@@ -9,6 +9,7 @@
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/param/video/raw.h>
+#include <spa/buffer/meta.h>
 #include <spa/pod/builder.h>
 #include <spa/debug/types.h>
 
@@ -35,6 +36,11 @@ typedef struct PwCapture {
     int dma_buf;
     int seq;
     int last_taken;
+    int crop_valid;
+    int crop_x;
+    int crop_y;
+    int crop_w;
+    int crop_h;
     uint8_t *bgra;
     int bgra_size;
     int failed;
@@ -154,6 +160,29 @@ static void on_process(void *userdata) {
     cap->src_width = cap->width;
     cap->src_height = cap->height;
     cap->dma_buf = data->type == SPA_DATA_DmaBuf;
+    cap->crop_valid = 0;
+    cap->crop_x = cap->crop_y = cap->crop_w = cap->crop_h = 0;
+#ifdef SPA_META_VideoCrop
+    {
+        struct spa_meta *meta = spa_buffer_find_meta(spa_buf, SPA_META_VideoCrop);
+        if (meta && meta->data && meta->size >= sizeof(struct spa_region)) {
+            struct spa_region *region = meta->data;
+            int cx = region->position.x;
+            int cy = region->position.y;
+            int cw = (int)region->size.width;
+            int ch = (int)region->size.height;
+            if (cw > 0 && ch > 0 && cx >= 0 && cy >= 0
+                && cx + cw <= cap->width && cy + ch <= cap->height
+                && (cw < cap->width || ch < cap->height)) {
+                cap->crop_valid = 1;
+                cap->crop_x = cx;
+                cap->crop_y = cy;
+                cap->crop_w = cw;
+                cap->crop_h = ch;
+            }
+        }
+    }
+#endif
     cap->seq++;
     pthread_mutex_unlock(&cap->mu);
     pw_stream_queue_buffer(cap->stream, buffer);
@@ -449,7 +478,23 @@ void al_pw_geometry(
     pthread_mutex_unlock(&cap->mu);
 }
 
+int al_pw_videocrop(PwCapture *cap, int *x, int *y, int *w, int *h) {
+    int ok = 0;
+    if (!cap) return 0;
+    pthread_mutex_lock(&cap->mu);
+    if (cap->crop_valid && cap->crop_w > 0 && cap->crop_h > 0) {
+        if (x) *x = cap->crop_x;
+        if (y) *y = cap->crop_y;
+        if (w) *w = cap->crop_w;
+        if (h) *h = cap->crop_h;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&cap->mu);
+    return ok;
+}
+
 void al_pw_close(PwCapture *cap) {
+
     if (!cap) {
         return;
     }

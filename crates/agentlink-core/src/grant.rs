@@ -726,8 +726,8 @@ fn connected_capability(invoke_grant: Option<NodePolicy>) -> NodePolicy {
 /// `owner-keys.json`. `relay_admin` and `relay_grant` are cleartext stamps
 /// the relay can set; they are ignored. A missing issuer list, a missing
 /// grant, a bad signature, the wrong node or grantee, a time window miss, or
-/// a revoked jti is a denial. A grant the node accepts is full use, then
-/// clipped by this node's own ceiling. A per-call cap can only narrow that.
+/// a revoked jti is a denial. A grant the node accepts is clipped by the
+/// grant's own policy, this node's ceiling, and an optional per-call cap.
 pub fn resolve_e2e_policy(
     trusted_issuers: &BTreeSet<String>,
     revoked_jtis: &BTreeSet<String>,
@@ -761,9 +761,13 @@ pub fn resolve_e2e_policy(
         expected_grantee_id,
         now_unix,
     )?;
-    // The node's own ceiling (phone consent, phase cap) still applies.
-    // A relay stamp cannot raise it.
-    Ok(connected_capability(invoke_grant).intersect(ceiling))
+    // The signed grant's policy is the ceiling the issuer approved. A per-call
+    // cap and the node's own ceiling can only narrow it. A relay stamp cannot
+    // raise it.
+    Ok(grant
+        .policy
+        .intersect(connected_capability(invoke_grant))
+        .intersect(ceiling))
 }
 
 /// One grant file on disk.
@@ -1821,6 +1825,74 @@ mod tests {
             .unwrap(),
             NodePolicy::read_only()
         );
+    }
+
+    #[test]
+    fn resolve_e2e_policy_honours_signed_grant_scope() {
+        let (owner, grantee, _) = ids();
+        let node = Identity::generate();
+        let now = util::unix_now();
+        let trusted = BTreeSet::from([owner.public_hex().to_ascii_lowercase()]);
+        let sign = |policy: NodePolicy| {
+            SignedGrant::sign(
+                &owner,
+                grantee.public_hex(),
+                node.public_hex(),
+                policy,
+                now - 1,
+                now + 600,
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap()
+        };
+        let desktop = resolve_e2e_policy(
+            &trusted,
+            &BTreeSet::new(),
+            Some(&sign(NodePolicy::desktop())),
+            node.public_hex(),
+            grantee.public_hex(),
+            now,
+            NodePolicy::full(),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(desktop, NodePolicy::desktop());
+        assert!(desktop.allow_exec && desktop.allow_desktop);
+        assert!(!desktop.allow_desktop_stream);
+
+        let exec = resolve_e2e_policy(
+            &trusted,
+            &BTreeSet::new(),
+            Some(&sign(NodePolicy::exec())),
+            node.public_hex(),
+            grantee.public_hex(),
+            now,
+            NodePolicy::full(),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(exec, NodePolicy::exec());
+        assert!(exec.allow_exec);
+        assert!(!exec.allow_desktop);
+
+        let narrowed = resolve_e2e_policy(
+            &trusted,
+            &BTreeSet::new(),
+            Some(&sign(NodePolicy::full())),
+            node.public_hex(),
+            grantee.public_hex(),
+            now,
+            NodePolicy::full(),
+            false,
+            None,
+            Some(NodePolicy::remote_view()),
+        )
+        .unwrap();
+        assert_eq!(narrowed, NodePolicy::remote_view());
     }
 
     #[test]

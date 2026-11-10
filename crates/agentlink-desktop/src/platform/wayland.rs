@@ -104,7 +104,7 @@ impl WaylandDesk {
             CaptureTarget::Window(query) => {
                 // One-shot WINDOW ScreenCast (picker + PipeWire). Not the
                 // Screenshot portal, which is full-session only.
-                super::portal_window::capture_window(&self.conn, query, 1000, 0).await
+                super::portal_window::capture_window(&self.conn, query, 1000, 0, &[]).await
             }
         }
     }

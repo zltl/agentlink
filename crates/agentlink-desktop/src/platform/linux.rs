@@ -78,6 +78,15 @@ impl LinuxState {
         #[cfg_attr(not(pipewire_headers), allow(unused_variables))] wait_ms: i32,
     ) -> Result<Frame> {
         self.ensure()?;
+        let monitor_sizes: Vec<(i32, i32)> = self
+            .monitors()
+            .ok()
+            .map(|list| {
+                list.into_iter()
+                    .map(|m| (m.width as i32, m.height as i32))
+                    .collect()
+            })
+            .unwrap_or_default();
         let frame = match self.display.as_mut().unwrap() {
             DisplayConn::X11(desk) => capture_x11(desk, &request.target)?,
             DisplayConn::Wayland(desk) => {
@@ -87,6 +96,7 @@ impl LinuxState {
                         query,
                         wait_ms,
                         request.max_width,
+                        &monitor_sizes,
                     ))?
                 } else {
                     self.rt.block_on(desk.capture(&request.target))?
@@ -116,6 +126,7 @@ impl LinuxState {
                                     query,
                                     wait_ms,
                                     request.max_width,
+                                    &monitor_sizes,
                                 )) {
                                     Ok(frame) => {
                                         tracing::info!(

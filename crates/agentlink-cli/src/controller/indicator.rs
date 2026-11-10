@@ -1,4 +1,8 @@
 //! Linux status icon. The window still opens when a desktop has no tray.
+//!
+//! When this process is on a node host, the menu also lists pending grant
+//! requests with Allow / Deny. Those actions sign or refuse locally; they are
+//! not `approve allow/deny` and they do not send the issuer key anywhere.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,12 +41,27 @@ fn run(open: Arc<AtomicBool>, quit: Arc<AtomicBool>) -> Result<(), String> {
         .build()
         .map_err(|err| err.to_string())?;
     runtime.block_on(async move {
-        let handle = AgentTray { open, quit }
-            .spawn()
-            .await
-            .map_err(|err| err.to_string())?;
+        let handle = AgentTray {
+            open,
+            quit,
+            pending: load_pending(),
+            on_node: agentlink_core::grant_request::default_node_data_dir().is_some(),
+        }
+        .spawn()
+        .await
+        .map_err(|err| err.to_string())?;
         while !quit_flag.load(Ordering::Relaxed) && !handle.is_closed() {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let pending = load_pending();
+            let on_node = agentlink_core::grant_request::default_node_data_dir().is_some();
+            let _ = handle
+                .update(|tray| {
+                    if tray.pending != pending || tray.on_node != on_node {
+                        tray.pending = pending;
+                        tray.on_node = on_node;
+                    }
+                })
+                .await;
         }
         handle.shutdown().await;
         Ok(())
@@ -50,9 +69,85 @@ fn run(open: Arc<AtomicBool>, quit: Arc<AtomicBool>) -> Result<(), String> {
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[derive(Clone, PartialEq, Eq)]
+struct PendingItem {
+    request_id: String,
+    label: String,
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn load_pending() -> Vec<PendingItem> {
+    let Some(dir) = agentlink_core::grant_request::default_node_data_dir() else {
+        return Vec::new();
+    };
+    let now = agentlink_core::util::unix_now();
+    let _ = agentlink_core::grant_request::expire_pending(&dir, now);
+    let Ok(reqs) = agentlink_core::grant_request::list_requests(&dir) else {
+        return Vec::new();
+    };
+    reqs.into_iter()
+        .filter(|r| r.is_pending(now))
+        .map(|r| {
+            let short = if r.grantee_id.len() >= 16 {
+                format!("{}…", &r.grantee_id[..16])
+            } else {
+                r.grantee_id.clone()
+            };
+            PendingItem {
+                request_id: r.request_id,
+                label: format!(
+                    "{short} — {} — ttl {}s",
+                    r.policy.capability_summary(),
+                    r.ttl_secs
+                ),
+            }
+        })
+        .collect()
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn local_allow(request_id: &str) {
+    let Some(dir) = agentlink_core::grant_request::default_node_data_dir() else {
+        tracing::warn!("grant allow from tray: this machine has no local node identity");
+        return;
+    };
+    let now = agentlink_core::util::unix_now();
+    match agentlink_core::grant_request::allow_request_in_dir(&dir, request_id, now) {
+        Ok((_req, grant)) => {
+            if let Err(err) = agentlink_core::grant_request::save_issued_grant(&dir, &grant) {
+                tracing::warn!(error = %err, "failed to store issued grant on the node");
+            }
+            if let Ok(client_dir) = agentlink_core::config::default_data_dir("client") {
+                let _ = agentlink_core::grant::save_grant(&client_dir, &grant);
+            }
+            tracing::info!(
+                jti = %grant.jti,
+                request_id,
+                "signed grant locally from the node tray; issuer key stayed on this machine"
+            );
+        }
+        Err(err) => tracing::warn!(error = %err, request_id, "tray grant allow failed"),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn local_deny(request_id: &str) {
+    let Some(dir) = agentlink_core::grant_request::default_node_data_dir() else {
+        return;
+    };
+    let now = agentlink_core::util::unix_now();
+    match agentlink_core::grant_request::deny_request(&dir, request_id, now) {
+        Ok(_) => tracing::info!(request_id, "denied grant request from the node tray"),
+        Err(err) => tracing::warn!(error = %err, request_id, "tray grant deny failed"),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 struct AgentTray {
     open: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
+    pending: Vec<PendingItem>,
+    on_node: bool,
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
@@ -62,7 +157,15 @@ impl ksni::Tray for AgentTray {
     }
 
     fn title(&self) -> String {
-        "agentlink".into()
+        if self.pending.is_empty() {
+            "agentlink".into()
+        } else {
+            format!(
+                "agentlink ({} grant request{})",
+                self.pending.len(),
+                if self.pending.len() == 1 { "" } else { "s" }
+            )
+        }
     }
 
     fn icon_name(&self) -> String {
@@ -75,21 +178,51 @@ impl ksni::Tray for AgentTray {
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
-        vec![
-            MenuItem::Standard(StandardItem {
-                label: "Open".into(),
-                activate: Box::new(|tray: &mut Self| {
-                    tray.open.store(true, Ordering::Relaxed);
-                }),
-                ..Default::default()
+        let mut items = Vec::new();
+        if self.on_node {
+            if self.pending.is_empty() {
+                items.push(MenuItem::Standard(StandardItem {
+                    label: "No pending grant requests".into(),
+                    enabled: false,
+                    ..Default::default()
+                }));
+            } else {
+                items.push(MenuItem::Standard(StandardItem {
+                    label: "Pending grant requests (local allow / deny)".into(),
+                    enabled: false,
+                    ..Default::default()
+                }));
+                for p in &self.pending {
+                    let id = p.request_id.clone();
+                    let deny_id = p.request_id.clone();
+                    items.push(MenuItem::Standard(StandardItem {
+                        label: format!("Allow {}", p.label),
+                        activate: Box::new(move |_tray: &mut Self| local_allow(&id)),
+                        ..Default::default()
+                    }));
+                    items.push(MenuItem::Standard(StandardItem {
+                        label: format!("Deny {}", p.label),
+                        activate: Box::new(move |_tray: &mut Self| local_deny(&deny_id)),
+                        ..Default::default()
+                    }));
+                }
+            }
+            items.push(MenuItem::Separator);
+        }
+        items.push(MenuItem::Standard(StandardItem {
+            label: "Open".into(),
+            activate: Box::new(|tray: &mut Self| {
+                tray.open.store(true, Ordering::Relaxed);
             }),
-            MenuItem::Standard(StandardItem {
-                label: "Quit".into(),
-                activate: Box::new(|tray: &mut Self| {
-                    tray.quit.store(true, Ordering::Relaxed);
-                }),
-                ..Default::default()
+            ..Default::default()
+        }));
+        items.push(MenuItem::Standard(StandardItem {
+            label: "Quit".into(),
+            activate: Box::new(|tray: &mut Self| {
+                tray.quit.store(true, Ordering::Relaxed);
             }),
-        ]
+            ..Default::default()
+        }));
+        items
     }
 }

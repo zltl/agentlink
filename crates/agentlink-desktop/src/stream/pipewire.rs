@@ -133,6 +133,26 @@ impl PwCapture {
 
     /// `Ok(None)` means the screen has not produced a new buffer (seq unchanged —
     /// no stale-frame memcpy).
+    /// VideoCrop on the last captured source buffer, in source pixels.
+    /// `None` when the producer omitted crop metadata.
+    pub fn videocrop(&self) -> Option<crate::capture::Rect> {
+        let mut x = 0i32;
+        let mut y = 0i32;
+        let mut w = 0i32;
+        let mut h = 0i32;
+        let ok = unsafe { al_pw_videocrop(self.raw, &mut x, &mut y, &mut w, &mut h) };
+        if ok != 0 && w > 0 && h > 0 && x >= 0 && y >= 0 {
+            Some(crate::capture::Rect {
+                x,
+                y,
+                width: w as u32,
+                height: h as u32,
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn take(&mut self, wait_ms: i32) -> Result<Option<(Frame, bool)>> {
         let mut width = 0i32;
         let mut height = 0i32;
@@ -216,6 +236,13 @@ impl Drop for PwCapture {
 extern "C" {
     fn al_pw_open(fd: c_int, node_id: u32) -> *mut c_void;
     fn al_pw_set_target_width(cap: *mut c_void, target_width: c_int);
+    fn al_pw_videocrop(
+        cap: *mut c_void,
+        x: *mut c_int,
+        y: *mut c_int,
+        w: *mut c_int,
+        h: *mut c_int,
+    ) -> c_int;
     fn al_pw_geometry(
         cap: *mut c_void,
         src_width: *mut c_int,
