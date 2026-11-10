@@ -84,7 +84,7 @@ agentlink grant paste '…' --prompt --data-dir …
 其它约束：
 
 - `grant paste` / `allow` / `prompt` / `paste-ui` / `issue` 等签发入口遇到 `AGENTLINK_REMOTE_EXEC`（节点 exec/pty/shell 会注入）时拒绝。这只是 CLI 防误用，**不是**防自授权边界：已获得 exec/full 的控制端与目标机同 UID，可清除该变量、读取 `grant-issuer.json` 私钥或改写 grant 权威目录。未获准的控制端仍然不能 exec。已授权的独立 SSH/Cursor（不是 agentlink exec）可在目标机本地代执行 grant。详见 `docs/grant-authorization-boundary.md`。
-- `grant paste-ui`：目标机图形粘贴身份码 → 展示指纹与声明 → 在可访问的权限列表（每项写出实际能力，默认选用最小且不大于请求的权限，而不是 zenity combo 的第一项）中缩小 scope、缩短 ttl → **最终确认框再次展示真正要签发的 scope 与 ttl** 后再签发，或拒绝/取消。取消与拒绝都不签发。仅粘贴不会授权。
+- `grant paste-ui`：目标机图形粘贴身份码 → 展示指纹与声明 → 用可访问的权限按钮（每项写出实际能力；OK 为默认最小且不大于请求的权限；每个预设一枚可点按钮，避免 zenity radiolist 无法用 AT-SPI 选中）缩小 scope、缩短 ttl → **最终确认框再次展示真正要签发的 scope 与 ttl** 后再签发，或拒绝/取消。取消与拒绝都不签发。仅粘贴不会授权。
 - 身份码解析有长度上限（8KiB）。used-nonces 原子落盘，删除待批文件或重启后同一 nonce 仍拒绝。
 - 时间边界：身份码在 `exp_unix` 当时仍有效，`exp_unix+1` 过期。跨目标公钥、跨 relay 指纹拒绝。
 - 公开身份码绝不可被当成 SignedGrant / bearer 授权。

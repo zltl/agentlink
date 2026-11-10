@@ -191,7 +191,7 @@ pub fn shrink_grant_prompt(
     );
 
     if display_ok() && command_exists("zenity") {
-        let Some(policy) = zenity_policy_radiolist(&hint, &allowed, &default_policy)? else {
+        let Some(policy) = zenity_policy_buttons(&hint, &allowed, &default_policy)? else {
             return Ok(None);
         };
         let Some(ttl_raw) = zenity_ttl_entry(&default_ttl)? else {
@@ -364,65 +364,92 @@ fn shrink_hint(
          请求 ttl: {requested_ttl_secs} 秒\n\
          默认选用最小权限: {default_summary}\n\
          默认有效期: {default_ttl}\n\
-         请在列表中点选要签发的权限（与最终确认必须一致）。"
+         请点下方按钮选用要签发的权限（与最终确认必须一致）。"
     )
 }
 
-fn zenity_policy_radiolist(
+/// Button label for a shrink-policy choice. The default (minimum) is marked
+/// so the first visible action never silently enlarges the request.
+pub fn policy_button_label(name: &str, is_default: bool) -> String {
+    if is_default {
+        format!("选用 {name}（默认最小）")
+    } else {
+        format!("选用 {name}")
+    }
+}
+
+/// Parse a [`policy_button_label`] back to the preset name.
+pub fn policy_from_button_label(label: &str) -> Option<String> {
+    let rest = label.strip_prefix("选用 ")?.trim();
+    let name = rest.split('（').next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Accessible policy picker: one AT-SPI-clickable button per allowed preset.
+///
+/// zenity `--list --radiolist` rows only expose `listitem.scroll-to` and are
+/// not selectable via AT-SPI. Push buttons already work in this grant UI, so
+/// each allowed policy is a button. The OK button is the minimum default;
+/// other presets are `--extra-button`s (stdout is the label; empty stdout is
+/// cancel). The final confirm dialog still shows the actual scope and ttl.
+fn zenity_policy_buttons(
     hint: &str,
     allowed: &[(String, String)],
     default_policy: &str,
 ) -> Result<Option<String>> {
+    let mut body = hint.to_string();
+    body.push_str("\n\n各权限实际能力：");
+    for (_, summary) in allowed {
+        body.push_str("\n• ");
+        body.push_str(summary);
+    }
+    body.push_str("\n\n请点下方按钮选用要签发的权限。取消签发不授权。");
+
+    let default_label = policy_button_label(default_policy, true);
     let mut args: Vec<String> = [
-        "--list",
-        "--radiolist",
+        "--question",
         "--title",
         "缩小权限后批准",
         "--ok-label",
-        "下一步",
+        default_label.as_str(),
         "--cancel-label",
         "取消签发",
         "--width",
-        "760",
-        "--height",
-        "420",
-        "--print-column",
-        "2",
+        "720",
         "--text",
-        hint,
-        "--column",
-        "选用",
-        "--column",
-        "权限",
-        "--column",
-        "实际能力",
+        body.as_str(),
     ]
     .into_iter()
     .map(str::to_string)
     .collect();
-    for (name, summary) in allowed {
-        args.push(if name == default_policy {
-            "TRUE".into()
-        } else {
-            "FALSE".into()
-        });
-        args.push(name.clone());
-        args.push(summary.clone());
+    let extra_labels: Vec<String> = allowed
+        .iter()
+        .filter(|(name, _)| name != default_policy)
+        .map(|(name, _)| policy_button_label(name, false))
+        .collect();
+    for label in &extra_labels {
+        args.push("--extra-button".into());
+        args.push(label.clone());
     }
     let out = std::process::Command::new("zenity").args(&args).output()?;
-    if !out.status.success() {
+    if out.status.success() {
+        return Ok(Some(default_policy.to_string()));
+    }
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if got.is_empty() {
         return Ok(None);
     }
-    let mut got = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if got.is_empty() {
-        got = default_policy.to_string();
-    }
-    if !allowed.iter().any(|(n, _)| n == &got) {
+    let name = policy_from_button_label(&got).unwrap_or(got);
+    if !allowed.iter().any(|(n, _)| n == &name) {
         return Err(anyhow!(
-            "选择了不可用的权限 `{got}`（只能缩小，不能加大请求权限）"
+            "选择了不可用的权限 `{name}`（只能缩小，不能加大请求权限）"
         ));
     }
-    Ok(Some(got))
+    Ok(Some(name))
 }
 
 fn zenity_ttl_entry(default_ttl: &str) -> Result<Option<String>> {
@@ -583,6 +610,24 @@ mod tests {
         assert!(REMOTE_EXEC_REFUSAL.contains("不是防自授权"));
         assert!(SIGNATURE_DISCLAIMER.contains("不证明"));
         assert!(SCOPE_NOTE.contains("不能无声加大"));
+    }
+
+    #[test]
+    fn policy_button_labels_round_trip_and_mark_the_minimum() {
+        assert_eq!(
+            policy_button_label("read-only", true),
+            "选用 read-only（默认最小）"
+        );
+        assert_eq!(policy_button_label("exec", false), "选用 exec");
+        assert_eq!(
+            policy_from_button_label("选用 read-only（默认最小）").as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(
+            policy_from_button_label("选用 exec").as_deref(),
+            Some("exec")
+        );
+        assert_eq!(policy_from_button_label("取消签发"), None);
     }
 
     #[test]
