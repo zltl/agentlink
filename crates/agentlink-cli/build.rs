@@ -3,6 +3,16 @@ include!("../agentlink-desktop/swift_rpath.rs");
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=AGENTLINK_RELEASE_VERSION");
+    // Stamp --version from the real git HEAD; without these, cargo can keep a
+    // stale hash after a subsequent commit that does not touch this file.
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()));
+    let git_dir = manifest.join("../..").join(".git");
+    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
+        if let Some(rel) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed={}", git_dir.join(rel).display());
+        }
+    }
     emit_version();
     link_swift_runtime();
     // OpenH264's static build asks for libstdc++. rustc 1.99 links with lld,
