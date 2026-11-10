@@ -18979,7 +18979,9 @@ fn grant_paste_card(
     let node_id = local_node_public_id(&dir)?;
     let now = agentlink_core::util::unix_now();
     let req = if let Ok(offer) = agentlink_core::grant_offer::decode_offer(card) {
-        agentlink_core::grant_offer::paste_offer_as_request(&dir, &offer, &node_id, None, now)
+        let relay_fp = agentlink_core::grant_offer::load_node_relay_fingerprint(&dir)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        agentlink_core::grant_offer::paste_offer_as_request(&dir, &offer, &node_id, relay_fp.as_deref(), now)
             .map_err(|err| anyhow!(err.to_string()))?
     } else if let Some(grantee) = agentlink_core::grant_offer::parse_raw_grantee_hex(card) {
         let policy = policy.as_deref().ok_or_else(|| {

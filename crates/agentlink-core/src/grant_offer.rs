@@ -219,7 +219,12 @@ pub fn verify_offer(
             ));
         }
     }
-    if let (Some(bound), Some(expected)) = (offer.relay_fp.as_deref(), expected_relay_fp) {
+    if let Some(bound) = offer.relay_fp.as_deref() {
+        let Some(expected) = expected_relay_fp else {
+            return Err(Error::Message(
+                "身份码绑定了 relay 证书指纹，但目标机没有可用于核对的本机 relay 指纹，拒绝（跨命名空间无法确认）。".into(),
+            ));
+        };
         if normalize_fp(bound) != normalize_fp(expected) {
             return Err(Error::Message(
                 "身份码绑定了不同的 relay 证书指纹（不同 relay 命名空间），拒绝签发。".into(),
@@ -227,6 +232,22 @@ pub fn verify_offer(
         }
     }
     Ok(())
+}
+
+/// Relay certificate fingerprint stored by the node in `node.json`.
+pub fn load_node_relay_fingerprint(data_dir: &std::path::Path) -> Result<Option<String>> {
+    let path = data_dir.join("node.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)
+        .map_err(|err| Error::Message(format!("node.json: {err}")))?;
+    Ok(value
+        .get("fingerprint")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string))
 }
 
 /// Verify a signed offer and store it as a pending request. Does not sign a grant.
@@ -385,6 +406,23 @@ mod tests {
         let card = encode_offer(&offer).unwrap();
         assert!(serde_json::from_str::<crate::grant::SignedGrant>(&card).is_err());
         verify_offer(&offer, offer.exp_unix, None, None).unwrap();
+        let bound = issue_offer(
+            &controller,
+            NodePolicy::exec(),
+            60,
+            now,
+            600,
+            None,
+            Some("sha256:abcd"),
+        )
+        .unwrap();
+        let err = verify_offer(&bound, now, None, None).unwrap_err().to_string();
+        assert!(err.contains("命名空间") || err.contains("relay"), "{err}");
+        let err = verify_offer(&bound, now, None, Some("sha256:ffff"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("命名空间") || err.contains("relay"), "{err}");
+        verify_offer(&bound, now, None, Some("sha256:abcd")).unwrap();
         let err = verify_offer(&offer, offer.exp_unix + 1, None, None)
             .unwrap_err()
             .to_string();
