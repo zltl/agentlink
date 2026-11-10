@@ -60,6 +60,34 @@ pub fn name_for_id(dir: &Path, id: &str) -> Result<Option<String>> {
         .map(|(name, _)| name))
 }
 
+/// Forward lookup: the pinned id for `name`, if any.
+///
+/// Name match is exact first, then case-insensitive when that is unique.
+pub fn id_for_name(dir: &Path, name: &str) -> Result<Option<String>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let path = pin_path(dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let file = serde_json::from_str::<PinFile>(&text)
+        .map_err(|err| Error::Message(format!("node-pins.json: {err}")))?;
+    if let Some(id) = file.nodes.get(name) {
+        return Ok(Some(id.to_ascii_lowercase()));
+    }
+    let mut matches = file
+        .nodes
+        .iter()
+        .filter(|(pinned_name, _)| pinned_name.eq_ignore_ascii_case(name));
+    match (matches.next(), matches.next()) {
+        (Some((_, id)), None) => Ok(Some(id.to_ascii_lowercase())),
+        _ => Ok(None),
+    }
+}
+
 /// Compare `id` with the pin for `name`, storing it on the first sighting.
 pub fn observe(dir: &Path, name: &str, id: &str) -> Result<PinStatus> {
     let name = name.trim();
@@ -136,5 +164,19 @@ mod tests {
         );
         assert_eq!(name_for_id(dir.path(), &"cd".repeat(32)).unwrap(), None);
         assert_eq!(name_for_id(dir.path(), "  ").unwrap(), None);
+    }
+
+    #[test]
+    fn id_for_name_returns_pinned_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "ab".repeat(32);
+        observe(dir.path(), "sufa-t417-9bf95e3-test", &id).unwrap();
+        assert_eq!(id_for_name(dir.path(), "sufa-t417-9bf95e3-test").unwrap(), Some(id.clone()));
+        assert_eq!(
+            id_for_name(dir.path(), "SUFA-T417-9BF95E3-TEST").unwrap(),
+            Some(id)
+        );
+        assert_eq!(id_for_name(dir.path(), "missing").unwrap(), None);
+        assert_eq!(id_for_name(dir.path(), "  ").unwrap(), None);
     }
 }

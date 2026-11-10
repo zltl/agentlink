@@ -52,34 +52,107 @@ impl PortalStreamSource {
     pub fn is_window(&self) -> bool {
         match self.source_type {
             Some(SOURCE_WINDOW) => true,
-            // Older portals may omit source_type; WINDOW-only SelectSources
-            // still only yields window streams when the implementation is honest.
-            None => false,
+            // GNOME 50 / some portals omit source_type on WINDOW-only sessions.
+            // Acceptance still goes through ensure_window_source (size / monitors).
+            None => true,
             Some(_) => false,
         }
     }
 }
 
+/// True when `size` is exactly one of the connected monitor resolutions.
+pub fn stream_size_matches_monitor(size: (i32, i32), monitors: &[(i32, i32)]) -> bool {
+    monitors.iter().any(|&mon| mon == size)
+}
+
 /// Reject monitor/virtual streams when the CLI asked for a window. Never treat
 /// a full-desktop stream as a window capture.
+///
+/// GNOME 50's `Start` result often omits `source_type` (and sometimes title)
+/// even after a WINDOW-only `SelectSources`. In that case we accept only when
+/// the stream size is present and does not match a known monitor, or when size
+/// is also omitted — the caller must then confirm the captured frame is not a
+/// monitor-sized desktop.
 pub fn ensure_window_source(source: &PortalStreamSource) -> Result<()> {
+    ensure_window_source_against_monitors(source, &[])
+}
+
+pub fn ensure_window_source_against_monitors(
+    source: &PortalStreamSource,
+    monitors: &[(i32, i32)],
+) -> Result<()> {
     match source.source_type {
-        Some(SOURCE_WINDOW) => Ok(()),
+        Some(SOURCE_WINDOW) => {
+            if let Some(size) = source.size {
+                if !monitors.is_empty() && stream_size_matches_monitor(size, monitors) {
+                    return Err(msg(format!(
+                        "portal ScreenCast labelled a {0}x{1} MONITOR-sized stream as WINDOW; refusing to treat a desktop/monitor capture as a window",
+                        size.0, size.1
+                    )));
+                }
+            }
+            Ok(())
+        }
         Some(SOURCE_MONITOR) => Err(msg(
-            "portal ScreenCast returned a MONITOR stream for --target window; \
-             refusing to treat a desktop/monitor capture as a window",
+            "portal ScreenCast returned a MONITOR stream for --target window; refusing to treat a desktop/monitor capture as a window",
         )),
         Some(SOURCE_VIRTUAL) => Err(msg(
-            "portal ScreenCast returned a VIRTUAL stream for --target window; \
-             refusing to treat it as a window",
+            "portal ScreenCast returned a VIRTUAL stream for --target window; refusing to treat it as a window",
         )),
         Some(other) => Err(msg(format!(
             "portal ScreenCast returned unknown source_type {other} for --target window"
         ))),
-        None => Err(msg(
-            "portal ScreenCast stream omitted source_type; cannot confirm WINDOW \
-             (refusing silent fallback to a possible monitor stream)",
-        )),
+        None => {
+            if let Some(size) = source.size {
+                if !monitors.is_empty() && stream_size_matches_monitor(size, monitors) {
+                    return Err(msg(format!(
+                        "portal ScreenCast stream omitted source_type and size {}x{} matches a monitor; refusing silent fallback to a desktop/monitor capture",
+                        size.0, size.1
+                    )));
+                }
+                tracing::info!(
+                    width = size.0,
+                    height = size.1,
+                    "portal omitted source_type; SelectSources was WINDOW-only and stream size does not match a known monitor — treating as the user-authorized window"
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                "portal omitted source_type and size; SelectSources was WINDOW-only — will confirm the captured frame is not a monitor-sized desktop"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// After a PipeWire frame arrives, reject a monitor-sized image when the
+/// portal did not explicitly confirm WINDOW (or claimed WINDOW at exact
+/// monitor resolution).
+pub fn ensure_captured_frame_is_window(
+    source: &PortalStreamSource,
+    frame_w: u32,
+    frame_h: u32,
+    monitors: &[(i32, i32)],
+) -> Result<()> {
+    let size = (frame_w as i32, frame_h as i32);
+    let looks_like_monitor = stream_size_matches_monitor(size, monitors);
+    match source.source_type {
+        Some(SOURCE_WINDOW) if looks_like_monitor => Err(msg(format!(
+            "portal WINDOW stream delivered a {frame_w}x{frame_h} monitor-sized frame; refusing to treat a desktop/monitor capture as a window"
+        ))),
+        Some(SOURCE_WINDOW) => Ok(()),
+        Some(_) => ensure_window_source_against_monitors(source, monitors),
+        None if looks_like_monitor => Err(msg(format!(
+            "portal omitted source_type and the captured frame is {frame_w}x{frame_h}, which matches a monitor; refusing silent fallback to a desktop/monitor capture"
+        ))),
+        None => {
+            tracing::info!(
+                frame_w,
+                frame_h,
+                "portal omitted source_type; captured frame is not a known monitor size"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -177,6 +250,51 @@ pub fn portal_response_error(response: u32, what: &str) -> crate::error::Desktop
     }
 }
 
+fn value_as_u32(val: &Value<'_>) -> Option<u32> {
+    match val {
+        Value::U8(v) => Some(u32::from(*v)),
+        Value::U16(v) => Some(u32::from(*v)),
+        Value::U32(v) => Some(*v),
+        Value::U64(v) if *v <= u64::from(u32::MAX) => Some(*v as u32),
+        Value::I32(v) if *v >= 0 => Some(*v as u32),
+        Value::I64(v) if *v >= 0 && *v <= i64::from(u32::MAX) => Some(*v as u32),
+        Value::Value(inner) => value_as_u32(inner),
+        _ => None,
+    }
+}
+
+fn value_as_i32(val: &Value<'_>) -> Option<i32> {
+    match val {
+        Value::I32(v) => Some(*v),
+        Value::I16(v) => Some(i32::from(*v)),
+        Value::I64(v) if *v >= i64::from(i32::MIN) && *v <= i64::from(i32::MAX) => Some(*v as i32),
+        Value::U32(v) if *v <= i32::MAX as u32 => Some(*v as i32),
+        Value::U16(v) => Some(i32::from(*v)),
+        Value::U8(v) => Some(i32::from(*v)),
+        Value::Value(inner) => value_as_i32(inner),
+        _ => None,
+    }
+}
+
+fn value_as_string(val: &Value<'_>) -> Option<String> {
+    match val {
+        Value::Str(text) => Some(text.to_string()),
+        Value::Value(inner) => value_as_string(inner),
+        _ => None,
+    }
+}
+
+fn value_as_i32_pair(val: &Value<'_>) -> Option<(i32, i32)> {
+    match val {
+        Value::Structure(fields) => {
+            let f = fields.fields();
+            Some((value_as_i32(f.first()?)?, value_as_i32(f.get(1)?)?))
+        }
+        Value::Value(inner) => value_as_i32_pair(inner),
+        _ => None,
+    }
+}
+
 /// Parse `streams` from `ScreenCast.Start` results (`a(ua{sv})`).
 #[cfg_attr(not(pipewire_headers), allow(dead_code))]
 pub fn parse_portal_streams(
@@ -226,21 +344,44 @@ pub fn parse_portal_streams(
                 Value::Str(text) => text.as_str(),
                 _ => continue,
             };
-            match (key, val) {
-                ("source_type", Value::U32(v)) => source.source_type = Some(*v),
-                ("id", Value::Str(text)) => source.id = Some(text.to_string()),
-                ("title", Value::Str(text)) => source.title = Some(text.to_string()),
-                ("app_id" | "app-id", Value::Str(text)) => source.app_id = Some(text.to_string()),
-                ("mapping_id" | "mapping-id", Value::Str(text)) => {
-                    source.mapping_id = Some(text.to_string())
-                }
-                ("size", Value::Structure(size_fields)) => {
-                    let f = size_fields.fields();
-                    if let (Some(Value::I32(w)), Some(Value::I32(h))) = (f.first(), f.get(1)) {
-                        source.size = Some((*w, *h));
+            match key {
+                "source_type" | "source-type" => {
+                    if let Some(v) = value_as_u32(val) {
+                        source.source_type = Some(v);
+                    } else {
+                        tracing::info!(?val, "portal stream source_type had an unexpected type");
                     }
                 }
-                _ => {}
+                "id" => {
+                    if let Some(s) = value_as_string(val) {
+                        source.id = Some(s);
+                    }
+                }
+                "title" => {
+                    if let Some(s) = value_as_string(val) {
+                        source.title = Some(s);
+                    }
+                }
+                "app_id" | "app-id" => {
+                    if let Some(s) = value_as_string(val) {
+                        source.app_id = Some(s);
+                    }
+                }
+                "mapping_id" | "mapping-id" => {
+                    if let Some(s) = value_as_string(val) {
+                        source.mapping_id = Some(s);
+                    }
+                }
+                "size" => {
+                    if let Some(size) = value_as_i32_pair(val) {
+                        source.size = Some(size);
+                    } else {
+                        tracing::info!(?val, "portal stream size had an unexpected type");
+                    }
+                }
+                other => {
+                    tracing::debug!(key = other, ?val, "portal stream property");
+                }
             }
         }
         out.push(source);
@@ -599,6 +740,9 @@ pub async fn capture_window(
     let result = consume_one_frame(fd, source.node_id, wait_ms, max_width);
     cleanup.close(conn).await;
     let mut frame = result?;
+    if let Err(err) = ensure_captured_frame_is_window(&source, frame.width, frame.height, &[]) {
+        return Err(err);
+    }
     frame.backend = "wayland-portal-window".into();
     Ok(frame)
 }
@@ -675,18 +819,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_source_type() {
+    fn omitted_source_type_is_accepted_when_size_is_not_a_monitor() {
         let source = PortalStreamSource {
             node_id: 1,
             source_type: None,
             id: None,
-            title: Some("Editor".into()),
+            title: Some("t417-iso-editor-wMn95K.txt".into()),
+            app_id: None,
+            mapping_id: None,
+            size: Some((900, 700)),
+        };
+        ensure_window_source(&source).unwrap();
+        ensure_window_source_against_monitors(&source, &[(2736, 1824)]).unwrap();
+        match_portal_window_query("t417-iso-editor", &source).unwrap();
+    }
+
+    #[test]
+    fn omitted_source_type_with_no_size_defers_to_frame_check() {
+        let source = PortalStreamSource {
+            node_id: 1,
+            source_type: None,
+            id: None,
+            title: None,
             app_id: None,
             mapping_id: None,
             size: None,
         };
-        let err = ensure_window_source(&source).unwrap_err().to_string();
-        assert!(err.contains("source_type"), "{err}");
+        ensure_window_source(&source).unwrap();
+        ensure_captured_frame_is_window(&source, 900, 700, &[(2736, 1824)]).unwrap();
+        let err = ensure_captured_frame_is_window(&source, 2736, 1824, &[(2736, 1824)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2736x1824"), "{err}");
+        assert!(err.contains("monitor"), "{err}");
+    }
+
+    #[test]
+    fn omitted_source_type_rejects_monitor_sized_stream() {
+        let source = PortalStreamSource {
+            node_id: 1,
+            source_type: None,
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: Some((2736, 1824)),
+        };
+        let err = ensure_window_source_against_monitors(&source, &[(2736, 1824)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2736x1824"), "{err}");
+        assert!(err.contains("monitor"), "{err}");
+        // Without a monitor list we cannot prove it is a desktop; the frame check
+        // still applies once sizes are known.
+        ensure_window_source(&source).unwrap();
     }
 
     #[test]
@@ -778,6 +964,26 @@ mod tests {
             app_id: None,
             mapping_id: None,
             size: None,
+        }
+        .is_window());
+        assert!(PortalStreamSource {
+            node_id: 9,
+            source_type: None,
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: Some((800, 600)),
+        }
+        .is_window());
+        assert!(!PortalStreamSource {
+            node_id: 9,
+            source_type: Some(SOURCE_MONITOR),
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: Some((2736, 1824)),
         }
         .is_window());
     }

@@ -814,7 +814,7 @@ enum GrantCommand {
         /// Lifetime: seconds (`900`) or units (`15m`, `1h`, `7d`, `1h30m`).
         #[arg(long, default_value = "1h")]
         ttl: String,
-        /// Kept for older scripts. A valid grant authorizes full use.
+        /// Access preset: `read-only`, `read-write`, `exec`, `desktop`, `remote-view`, `remote-control`, or `full`.
         #[arg(long, default_value = "full")]
         policy: String,
         /// Grantee public key hex. Defaults to this CLI's identity.
@@ -824,6 +824,8 @@ enum GrantCommand {
         /// Defaults to AGENTLINK_ISSUER_DATA_DIR, then the default node data dir
         /// (~/.local/share/agentlink/node) when it already has issuer artifacts;
         /// otherwise signs with this CLI's operator identity.
+        /// Local issue uses this directory and does not require a relay admin token
+        /// when the node name is pinned or matches this node's identity.
         #[arg(long)]
         issuer_data_dir: Option<PathBuf>,
         /// Write the raw grant JSON here (`-` prints it) instead of stdout summary.
@@ -857,8 +859,8 @@ enum GrantCommand {
         /// Lifetime: seconds (`900`) or units (`15m`, `1h`, `7d`, `1h30m`).
         #[arg(long, default_value = "1h")]
         ttl: String,
-        /// Kept for older scripts. A new grant authorizes full use.
-        /// Used only when a new grant is issued; refresh keeps the stored policy.
+        /// Access preset used only when a new grant is issued; refresh keeps the stored policy.
+        /// `read-only`, `read-write`, `exec`, `desktop`, `remote-view`, `remote-control`, or `full`.
         #[arg(long, default_value = "full")]
         policy: String,
         /// Grantee public key hex. Defaults to this CLI's identity.
@@ -16965,28 +16967,81 @@ async fn resolve_local_grant_node(
 }
 
 async fn resolve_grant_node(cli: &Cli, node: &str) -> Result<String> {
+    resolve_grant_node_local_or_relay(cli, node, None).await
+}
+
+/// Resolve a node name to its public id without requiring a relay token when
+/// the name is already pinned locally or matches `--issuer-data-dir`'s node.
+async fn resolve_grant_node_local_or_relay(
+    cli: &Cli,
+    node: &str,
+    issuer_data_dir: Option<&std::path::Path>,
+) -> Result<String> {
     let node = node.trim();
     if is_public_key_hex(node) {
         return Ok(node.to_ascii_lowercase());
     }
-    let client = connect_client(cli, "grant").await?;
-    let nodes = client
-        .list_nodes()
-        .await
-        .map_err(|err| anyhow!(err.to_string()))?;
-    let mut matches = nodes
-        .iter()
-        .filter(|info| info.name == node || info.id.eq_ignore_ascii_case(node));
-    let Some(first) = matches.next() else {
-        return Err(anyhow!(
-            "no node named `{node}`; run `agentlink nodes` or pass the node id"
-        ));
-    };
-    let id = first.id.clone();
-    if matches.next().is_some() {
-        return Err(anyhow!("more than one node matches `{node}`; pass the node id"));
+    let dir = config_dir(cli)?;
+    if let Some(id) = agentlink_core::node_pin::id_for_name(&dir, node)
+        .map_err(|err| anyhow!(err.to_string()))?
+    {
+        return Ok(id);
     }
-    Ok(id)
+    let issuer_dir = issuer_data_dir
+        .map(|path| path.to_path_buf())
+        .or_else(|| resolve_issuer_data_dir(None));
+    if let Some(issuer_dir) = issuer_dir {
+        if let Some(id) = local_issuer_node_id(&issuer_dir, node) {
+            return Ok(id);
+        }
+    }
+    match connect_client(cli, "grant").await {
+        Ok(client) => {
+            let nodes = client
+                .list_nodes()
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let mut matches = nodes
+                .iter()
+                .filter(|info| info.name == node || info.id.eq_ignore_ascii_case(node));
+            let Some(first) = matches.next() else {
+                return Err(anyhow!(
+                    "no node named `{node}`; run `agentlink nodes` or pass the node id"
+                ));
+            };
+            let id = first.id.clone();
+            if matches.next().is_some() {
+                return Err(anyhow!(
+                    "more than one node matches `{node}`; pass the node id"
+                ));
+            }
+            Ok(id)
+        }
+        Err(err) => Err(anyhow!(
+            "no local pin or issuer identity for node `{node}`, and the relay is unavailable ({err}).              On the node host pass --issuer-data-dir <node-data-dir>, or pass the 64-hex node id"
+        )),
+    }
+}
+
+/// Read the node public id from an issuer/node data dir when `name` matches
+/// `node.json`. Never creates identity files.
+fn local_issuer_node_id(issuer_dir: &std::path::Path, name: &str) -> Option<String> {
+    let ident_path = issuer_dir.join("identity.json");
+    if !ident_path.is_file() {
+        return None;
+    }
+    let ident: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(ident_path).ok()?).ok()?;
+    let id = ident.get("public_hex")?.as_str()?.trim().to_ascii_lowercase();
+    if !is_public_key_hex(&id) {
+        return None;
+    }
+    let node_cfg = issuer_dir.join("node.json");
+    if !node_cfg.is_file() {
+        return None;
+    }
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(node_cfg).ok()?).ok()?;
+    let stored = cfg.get("name")?.as_str()?.trim();
+    (stored == name).then_some(id)
 }
 
 /// Where [`resolve_issuer_data_dir`] found the issuer data directory.
@@ -18641,8 +18696,9 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     "--grantee must be a 32-byte ed25519 public key hex"
                 ));
             }
-            let node_id = resolve_grant_node(cli, &node).await?;
             let issuer_data_dir = resolve_issuer_data_dir(issuer_data_dir.as_deref());
+            let node_id =
+                resolve_grant_node_local_or_relay(cli, &node, issuer_data_dir.as_deref()).await?;
             let issuer = grant_issuer(issuer_data_dir.as_deref(), &operator)?;
             let trust_owner_cmd = operator_trust_owner_cmd(&issuer, issuer_data_dir.as_deref());
             let now = agentlink_core::util::unix_now();
@@ -18678,7 +18734,9 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             let ttl_secs = parse_ttl(ttl)?;
             let operator = Identity::load_or_create(&operator_identity_path(cli)?)
                 .map_err(|err| anyhow!(err.to_string()))?;
-            let node_id = resolve_grant_node(cli, node).await?;
+            let issuer_data_dir = resolve_issuer_data_dir(issuer_data_dir.as_deref());
+            let node_id =
+                resolve_grant_node_local_or_relay(cli, node, issuer_data_dir.as_deref()).await?;
             let stored = agentlink_core::grant::load_grant(&dir, &node_id)
                 .map_err(|err| anyhow!(err.to_string()))?
                 .ok_or_else(|| {
@@ -18686,7 +18744,6 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                         "no stored grant for node {node_id}; run `agentlink grant issue --node {node_id}`"
                     )
                 })?;
-            let issuer_data_dir = resolve_issuer_data_dir(issuer_data_dir.as_deref());
             let issuer = grant_issuer(issuer_data_dir.as_deref(), &operator)?;
             let trust_owner_cmd = operator_trust_owner_cmd(&issuer, issuer_data_dir.as_deref());
             let now = agentlink_core::util::unix_now();
@@ -18730,8 +18787,9 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     "--grantee must be a 32-byte ed25519 public key hex"
                 ));
             }
-            let node_id = resolve_grant_node(cli, node).await?;
             let issuer_data_dir = resolve_issuer_data_dir(issuer_data_dir.as_deref());
+            let node_id =
+                resolve_grant_node_local_or_relay(cli, node, issuer_data_dir.as_deref()).await?;
             let issuer = grant_issuer(issuer_data_dir.as_deref(), &operator)?;
             let trust_owner_cmd = operator_trust_owner_cmd(&issuer, issuer_data_dir.as_deref());
             let (grant, action) = agentlink_core::grant::ensure_grant(
