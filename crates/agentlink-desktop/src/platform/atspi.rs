@@ -328,6 +328,20 @@ pub fn is_application_bus(bus: &str) -> bool {
     !bus.is_empty() && bus != ATSPI_REGISTRY_BUS
 }
 
+/// Roles that can own an editable descendant without being editable themselves.
+/// Used when GTK puts FOCUSED on the frame/window rather than the SourceView.
+pub fn is_focus_container_role(role: u32) -> bool {
+    matches!(
+        role,
+        14 | // desktop
+        16 | // dialog
+        23 | // frame
+        39 | // panel
+        69 | // window
+        75 // application
+    )
+}
+
 async fn find_insert_target(conn: &Connection, root: &ObjectRef) -> Result<Option<ObjectRef>> {
     let count = prop_i32(conn, root, "ChildCount").await.unwrap_or(0);
     let count = count.clamp(0, 128);
@@ -341,18 +355,78 @@ async fn find_insert_target(conn: &Connection, root: &ObjectRef) -> Result<Optio
     let (apps, others): (Vec<_>, Vec<_>) = children
         .into_iter()
         .partition(|child| is_application_bus(&child.bus));
+    // 1) Focused + editable wins.
     for child in apps.iter().chain(others.iter()) {
         let mut budget = 800u32;
         if let Some(found) = find_focused_editable(conn, child, &mut budget).await? {
             return Ok(Some(found));
         }
     }
-    // Second pass: an active/focused frame may expose an editable descendant
-    // that does not itself have the FOCUSED state (GTK4 SourceView).
+    // 2) Something else is focused: only descend into container roles
+    // (window/frame/…). A focused button/label/toolbar must not redirect
+    // InsertText into a sibling editor in another active frame.
+    let mut focused: Option<(ObjectRef, u32)> = None;
     for child in apps.iter().chain(others.iter()) {
+        let mut budget = 800u32;
+        if let Some(found) = find_focused_node(conn, child, &mut budget).await? {
+            focused = Some(found);
+            break;
+        }
+    }
+    if let Some((node, role)) = focused {
+        if is_focus_container_role(role) {
+            let mut budget = 800u32;
+            if let Some(found) = find_first_editable(conn, &node, &mut budget).await? {
+                let _ = grab_focus(conn, &found).await;
+                return Ok(Some(found));
+            }
+            return Ok(None);
+        }
+        return Ok(None);
+    }
+    // 3) Nothing focused: last resort — editable under an ACTIVE application
+    // frame (GTK4 SourceView often lacks FOCUSED on the text node itself).
+    for child in apps.iter() {
         let mut budget = 800u32;
         if let Some(found) = find_editable_in_active(conn, child, &mut budget).await? {
             let _ = grab_focus(conn, &found).await;
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+async fn find_focused_node(
+    conn: &Connection,
+    object: &ObjectRef,
+    budget: &mut u32,
+) -> Result<Option<(ObjectRef, u32)>> {
+    if *budget == 0 {
+        return Ok(None);
+    }
+    *budget -= 1;
+    let states = states_of(conn, object).await.unwrap_or_default();
+    if state_has(&states, ATSPI_STATE_FOCUSED) {
+        let role = role_of(conn, object).await.unwrap_or(67);
+        return Ok(Some((
+            ObjectRef {
+                bus: object.bus.clone(),
+                path: object.path.clone(),
+            },
+            role,
+        )));
+    }
+    let count = prop_i32(conn, object, "ChildCount").await.unwrap_or(0);
+    let count = count.clamp(0, 128);
+    for index in 0..count {
+        if *budget == 0 {
+            break;
+        }
+        let child = match child_at(conn, object, index).await {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if let Some(found) = Box::pin(find_focused_node(conn, &child, budget)).await? {
             return Ok(Some(found));
         }
     }
@@ -381,7 +455,7 @@ async fn find_editable_in_active(
     let count = prop_i32(conn, object, "ChildCount").await.unwrap_or(0);
     let count = count.clamp(0, 128);
     // Remember an editable under an active ancestor.
-    let mut inherited = active_or_focused;
+    let inherited = active_or_focused;
     for index in 0..count {
         if *budget == 0 {
             break;
@@ -726,5 +800,15 @@ mod tests {
         assert!(is_application_bus(":1.13"));
         assert!(!is_application_bus(ATSPI_REGISTRY_BUS));
         assert!(!is_application_bus(""));
+    }
+
+    #[test]
+    fn focus_container_roles_allow_descendant_editable_search() {
+        assert!(is_focus_container_role(23)); // frame
+        assert!(is_focus_container_role(69)); // window
+        assert!(is_focus_container_role(75)); // application
+        assert!(!is_focus_container_role(43)); // button
+        assert!(!is_focus_container_role(61)); // text (must be focused itself)
+        assert!(!is_focus_container_role(29)); // label
     }
 }

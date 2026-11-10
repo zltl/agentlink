@@ -134,7 +134,11 @@ Live probe on the focused GtkSourceView (`:1.13`, EditableText):
 2. After InsertText returns true, `GetText` must show the inserted scalars at
    the pre-insert caret — RPC true alone is not success.
 3. Negative: if there is no focused editable, `type` errors and does **not**
-   fall through to keysyms (ASCII or otherwise).
+   fall through to keysyms (ASCII or otherwise). A focused non-editable
+   (button/label/toolbar) must not redirect into another window’s editor via
+   the old “any active frame” fallback; only focused container roles
+   (window/frame/…) may search a descendant editable, else an ACTIVE
+   application frame when nothing is focused.
 4. Keysym+IME-guard remains only when a field exists but InsertText/verify
    failed and the payload is ASCII.
 
