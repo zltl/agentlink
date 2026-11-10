@@ -58,7 +58,9 @@ pub async fn insert_text_at_focus(text: &str) -> Result<()> {
     )
     .await
     .map_err(|err| msg(format!("AT-SPI EditableText: {err}")))?;
-    let length = i32::try_from(text.len()).unwrap_or(i32::MAX);
+    // AT-SPI InsertText `length` is a character count, not UTF-8 bytes.
+    // Passing text.len() worked for ASCII and silently failed for CJK.
+    let length = insert_text_length(text);
     let ok: bool = proxy
         .call("InsertText", &(caret, text, length))
         .await
@@ -465,8 +467,16 @@ fn _map_unused(map: HashMap<String, String>) -> usize {
     map.len()
 }
 
+
+/// AT-SPI EditableText.InsertText length is Unicode scalar values (BMP
+/// CJK equals UTF-16 units). Never use UTF-8 byte length here.
+pub fn insert_text_length(text: &str) -> i32 {
+    i32::try_from(text.chars().count()).unwrap_or(i32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -491,5 +501,14 @@ mod tests {
         let states = vec![ATSPI_STATE_EDITABLE, ATSPI_STATE_FOCUSED, 25, 26, 30];
         assert!(state_has(&states, ATSPI_STATE_FOCUSED));
         assert!(state_has(&states, ATSPI_STATE_EDITABLE));
+    }
+
+    #[test]
+    fn insert_text_length_uses_unicode_scalars_not_utf8_bytes() {
+        assert_eq!(insert_text_length("ABC"), 3);
+        let cjk = "中文输入测试：你好。";
+        assert_eq!(cjk.chars().count(), 11);
+        assert!(cjk.len() > 11, "the CJK fixture must be multi-byte UTF-8");
+        assert_eq!(insert_text_length(cjk), 11);
     }
 }

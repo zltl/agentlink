@@ -63,3 +63,31 @@ Rebuild/install the node binary from this branch, restart `agentlink-node.servic
 - IME bypass via engine switch needs `ibus` or `fcitx5-remote` on PATH; otherwise keysyms may still compose if AT-SPI InsertText also fails (e.g. non-editable focus).
 - X11 window fallback does not show Wayland-native occlusion over that window.
 - Invite behavior unchanged: invite enrolls only; control still requires a node-local grant.
+
+## Follow-up after live sufa retest (21:00–21:03 Asia/Shanghai)
+
+Live isolated node `sufa-t417-9bf95e3-test` on 127.0.0.1:18443, binary
+`0.1.0 (9bf95e332fb97b275e2e8e405d59f7166826da4d)` linked to libpipewire-0.3
+(sha256 ea70ef3f73e30f4ed0901637f5daf57c1b7b13daa6d0e44eff8dc71e050d1d61).
+
+- **ui-tree**: PASS. `backend: atspi`, JSON tree, no GetDesktop/UnknownMethod.
+  System-scope/SSH-started node with session bus env attaches to the user a11y bus.
+- **type / IME**: With IBus engine `libpinyin` (toolbar 中) left on, ASCII, punctuation,
+  and newlines committed literally into an isolated gnome-text-editor
+  (`T417-ISO-INPUT-OK-9bf95e3` / `Hello, world! 123; --path=/tmp`). IME remained
+  `libpinyin` afterward. CJK `中文输入测试：你好。` reported "typed 11 characters"
+  but did not appear. Cause: `InsertText` passed `text.len()` (UTF-8 bytes) as the
+  AT-SPI character `length` (11 scalars vs 33 bytes). ASCII was accidentally correct.
+  Fixed to `text.chars().count()`.
+- **window screenshot**: Full-screen capture still works (2736×1824). Window capture
+  returns an honest capability error: `Shell.GetWindows` is AccessDenied to regular
+  clients (confirmed with session `gdbus` and `systemd-run --user`).
+  `org.gnome.Shell.Screenshot.ScreenshotWindow` is also AccessDenied. The isolated
+  editor is Wayland-native; `xlsclients` only shows `ibus-x11` and `mutter-x11-frames`,
+  so the X11 drawable fallback cannot capture it. AT-SPI `GetExtents(SCREEN)` reports
+  `0,0` for that frame (Wayland clients do not have global coordinates), so a
+  cropped full-desktop region would be the wrong pixels and is not used.
+  No GNOME desktop policy was loosened. Error text now also reports the failed
+  X11 fallback.
+
+`cargo test --release -p agentlink-desktop --lib` on sufa (PipeWire): 69 passed.

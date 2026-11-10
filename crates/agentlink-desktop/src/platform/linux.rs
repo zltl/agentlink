@@ -98,7 +98,11 @@ impl LinuxState {
                                 );
                                 frame
                             }
-                            Err(_) => return Err(err),
+                            Err(x11_err) => {
+                                return Err(msg(format!(
+                                    "{err}; X11 window fallback also failed ({x11_err}). On this GNOME session, Shell Introspect GetWindows and ScreenshotWindow are AccessDenied to regular clients, and Wayland-native windows have no X11 drawable. Full-screen or monitor capture still works."
+                                )));
+                            }
                         },
                     }
                 } else {
@@ -257,7 +261,7 @@ impl LinuxState {
             {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    tracing::debug!(
+                    tracing::info!(
                         error = %err,
                         "AT-SPI InsertText unavailable; typing keysyms with IME guard"
                     );
