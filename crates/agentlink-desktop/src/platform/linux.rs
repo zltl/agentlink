@@ -19,6 +19,7 @@ use crate::Desktop;
 
 #[cfg(pipewire_headers)]
 use super::mutter::{self, MutterDesk};
+use super::portal_window;
 use super::wayland::{self, WaylandDesk};
 use super::x11::X11Desk;
 
@@ -79,7 +80,18 @@ impl LinuxState {
         self.ensure()?;
         let frame = match self.display.as_mut().unwrap() {
             DisplayConn::X11(desk) => capture_x11(desk, &request.target)?,
-            DisplayConn::Wayland(desk) => self.rt.block_on(desk.capture(&request.target))?,
+            DisplayConn::Wayland(desk) => {
+                if let CaptureTarget::Window(query) = &request.target {
+                    self.rt.block_on(portal_window::capture_window(
+                        &desk.connection(),
+                        query,
+                        wait_ms,
+                        request.max_width,
+                    ))?
+                } else {
+                    self.rt.block_on(desk.capture(&request.target))?
+                }
+            }
             #[cfg(pipewire_headers)]
             DisplayConn::Mutter(desk) => {
                 if let CaptureTarget::Window(query) = &request.target {
@@ -99,9 +111,28 @@ impl LinuxState {
                                 frame
                             }
                             Err(x11_err) => {
-                                return Err(msg(format!(
-                                    "{err}; X11 window fallback also failed ({x11_err}). On this GNOME session, Shell Introspect GetWindows and ScreenshotWindow are AccessDenied to regular clients, and Wayland-native windows have no X11 drawable. Full-screen or monitor capture still works."
-                                )));
+                                match self.rt.block_on(portal_window::capture_window(
+                                    &desk.connection(),
+                                    query,
+                                    wait_ms,
+                                    request.max_width,
+                                )) {
+                                    Ok(frame) => {
+                                        tracing::info!(
+                                            mutter = %err,
+                                            x11 = %x11_err,
+                                            "Mutter/X11 window capture unavailable; used portal ScreenCast WINDOW"
+                                        );
+                                        frame
+                                    }
+                                    Err(portal_err) => {
+                                        return Err(msg(format!(
+                                            "{err}; X11 window fallback also failed ({x11_err}); \
+                                             portal ScreenCast WINDOW also failed ({portal_err}). \
+                                             Full-screen or monitor capture still works."
+                                        )));
+                                    }
+                                }
                             }
                         },
                     }

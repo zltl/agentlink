@@ -22,7 +22,9 @@ Date: 2026-11-10 (Asia/Shanghai). Branch: `fix/desktop-input-a11y-window-t417` (
 - `crates/agentlink-desktop/src/platform/ime.rs` — new; temporary IBus/Fcitx5 guard
 - `crates/agentlink-desktop/src/platform/shell_windows.rs` — new; title/id matching (+ unit tests)
 - `crates/agentlink-desktop/src/platform/mutter.rs` — `RecordWindow` one-shot capture
-- `crates/agentlink-desktop/src/platform/linux.rs` — type path (InsertText + IME guard); window capture routing
+- `crates/agentlink-desktop/src/platform/portal_window.rs` — portal ScreenCast WINDOW one-shot (+ matcher/cleanup tests)
+- `crates/agentlink-desktop/src/platform/wayland.rs` — window target routes to portal ScreenCast WINDOW
+- `crates/agentlink-desktop/src/platform/linux.rs` — type path (InsertText + IME guard); window capture routing (Mutter → X11 → portal)
 - `crates/agentlink-desktop/src/platform/mod.rs` — module wiring
 - `crates/agentlink-cli/src/main.rs` — tip needles for new capability errors
 
@@ -59,7 +61,8 @@ Rebuild/install the node binary from this branch, restart `agentlink-node.servic
 
 ## Remaining limitations
 
-- Portal-only Wayland (no Mutter private API) still cannot capture a single window; error stays capability-clear.
+- Window capture without Mutter Introspect uses portal ScreenCast WINDOW (interactive picker). Builds without libpipewire cannot consume the stream.
+- GNOME may omit window title/app_id in `Start` stream props; then `--window-id` cannot be machine-verified against the selection (still WINDOW-only; no monitor relabel).
 - IME bypass via engine switch needs `ibus` or `fcitx5-remote` on PATH; otherwise keysyms may still compose if AT-SPI InsertText also fails (e.g. non-editable focus).
 - X11 window fallback does not show Wayland-native occlusion over that window.
 - Invite behavior unchanged: invite enrolls only; control still requires a node-local grant.
@@ -154,15 +157,58 @@ Live probe on the focused GtkSourceView (`:1.13`, EditableText):
 5. Negative: focus a non-editable UI (or no window); `type` must error with
    `no focused editable text field`.
 
-### Window-capture capability limits (unchanged)
+### Window-capture capability limits → portal ScreenCast WINDOW
 
 On this GNOME session, `org.gnome.Shell.Introspect.GetWindows` and
 `ScreenshotWindow` are AccessDenied to regular clients. The test editor is
 Wayland-native (no X11 drawable). Mutter `RecordWindow` needs Introspect ids.
-xdg-desktop-portal Screenshot is full-session only here — not a silent
-single-window path. Do not crop a full desktop and call it a window. The
-client gets a clear capability error; full-screen/monitor capture still works.
-No GNOME security policy was loosened.
+xdg-desktop-portal **Screenshot** is still full-session only — we do **not**
+crop a desktop and call it a window.
 
-`cargo test -p agentlink-desktop --lib`: 73 passed locally (includes
-byte-length + landed-text + no-editable classifier tests).
+**Supported path (this branch):** `org.freedesktop.portal.ScreenCast` with
+`SelectSources(types=WINDOW, multiple=false, persist_mode=0)`, then `Start`
+(official GNOME Share / window picker), `OpenPipeWireRemote`, and the existing
+PipeWire frame consumer. Fallback order for `--target window`:
+
+1. Mutter `RecordWindow` (when Introspect ids work)
+2. X11 window drawable (XWayland only)
+3. Portal ScreenCast WINDOW (picker + PipeWire)
+
+#### Token / session lifetime
+
+- Default `persist_mode=0` (do not persist). One-shot / transient.
+- Restore tokens from `Start`, if any, are **ignored** and never written to disk
+  (no mode-0644 secret files).
+- On success, cancel, timeout, mismatch, or error: `Session.Close` and any
+  in-flight `Request.Close` (timeout cancels the picker request). PipeWire fds
+  drop with the consumer.
+- Picker wait: 90s default (`AGENTLINK_PORTAL_PICKER_TIMEOUT_SECS`, clamp 5–600).
+
+#### Mismatch behavior
+
+- Stream `source_type` must be `WINDOW` (2). `MONITOR` / `VIRTUAL` / missing
+  type → hard error (no silent fullscreen-as-window).
+- If the portal discloses `title` / `app_id` and the CLI `window_id` does not
+  match → hard error.
+- GNOME’s `Start` results often omit title/app_id (opaque stream id only). Then
+  a non-empty `--window-id` is a **picker hint** for the operator; pixels still
+  come only from the window the user authorized. Empty `window_id` also returns
+  only that portal-selected window (logged explicitly).
+
+#### How to retest portal window capture (sufa iso)
+
+Isolated node only (`runtime-iso`, relay `127.0.0.1:18443`). Production
+`abf86f1` / `:17443` untouched.
+
+```bash
+agentlink screenshot <iso-node> --target window --window-id t417-iso-editor
+```
+
+Expect the GNOME ScreenCast window picker. Select
+`t417-iso-editor-wMn95K.txt` (isolated gnome-text-editor), then Allow/Share.
+Do not auto-click the dialog. A waiting/timeout state while the user is away
+is not a test failure — cancel path must release the session.
+
+`cargo test -p agentlink-desktop --lib`: 85 passed locally (73 prior + portal
+window matcher/cleanup/no-monitor-fallback tests; CJK byte-length + landed-text
++ no-editable classifier tests remain).

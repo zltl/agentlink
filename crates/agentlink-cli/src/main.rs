@@ -10279,12 +10279,14 @@ const SCREENSHOT_WINDOW_TIP_MARKER: &str = "window capture did not match any vis
 /// full-screen/monitor fallbacks. Idempotent, and leaves unrelated desktop
 /// errors alone.
 fn decorate_screenshot_window_not_found(message: &str) -> String {
-    const NEEDLES: [&str; 5] = [
+    const NEEDLES: [&str; 7] = [
         "no X11 window matches '",
         "no window title contains '",
         "mock window '",
         "window capture capability missing:",
         "Mutter RecordWindow failed",
+        "portal-authorized window does not match",
+        "portal ScreenCast returned a MONITOR stream",
     ];
     if message.contains(SCREENSHOT_WINDOW_TIP_MARKER)
         || message.contains("ui-tree")

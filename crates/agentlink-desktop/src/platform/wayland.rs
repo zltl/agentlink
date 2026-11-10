@@ -101,9 +101,11 @@ impl WaylandDesk {
                 "the Wayland screenshot portal returns one image for the session; use target screen or region",
             )),
             CaptureTarget::Region(rect) => crop_frame(&frame, *rect),
-            CaptureTarget::Window(_) => Err(msg(
-                "the Wayland screenshot portal cannot capture one window. Use get_ui_tree, or an X11 session for window ids.",
-            )),
+            CaptureTarget::Window(query) => {
+                // One-shot WINDOW ScreenCast (picker + PipeWire). Not the
+                // Screenshot portal, which is full-session only.
+                super::portal_window::capture_window(&self.conn, query, 1000, 0).await
+            }
         }
     }
 
