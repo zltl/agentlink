@@ -337,6 +337,15 @@ fn session_path(conn: &Connection, token: &str) -> Result<String> {
 }
 
 #[cfg_attr(not(pipewire_headers), allow(dead_code))]
+fn owned_object_path(path: &str) -> Result<OwnedObjectPath> {
+    OwnedObjectPath::try_from(path).map_err(|err| {
+        msg(format!(
+            "portal object path '{path}' is invalid ({err})"
+        ))
+    })
+}
+
+#[cfg_attr(not(pipewire_headers), allow(dead_code))]
 async fn call_and_wait(
     conn: &Connection,
     path: &str,
@@ -448,6 +457,14 @@ pub async fn authorize_window_stream(
         return Err(portal_response_error(response, "ScreenCast.CreateSession"));
     }
 
+    let session_opath = match owned_object_path(&session) {
+        Ok(path) => path,
+        Err(err) => {
+            cleanup.close(conn).await;
+            return Err(err);
+        }
+    };
+
     let select_token = unique_token("scws");
     let select_path = request_path(conn, &select_token)?;
     let select_result = call_and_wait(conn, &select_path, Duration::from_secs(20), async {
@@ -459,8 +476,9 @@ pub async fn authorize_window_stream(
         options.insert("persist_mode", Value::from(PERSIST_NONE));
         // Omit cursor_mode (portal default = Hidden) so we do not close the
         // session on older backends that advertise a smaller cursor bitmask.
+        // Session handle must be object-path `o`, not string `s`.
         portal
-            .call::<_, _, OwnedObjectPath>("SelectSources", &(&session, options))
+            .call::<_, _, OwnedObjectPath>("SelectSources", &(&session_opath, options))
             .await
             .map_err(|err| msg(format!("ScreenCast.SelectSources(WINDOW): {err}")))?;
         Ok(())
@@ -493,7 +511,7 @@ pub async fn authorize_window_stream(
         let mut options: HashMap<&str, Value<'_>> = HashMap::new();
         options.insert("handle_token", Value::from(start_token.as_str()));
         portal
-            .call::<_, _, OwnedObjectPath>("Start", &(&session, "", options))
+            .call::<_, _, OwnedObjectPath>("Start", &(&session_opath, "", options))
             .await
             .map_err(|err| msg(format!("ScreenCast.Start: {err}")))?;
         Ok(())
@@ -553,9 +571,10 @@ pub async fn open_pipewire_remote_fd(
     session_path: &str,
 ) -> Result<std::os::fd::OwnedFd> {
     let portal = screencast_proxy(conn).await?;
+    let session_opath = owned_object_path(session_path)?;
     let options: HashMap<&str, Value<'_>> = HashMap::new();
     let fd: zbus::zvariant::OwnedFd = portal
-        .call("OpenPipeWireRemote", &(session_path, options))
+        .call("OpenPipeWireRemote", &(&session_opath, options))
         .await
         .map_err(|err| msg(format!("OpenPipeWireRemote: {err}")))?;
     Ok(std::os::fd::OwnedFd::from(fd))
