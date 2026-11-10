@@ -247,14 +247,45 @@ pub fn ensure_window_source_against_monitors(
 }
 
 /// After a PipeWire frame arrives, reject a monitor-sized image when the
-/// portal did not explicitly confirm WINDOW (or claimed WINDOW at exact
-/// monitor resolution).
+/// portal did not confirm a WINDOW (or claimed WINDOW at exact monitor
+/// resolution *and* we have a tight crop). A letterboxed WINDOW buffer may
+/// legally match the output resolution — do not invent a crop, and do not
+/// reject solely for that size (live GNOME 50: WINDOW source_type=2, size
+/// 1368x912 without position, PipeWire buffer 2736x1824).
 pub fn ensure_captured_frame_is_window(
     source: &PortalStreamSource,
     frame_w: u32,
     frame_h: u32,
     monitors: &[(i32, i32)],
+    letterboxed: bool,
 ) -> Result<()> {
+    match source.source_type {
+        Some(SOURCE_MONITOR) => {
+            return Err(msg(
+                "portal ScreenCast returned a MONITOR stream for --target window; refusing to treat a desktop/monitor capture as a window",
+            ));
+        }
+        Some(SOURCE_VIRTUAL) => {
+            return Err(msg(
+                "portal ScreenCast returned a VIRTUAL stream for --target window; refusing to treat it as a window",
+            ));
+        }
+        Some(other) if other != SOURCE_WINDOW => {
+            return Err(msg(format!(
+                "portal ScreenCast returned unknown source_type {other} for --target window"
+            )));
+        }
+        _ => {}
+    }
+    if letterboxed {
+        tracing::info!(
+            frame_w,
+            frame_h,
+            source_type = ?source.source_type,
+            "letterboxed official WINDOW buffer may match a monitor size; keeping it marked letterboxed without inventing a crop"
+        );
+        return Ok(());
+    }
     let size = (frame_w as i32, frame_h as i32);
     let looks_like_monitor = stream_size_matches_monitor(size, monitors);
     match source.source_type {
@@ -262,7 +293,6 @@ pub fn ensure_captured_frame_is_window(
             "portal WINDOW stream delivered a {frame_w}x{frame_h} monitor-sized frame; refusing to treat a desktop/monitor capture as a window"
         ))),
         Some(SOURCE_WINDOW) => Ok(()),
-        Some(_) => ensure_window_source_against_monitors(source, monitors),
         None if looks_like_monitor => Err(msg(format!(
             "portal omitted source_type and the captured frame is {frame_w}x{frame_h}, which matches a monitor; refusing silent fallback to a desktop/monitor capture"
         ))),
@@ -274,6 +304,7 @@ pub fn ensure_captured_frame_is_window(
             );
             Ok(())
         }
+        Some(_) => ensure_window_source_against_monitors(source, monitors),
     }
 }
 
@@ -1047,7 +1078,9 @@ pub async fn capture_window(
             frame.backend = "wayland-portal-window-letterboxed".into();
         }
     }
-    if let Err(err) = ensure_captured_frame_is_window(&source, frame.width, frame.height, monitors)
+    let letterboxed = matches!(geometry, WindowFrameGeometry::Letterboxed { .. });
+    if let Err(err) =
+        ensure_captured_frame_is_window(&source, frame.width, frame.height, monitors, letterboxed)
     {
         return Err(err);
     }
@@ -1190,6 +1223,38 @@ mod tests {
     }
 
     #[test]
+    fn letterboxed_window_buffer_may_match_monitor_size() {
+        let window = PortalStreamSource {
+            node_id: 88,
+            source_type: Some(SOURCE_WINDOW),
+            id: None,
+            title: None,
+            app_id: None,
+            mapping_id: None,
+            size: Some((1368, 912)),
+            position: None,
+        };
+        ensure_captured_frame_is_window(&window, 2736, 1824, &[(2736, 1824)], true).unwrap();
+        let err = ensure_captured_frame_is_window(&window, 2736, 1824, &[(2736, 1824)], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("monitor"), "{err}");
+        let omitted = PortalStreamSource {
+            source_type: None,
+            ..window.clone()
+        };
+        ensure_captured_frame_is_window(&omitted, 2736, 1824, &[(2736, 1824)], true).unwrap();
+        let monitor = PortalStreamSource {
+            source_type: Some(SOURCE_MONITOR),
+            ..window
+        };
+        let err = ensure_captured_frame_is_window(&monitor, 2736, 1824, &[(2736, 1824)], true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MONITOR"), "{err}");
+    }
+
+    #[test]
     fn omitted_source_type_with_no_size_defers_to_frame_check() {
         let source = PortalStreamSource {
             node_id: 1,
@@ -1202,8 +1267,8 @@ mod tests {
             position: None,
         };
         ensure_window_source(&source).unwrap();
-        ensure_captured_frame_is_window(&source, 900, 700, &[(2736, 1824)]).unwrap();
-        let err = ensure_captured_frame_is_window(&source, 2736, 1824, &[(2736, 1824)])
+        ensure_captured_frame_is_window(&source, 900, 700, &[(2736, 1824)], false).unwrap();
+        let err = ensure_captured_frame_is_window(&source, 2736, 1824, &[(2736, 1824)], false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("2736x1824"), "{err}");

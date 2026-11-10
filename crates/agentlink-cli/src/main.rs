@@ -947,6 +947,47 @@ enum GrantCommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// 控制端（远程）：生成一张身份码，复制到【目标机】本地粘贴。
+    ///
+    /// 公开身份不是凭证，身份码不是 grant，relay 不能据此授权。
+    Offer {
+        /// 请求的权限预设。`desktop` 含 exec 与文件读写，会写在码里并在目标机展示。
+        #[arg(long, default_value = "desktop")]
+        policy: String,
+        /// 若目标机同意，grant 的有效期。
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+        /// 可选：绑定目标机 64 位公钥，防止跨目标粘贴。
+        #[arg(long)]
+        node: Option<String>,
+        /// 身份码本身过期时间（默认 10m），过期后目标机必须要求控制端重发。
+        #[arg(long, default_value = "10m")]
+        offer_ttl: String,
+        /// 可选：绑定 relay 证书指纹（不同命名空间拒绝）。
+        #[arg(long)]
+        relay_fp: Option<String>,
+        /// 把身份码写到文件（`-` 打印到 stdout）。默认打印到终端。
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// 目标机（本地）：粘贴控制端身份码或完整 64 位公钥，形成待批请求。
+    ///
+    /// 不会签发 grant。核对指纹与实际权限后，再 `grant allow` 或 `--prompt`。
+    Paste {
+        /// `grant offer` 的整行，或 64 位控制端公钥。
+        card: String,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// 仅当粘贴裸公钥时需要（身份码已自带策略）。
+        #[arg(long)]
+        policy: Option<String>,
+        /// 仅当粘贴裸公钥时需要。
+        #[arg(long)]
+        ttl: Option<String>,
+        /// 粘贴校验通过后，在本机弹出 Allow/Deny（不是 `approve allow`）。
+        #[arg(long)]
+        prompt: bool,
+    },
     /// Record a pending request on this node without signing a grant.
     ///
     /// The request cannot be used for control until `grant allow` is run
@@ -17818,6 +17859,43 @@ mod grant_ttl_tests {
             }
             other => panic!("expected grant prompt, got {other:?}"),
         }
+        let offer = Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "offer",
+            "--policy",
+            "desktop",
+            "--ttl",
+            "4h",
+        ])
+        .unwrap();
+        match offer.command {
+            Command::Grant {
+                action: GrantCommand::Offer { policy, ttl, .. },
+            } => {
+                assert_eq!(policy, "desktop");
+                assert_eq!(ttl, "4h");
+            }
+            other => panic!("expected grant offer, got {other:?}"),
+        }
+        let paste = Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "paste",
+            "agentlink-offer:v1:x",
+            "--data-dir",
+            "/tmp/node",
+        ])
+        .unwrap();
+        match paste.command {
+            Command::Grant {
+                action: GrantCommand::Paste { card, prompt, .. },
+            } => {
+                assert!(card.starts_with("agentlink-offer:v1:"));
+                assert!(!prompt);
+            }
+            other => panic!("expected grant paste, got {other:?}"),
+        }
         // Held destructive-ops verbs stay on `approve`, not `grant`.
         let approve = Cli::try_parse_from([
             "agentlink",
@@ -19437,6 +19515,182 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                 let denied = agentlink_core::grant_request::deny_request(&dir, &req.request_id, now)
                     .map_err(|err| anyhow!(err.to_string()))?;
                 eprintln!("denied grant request {}", denied.request_id);
+            }
+            Ok(0)
+        }
+        GrantCommand::Offer {
+            policy,
+            ttl,
+            node,
+            offer_ttl,
+            relay_fp,
+            out,
+        } => {
+            let operator = Identity::load_or_create(&operator_identity_path(cli)?)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let policy = parse_access(&policy)?;
+            let ttl_secs = parse_ttl(&ttl)? as u64;
+            let offer_ttl_secs = parse_ttl(&offer_ttl)? as u64;
+            let now = agentlink_core::util::unix_now();
+            let offer = agentlink_core::grant_offer::issue_offer(
+                &operator,
+                policy,
+                ttl_secs,
+                now,
+                offer_ttl_secs,
+                node.as_deref(),
+                relay_fp.as_deref(),
+            )
+            .map_err(|err| anyhow!(err.to_string()))?;
+            let card = agentlink_core::grant_offer::encode_offer(&offer)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let fp = offer
+                .fingerprint()
+                .map_err(|err| anyhow!(err.to_string()))?;
+            if let Some(path) = out.as_deref() {
+                if path == "-" {
+                    println!("{card}");
+                } else {
+                    agentlink_core::util::write_secret(std::path::Path::new(path), card.as_bytes())
+                        .map_err(|err| anyhow!(err.to_string()))?;
+                    eprintln!("wrote {path}");
+                }
+            }
+            emit(
+                cli.json,
+                json!({
+                    "kind": "controller_offer",
+                    "note": "public identity, not a grant, not a credential",
+                    "card": card,
+                    "grantee_id": offer.grantee_id,
+                    "fingerprint": fp,
+                    "access": offer.policy.capability_summary(),
+                    "ttl_secs": offer.ttl_secs,
+                    "offer_exp_unix": offer.exp_unix,
+                    "node_id": offer.node_id,
+                }),
+                || {
+                    if out.is_none() {
+                        println!("{card}");
+                    }
+                    eprintln!("这是【控制端】身份码：公开身份，不是授权凭证，也不是 grant token；relay 不能据此授权。");
+                    eprintln!("控制端公钥指纹: {fp}");
+                    eprintln!("控制端公钥: {}", offer.grantee_id);
+                    eprintln!("请求权限: {}", offer.policy.capability_summary());
+                    eprintln!("若目标机同意，grant 有效期: {} 秒", offer.ttl_secs);
+                    eprintln!("此身份码过期 unix: {}", offer.exp_unix);
+                    if let Some(id) = offer.node_id.as_deref() {
+                        eprintln!("已绑定目标机公钥: {id}");
+                    }
+                    eprintln!("请把上面以 {} 开头的整行复制到【目标机】本地运行：", agentlink_core::grant_offer::OFFER_PREFIX);
+                    eprintln!("  agentlink grant paste '<身份码>' --data-dir <目标节点数据目录>");
+                    eprintln!("然后在目标机核对指纹，再 `grant allow` 或 `grant prompt`。已有有效 grant 无需重复粘贴。");
+                    eprintln!("文档: docs/grant-offer.md");
+                },
+            );
+            Ok(0)
+        }
+        GrantCommand::Paste {
+            card,
+            data_dir,
+            policy,
+            ttl,
+            prompt,
+        } => {
+            let dir = grant_node_data_dir(data_dir.as_deref())?;
+            let node_id = local_node_public_id(&dir)?;
+            let now = agentlink_core::util::unix_now();
+            let req = if let Ok(offer) = agentlink_core::grant_offer::decode_offer(card) {
+                agentlink_core::grant_offer::paste_offer_as_request(&dir, &offer, &node_id, None, now)
+                    .map_err(|err| anyhow!(err.to_string()))?
+            } else if let Some(grantee) = agentlink_core::grant_offer::parse_raw_grantee_hex(card) {
+                let policy = policy.as_deref().ok_or_else(|| {
+                    anyhow!("粘贴的是完整控制端公钥，请同时指定 --policy 与 --ttl。仅公钥能标识控制端，但不能证明此刻持有私钥；控制端之后仍须用私钥完成 E2E。名称无效。")
+                })?;
+                let ttl = ttl.as_deref().ok_or_else(|| anyhow!("粘贴裸公钥时必须指定 --ttl"))?;
+                let policy = parse_access(policy)?;
+                let ttl_secs = parse_ttl(ttl)? as u64;
+                let draft = agentlink_core::grant_request::draft_request(
+                    &grantee,
+                    &node_id,
+                    policy,
+                    ttl_secs,
+                    now,
+                    agentlink_core::grant_request::DEFAULT_REQUEST_TTL_SECS,
+                )
+                .map_err(|err| anyhow!(err.to_string()))?;
+                agentlink_core::grant_request::submit_request(&dir, &node_id, draft, now)
+                    .map_err(|err| anyhow!(err.to_string()))?
+            } else {
+                // Prefer the decode error (Chinese, distinguishes invite vs offer).
+                return Err(anyhow!(
+                    agentlink_core::grant_offer::decode_offer(card)
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "无法解析身份码".into())
+                ));
+            };
+            let fp = agentlink_core::grant_offer::sha256_ssh_fingerprint(&req.grantee_id)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            emit(
+                cli.json,
+                json!({
+                    "kind": "pending_request",
+                    "note": "not a grant; local allow required",
+                    "request_id": req.request_id,
+                    "grantee_id": req.grantee_id,
+                    "fingerprint": fp,
+                    "access": req.policy.capability_summary(),
+                    "ttl_secs": req.ttl_secs,
+                    "exp_unix": req.exp_unix,
+                    "status": "pending",
+                }),
+                || {
+                    eprintln!("已在【目标机】记录待批请求 {}（还不是 grant）", req.request_id);
+                    eprintln!("控制端公钥指纹: {fp}");
+                    eprintln!("控制端公钥: {}", req.grantee_id);
+                    eprintln!("请求权限: {}", req.policy.capability_summary());
+                    eprintln!("若同意，grant 有效期: {} 秒", req.ttl_secs);
+                    eprintln!(
+                        "请核对比指纹后在本机执行:\n  agentlink grant allow {} --data-dir {}\n或: agentlink grant prompt --data-dir {}",
+                        req.request_id,
+                        dir.display(),
+                        dir.display()
+                    );
+                    eprintln!("这不是 `agentlink approve allow`（那是危险操作确认）。");
+                },
+            );
+            if *prompt {
+                // Re-enter the existing prompt path logic by constructing body.
+                let body = format!(
+                    "agentlink grant request\n\nrequest: {}\ncontroller fingerprint: {}\ncontroller: {}\naccess: {}\ngrant ttl: {}s\n\nAllow 使用本机 issuer 签发。Deny 拒绝。都不是 approve allow。",
+                    req.request_id,
+                    fp,
+                    req.grantee_id,
+                    req.policy.capability_summary(),
+                    req.ttl_secs,
+                );
+                let allow = local_grant_decision_prompt(&body)?;
+                if allow {
+                    let issuer = agentlink_core::grant::load_issuer(&dir)
+                        .map_err(|err| anyhow!(err.to_string()))?
+                        .ok_or_else(|| anyhow!("no grant-issuer.json in {}", dir.display()))?;
+                    let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
+                        &dir,
+                        &req.request_id,
+                        now,
+                    )
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                    let _ = agentlink_core::grant_request::save_issued_grant(&dir, &grant);
+                    let path = agentlink_core::grant::save_grant(&config_dir(cli)?, &grant)
+                        .map_err(|err| anyhow!(err.to_string()))?;
+                    write_grant_result(cli, None, &grant, &path, &issuer, None)?;
+                    eprintln!("已在目标机本地签发；issuer 密钥未离开本机。");
+                } else {
+                    let denied = agentlink_core::grant_request::deny_request(&dir, &req.request_id, now)
+                        .map_err(|err| anyhow!(err.to_string()))?;
+                    eprintln!("已拒绝待批请求 {}", denied.request_id);
+                }
             }
             Ok(0)
         }

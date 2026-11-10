@@ -1,0 +1,368 @@
+//! Controller identity offer cards for target-local grant issuance.
+//!
+//! A card is a *public identity plus a signed request*, not a grant and not a
+//! credential. The target machine user must still issue a grant locally. See
+//! `docs/grant-offer.md`.
+
+use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::error::{Error, Result};
+use crate::grant_request::{self, AccessRequest};
+use crate::identity::{self, Identity};
+use crate::permissions::{parse_access, NodePolicy};
+
+pub const OFFER_PREFIX: &str = "agentlink-offer:v1:";
+pub const DEFAULT_OFFER_TTL_SECS: u64 = 10 * 60;
+pub const MIN_OFFER_TTL_SECS: u64 = 30;
+pub const MAX_OFFER_TTL_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantOffer {
+    pub v: u32,
+    pub grantee_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_fp: Option<String>,
+    pub policy: NodePolicy,
+    pub ttl_secs: u64,
+    pub iat_unix: i64,
+    pub exp_unix: i64,
+    pub nonce: String,
+    pub sig_hex: String,
+}
+
+impl GrantOffer {
+    pub fn fingerprint(&self) -> Result<String> {
+        sha256_ssh_fingerprint(&self.grantee_id)
+    }
+}
+
+fn is_key_hex(id: &str) -> bool {
+    let id = id.trim();
+    id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn normalize_fp(fp: &str) -> String {
+    fp.trim().to_ascii_lowercase()
+}
+
+fn canonical_bytes(offer: &GrantOffer) -> Result<Vec<u8>> {
+    // Signature covers fields except sig_hex, in a fixed order.
+    let policy = serde_json::to_string(&offer.policy)
+        .map_err(|err| Error::Message(format!("offer policy: {err}")))?;
+    Ok(format!(
+        "agentlink-offer-v1\ngrantee={}\nnode={}\nrelay_fp={}\npolicy={}\nttl={}\niat={}\nexp={}\nnonce={}",
+        offer.grantee_id.trim().to_ascii_lowercase(),
+        offer.node_id.as_deref().unwrap_or("").trim().to_ascii_lowercase(),
+        offer.relay_fp.as_deref().map(normalize_fp).unwrap_or_default(),
+        policy,
+        offer.ttl_secs,
+        offer.iat_unix,
+        offer.exp_unix,
+        offer.nonce.trim(),
+    )
+    .into_bytes())
+}
+
+/// OpenSSH-style `SHA256:` fingerprint of a 32-byte ed25519 public key.
+pub fn sha256_ssh_fingerprint(public_hex: &str) -> Result<String> {
+    let hex = public_hex.trim().to_ascii_lowercase();
+    if !is_key_hex(&hex) {
+        return Err(Error::Message(
+            "控制端公钥必须是 64 位十六进制 ed25519 公钥，名称或 relay 上的短 ID 不能代替密码学身份".into(),
+        ));
+    }
+    let bytes = hex::decode(&hex).map_err(|err| Error::Message(format!("公钥无法解码: {err}")))?;
+    let digest = Sha256::digest(&bytes);
+    Ok(format!("SHA256:{}", STANDARD_NO_PAD.encode(digest)))
+}
+
+pub fn encode_offer(offer: &GrantOffer) -> Result<String> {
+    let json = serde_json::to_vec(offer)
+        .map_err(|err| Error::Message(format!("无法编码身份码: {err}")))?;
+    Ok(format!("{OFFER_PREFIX}{}", URL_SAFE_NO_PAD.encode(json)))
+}
+
+pub fn decode_offer(text: &str) -> Result<GrantOffer> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(Error::Message(
+            "身份码为空。请在控制端运行 `agentlink grant offer` 并复制整行，或粘贴完整的 64 位公钥。身份码不是 grant，也不能在 relay 上生效。".into(),
+        ));
+    }
+    if text.starts_with("agentlink-invite:") {
+        return Err(Error::Message(
+            "这是节点入会邀请（agentlink-invite），不是控制端身份码，也不能当作授权凭证。请在控制端运行 `agentlink grant offer`。".into(),
+        ));
+    }
+    let payload = text.strip_prefix(OFFER_PREFIX).ok_or_else(|| {
+        Error::Message(format!(
+            "身份码必须以 {OFFER_PREFIX} 开头（由控制端 `agentlink grant offer` 生成），或直接粘贴 64 位控制端公钥。短名称/relay ID 无效。"
+        ))
+    })?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|_| {
+        Error::Message("身份码损坏（不是有效的 base64）。请重新从控制端复制整行，不要改码。".into())
+    })?;
+    let offer: GrantOffer = serde_json::from_slice(&bytes).map_err(|_| {
+        Error::Message(
+            "身份码损坏（不是有效的 JSON）。请重新从控制端复制，不要把身份码当 grant token。"
+                .into(),
+        )
+    })?;
+    if offer.v != 1 {
+        return Err(Error::Message(format!(
+            "不支持的身份码版本 {}。请升级目标机 agentlink，或让控制端重新生成 v1 身份码。",
+            offer.v
+        )));
+    }
+    Ok(offer)
+}
+
+/// A pasted 64-hex public key, with policy/ttl supplied on the target.
+pub fn parse_raw_grantee_hex(text: &str) -> Option<String> {
+    let text = text.trim().to_ascii_lowercase();
+    is_key_hex(&text).then_some(text)
+}
+
+pub fn issue_offer(
+    controller: &Identity,
+    policy: NodePolicy,
+    ttl_secs: u64,
+    now_unix: i64,
+    offer_ttl_secs: u64,
+    node_id: Option<&str>,
+    relay_fp: Option<&str>,
+) -> Result<GrantOffer> {
+    if ttl_secs == 0 || ttl_secs > grant_request::MAX_GRANT_TTL_SECS {
+        return Err(Error::Message(format!(
+            "授权有效期必须在 1 秒到 {} 秒之间，且会在目标机界面上完整展示实际能力（desktop 含 exec 与文件读写）",
+            grant_request::MAX_GRANT_TTL_SECS
+        )));
+    }
+    let offer_ttl = offer_ttl_secs.clamp(MIN_OFFER_TTL_SECS, MAX_OFFER_TTL_SECS);
+    let node_id = node_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    if let Some(id) = node_id.as_deref() {
+        if !is_key_hex(id) {
+            return Err(Error::Message(
+                "绑定的目标节点必须是 64 位公钥，不能只用名称。".into(),
+            ));
+        }
+    }
+    let mut offer = GrantOffer {
+        v: 1,
+        grantee_id: controller.public_hex().to_ascii_lowercase(),
+        node_id,
+        relay_fp: relay_fp
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(normalize_fp),
+        policy,
+        ttl_secs,
+        iat_unix: now_unix,
+        exp_unix: now_unix.saturating_add(offer_ttl as i64),
+        nonce: uuid::Uuid::new_v4().to_string(),
+        sig_hex: String::new(),
+    };
+    let message = canonical_bytes(&offer)?;
+    offer.sig_hex = controller.sign_message(&message);
+    Ok(offer)
+}
+
+pub fn verify_offer(
+    offer: &GrantOffer,
+    now_unix: i64,
+    expected_node_id: Option<&str>,
+    expected_relay_fp: Option<&str>,
+) -> Result<()> {
+    if !is_key_hex(&offer.grantee_id) {
+        return Err(Error::Message(
+            "身份码里的控制端公钥无效。名称或 relay 声称的 ID 不能代替密码学身份。".into(),
+        ));
+    }
+    if offer.sig_hex.trim().is_empty() {
+        return Err(Error::Message(
+            "身份码没有控制端签名，无法证明其持有对应私钥。拒绝签发。".into(),
+        ));
+    }
+    let message = canonical_bytes(offer)?;
+    identity::verify_message(&offer.grantee_id, &message, &offer.sig_hex).map_err(|_| {
+        Error::Message(
+            "身份码签名无效：可能被改码、换了控制端密钥，或内容被篡改。拒绝签发。".into(),
+        )
+    })?;
+    if now_unix < offer.iat_unix.saturating_sub(30) {
+        return Err(Error::Message("身份码尚未生效（时钟偏差过大）。".into()));
+    }
+    if now_unix > offer.exp_unix {
+        return Err(Error::Message(
+            "身份码已过期。请让控制端重新运行 `agentlink grant offer`，不要重放旧码。".into(),
+        ));
+    }
+    if let (Some(bound), Some(expected)) = (offer.node_id.as_deref(), expected_node_id) {
+        if !bound.eq_ignore_ascii_case(expected.trim()) {
+            return Err(Error::Message(
+                "身份码绑定了另一台目标机的公钥，不能在本机签发（跨目标拒绝）。".into(),
+            ));
+        }
+    }
+    if let (Some(bound), Some(expected)) = (offer.relay_fp.as_deref(), expected_relay_fp) {
+        if normalize_fp(bound) != normalize_fp(expected) {
+            return Err(Error::Message(
+                "身份码绑定了不同的 relay 证书指纹（不同 relay 命名空间），拒绝签发。".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify a signed offer and store it as a pending request. Does not sign a grant.
+pub fn paste_offer_as_request(
+    data_dir: &std::path::Path,
+    offer: &GrantOffer,
+    expected_node_id: &str,
+    expected_relay_fp: Option<&str>,
+    now_unix: i64,
+) -> Result<AccessRequest> {
+    verify_offer(offer, now_unix, Some(expected_node_id), expected_relay_fp)?;
+    let mut req = grant_request::draft_request(
+        &offer.grantee_id,
+        expected_node_id,
+        offer.policy,
+        offer.ttl_secs,
+        now_unix,
+        offer.exp_unix.saturating_sub(now_unix).max(1) as u64,
+    )?;
+    // Bind anti-replay to the offer nonce so the same card cannot be queued twice.
+    req.nonce = offer.nonce.clone();
+    req.exp_unix = offer.exp_unix;
+    grant_request::submit_request(data_dir, expected_node_id, req, now_unix)
+}
+
+pub fn parse_policy(name: &str) -> Result<NodePolicy> {
+    parse_access(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    fn node() -> String {
+        Identity::generate().public_hex().to_string()
+    }
+
+    #[test]
+    fn offer_roundtrip_and_paste_then_replay_rejected() {
+        let controller = Identity::generate();
+        let target = node();
+        let now = 1_700_000_000;
+        let offer = issue_offer(
+            &controller,
+            NodePolicy::desktop(),
+            3600,
+            now,
+            600,
+            Some(&target),
+            Some("sha256:abc"),
+        )
+        .unwrap();
+        assert!(offer.policy.capability_summary().contains("exec/shell"));
+        let card = encode_offer(&offer).unwrap();
+        assert!(card.starts_with(OFFER_PREFIX));
+        let parsed = decode_offer(&card).unwrap();
+        assert_eq!(parsed.grantee_id, controller.public_hex());
+        verify_offer(&parsed, now, Some(&target), Some("SHA256:ABC")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        // identity for allow_request_in_dir is not required here
+        let req =
+            paste_offer_as_request(dir.path(), &parsed, &target, Some("sha256:abc"), now).unwrap();
+        assert_eq!(req.grantee_id, controller.public_hex());
+        assert_eq!(req.policy, NodePolicy::desktop());
+
+        let replay = paste_offer_as_request(dir.path(), &parsed, &target, Some("sha256:abc"), now)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            replay.contains("replay")
+                || replay.contains("already")
+                || replay.contains("重放")
+                || replay.contains("too many")
+                || replay.contains("already used"),
+            "{replay}"
+        );
+    }
+
+    #[test]
+    fn tamper_wrong_node_expired_and_invite_are_rejected() {
+        let controller = Identity::generate();
+        let target = node();
+        let other = node();
+        let now = 1_700_000_000;
+        let offer = issue_offer(
+            &controller,
+            NodePolicy::exec(),
+            60,
+            now,
+            600,
+            Some(&target),
+            Some("sha256:one"),
+        )
+        .unwrap();
+
+        let mut bad = offer.clone();
+        bad.grantee_id = Identity::generate().public_hex().to_string();
+        let err = verify_offer(&bad, now, Some(&target), Some("sha256:one"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("签名") || err.contains("换了"), "{err}");
+
+        let err = verify_offer(&offer, now, Some(&other), Some("sha256:one"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("跨目标") || err.contains("另一台"), "{err}");
+
+        let err = verify_offer(&offer, now, Some(&target), Some("sha256:two"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("relay") || err.contains("命名空间"), "{err}");
+
+        let err = verify_offer(&offer, now + 10_000, Some(&target), Some("sha256:one"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("过期"), "{err}");
+
+        let err = decode_offer("agentlink-invite:v1:e30")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("邀请"), "{err}");
+        assert!(err.contains("不是控制端身份码"), "{err}");
+    }
+
+    #[test]
+    fn raw_hex_is_identity_only_not_an_offer_token() {
+        let hex = Identity::generate().public_hex().to_string();
+        assert_eq!(parse_raw_grantee_hex(&hex).as_deref(), Some(hex.as_str()));
+        assert!(decode_offer(&hex).is_err());
+        let fp = sha256_ssh_fingerprint(&hex).unwrap();
+        assert!(fp.starts_with("SHA256:"));
+        assert!(fp.len() > 15);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_key_changes() {
+        let a = Identity::generate().public_hex().to_string();
+        let b = Identity::generate().public_hex().to_string();
+        assert_ne!(
+            sha256_ssh_fingerprint(&a).unwrap(),
+            sha256_ssh_fingerprint(&b).unwrap()
+        );
+    }
+}

@@ -22,6 +22,7 @@ pub mod extensions;
 pub mod frame;
 pub mod grant;
 pub mod grant_request;
+pub mod grant_offer;
 pub mod ice;
 pub mod identity;
 pub mod invite;
