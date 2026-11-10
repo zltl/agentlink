@@ -21,6 +21,7 @@ use crate::error::{msg, Result};
 
 const ATSPI_REGISTRY_BUS: &str = "org.a11y.atspi.Registry";
 const ATSPI_ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+const ATSPI_STATE_ACTIVE: u32 = 1;
 const ATSPI_STATE_EDITABLE: u32 = 7;
 const ATSPI_STATE_FOCUSED: u32 = 12;
 
@@ -43,8 +44,7 @@ pub async fn tree(max_depth: u32, max_nodes: u32) -> Result<UiNode> {
 pub async fn insert_text_at_focus(text: &str) -> Result<()> {
     let conn = atspi_bus().await?;
     let root = desktop_root(&conn).await?;
-    let mut budget = 400u32;
-    let focused = find_focused_editable(&conn, &root, &mut budget)
+    let focused = find_insert_target(&conn, &root)
         .await?
         .ok_or_else(|| {
             msg("AT-SPI capability: no focused editable text field for InsertText")
@@ -300,6 +300,130 @@ async fn action<'a>(conn: &'a Connection, object: &'a ObjectRef) -> Result<Proxy
     .map_err(|err| msg(err.to_string()))
 }
 
+
+/// Shell/registry trees are huge and sit in front of application buses on the
+/// desktop root. Searching those first exhausts the walk budget before the
+/// focused GTK editor is reached, so InsertText never runs and CJK cannot be
+/// delivered via keysyms.
+pub fn is_application_bus(bus: &str) -> bool {
+    !bus.is_empty() && bus != ATSPI_REGISTRY_BUS
+}
+
+async fn find_insert_target(conn: &Connection, root: &ObjectRef) -> Result<Option<ObjectRef>> {
+    let count = prop_i32(conn, root, "ChildCount").await.unwrap_or(0);
+    let count = count.clamp(0, 128);
+    let mut children = Vec::new();
+    for index in 0..count {
+        match child_at(conn, root, index).await {
+            Ok(child) => children.push(child),
+            Err(_) => continue,
+        }
+    }
+    let (apps, others): (Vec<_>, Vec<_>) = children
+        .into_iter()
+        .partition(|child| is_application_bus(&child.bus));
+    for child in apps.iter().chain(others.iter()) {
+        let mut budget = 800u32;
+        if let Some(found) = find_focused_editable(conn, child, &mut budget).await? {
+            return Ok(Some(found));
+        }
+    }
+    // Second pass: an active/focused frame may expose an editable descendant
+    // that does not itself have the FOCUSED state (GTK4 SourceView).
+    for child in apps.iter().chain(others.iter()) {
+        let mut budget = 800u32;
+        if let Some(found) = find_editable_in_active(conn, child, &mut budget).await? {
+            let _ = grab_focus(conn, &found).await;
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+async fn find_editable_in_active(
+    conn: &Connection,
+    object: &ObjectRef,
+    budget: &mut u32,
+) -> Result<Option<ObjectRef>> {
+    if *budget == 0 {
+        return Ok(None);
+    }
+    *budget -= 1;
+    let states = states_of(conn, object).await.unwrap_or_default();
+    let editable = state_has(&states, ATSPI_STATE_EDITABLE);
+    let active_or_focused = state_has(&states, ATSPI_STATE_FOCUSED)
+        || state_has(&states, ATSPI_STATE_ACTIVE);
+    if editable && active_or_focused {
+        return Ok(Some(ObjectRef {
+            bus: object.bus.clone(),
+            path: object.path.clone(),
+        }));
+    }
+    let count = prop_i32(conn, object, "ChildCount").await.unwrap_or(0);
+    let count = count.clamp(0, 128);
+    // Remember an editable under an active ancestor.
+    let mut inherited = active_or_focused;
+    for index in 0..count {
+        if *budget == 0 {
+            break;
+        }
+        let child = match child_at(conn, object, index).await {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if inherited {
+            if let Some(found) = find_first_editable(conn, &child, budget).await? {
+                return Ok(Some(found));
+            }
+        } else if let Some(found) = Box::pin(find_editable_in_active(conn, &child, budget)).await? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+async fn find_first_editable(
+    conn: &Connection,
+    object: &ObjectRef,
+    budget: &mut u32,
+) -> Result<Option<ObjectRef>> {
+    if *budget == 0 {
+        return Ok(None);
+    }
+    *budget -= 1;
+    let states = states_of(conn, object).await.unwrap_or_default();
+    if state_has(&states, ATSPI_STATE_EDITABLE) {
+        return Ok(Some(ObjectRef {
+            bus: object.bus.clone(),
+            path: object.path.clone(),
+        }));
+    }
+    let count = prop_i32(conn, object, "ChildCount").await.unwrap_or(0);
+    let count = count.clamp(0, 128);
+    for index in 0..count {
+        if *budget == 0 {
+            break;
+        }
+        let child = match child_at(conn, object, index).await {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if let Some(found) = Box::pin(find_first_editable(conn, &child, budget)).await? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+async fn grab_focus(conn: &Connection, object: &ObjectRef) -> Result<bool> {
+    let proxy = component(conn, object).await?;
+    let ok: bool = proxy
+        .call("GrabFocus", &())
+        .await
+        .unwrap_or(false);
+    Ok(ok)
+}
+
 async fn find_focused_editable(
     conn: &Connection,
     object: &ObjectRef,
@@ -510,5 +634,12 @@ mod tests {
         assert_eq!(cjk.chars().count(), 10);
         assert!(cjk.len() > 10, "the CJK fixture must be multi-byte UTF-8");
         assert_eq!(insert_text_length(cjk), 10);
+    }
+
+    #[test]
+    fn application_buses_are_preferred_over_the_registry() {
+        assert!(is_application_bus(":1.13"));
+        assert!(!is_application_bus(ATSPI_REGISTRY_BUS));
+        assert!(!is_application_bus(""));
     }
 }

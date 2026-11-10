@@ -265,6 +265,13 @@ impl LinuxState {
                         error = %err,
                         "AT-SPI InsertText unavailable; typing keysyms with IME guard"
                     );
+                    if !text.chars().all(|ch| {
+                        ch.is_ascii() && (ch.is_ascii_graphic() || ch.is_ascii_whitespace())
+                    }) {
+                        return Err(msg(format!(
+                            "{err}. Keysym fallback cannot type non-ASCII literally; InsertText needs a focused editable field"
+                        )));
+                    }
                 }
             }
             super::ime::ImeGuard::engage()

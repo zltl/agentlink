@@ -91,3 +91,20 @@ Live isolated node `sufa-t417-9bf95e3-test` on 127.0.0.1:18443, binary
   X11 fallback.
 
 `cargo test --release -p agentlink-desktop --lib` on sufa (PipeWire): 69 passed.
+
+## Follow-up: CJK still missing after length fix (21:14 Asia/Shanghai)
+
+Live log on the 15b4475-code binary (sha256 02616989…, version string still
+cached as 9bf95e3): `AT-SPI InsertText unavailable; no focused editable text
+field`. The CLI then fell back to keysyms with a temporary Latin IME guard.
+ASCII/punctuation/newlines can be typed that way; CJK cannot, but the CLI
+still reported "typed N characters".
+
+Cause: `find_focused_editable` DFS from the desktop root spent its budget in
+the large GNOME Shell/registry tree before reaching application buses (the
+isolated editor is on a `:1.13` TextEditor bus). The length fix remains
+correct for when InsertText does run.
+
+Change: search application buses first; if needed, GrabFocus an editable in
+an active/focused frame; do not report keysym success for non-ASCII when
+InsertText failed.
