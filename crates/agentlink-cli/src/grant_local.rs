@@ -10,6 +10,7 @@
 //! detached, read `grant-issuer.json`, or write grant-authority directories.
 //! See `docs/grant-authorization-boundary.md`.
 
+use agentlink_core::permissions::parse_access;
 use anyhow::{anyhow, Result};
 
 /// Set by the node on every exec / pty / shell it spawns.
@@ -163,106 +164,368 @@ pub fn decision_prompt(body: &str) -> Result<bool> {
 /// After an Allow decision, let the local user shrink policy/ttl.
 ///
 /// Returns `Ok(None)` if the user cancels this step (request stays pending;
-/// pasting a card alone never authorizes). `policy`/`ttl` CLI values become
-/// the form defaults; empty fields keep the requested values. The allow path
-/// still rejects any silent increase.
+/// pasting a card alone never authorizes). The graphical path uses an
+/// accessible radiolist (not a zenity combo that always starts at the first
+/// item) plus a pre-filled ttl entry, then a final confirmation that shows
+/// the **actual** scope and ttl about to be signed. Cancel at any of those
+/// steps does not issue a grant. The allow path still rejects any increase.
 pub fn shrink_grant_prompt(
     requested_policy: &str,
     requested_ttl_secs: u64,
     policy_default: Option<String>,
     ttl_default: Option<String>,
 ) -> Result<Option<(Option<String>, Option<u64>)>> {
-    let default_policy = policy_default
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(requested_policy);
-    let default_ttl = ttl_default
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| requested_ttl_secs.to_string());
-    let hint = format!(
-        "可缩小权限或缩短有效期，不能加大。\n请求权限: {requested_policy}\n请求 ttl: {requested_ttl_secs} 秒\n默认将签发: {default_policy} / {default_ttl}"
+    let _ = policy_default; // listed options come from the request; default is the minimum
+    let allowed = allowed_shrink_presets(requested_policy)?;
+    if allowed.is_empty() {
+        return Err(anyhow!("请求权限 {requested_policy} 没有可签发的缩小项"));
+    }
+    let default_policy = default_shrink_policy(requested_policy)?;
+    let default_ttl = default_shrink_ttl_text(requested_ttl_secs, ttl_default.as_deref())?;
+    let hint = shrink_hint(
+        requested_policy,
+        requested_ttl_secs,
+        &default_policy,
+        &default_ttl,
+        &allowed,
     );
+
     if display_ok() && command_exists("zenity") {
-        let out = std::process::Command::new("zenity")
-            .args([
-                "--forms",
-                "--title",
-                "缩小权限后批准",
-                "--ok-label",
-                "签发",
-                "--cancel-label",
-                "取消签发",
-                "--text",
-                &hint,
-                "--add-combo",
-                "权限（只能缩小）",
-                "--combo-values",
-                "read-only|read-write|exec|desktop|remote-view|remote-control|full",
-                "--add-entry",
-                "有效期（秒或 5m/1h，只能缩短）",
-            ])
-            .output()?;
-        if !out.status.success() {
+        let Some(policy) = zenity_policy_radiolist(&hint, &allowed, &default_policy)? else {
+            return Ok(None);
+        };
+        let Some(ttl_raw) = zenity_ttl_entry(&default_ttl)? else {
+            return Ok(None);
+        };
+        let ttl_secs = parse_shrink_ttl(&ttl_raw)?;
+        if !confirm_issue(&policy, ttl_secs)? {
             return Ok(None);
         }
-        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return parse_shrink_form(&line, default_policy, &default_ttl);
+        return Ok(Some((Some(policy), Some(ttl_secs))));
     }
     if display_ok() && command_exists("kdialog") {
-        let policy_out = std::process::Command::new("kdialog")
-            .args([
-                "--title",
-                "缩小权限后批准",
-                "--inputbox",
-                &format!("{hint}\n权限（只能缩小，默认 {default_policy}）"),
-                default_policy,
-            ])
-            .output()?;
-        if !policy_out.status.success() {
+        let Some(policy) = kdialog_policy_radiolist(&hint, &allowed, &default_policy)? else {
             return Ok(None);
-        }
+        };
         let ttl_out = std::process::Command::new("kdialog")
             .args([
                 "--title",
-                "缩小权限后批准",
+                "缩短有效期后批准",
                 "--inputbox",
-                &format!("有效期（只能缩短，默认 {default_ttl}）"),
+                "有效期（秒或 5m/1h，只能缩短）",
                 &default_ttl,
             ])
             .output()?;
         if !ttl_out.status.success() {
             return Ok(None);
         }
-        let policy_s = String::from_utf8_lossy(&policy_out.stdout)
-            .trim()
-            .to_string();
-        let ttl_s = String::from_utf8_lossy(&ttl_out.stdout).trim().to_string();
-        return parse_shrink_form(&format!("{policy_s}|{ttl_s}"), default_policy, &default_ttl);
+        let ttl_raw = String::from_utf8_lossy(&ttl_out.stdout).trim().to_string();
+        let ttl_field = if ttl_raw.is_empty() {
+            default_ttl.clone()
+        } else {
+            ttl_raw
+        };
+        let ttl_secs = parse_shrink_ttl(&ttl_field)?;
+        if !confirm_issue(&policy, ttl_secs)? {
+            return Ok(None);
+        }
+        return Ok(Some((Some(policy), Some(ttl_secs))));
     }
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) && !display_ok() {
-        // Headless: honor CLI defaults without a dialog. The allow path still
-        // rejects increases. Graphical tests must run on the seat.
-        return parse_shrink_form(
-            &format!("{default_policy}|{default_ttl}"),
-            default_policy,
-            &default_ttl,
-        );
+        // Headless: honor the minimum default. Graphical issuance must go
+        // through the dialogs above; tests must not skip that UI.
+        let ttl_secs = parse_shrink_ttl(&default_ttl)?;
+        return Ok(Some((Some(default_policy), Some(ttl_secs))));
     }
     eprint!("{hint}\n权限（回车=默认 {default_policy}）: ");
     let mut policy_line = String::new();
     std::io::stdin().read_line(&mut policy_line)?;
+    let policy = {
+        let raw = policy_line.trim();
+        if raw.is_empty() {
+            default_policy.clone()
+        } else {
+            raw.to_string()
+        }
+    };
+    if !allowed.iter().any(|(n, _)| n == &policy) {
+        return Err(anyhow!(
+            "权限 `{policy}` 不在可缩小列表中（不能加大请求权限）"
+        ));
+    }
     eprint!("有效期（回车=默认 {default_ttl}）: ");
     let mut ttl_line = String::new();
     std::io::stdin().read_line(&mut ttl_line)?;
-    parse_shrink_form(
-        &format!("{}|{}", policy_line.trim(), ttl_line.trim()),
-        default_policy,
-        &default_ttl,
+    let ttl_field = if ttl_line.trim().is_empty() {
+        default_ttl
+    } else {
+        ttl_line.trim().to_string()
+    };
+    let ttl_secs = parse_shrink_ttl(&ttl_field)?;
+    eprint!(
+        "{}\n确认签发？(yes/no): ",
+        issue_confirm_body(&policy, ttl_secs)
+    );
+    let mut yes = String::new();
+    std::io::stdin().read_line(&mut yes)?;
+    match yes.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" | "ok" => Ok(Some((Some(policy), Some(ttl_secs)))),
+        _ => Ok(None),
+    }
+}
+
+/// Presets, narrowest first. The first entry that is a subset of the request
+/// is the default (最小，且不能加大请求).
+pub const SHRINK_PRESETS: &[&str] = &[
+    "read-only",
+    "read-write",
+    "exec",
+    "desktop",
+    "remote-view",
+    "remote-control",
+    "full",
+];
+
+/// Policies the target may choose: each is a subset of the request, with a
+/// human-readable capability summary (not just the short preset name).
+pub fn allowed_shrink_presets(requested_policy: &str) -> Result<Vec<(String, String)>> {
+    let requested = parse_access(requested_policy).map_err(|err| anyhow!(err.to_string()))?;
+    let mut out = Vec::new();
+    for name in SHRINK_PRESETS {
+        let policy = parse_access(name).map_err(|err| anyhow!(err.to_string()))?;
+        if policy.is_subset_of(requested) {
+            out.push(((*name).to_string(), policy.capability_summary()));
+        }
+    }
+    if out.is_empty() {
+        let policy = parse_access(requested_policy).map_err(|err| anyhow!(err.to_string()))?;
+        out.push((
+            policy.preset_name().to_string(),
+            policy.capability_summary(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Narrowest allowed preset (typically `read-only`). Never larger than the request.
+pub fn default_shrink_policy(requested_policy: &str) -> Result<String> {
+    let allowed = allowed_shrink_presets(requested_policy)?;
+    Ok(allowed
+        .into_iter()
+        .next()
+        .map(|(name, _)| name)
+        .unwrap_or_else(|| requested_policy.to_string()))
+}
+
+/// Prefill the ttl field: honor a shorter CLI value, ignore any increase.
+pub fn default_shrink_ttl_text(
+    requested_ttl_secs: u64,
+    ttl_default: Option<&str>,
+) -> Result<String> {
+    if let Some(raw) = ttl_default.map(str::trim).filter(|s| !s.is_empty()) {
+        let secs = parse_shrink_ttl(raw)?;
+        if secs > 0 && secs <= requested_ttl_secs {
+            return Ok(raw.to_string());
+        }
+    }
+    Ok(requested_ttl_secs.to_string())
+}
+
+pub fn issue_confirm_body(policy: &str, ttl_secs: u64) -> String {
+    let summary = parse_access(policy)
+        .map(|p| p.capability_summary())
+        .unwrap_or_else(|_| policy.to_string());
+    format!(
+        "即将签发的权限如下（以此为准，不是上一步未改动的提示）：\n\n\
+         权限: {summary}\n\
+         有效期: {ttl_secs} 秒\n\n\
+         取消签发不授权，待批请求仍保留。"
     )
+}
+
+fn shrink_hint(
+    requested_policy: &str,
+    requested_ttl_secs: u64,
+    default_policy: &str,
+    default_ttl: &str,
+    allowed: &[(String, String)],
+) -> String {
+    let requested_summary = parse_access(requested_policy)
+        .map(|p| p.capability_summary())
+        .unwrap_or_else(|_| requested_policy.to_string());
+    let default_summary = allowed
+        .iter()
+        .find(|(n, _)| n == default_policy)
+        .map(|(_, s)| s.clone())
+        .unwrap_or_else(|| default_policy.to_string());
+    format!(
+        "可缩小权限或缩短有效期，不能加大。\n\
+         请求权限: {requested_summary}\n\
+         请求 ttl: {requested_ttl_secs} 秒\n\
+         默认选用最小权限: {default_summary}\n\
+         默认有效期: {default_ttl}\n\
+         请在列表中点选要签发的权限（与最终确认必须一致）。"
+    )
+}
+
+fn zenity_policy_radiolist(
+    hint: &str,
+    allowed: &[(String, String)],
+    default_policy: &str,
+) -> Result<Option<String>> {
+    let mut args: Vec<String> = [
+        "--list",
+        "--radiolist",
+        "--title",
+        "缩小权限后批准",
+        "--ok-label",
+        "下一步",
+        "--cancel-label",
+        "取消签发",
+        "--width",
+        "760",
+        "--height",
+        "420",
+        "--print-column",
+        "2",
+        "--text",
+        hint,
+        "--column",
+        "选用",
+        "--column",
+        "权限",
+        "--column",
+        "实际能力",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    for (name, summary) in allowed {
+        args.push(if name == default_policy {
+            "TRUE".into()
+        } else {
+            "FALSE".into()
+        });
+        args.push(name.clone());
+        args.push(summary.clone());
+    }
+    let out = std::process::Command::new("zenity").args(&args).output()?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let mut got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if got.is_empty() {
+        got = default_policy.to_string();
+    }
+    if !allowed.iter().any(|(n, _)| n == &got) {
+        return Err(anyhow!(
+            "选择了不可用的权限 `{got}`（只能缩小，不能加大请求权限）"
+        ));
+    }
+    Ok(Some(got))
+}
+
+fn zenity_ttl_entry(default_ttl: &str) -> Result<Option<String>> {
+    let out = std::process::Command::new("zenity")
+        .args([
+            "--entry",
+            "--title",
+            "缩短有效期后批准",
+            "--width",
+            "480",
+            "--text",
+            "有效期（秒或 5m/1h，只能缩短；框内为将使用的值）",
+            "--entry-text",
+            default_ttl,
+            "--ok-label",
+            "下一步",
+            "--cancel-label",
+            "取消签发",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let mut got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if got.is_empty() {
+        got = default_ttl.to_string();
+    }
+    Ok(Some(got))
+}
+
+fn confirm_issue(policy: &str, ttl_secs: u64) -> Result<bool> {
+    let body = issue_confirm_body(policy, ttl_secs);
+    if display_ok() && command_exists("zenity") {
+        let status = std::process::Command::new("zenity")
+            .args([
+                "--question",
+                "--title",
+                "确认最终签发",
+                "--ok-label",
+                "确认签发",
+                "--cancel-label",
+                "取消签发",
+                "--no-wrap",
+                "--width",
+                "640",
+                "--text",
+                &body,
+            ])
+            .status()?;
+        return Ok(status.success());
+    }
+    if display_ok() && command_exists("kdialog") {
+        let status = std::process::Command::new("kdialog")
+            .args([
+                "--yesno",
+                &body,
+                "--yes-label",
+                "确认签发",
+                "--no-label",
+                "取消签发",
+                "--title",
+                "确认最终签发",
+            ])
+            .status()?;
+        return Ok(status.success());
+    }
+    Ok(true)
+}
+
+fn kdialog_policy_radiolist(
+    hint: &str,
+    allowed: &[(String, String)],
+    default_policy: &str,
+) -> Result<Option<String>> {
+    let mut args: Vec<String> = vec![
+        "--title".into(),
+        "缩小权限后批准".into(),
+        "--radiolist".into(),
+        hint.to_string(),
+    ];
+    for (name, summary) in allowed {
+        args.push(name.clone());
+        args.push(format!("{name} — {summary}"));
+        args.push(if name == default_policy {
+            "on".into()
+        } else {
+            "off".into()
+        });
+    }
+    let out = std::process::Command::new("kdialog").args(&args).output()?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let mut got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if got.is_empty() {
+        got = default_policy.to_string();
+    }
+    if !allowed.iter().any(|(n, _)| n == &got) {
+        return Err(anyhow!(
+            "选择了不可用的权限 `{got}`（只能缩小，不能加大请求权限）"
+        ));
+    }
+    Ok(Some(got))
 }
 
 /// Parse `policy|ttl` form output. Empty fields fall back to the supplied defaults.
@@ -290,7 +553,7 @@ pub fn parse_shrink_form(
     Ok(Some((Some(policy), Some(ttl_secs))))
 }
 
-fn parse_shrink_ttl(raw: &str) -> Result<u64> {
+pub fn parse_shrink_ttl(raw: &str) -> Result<u64> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(anyhow!("有效期不能为空"));
@@ -332,5 +595,65 @@ mod tests {
         assert_eq!(got, (Some("exec".into()), Some(300)));
         let got = parse_shrink_form("|60", "exec", "300").unwrap().unwrap();
         assert_eq!(got, (Some("exec".into()), Some(60)));
+    }
+
+    #[test]
+    fn allowed_presets_do_not_enlarge_the_request() {
+        let exec = allowed_shrink_presets("exec").unwrap();
+        let names: Vec<_> = exec.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["read-only", "read-write", "exec"]);
+        assert!(exec
+            .iter()
+            .any(|(n, s)| n == "exec" && s.contains("exec/shell")));
+        assert!(exec
+            .iter()
+            .any(|(n, s)| n == "read-only" && s.contains("no exec/shell")));
+        assert!(!names.contains(&"desktop"));
+        assert!(!names.contains(&"full"));
+
+        let desktop = allowed_shrink_presets("desktop").unwrap();
+        let dnames: Vec<_> = desktop.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(dnames.contains(&"read-only"));
+        assert!(dnames.contains(&"exec"));
+        assert!(dnames.contains(&"desktop"));
+        assert!(!dnames.contains(&"full"));
+        assert!(!dnames.contains(&"remote-view")); // remote-view is not a subset of desktop
+        let desktop_sum = desktop
+            .iter()
+            .find(|(n, _)| n == "desktop")
+            .unwrap()
+            .1
+            .clone();
+        assert!(desktop_sum.contains("exec/shell"));
+        assert!(desktop_sum.contains("screenshots, input, and accessibility"));
+        assert!(desktop_sum.contains("no live desktop stream"));
+    }
+
+    #[test]
+    fn default_policy_is_the_minimum_allowed_and_not_the_request() {
+        assert_eq!(default_shrink_policy("desktop").unwrap(), "read-only");
+        assert_eq!(default_shrink_policy("exec").unwrap(), "read-only");
+        assert_eq!(default_shrink_policy("full").unwrap(), "read-only");
+        assert_eq!(default_shrink_policy("read-only").unwrap(), "read-only");
+    }
+
+    #[test]
+    fn default_ttl_honors_a_shorter_value_and_rejects_an_increase_as_prefill() {
+        assert_eq!(default_shrink_ttl_text(3600, Some("5m")).unwrap(), "5m");
+        assert_eq!(default_shrink_ttl_text(3600, Some("2h")).unwrap(), "3600");
+        assert_eq!(default_shrink_ttl_text(3600, None).unwrap(), "3600");
+    }
+
+    #[test]
+    fn final_confirm_body_shows_real_scope_and_ttl_and_cancel_does_not_authorize() {
+        let body = issue_confirm_body("exec", 300);
+        assert!(body.contains("exec ("));
+        assert!(body.contains("exec/shell"));
+        assert!(body.contains("no screenshots/input") || body.contains("no screenshots"));
+        assert!(body.contains("300 秒"));
+        assert!(body.contains("取消签发不授权"));
+        let ro = issue_confirm_body("read-only", 60);
+        assert!(ro.contains("no exec/shell"));
+        assert!(ro.contains("60 秒"));
     }
 }
