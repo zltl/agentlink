@@ -22,6 +22,9 @@ pub const DEFAULT_REQUEST_TTL_SECS: u64 = 10 * 60;
 pub const MIN_REQUEST_TTL_SECS: u64 = 30;
 pub const MAX_REQUEST_TTL_SECS: u64 = 24 * 60 * 60;
 pub const MAX_GRANT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const USED_NONCES_FILE: &str = "used-nonces.json";
+const MAX_NONCE_LEN: usize = 80;
+const NONCE_RETAIN_SECS: i64 = 8 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -136,6 +139,9 @@ fn list_raw(data_dir: &Path) -> Result<Vec<(PathBuf, AccessRequest)>> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        if path.file_name().and_then(|n| n.to_str()) == Some(USED_NONCES_FILE) {
+            continue;
+        }
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(_) => continue,
@@ -185,6 +191,73 @@ fn save_request(data_dir: &Path, req: &AccessRequest) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn used_nonces_path(data_dir: &Path) -> PathBuf {
+    requests_dir(data_dir).join(USED_NONCES_FILE)
+}
+
+fn load_used_nonces_map(data_dir: &Path) -> Result<std::collections::BTreeMap<String, i64>> {
+    let path = used_nonces_path(data_dir);
+    if !path.is_file() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let text = fs::read_to_string(&path)?;
+    serde_json::from_str(&text)
+        .map_err(|err| Error::Message(format!("used-nonces {}: {err}", path.display())))
+}
+
+fn remember_nonce(data_dir: &Path, nonce: &str, now_unix: i64) -> Result<()> {
+    let nonce = nonce.trim();
+    if nonce.is_empty() || nonce.len() > MAX_NONCE_LEN {
+        return Err(Error::Message("invalid request nonce".into()));
+    }
+    let dir = requests_dir(data_dir);
+    util::ensure_dir(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+    let mut map = load_used_nonces_map(data_dir)?;
+    if map.contains_key(nonce) {
+        return Err(Error::Message(
+            "request nonce was already used (replay)".into(),
+        ));
+    }
+    map.retain(|_, ts| now_unix.saturating_sub(*ts) <= NONCE_RETAIN_SECS);
+    map.insert(nonce.to_string(), now_unix);
+    let path = used_nonces_path(data_dir);
+    util::write_secret(&path, serde_json::to_string_pretty(&map)?.as_bytes())?;
+    Ok(())
+}
+
+/// Narrow a requested grant. The target may shrink policy or ttl, never enlarge.
+pub fn resolve_allow_scope(
+    requested: NodePolicy,
+    requested_ttl: u64,
+    policy: Option<NodePolicy>,
+    ttl_secs: Option<u64>,
+) -> Result<(NodePolicy, u64)> {
+    let policy = match policy {
+        Some(p) if p.is_subset_of(requested) => p,
+        Some(_) => {
+            return Err(Error::Message(
+                "目标机可以缩小权限，但不能加大（例如把 read-only 改成 desktop/exec）。".into(),
+            ))
+        }
+        None => requested,
+    };
+    let ttl = match ttl_secs {
+        Some(t) if t > 0 && t <= requested_ttl => t,
+        Some(_) => {
+            return Err(Error::Message(
+                "目标机可以缩短有效期，但不能延长请求里的 ttl。请求 ttl 只约束这份待批，并不强迫目标机授权。".into(),
+            ))
+        }
+        None => requested_ttl,
+    };
+    Ok((policy, ttl))
+}
+
 /// Store a pending request after rate-limit, expiry, replay, and node-id checks.
 pub fn submit_request(
     data_dir: &Path,
@@ -208,6 +281,8 @@ pub fn submit_request(
             "request nonce was already used (replay)".into(),
         ));
     }
+    // Durable nonce log survives request-file deletion and process restart.
+    remember_nonce(data_dir, &req.nonce, now_unix)?;
     if existing.iter().any(|(_, r)| r.request_id == req.request_id) {
         return Err(Error::Message("request id already exists (replay)".into()));
     }
@@ -259,6 +334,8 @@ pub fn allow_request(
     issuer: &Identity,
     expected_node_id: &str,
     now_unix: i64,
+    policy: Option<NodePolicy>,
+    ttl_secs: Option<u64>,
 ) -> Result<(AccessRequest, SignedGrant)> {
     let mut req = load_request(data_dir, request_id)?
         .ok_or_else(|| Error::Message(format!("no grant request {request_id}")))?;
@@ -278,12 +355,13 @@ pub fn allow_request(
             req.node_id
         )));
     }
-    let exp = now_unix.saturating_add(req.ttl_secs as i64);
+    let (policy, ttl_secs) = resolve_allow_scope(req.policy, req.ttl_secs, policy, ttl_secs)?;
+    let exp = now_unix.saturating_add(ttl_secs as i64);
     let grant = SignedGrant::sign(
         issuer,
         &req.grantee_id,
         &req.node_id,
-        req.policy,
+        policy,
         now_unix.saturating_sub(30),
         exp,
         uuid::Uuid::new_v4().to_string(),
@@ -327,11 +405,15 @@ pub fn allow_request_in_dir(
     data_dir: &Path,
     request_id: &str,
     now_unix: i64,
+    policy: Option<NodePolicy>,
+    ttl_secs: Option<u64>,
 ) -> Result<(AccessRequest, SignedGrant)> {
     let node_id = node_public_hex(data_dir)?;
     let issuer = grant::load_issuer(data_dir)?
         .ok_or_else(|| Error::Message(format!("no grant-issuer.json in {}", data_dir.display())))?;
-    allow_request(data_dir, request_id, &issuer, &node_id, now_unix)
+    allow_request(
+        data_dir, request_id, &issuer, &node_id, now_unix, policy, ttl_secs,
+    )
 }
 
 /// Store a signed grant under `<data_dir>/issued-grants/` (mode 600, dir 700).
@@ -394,8 +476,16 @@ mod tests {
             .capability_summary()
             .contains("exec/shell"));
 
-        let (decided, grant) =
-            allow_request(dir.path(), &stored.request_id, &issuer, &node, now).unwrap();
+        let (decided, grant) = allow_request(
+            dir.path(),
+            &stored.request_id,
+            &issuer,
+            &node,
+            now,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(decided.status, RequestStatus::Approved);
         assert_eq!(grant.grantee_id, grantee);
         assert_eq!(grant.node_id, node);
@@ -403,9 +493,17 @@ mod tests {
         assert_eq!(grant.issuer_id, issuer.public_hex());
         assert!(!grant.sig_hex.is_empty());
 
-        let err = allow_request(dir.path(), &stored.request_id, &issuer, &node, now)
-            .unwrap_err()
-            .to_string();
+        let err = allow_request(
+            dir.path(),
+            &stored.request_id,
+            &issuer,
+            &node,
+            now,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("already"), "{err}");
 
         let replay = submit_request(dir.path(), &node, req, now)
@@ -471,5 +569,36 @@ mod tests {
     fn parse_policy_names() {
         assert_eq!(parse_policy("desktop").unwrap(), NodePolicy::desktop());
         assert!(parse_policy("not-a-policy").is_err());
+    }
+
+    #[test]
+    fn narrow_allow_cannot_enlarge_and_can_shrink() {
+        let req = NodePolicy::desktop();
+        let (p, t) = resolve_allow_scope(req, 3600, Some(NodePolicy::exec()), Some(600)).unwrap();
+        assert_eq!(p, NodePolicy::exec());
+        assert_eq!(t, 600);
+        let err = resolve_allow_scope(NodePolicy::exec(), 600, Some(NodePolicy::desktop()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不能加大"), "{err}");
+        let err = resolve_allow_scope(req, 600, None, Some(3600))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不能延长"), "{err}");
+    }
+
+    #[test]
+    fn nonce_log_survives_deleting_the_request_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_issuer, grantee, node) = ids();
+        let now = 1_700_000_000;
+        let req = draft_request(&grantee, &node, NodePolicy::exec(), 60, now, 600).unwrap();
+        let stored = submit_request(dir.path(), &node, req.clone(), now).unwrap();
+        let path = requests_dir(dir.path()).join(format!("{}.json", stored.request_id));
+        std::fs::remove_file(&path).unwrap();
+        let err = submit_request(dir.path(), &node, req, now)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("replay"), "{err}");
     }
 }

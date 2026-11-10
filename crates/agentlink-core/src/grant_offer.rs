@@ -18,6 +18,7 @@ pub const OFFER_PREFIX: &str = "agentlink-offer:v1:";
 pub const DEFAULT_OFFER_TTL_SECS: u64 = 10 * 60;
 pub const MIN_OFFER_TTL_SECS: u64 = 30;
 pub const MAX_OFFER_TTL_SECS: u64 = 24 * 60 * 60;
+pub const MAX_OFFER_TEXT_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantOffer {
@@ -89,6 +90,12 @@ pub fn encode_offer(offer: &GrantOffer) -> Result<String> {
 
 pub fn decode_offer(text: &str) -> Result<GrantOffer> {
     let text = text.trim();
+    if text.len() > MAX_OFFER_TEXT_BYTES {
+        return Err(Error::Message(format!(
+            "身份码过长（{} 字节，上限 {MAX_OFFER_TEXT_BYTES}）。拒绝解析，以防资源耗尽。",
+            text.len()
+        )));
+    }
     if text.is_empty() {
         return Err(Error::Message(
             "身份码为空。请在控制端运行 `agentlink grant offer` 并复制整行，或粘贴完整的 64 位公钥。身份码不是 grant，也不能在 relay 上生效。".into(),
@@ -364,5 +371,23 @@ mod tests {
             sha256_ssh_fingerprint(&a).unwrap(),
             sha256_ssh_fingerprint(&b).unwrap()
         );
+    }
+
+    #[test]
+    fn oversized_card_is_rejected_and_offer_is_not_a_bearer_grant() {
+        let huge = format!("{OFFER_PREFIX}{}", "A".repeat(MAX_OFFER_TEXT_BYTES));
+        let err = decode_offer(&huge).unwrap_err().to_string();
+        assert!(err.contains("过长") || err.contains("上限"), "{err}");
+
+        let controller = Identity::generate();
+        let now = 1_700_000_000;
+        let offer = issue_offer(&controller, NodePolicy::exec(), 60, now, 600, None, None).unwrap();
+        let card = encode_offer(&offer).unwrap();
+        assert!(serde_json::from_str::<crate::grant::SignedGrant>(&card).is_err());
+        verify_offer(&offer, offer.exp_unix, None, None).unwrap();
+        let err = verify_offer(&offer, offer.exp_unix + 1, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("过期"), "{err}");
     }
 }

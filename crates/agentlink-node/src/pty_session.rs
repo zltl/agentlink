@@ -96,6 +96,7 @@ impl PtyManager {
             cmd.cwd(dir);
         }
         apply_interactive_term(&mut cmd);
+        cmd.env("AGENTLINK_REMOTE_EXEC", "1");
 
         let mut child = pair
             .slave
@@ -347,6 +348,7 @@ mod tests {
         let mut cmd = CommandBuilder::new("sh");
         cmd.env("TERM", "dumb");
         apply_interactive_term(&mut cmd);
+        cmd.env("AGENTLINK_REMOTE_EXEC", "1");
         assert_eq!(
             cmd.get_env("TERM").and_then(|v| v.to_str()),
             Some("xterm-256color")
@@ -358,6 +360,7 @@ mod tests {
         let mut cmd = CommandBuilder::new("sh");
         cmd.env("TERM", "screen-256color");
         apply_interactive_term(&mut cmd);
+        cmd.env("AGENTLINK_REMOTE_EXEC", "1");
         assert_eq!(
             cmd.get_env("TERM").and_then(|v| v.to_str()),
             Some("screen-256color")

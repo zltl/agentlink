@@ -88,15 +88,12 @@ fn load_pending() -> Vec<PendingItem> {
     reqs.into_iter()
         .filter(|r| r.is_pending(now))
         .map(|r| {
-            let short = if r.grantee_id.len() >= 16 {
-                format!("{}…", &r.grantee_id[..16])
-            } else {
-                r.grantee_id.clone()
-            };
+            let fp = agentlink_core::grant_offer::sha256_ssh_fingerprint(&r.grantee_id)
+                .unwrap_or_else(|_| "SHA256:?".into());
             PendingItem {
                 request_id: r.request_id,
                 label: format!(
-                    "{short} — {} — ttl {}s",
+                    "{fp} — {} — ttl {}s（签名≠人员/名称）",
                     r.policy.capability_summary(),
                     r.ttl_secs
                 ),
@@ -106,13 +103,33 @@ fn load_pending() -> Vec<PendingItem> {
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn launch_paste_ui() {
+    if crate::grant_local::remote_exec_is_set() {
+        tracing::warn!("{}", crate::grant_local::REMOTE_EXEC_REFUSAL);
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot launch grant paste-ui");
+            return;
+        }
+    };
+    match std::process::Command::new(exe).args(["grant", "paste-ui"]).spawn() {
+        Ok(_) => {}
+        Err(err) => tracing::warn!(error = %err, "failed to open grant paste-ui"),
+    }
+}
+
 fn local_allow(request_id: &str) {
     let Some(dir) = agentlink_core::grant_request::default_node_data_dir() else {
         tracing::warn!("grant allow from tray: this machine has no local node identity");
         return;
     };
     let now = agentlink_core::util::unix_now();
-    match agentlink_core::grant_request::allow_request_in_dir(&dir, request_id, now) {
+    match agentlink_core::grant_request::allow_request_in_dir(&dir, request_id, now, None, None) {
         Ok((_req, grant)) => {
             if let Err(err) = agentlink_core::grant_request::save_issued_grant(&dir, &grant) {
                 tracing::warn!(error = %err, "failed to store issued grant on the node");
@@ -180,6 +197,11 @@ impl ksni::Tray for AgentTray {
         use ksni::menu::*;
         let mut items = Vec::new();
         if self.on_node {
+            items.push(MenuItem::Standard(StandardItem {
+                label: "粘贴控制端身份码…".into(),
+                activate: Box::new(|_tray: &mut Self| launch_paste_ui()),
+                ..Default::default()
+            }));
             if self.pending.is_empty() {
                 items.push(MenuItem::Standard(StandardItem {
                     label: "No pending grant requests".into(),

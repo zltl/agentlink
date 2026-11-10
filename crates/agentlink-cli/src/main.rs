@@ -20,6 +20,7 @@ mod tray;
 #[cfg(windows)]
 mod tray_win;
 mod controller;
+mod grant_local;
 mod update;
 mod version;
 
@@ -930,6 +931,12 @@ enum GrantCommand {
         /// Write the signed grant JSON here (`-` prints it) in addition to storing it.
         #[arg(long)]
         out: Option<String>,
+        /// Optional narrower policy than the request (target may shrink, never enlarge).
+        #[arg(long)]
+        policy: Option<String>,
+        /// Optional shorter ttl than the request (target may shrink, never extend).
+        #[arg(long)]
+        ttl: Option<String>,
     },
     /// Deny a pending grant request on this node. Local only.
     Deny {
@@ -946,6 +953,12 @@ enum GrantCommand {
         request_id: Option<String>,
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Optional narrower policy than the request (target may shrink, never enlarge).
+        #[arg(long)]
+        policy: Option<String>,
+        /// Optional shorter ttl than the request (target may shrink, never extend).
+        #[arg(long)]
+        ttl: Option<String>,
     },
     /// 控制端（远程）：生成一张身份码，复制到【目标机】本地粘贴。
     ///
@@ -973,9 +986,18 @@ enum GrantCommand {
     /// 目标机（本地）：粘贴控制端身份码或完整 64 位公钥，形成待批请求。
     ///
     /// 不会签发 grant。核对指纹与实际权限后，再 `grant allow` 或 `--prompt`。
+    /// 目标机图形入口：弹出粘贴框，核对指纹后再批准。不只 CLI。
+    PasteUi {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        policy: Option<String>,
+        #[arg(long)]
+        ttl: Option<String>,
+    },
     Paste {
-        /// `grant offer` 的整行，或 64 位控制端公钥。
-        card: String,
+        /// `grant offer` 的整行，或 64 位控制端公钥。省略则打开本机图形/终端粘贴框。
+        card: Option<String>,
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// 仅当粘贴裸公钥时需要（身份码已自带策略）。
@@ -17834,11 +17856,13 @@ mod grant_ttl_tests {
         let allow = Cli::try_parse_from(["agentlink", "grant", "allow", "req-1", "--data-dir", "/tmp/node"]).unwrap();
         match allow.command {
             Command::Grant {
-                action: GrantCommand::Allow { request_id, data_dir, out },
+                action: GrantCommand::Allow { request_id, data_dir, out, policy, ttl },
             } => {
                 assert_eq!(request_id, "req-1");
                 assert_eq!(data_dir, Some(PathBuf::from("/tmp/node")));
                 assert!(out.is_none());
+                assert!(policy.is_none());
+                assert!(ttl.is_none());
             }
             other => panic!("expected grant allow, got {other:?}"),
         }
@@ -17852,10 +17876,12 @@ mod grant_ttl_tests {
         let prompt = Cli::try_parse_from(["agentlink", "grant", "prompt"]).unwrap();
         match prompt.command {
             Command::Grant {
-                action: GrantCommand::Prompt { request_id, data_dir },
+                action: GrantCommand::Prompt { request_id, data_dir, policy, ttl },
             } => {
                 assert!(request_id.is_none());
                 assert!(data_dir.is_none());
+                assert!(policy.is_none());
+                assert!(ttl.is_none());
             }
             other => panic!("expected grant prompt, got {other:?}"),
         }
@@ -17891,11 +17917,39 @@ mod grant_ttl_tests {
             Command::Grant {
                 action: GrantCommand::Paste { card, prompt, .. },
             } => {
-                assert!(card.starts_with("agentlink-offer:v1:"));
+                assert!(card.as_deref().unwrap().starts_with("agentlink-offer:v1:"));
                 assert!(!prompt);
             }
             other => panic!("expected grant paste, got {other:?}"),
         }
+        let shrink = Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "allow",
+            "req-1",
+            "--policy",
+            "exec",
+            "--ttl",
+            "10m",
+        ])
+        .unwrap();
+        match shrink.command {
+            Command::Grant {
+                action: GrantCommand::Allow { policy, ttl, .. },
+            } => {
+                assert_eq!(policy.as_deref(), Some("exec"));
+                assert_eq!(ttl.as_deref(), Some("10m"));
+            }
+            other => panic!("expected shrink allow, got {other:?}"),
+        }
+        let paste_ui = Cli::try_parse_from(["agentlink", "grant", "paste-ui", "--data-dir", "/tmp/node"]).unwrap();
+        match paste_ui.command {
+            Command::Grant {
+                action: GrantCommand::PasteUi { data_dir, .. },
+            } => assert_eq!(data_dir, Some(PathBuf::from("/tmp/node"))),
+            other => panic!("expected grant paste-ui, got {other:?}"),
+        }
+
         // Held destructive-ops verbs stay on `approve`, not `grant`.
         let approve = Cli::try_parse_from([
             "agentlink",
@@ -18883,69 +18937,6 @@ fn revoke_data_dir(explicit: Option<&std::path::Path>) -> Result<std::path::Path
 }
 
 
-
-fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let p = dir.join(name);
-                p.is_file()
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Local Allow/Deny UI for a pending grant request. Never talks to the relay.
-fn local_grant_decision_prompt(body: &str) -> Result<bool> {
-    let display_ok = std::env::var_os("DISPLAY")
-        .or_else(|| std::env::var_os("WAYLAND_DISPLAY"))
-        .is_some();
-    if display_ok && command_exists("zenity") {
-        let status = std::process::Command::new("zenity")
-            .args([
-                "--question",
-                "--title",
-                "agentlink grant request",
-                "--ok-label",
-                "Allow",
-                "--cancel-label",
-                "Deny",
-                "--no-wrap",
-                "--width",
-                "520",
-                "--text",
-                body,
-            ])
-            .status()?;
-        return Ok(status.success());
-    }
-    if display_ok && command_exists("kdialog") {
-        let status = std::process::Command::new("kdialog")
-            .args([
-                "--yesno",
-                body,
-                "--yes-label",
-                "Allow",
-                "--no-label",
-                "Deny",
-                "--title",
-                "agentlink grant request",
-            ])
-            .status()?;
-        return Ok(status.success());
-    }
-    eprint!("{body}\nType allow or deny: ");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    match line.trim().to_ascii_lowercase().as_str() {
-        "allow" | "a" | "yes" | "y" => Ok(true),
-        "deny" | "d" | "no" | "n" => Ok(false),
-        other => Err(anyhow!(
-            "expected allow or deny, got `{other}`. This prompt only runs on the node host."
-        )),
-    }
-}
-
 fn grant_node_data_dir(explicit: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
     revoke_data_dir(explicit)
 }
@@ -18971,7 +18962,128 @@ fn local_node_public_id(data_dir: &std::path::Path) -> Result<String> {
     Ok(id)
 }
 
+fn grant_paste_card(
+    cli: &Cli,
+    card: Option<&str>,
+    data_dir: Option<&std::path::PathBuf>,
+    policy: &Option<String>,
+    ttl: &Option<String>,
+    prompt: bool,
+) -> Result<i32> {
+    let card_owned = match card {
+        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        _ => grant_local::paste_card_dialog()?,
+    };
+    let card = card_owned.as_str();
+    let dir = grant_node_data_dir(data_dir.map(|p| p.as_path()))?;
+    let node_id = local_node_public_id(&dir)?;
+    let now = agentlink_core::util::unix_now();
+    let req = if let Ok(offer) = agentlink_core::grant_offer::decode_offer(card) {
+        agentlink_core::grant_offer::paste_offer_as_request(&dir, &offer, &node_id, None, now)
+            .map_err(|err| anyhow!(err.to_string()))?
+    } else if let Some(grantee) = agentlink_core::grant_offer::parse_raw_grantee_hex(card) {
+        let policy = policy.as_deref().ok_or_else(|| {
+            anyhow!("粘贴的是完整控制端公钥，请同时指定 --policy 与 --ttl。仅公钥能标识控制端，但不能证明此刻持有私钥；控制端之后仍须用私钥完成 E2E。名称无效。")
+        })?;
+        let ttl = ttl.as_deref().ok_or_else(|| anyhow!("粘贴裸公钥时必须指定 --ttl"))?;
+        let policy = parse_access(policy)?;
+        let ttl_secs = parse_ttl(ttl)? as u64;
+        let draft = agentlink_core::grant_request::draft_request(
+            &grantee,
+            &node_id,
+            policy,
+            ttl_secs,
+            now,
+            agentlink_core::grant_request::DEFAULT_REQUEST_TTL_SECS,
+        )
+        .map_err(|err| anyhow!(err.to_string()))?;
+        agentlink_core::grant_request::submit_request(&dir, &node_id, draft, now)
+            .map_err(|err| anyhow!(err.to_string()))?
+    } else {
+        return Err(anyhow!(
+            agentlink_core::grant_offer::decode_offer(card)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "无法解析身份码".into())
+        ));
+    };
+    let fp = agentlink_core::grant_offer::sha256_ssh_fingerprint(&req.grantee_id)
+        .map_err(|err| anyhow!(err.to_string()))?;
+    emit(
+        cli.json,
+        json!({
+            "kind": "pending_request",
+            "note": "not a grant; local allow required",
+            "request_id": req.request_id,
+            "grantee_id": req.grantee_id,
+            "fingerprint": fp,
+            "access": req.policy.capability_summary(),
+            "ttl_secs": req.ttl_secs,
+            "exp_unix": req.exp_unix,
+            "status": "pending",
+        }),
+        || {
+            eprintln!("已在【目标机】记录待批请求 {}（还不是 grant）", req.request_id);
+            eprintln!("控制端公钥指纹: {fp}");
+            eprintln!("控制端公钥: {}", req.grantee_id);
+            eprintln!("请求权限: {}", req.policy.capability_summary());
+            eprintln!("若同意，grant 有效期: {} 秒", req.ttl_secs);
+            eprintln!("{}", grant_local::SIGNATURE_DISCLAIMER);
+            eprintln!("{}", grant_local::SCOPE_NOTE);
+            eprintln!(
+                "请核对比指纹后在本机执行:\n  agentlink grant allow {} --data-dir {}\n或: agentlink grant prompt --data-dir {}\n图形入口: agentlink grant paste-ui --data-dir {}",
+                req.request_id,
+                dir.display(),
+                dir.display(),
+                dir.display()
+            );
+            eprintln!("这不是 `agentlink approve allow`（那是危险操作确认）。");
+        },
+    );
+    if prompt {
+        let body = grant_local::request_prompt_body(
+            &req.request_id,
+            &fp,
+            &req.grantee_id,
+            &req.policy.capability_summary(),
+            req.ttl_secs,
+            req.exp_unix,
+        );
+        let allow = grant_local::decision_prompt(&body)?;
+        if allow {
+            let issuer = agentlink_core::grant::load_issuer(&dir)
+                .map_err(|err| anyhow!(err.to_string()))?
+                .ok_or_else(|| anyhow!("no grant-issuer.json in {}", dir.display()))?;
+            let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
+                &dir,
+                &req.request_id,
+                now,
+                None,
+                None,
+            )
+            .map_err(|err| anyhow!(err.to_string()))?;
+            let _ = agentlink_core::grant_request::save_issued_grant(&dir, &grant);
+            let path = agentlink_core::grant::save_grant(&config_dir(cli)?, &grant)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            write_grant_result(cli, None, &grant, &path, &issuer, None)?;
+            eprintln!("已在目标机本地签发；issuer 密钥未离开本机。");
+        } else {
+            let denied = agentlink_core::grant_request::deny_request(&dir, &req.request_id, now)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            eprintln!("已拒绝待批请求 {}", denied.request_id);
+        }
+    }
+    Ok(0)
+}
+
 async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
+    let mutating = !matches!(
+        action,
+        GrantCommand::List | GrantCommand::Show { .. } | GrantCommand::Pending { .. }
+    );
+    if mutating {
+        grant_local::refuse_if_remote_exec()?;
+    }
     let dir = config_dir(cli)?;
     match action {
         GrantCommand::Issue {
@@ -19422,13 +19534,19 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             request_id,
             data_dir,
             out,
+            policy,
+            ttl,
         } => {
             let dir = grant_node_data_dir(data_dir.as_deref())?;
             let now = agentlink_core::util::unix_now();
+            let policy = policy.as_deref().map(parse_access).transpose()?;
+            let ttl_secs = ttl.as_deref().map(parse_ttl).transpose()?.map(|v| v as u64);
             let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
                 &dir,
                 request_id,
                 now,
+                policy,
+                ttl_secs,
             )
             .map_err(|err| anyhow!(err.to_string()))?;
             let issuer = agentlink_core::grant::load_issuer(&dir)
@@ -19464,6 +19582,8 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
         GrantCommand::Prompt {
             request_id,
             data_dir,
+            policy,
+            ttl,
         } => {
             let dir = grant_node_data_dir(data_dir.as_deref())?;
             let now = agentlink_core::util::unix_now();
@@ -19486,24 +19606,29 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     req.status
                 ));
             }
-            let body = format!(
-                "agentlink grant request\n\nrequest: {}\ncontroller: {}\nnode: {}\naccess: {}\ngrant ttl: {}s\nrequest expires unix: {}\n\nAllow signs a grant with this node's local issuer. Deny stores a refusal. Neither is `agentlink approve allow/deny` (held destructive ops). The issuer key stays on this machine.",
-                req.request_id,
-                req.grantee_id,
-                req.node_id,
-                req.policy.capability_summary(),
+            let fp = agentlink_core::grant_offer::sha256_ssh_fingerprint(&req.grantee_id)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let body = grant_local::request_prompt_body(
+                &req.request_id,
+                &fp,
+                &req.grantee_id,
+                &req.policy.capability_summary(),
                 req.ttl_secs,
                 req.exp_unix,
             );
-            let allow = local_grant_decision_prompt(&body)?;
+            let allow = grant_local::decision_prompt(&body)?;
             if allow {
                 let issuer = agentlink_core::grant::load_issuer(&dir)
                     .map_err(|err| anyhow!(err.to_string()))?
                     .ok_or_else(|| anyhow!("no grant-issuer.json in {}", dir.display()))?;
+                let policy = policy.as_deref().map(parse_access).transpose()?;
+                let ttl_secs = ttl.as_deref().map(parse_ttl).transpose()?.map(|v| v as u64);
                 let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
                     &dir,
                     &req.request_id,
                     now,
+                    policy,
+                    ttl_secs,
                 )
                 .map_err(|err| anyhow!(err.to_string()))?;
                 let _ = agentlink_core::grant_request::save_issued_grant(&dir, &grant);
@@ -19584,116 +19709,24 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     }
                     eprintln!("请把上面以 {} 开头的整行复制到【目标机】本地运行：", agentlink_core::grant_offer::OFFER_PREFIX);
                     eprintln!("  agentlink grant paste '<身份码>' --data-dir <目标节点数据目录>");
-                    eprintln!("然后在目标机核对指纹，再 `grant allow` 或 `grant prompt`。已有有效 grant 无需重复粘贴。");
+                    eprintln!("然后在目标机核对指纹，再 `grant allow` / `grant prompt` / `grant paste-ui`。已有有效 grant 无需重复粘贴。");
                     eprintln!("文档: docs/grant-offer.md");
                 },
             );
             Ok(0)
         }
+        GrantCommand::PasteUi {
+            data_dir,
+            policy,
+            ttl,
+        } => grant_paste_card(cli, None, data_dir.as_ref(), policy, ttl, true),
         GrantCommand::Paste {
             card,
             data_dir,
             policy,
             ttl,
             prompt,
-        } => {
-            let dir = grant_node_data_dir(data_dir.as_deref())?;
-            let node_id = local_node_public_id(&dir)?;
-            let now = agentlink_core::util::unix_now();
-            let req = if let Ok(offer) = agentlink_core::grant_offer::decode_offer(card) {
-                agentlink_core::grant_offer::paste_offer_as_request(&dir, &offer, &node_id, None, now)
-                    .map_err(|err| anyhow!(err.to_string()))?
-            } else if let Some(grantee) = agentlink_core::grant_offer::parse_raw_grantee_hex(card) {
-                let policy = policy.as_deref().ok_or_else(|| {
-                    anyhow!("粘贴的是完整控制端公钥，请同时指定 --policy 与 --ttl。仅公钥能标识控制端，但不能证明此刻持有私钥；控制端之后仍须用私钥完成 E2E。名称无效。")
-                })?;
-                let ttl = ttl.as_deref().ok_or_else(|| anyhow!("粘贴裸公钥时必须指定 --ttl"))?;
-                let policy = parse_access(policy)?;
-                let ttl_secs = parse_ttl(ttl)? as u64;
-                let draft = agentlink_core::grant_request::draft_request(
-                    &grantee,
-                    &node_id,
-                    policy,
-                    ttl_secs,
-                    now,
-                    agentlink_core::grant_request::DEFAULT_REQUEST_TTL_SECS,
-                )
-                .map_err(|err| anyhow!(err.to_string()))?;
-                agentlink_core::grant_request::submit_request(&dir, &node_id, draft, now)
-                    .map_err(|err| anyhow!(err.to_string()))?
-            } else {
-                // Prefer the decode error (Chinese, distinguishes invite vs offer).
-                return Err(anyhow!(
-                    agentlink_core::grant_offer::decode_offer(card)
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "无法解析身份码".into())
-                ));
-            };
-            let fp = agentlink_core::grant_offer::sha256_ssh_fingerprint(&req.grantee_id)
-                .map_err(|err| anyhow!(err.to_string()))?;
-            emit(
-                cli.json,
-                json!({
-                    "kind": "pending_request",
-                    "note": "not a grant; local allow required",
-                    "request_id": req.request_id,
-                    "grantee_id": req.grantee_id,
-                    "fingerprint": fp,
-                    "access": req.policy.capability_summary(),
-                    "ttl_secs": req.ttl_secs,
-                    "exp_unix": req.exp_unix,
-                    "status": "pending",
-                }),
-                || {
-                    eprintln!("已在【目标机】记录待批请求 {}（还不是 grant）", req.request_id);
-                    eprintln!("控制端公钥指纹: {fp}");
-                    eprintln!("控制端公钥: {}", req.grantee_id);
-                    eprintln!("请求权限: {}", req.policy.capability_summary());
-                    eprintln!("若同意，grant 有效期: {} 秒", req.ttl_secs);
-                    eprintln!(
-                        "请核对比指纹后在本机执行:\n  agentlink grant allow {} --data-dir {}\n或: agentlink grant prompt --data-dir {}",
-                        req.request_id,
-                        dir.display(),
-                        dir.display()
-                    );
-                    eprintln!("这不是 `agentlink approve allow`（那是危险操作确认）。");
-                },
-            );
-            if *prompt {
-                // Re-enter the existing prompt path logic by constructing body.
-                let body = format!(
-                    "agentlink grant request\n\nrequest: {}\ncontroller fingerprint: {}\ncontroller: {}\naccess: {}\ngrant ttl: {}s\n\nAllow 使用本机 issuer 签发。Deny 拒绝。都不是 approve allow。",
-                    req.request_id,
-                    fp,
-                    req.grantee_id,
-                    req.policy.capability_summary(),
-                    req.ttl_secs,
-                );
-                let allow = local_grant_decision_prompt(&body)?;
-                if allow {
-                    let issuer = agentlink_core::grant::load_issuer(&dir)
-                        .map_err(|err| anyhow!(err.to_string()))?
-                        .ok_or_else(|| anyhow!("no grant-issuer.json in {}", dir.display()))?;
-                    let (_req, grant) = agentlink_core::grant_request::allow_request_in_dir(
-                        &dir,
-                        &req.request_id,
-                        now,
-                    )
-                    .map_err(|err| anyhow!(err.to_string()))?;
-                    let _ = agentlink_core::grant_request::save_issued_grant(&dir, &grant);
-                    let path = agentlink_core::grant::save_grant(&config_dir(cli)?, &grant)
-                        .map_err(|err| anyhow!(err.to_string()))?;
-                    write_grant_result(cli, None, &grant, &path, &issuer, None)?;
-                    eprintln!("已在目标机本地签发；issuer 密钥未离开本机。");
-                } else {
-                    let denied = agentlink_core::grant_request::deny_request(&dir, &req.request_id, now)
-                        .map_err(|err| anyhow!(err.to_string()))?;
-                    eprintln!("已拒绝待批请求 {}", denied.request_id);
-                }
-            }
-            Ok(0)
-        }
+        } => grant_paste_card(cli, card.as_deref(), data_dir.as_ref(), policy, ttl, *prompt),
         GrantCommand::Request {
             grantee,
             policy,

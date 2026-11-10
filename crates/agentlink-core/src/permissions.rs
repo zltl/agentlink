@@ -218,6 +218,11 @@ impl NodePolicy {
         }
     }
 
+    /// True when every capability in `self` is already in `other`.
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.intersect(other) == self
+    }
+
     pub fn allows(&self, op: &Op) -> std::result::Result<(), String> {
         let (ok, kind) = match op {
             Op::Stat { .. }

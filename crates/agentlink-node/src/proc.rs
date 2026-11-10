@@ -83,6 +83,9 @@ fn finish_command(
         validate_env(key, value)?;
         cmd.env(key, value);
     }
+    // Always mark node-spawned processes so local grant issuance cannot be
+    // reached via agentlink exec/pty, even when the caller has an exec grant.
+    cmd.env("AGENTLINK_REMOTE_EXEC", "1");
     Ok(())
 }
 

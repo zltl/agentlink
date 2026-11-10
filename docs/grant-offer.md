@@ -71,8 +71,21 @@ agentlink grant offer --policy desktop --ttl 4h [--node <目标64位公钥>]
 agentlink grant paste 'agentlink-offer:v1:…' --data-dir <节点数据目录>
 agentlink grant pending --data-dir …
 agentlink grant allow <request-id> --data-dir …
+# 目标机可以缩小权限或缩短 ttl，不能加大：
+agentlink grant allow <request-id> --policy exec --ttl 10m --data-dir …
+# 或图形入口（zenity/kdialog 粘贴框 + 核对指纹后批准）
+agentlink grant paste-ui --data-dir …
 # 或
 agentlink grant paste '…' --prompt --data-dir …
 ```
+
+目标机托盘在节点本机还提供「粘贴控制端身份码…」与带 SHA256 指纹的 Allow/Deny。UI 必须展示指纹，并写明：签名只证明私钥，不证明屏幕名称或人员真实性。
+
+其它约束：
+
+- `grant paste` / `allow` / `prompt` / `paste-ui` / `issue` 等签发入口遇到 `AGENTLINK_REMOTE_EXEC`（节点 exec/pty/shell 会注入）时拒绝。即使控制端已有 exec 授权，也不能借此为自身或第三方扩大 scope。已授权的独立 SSH/Cursor 可在目标机本地代执行 grant。
+- 身份码解析有长度上限（8KiB）。used-nonces 原子落盘，删除待批文件或重启后同一 nonce 仍拒绝。
+- 时间边界：身份码在 `exp_unix` 当时仍有效，`exp_unix+1` 过期。跨目标公钥、跨 relay 指纹拒绝。
+- 公开身份码绝不可被当成 SignedGrant / bearer 授权。
 
 错误信息使用可理解的中文，并分清控制端与目标机。
