@@ -71,14 +71,39 @@ impl LinuxState {
         self.capture_frame(request, 1000)
     }
 
-    fn capture_frame(&mut self, request: &CaptureRequest, wait_ms: i32) -> Result<Frame> {
+    fn capture_frame(
+        &mut self,
+        request: &CaptureRequest,
+        #[cfg_attr(not(pipewire_headers), allow(unused_variables))] wait_ms: i32,
+    ) -> Result<Frame> {
         self.ensure()?;
         let frame = match self.display.as_mut().unwrap() {
             DisplayConn::X11(desk) => capture_x11(desk, &request.target)?,
             DisplayConn::Wayland(desk) => self.rt.block_on(desk.capture(&request.target))?,
             #[cfg(pipewire_headers)]
             DisplayConn::Mutter(desk) => {
-                desk.capture_wait(&request.target, wait_ms, request.max_width)?
+                if let CaptureTarget::Window(query) = &request.target {
+                    match self
+                        .rt
+                        .block_on(desk.capture_window(query, wait_ms, request.max_width))
+                    {
+                        Ok(frame) => frame,
+                        Err(err) => match X11Desk::connect()
+                            .and_then(|mut x11| x11.capture_window(query))
+                        {
+                            Ok(frame) => {
+                                tracing::info!(
+                                    error = %err,
+                                    "Mutter RecordWindow unavailable; captured the X11 window drawable"
+                                );
+                                frame
+                            }
+                            Err(_) => return Err(err),
+                        },
+                    }
+                } else {
+                    desk.capture_wait(&request.target, wait_ms, request.max_width)?
+                }
             }
         };
         // PipeWire/Mutter already applied max_width capture-side; scale_frame
@@ -223,6 +248,25 @@ impl LinuxState {
 
     fn inject(&mut self, action: &InputAction) -> Result<()> {
         self.ensure()?;
+        // Literal text: prefer AT-SPI InsertText (bypasses IME). Otherwise
+        // temporarily switch composing IMEs to Latin, type keysyms, restore.
+        let _ime_guard = if let InputAction::Type { text } = action {
+            match self
+                .rt
+                .block_on(super::atspi::insert_text_at_focus(text))
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        "AT-SPI InsertText unavailable; typing keysyms with IME guard"
+                    );
+                }
+            }
+            super::ime::ImeGuard::engage()
+        } else {
+            None
+        };
         match self.display.take() {
             Some(DisplayConn::X11(mut desk)) => {
                 let result = perform(&mut desk, action);

@@ -7,9 +7,13 @@ use crate::Desktop;
 #[cfg(target_os = "linux")]
 mod atspi;
 #[cfg(target_os = "linux")]
+mod ime;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(target_os = "linux", pipewire_headers))]
 mod mutter;
+#[cfg(target_os = "linux")]
+mod shell_windows;
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(target_os = "linux")]

@@ -4,6 +4,11 @@
 //! Element ids are `atspi|{bus-name}|{object-path}` and can be used until the
 //! next tree request. Click, focus, and set-value call Action, Component, and
 //! EditableText on that object.
+//!
+//! Desktop root: libatspi's `atspi_get_desktop(0)` is **not** a D-Bus
+//! `Registry.GetDesktop` call (that method does not exist on modern
+//! `org.a11y.atspi.Registry`). It is a client-side alias for the registry
+//! accessible at `/org/a11y/atspi/accessible/root`.
 
 use std::collections::HashMap;
 
@@ -13,6 +18,11 @@ use zbus::{Connection, Proxy};
 use crate::a11y::UiNode;
 use crate::capture::Rect;
 use crate::error::{msg, Result};
+
+const ATSPI_REGISTRY_BUS: &str = "org.a11y.atspi.Registry";
+const ATSPI_ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+const ATSPI_STATE_EDITABLE: u32 = 7;
+const ATSPI_STATE_FOCUSED: u32 = 12;
 
 struct ObjectRef {
     bus: String,
@@ -26,6 +36,37 @@ pub async fn tree(max_depth: u32, max_nodes: u32) -> Result<UiNode> {
     walk(&conn, &root, max_depth.max(1), &mut budget)
         .await?
         .ok_or_else(|| msg("AT-SPI desktop tree is empty"))
+}
+
+/// Insert `text` at the caret of the focused editable accessible, if any.
+/// Used by Linux `type` so committed text bypasses the session IME.
+pub async fn insert_text_at_focus(text: &str) -> Result<()> {
+    let conn = atspi_bus().await?;
+    let root = desktop_root(&conn).await?;
+    let mut budget = 400u32;
+    let focused = find_focused_editable(&conn, &root, &mut budget)
+        .await?
+        .ok_or_else(|| {
+            msg("AT-SPI capability: no focused editable text field for InsertText")
+        })?;
+    let caret = caret_offset(&conn, &focused).await.unwrap_or(0);
+    let proxy = Proxy::new(
+        &conn,
+        focused.bus.as_str(),
+        focused.path.as_str(),
+        "org.a11y.atspi.EditableText",
+    )
+    .await
+    .map_err(|err| msg(format!("AT-SPI EditableText: {err}")))?;
+    let length = i32::try_from(text.len()).unwrap_or(i32::MAX);
+    let ok: bool = proxy
+        .call("InsertText", &(caret, text, length))
+        .await
+        .map_err(|err| msg(format!("AT-SPI InsertText: {err}")))?;
+    if !ok {
+        return Err(msg("AT-SPI InsertText returned false"));
+    }
+    Ok(())
 }
 
 pub async fn act(id: &str, op: crate::a11y::ElementOp, value: Option<&str>) -> Result<()> {
@@ -82,44 +123,52 @@ pub async fn act(id: &str, op: crate::a11y::ElementOp, value: Option<&str>) -> R
 }
 
 async fn atspi_bus() -> Result<Connection> {
-    let session = Connection::session()
-        .await
-        .map_err(|err| msg(format!("session bus: {err}")))?;
+    let session = Connection::session().await.map_err(|err| {
+        msg(format!(
+            "AT-SPI capability missing: session bus unavailable ({err}). \
+             Export DBUS_SESSION_BUS_ADDRESS from the interactive user session."
+        ))
+    })?;
     let launcher = Proxy::new(&session, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
         .await
         .map_err(|err| {
             msg(format!(
-                "AT-SPI bus launcher: {err}. Install at-spi2-core and start the session accessibility bus."
+                "AT-SPI capability missing: accessibility bus launcher unreachable ({err}). \
+                 Install at-spi2-core and run the node in the interactive user session."
             ))
         })?;
-    let address: String = launcher
-        .call("GetAddress", &())
-        .await
-        .map_err(|err| msg(format!("AT-SPI GetAddress: {err}")))?;
+    let address: String = launcher.call("GetAddress", &()).await.map_err(|err| {
+        msg(format!(
+            "AT-SPI capability missing: GetAddress failed ({err}). \
+             Enable toolkit accessibility and ensure the session a11y bus is running."
+        ))
+    })?;
     zbus::connection::Builder::address(address.as_str())
         .map_err(|err| msg(err.to_string()))?
         .build()
         .await
-        .map_err(|err| msg(format!("AT-SPI bus: {err}")))
+        .map_err(|err| {
+            msg(format!(
+                "AT-SPI capability missing: could not connect to accessibility bus ({err})"
+            ))
+        })
 }
 
 async fn desktop_root(conn: &Connection) -> Result<ObjectRef> {
-    let registry = Proxy::new(
-        conn,
-        "org.a11y.atspi.Registry",
-        "/org/a11y/atspi/registry",
-        "org.a11y.atspi.Registry",
-    )
-    .await
-    .map_err(|err| msg(format!("AT-SPI registry: {err}")))?;
-    let (bus, path): (String, OwnedObjectPath) = registry
-        .call("GetDesktop", &(0i32,))
-        .await
-        .map_err(|err| msg(format!("AT-SPI GetDesktop: {err}")))?;
-    Ok(ObjectRef {
-        bus,
-        path: path.to_string(),
-    })
+    // Match libatspi `atspi_get_desktop(0)`: ref the registry accessible root.
+    // Do not call Registry.GetDesktop — that method is not on the D-Bus API.
+    let root = ObjectRef {
+        bus: ATSPI_REGISTRY_BUS.to_string(),
+        path: ATSPI_ROOT_PATH.to_string(),
+    };
+    // Probe ChildCount so a missing registry yields a clear capability error
+    // instead of an empty walk later.
+    match prop_i32(conn, &root, "ChildCount").await {
+        Ok(_) => Ok(root),
+        Err(err) => Err(msg(format!(
+            "AT-SPI capability missing: desktop root {ATSPI_ROOT_PATH} is unreachable ({err})"
+        ))),
+    }
 }
 
 async fn walk(
@@ -133,20 +182,21 @@ async fn walk(
     }
     *budget -= 1;
     let name = prop_string(conn, object, "Name").await.unwrap_or_default();
-    let role_id = prop_u32(conn, object, "Role").await.unwrap_or(67);
+    let role_id = role_of(conn, object).await.unwrap_or(67);
     let bounds = extents(conn, object).await.unwrap_or(Rect {
         x: 0,
         y: 0,
         width: 0,
         height: 0,
     });
+    let focused = state_has(&states_of(conn, object).await.unwrap_or_default(), ATSPI_STATE_FOCUSED);
     let mut node = UiNode {
         id: format!("atspi|{}|{}", object.bus, object.path),
         role: role_name(role_id).to_string(),
         name,
         bounds,
         value: String::new(),
-        focused: false,
+        focused,
         children: Vec::new(),
     };
     if depth <= 1 {
@@ -248,20 +298,90 @@ async fn action<'a>(conn: &'a Connection, object: &'a ObjectRef) -> Result<Proxy
     .map_err(|err| msg(err.to_string()))
 }
 
+async fn find_focused_editable(
+    conn: &Connection,
+    object: &ObjectRef,
+    budget: &mut u32,
+) -> Result<Option<ObjectRef>> {
+    if *budget == 0 {
+        return Ok(None);
+    }
+    *budget -= 1;
+    let states = states_of(conn, object).await.unwrap_or_default();
+    let focused = state_has(&states, ATSPI_STATE_FOCUSED);
+    let editable = state_has(&states, ATSPI_STATE_EDITABLE);
+    if focused && editable {
+        return Ok(Some(ObjectRef {
+            bus: object.bus.clone(),
+            path: object.path.clone(),
+        }));
+    }
+    let count = prop_i32(conn, object, "ChildCount").await.unwrap_or(0);
+    let count = count.clamp(0, 128);
+    for index in 0..count {
+        if *budget == 0 {
+            break;
+        }
+        let child = match child_at(conn, object, index).await {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if let Some(found) = Box::pin(find_focused_editable(conn, &child, budget)).await? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+async fn caret_offset(conn: &Connection, object: &ObjectRef) -> Result<i32> {
+    let value = dbus_prop(conn, object, "org.a11y.atspi.Text", "CaretOffset").await?;
+    match &*value {
+        Value::I32(number) => Ok(*number),
+        Value::U32(number) => Ok(*number as i32),
+        _ => Err(msg("AT-SPI CaretOffset is not an integer")),
+    }
+}
+
+async fn role_of(conn: &Connection, object: &ObjectRef) -> Result<u32> {
+    let proxy = accessible(conn, object).await?;
+    let role: u32 = proxy
+        .call("GetRole", &())
+        .await
+        .map_err(|err| msg(format!("AT-SPI GetRole: {err}")))?;
+    Ok(role)
+}
+
+async fn states_of(conn: &Connection, object: &ObjectRef) -> Result<Vec<u32>> {
+    let proxy = accessible(conn, object).await?;
+    let states: Vec<u32> = proxy
+        .call("GetState", &())
+        .await
+        .map_err(|err| msg(format!("AT-SPI GetState: {err}")))?;
+    Ok(states)
+}
+
+/// `GetState` historically returns two uint32 bitfields; some stacks return a
+/// list of state enum values. Accept either encoding.
+pub fn state_has(states: &[u32], state: u32) -> bool {
+    if states.iter().any(|value| *value == state) && states.len() > 2 {
+        return true;
+    }
+    if states.len() <= 4 {
+        let bit = state;
+        let index = (bit / 32) as usize;
+        let shift = bit % 32;
+        if let Some(word) = states.get(index) {
+            return (word & (1u32 << shift)) != 0;
+        }
+    }
+    states.iter().any(|value| *value == state)
+}
+
 async fn prop_string(conn: &Connection, object: &ObjectRef, name: &str) -> Result<String> {
     let value = dbus_prop(conn, object, "org.a11y.atspi.Accessible", name).await?;
     match &*value {
         Value::Str(text) => Ok(text.to_string()),
         _ => Ok(String::new()),
-    }
-}
-
-async fn prop_u32(conn: &Connection, object: &ObjectRef, name: &str) -> Result<u32> {
-    let value = dbus_prop(conn, object, "org.a11y.atspi.Accessible", name).await?;
-    match &*value {
-        Value::U32(number) => Ok(*number),
-        Value::U16(number) => Ok(*number as u32),
-        _ => Err(msg(format!("AT-SPI property {name} is not an integer"))),
     }
 }
 
@@ -343,4 +463,33 @@ fn role_name(role: u32) -> &'static str {
 #[allow(dead_code)]
 fn _map_unused(map: HashMap<String, String>) -> usize {
     map.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_root_paths_match_libatspi() {
+        assert_eq!(ATSPI_REGISTRY_BUS, "org.a11y.atspi.Registry");
+        assert_eq!(ATSPI_ROOT_PATH, "/org/a11y/atspi/accessible/root");
+    }
+
+    #[test]
+    fn state_bitfield_detects_focused_and_editable() {
+        // Two-word bitfield encoding used by classic at-spi2.
+        let mut words = [0u32; 2];
+        words[(ATSPI_STATE_FOCUSED / 32) as usize] |= 1 << (ATSPI_STATE_FOCUSED % 32);
+        words[(ATSPI_STATE_EDITABLE / 32) as usize] |= 1 << (ATSPI_STATE_EDITABLE % 32);
+        assert!(state_has(&words, ATSPI_STATE_FOCUSED));
+        assert!(state_has(&words, ATSPI_STATE_EDITABLE));
+        assert!(!state_has(&words, 0));
+    }
+
+    #[test]
+    fn state_list_encoding_is_accepted() {
+        let states = vec![ATSPI_STATE_EDITABLE, ATSPI_STATE_FOCUSED, 25, 26, 30];
+        assert!(state_has(&states, ATSPI_STATE_FOCUSED));
+        assert!(state_has(&states, ATSPI_STATE_EDITABLE));
+    }
 }

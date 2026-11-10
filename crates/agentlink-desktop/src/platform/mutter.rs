@@ -14,6 +14,10 @@
 //! 4. Input goes to the same remote desktop session. Absolute pointer
 //!    positions are in stream pixels, so `NotifyPointerMotionAbsolute` takes
 //!    the stream path.
+//! 5. Single-window screenshots use a separate ScreenCast session with
+//!    `RecordWindow` (Mutter API ≥ 2) and GNOME Shell Introspect window ids.
+//!    This is a real compositor window stream (content + geometry + occlusion),
+//!    not a cropped monitor frame.
 //!
 //! The PipeWire node lives on the user's default PipeWire daemon (not a
 //! portal-provided fd), so [`PwCapture::open_default`] connects to it directly.
@@ -169,9 +173,19 @@ impl MutterDesk {
             ))),
             CaptureTarget::Region(rect) => crop_frame(&frame, *rect),
             CaptureTarget::Window(_) => Err(msg(
-                "Mutter ScreenCast cannot capture one window; capture the screen or the region",
+                "internal error: Mutter window capture must use capture_window",
             )),
         }
+    }
+
+    /// One-shot `RecordWindow` capture. Runs on the caller's tokio runtime.
+    pub async fn capture_window(
+        &self,
+        query: &str,
+        wait_ms: i32,
+        max_width: u32,
+    ) -> Result<Frame> {
+        record_window_frame(&self.conn, query, wait_ms.max(500), max_width).await
     }
 
     /// Reuse one PipeWire consumer for screenshots and the live session: a
@@ -228,6 +242,123 @@ impl MutterDesk {
         Err(msg("Mutter ScreenCast has not delivered a frame yet"))
     }
 
+}
+
+async fn record_window_frame(
+    conn: &Connection,
+    query: &str,
+    wait_ms: i32,
+    max_width: u32,
+) -> Result<Frame> {
+    let window_id = resolve_mutter_window(conn, query).await?;
+    let screencast = Proxy::new(conn, MUTTER_SC, SC_PATH, SC_IFACE)
+        .await
+        .map_err(|err| {
+            msg(format!(
+                "window capture capability missing: Mutter ScreenCast unavailable ({err})"
+            ))
+        })?;
+    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let screencast_path: OwnedObjectPath = screencast
+        .call("CreateSession", &(options,))
+        .await
+        .map_err(|err| msg(format!("ScreenCast.CreateSession (window): {err}")))?;
+    let screencast_session =
+        Proxy::new(conn, MUTTER_SC, screencast_path.as_str(), SC_SESSION_IFACE)
+            .await
+            .map_err(|err| msg(format!("Mutter ScreenCast session: {err}")))?;
+    let mut props: HashMap<&str, Value<'_>> = HashMap::new();
+    props.insert("window-id", Value::U64(window_id));
+    props.insert("cursor-mode", Value::from(1u32));
+    let stream_path: OwnedObjectPath = screencast_session
+        .call("RecordWindow", &(props,))
+        .await
+        .map_err(|err| {
+            msg(format!(
+                "window capture capability missing: Mutter RecordWindow failed ({err}). \
+                 Needs Mutter ScreenCast API ≥ 2; use screen/monitor capture otherwise."
+            ))
+        })?;
+    let stream = Proxy::new(conn, MUTTER_SC, stream_path.as_str(), SC_STREAM_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter ScreenCast stream: {err}")))?;
+    let mut signals = stream
+        .receive_signal("PipeWireStreamAdded")
+        .await
+        .map_err(|err| msg(format!("PipeWireStreamAdded: {err}")))?;
+    screencast_session
+        .call::<_, _, ()>("Start", &())
+        .await
+        .map_err(|err| msg(format!("ScreenCast.Start (window): {err}")))?;
+    let message = tokio::time::timeout(Duration::from_secs(10), signals.next())
+        .await
+        .map_err(|_| msg("Mutter did not add a PipeWire window stream within 10s"))?
+        .ok_or_else(|| msg("Mutter closed the window ScreenCast stream"))?;
+    let node: u32 = message
+        .body()
+        .deserialize()
+        .map_err(|err| msg(format!("PipeWireStreamAdded node: {err}")))?;
+    let mut capture = PwCapture::open_default(node)?;
+    let target = crate::stream::pipewire::resolve_target_width(max_width);
+    capture.set_target_width(target);
+    let mut last_err = msg("Mutter window ScreenCast has not delivered a frame yet");
+    for _ in 0..8 {
+        match capture.take(wait_ms) {
+            Ok(Some((frame, _))) => {
+                let _ = screencast_session.call::<_, _, ()>("Stop", &()).await;
+                return Ok(frame);
+            }
+            Ok(None) => {}
+            Err(err) => last_err = err,
+        }
+    }
+    let _ = screencast_session.call::<_, _, ()>("Stop", &()).await;
+    Err(last_err)
+}
+
+async fn resolve_mutter_window(conn: &Connection, query: &str) -> Result<u64> {
+    let windows = list_shell_windows(conn).await?;
+    super::shell_windows::match_window_query(query, &windows)
+}
+
+async fn list_shell_windows(conn: &Connection) -> Result<Vec<super::shell_windows::ShellWindow>> {
+    let introspect = Proxy::new(
+        conn,
+        "org.gnome.Shell.Introspect",
+        "/org/gnome/Shell/Introspect",
+        "org.gnome.Shell.Introspect",
+    )
+    .await
+    .map_err(|err| {
+        msg(format!(
+            "window capture capability missing: GNOME Shell Introspect unreachable ({err})"
+        ))
+    })?;
+    let reply: HashMap<u64, HashMap<String, OwnedValue>> = introspect
+        .call("GetWindows", &())
+        .await
+        .map_err(|err| {
+            msg(format!(
+                "window capture capability missing: Shell.GetWindows failed ({err})"
+            ))
+        })?;
+    let mut out = Vec::with_capacity(reply.len());
+    for (id, props) in reply {
+        let title = owned_str(props.get("title")).unwrap_or_default();
+        let hidden = matches!(
+            props.get("is-hidden").map(|value| &**value),
+            Some(Value::Bool(true))
+        );
+        out.push(super::shell_windows::ShellWindow { id, title, hidden });
+    }
+    Ok(out)
+}
+
+fn owned_str(value: Option<&OwnedValue>) -> Option<String> {
+    match value.map(|value| &**value) {
+        Some(Value::Str(text)) => Some(text.to_string()),
+        _ => None,
+    }
 }
 
 async fn open_screencast(conn: &Connection, connector: &str) -> Result<(String, String, u32)> {
@@ -427,3 +558,4 @@ pub async fn notify_keysym(
         .await
         .map_err(|err| msg(format!("keysym: {err}")))
 }
+

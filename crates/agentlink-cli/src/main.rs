@@ -10172,13 +10172,14 @@ const ATSPI_BUS_TIP_MARKER: &str = "the node's accessibility bus is unreachable"
 /// error already self-documents (`at-spi2-core` guard) and stale-element /
 /// no-click errors carry their own tips, so those are left alone. Idempotent.
 fn decorate_atspi_bus_failure(message: &str) -> String {
-    const NEEDLES: [&str; 6] = [
+    const NEEDLES: [&str; 7] = [
         "AT-SPI GetDesktop: ",
         "AT-SPI registry: ",
         "AT-SPI bus: ",
         "AT-SPI GetAddress: ",
         "session bus: ",
         "AT-SPI desktop tree is empty",
+        "AT-SPI capability missing:",
     ];
     if message.contains(ATSPI_BUS_TIP_MARKER)
         || message.contains("at-spi2-core")
@@ -10219,6 +10220,7 @@ mod atspi_bus_tip_tests {
             "AT-SPI GetAddress: ServiceUnknown",
             "session bus: NotSupported",
             "AT-SPI desktop tree is empty",
+            "AT-SPI capability missing: desktop root unreachable",
         ] {
             let out = decorate_atspi_bus_failure(raw);
             assert!(out.starts_with(&format!("{raw}. tip:")), "{out}");
@@ -10277,10 +10279,12 @@ const SCREENSHOT_WINDOW_TIP_MARKER: &str = "window capture did not match any vis
 /// full-screen/monitor fallbacks. Idempotent, and leaves unrelated desktop
 /// errors alone.
 fn decorate_screenshot_window_not_found(message: &str) -> String {
-    const NEEDLES: [&str; 3] = [
+    const NEEDLES: [&str; 5] = [
         "no X11 window matches '",
         "no window title contains '",
         "mock window '",
+        "window capture capability missing:",
+        "Mutter RecordWindow failed",
     ];
     if message.contains(SCREENSHOT_WINDOW_TIP_MARKER)
         || message.contains("ui-tree")
