@@ -261,6 +261,10 @@ impl LinuxState {
             {
                 Ok(()) => return Ok(()),
                 Err(err) => {
+                    // No writable focused field: never report success via keysyms.
+                    if super::atspi::is_no_editable_insert_error(&err.to_string()) {
+                        return Err(err);
+                    }
                     tracing::info!(
                         error = %err,
                         "AT-SPI InsertText unavailable; typing keysyms with IME guard"

@@ -102,9 +102,63 @@ still reported "typed N characters".
 
 Cause: `find_focused_editable` DFS from the desktop root spent its budget in
 the large GNOME Shell/registry tree before reaching application buses (the
-isolated editor is on a `:1.13` TextEditor bus). The length fix remains
-correct for when InsertText does run.
+isolated editor is on a `:1.13` TextEditor bus).
 
-Change: search application buses first; if needed, GrabFocus an editable in
-an active/focused frame; do not report keysym success for non-ASCII when
-InsertText failed.
+Change (15ac65a): search application buses first; if needed, GrabFocus an
+editable in an active/focused frame; do not report keysym success for
+non-ASCII when InsertText failed.
+
+## Follow-up: InsertText true but CJK still missing (21:24–21:35 Asia/Shanghai)
+
+After 15ac65a (sha256 60cd72f9…), CJK `中文输入测试：你好。` returned
+`typed 11 characters` with **no** InsertText-failure log, IBus stayed
+`libpinyin`, and the visible editor still lacked the CJK. Editor stderr:
+
+`gtk_text_buffer_emit_insert: assertion 'g_utf8_validate (text, len, NULL)' failed`
+
+**Real cause:** AT-SPI `EditableText.InsertText` `length` is the UTF-8 **byte**
+count to consume from `text` (libatspi: “number of characters … in bytes”).
+Commit 15b4475/15ac65a passed `text.chars().count()` (10 scalars for the
+fixture, 30 UTF-8 bytes). GTK validated/inserted only 10 bytes, mid-sequence
+UTF-8 failed, **InsertText still returned true**, and nothing landed. The
+earlier “byte length was wrong” diagnosis was inverted; byte length failed
+then because the editor bus was never reached.
+
+Live probe on the focused GtkSourceView (`:1.13`, EditableText):
+- `InsertText(..., length=10)` → D-Bus `true`, `GetText` unchanged, GTK critical
+- `InsertText(..., length=30)` → D-Bus `true`, `GetText` contains the CJK
+- `length=-1` also inserts the full string
+
+**Fix:**
+1. `insert_text_length` uses `text.len()` (UTF-8 bytes).
+2. After InsertText returns true, `GetText` must show the inserted scalars at
+   the pre-insert caret — RPC true alone is not success.
+3. Negative: if there is no focused editable, `type` errors and does **not**
+   fall through to keysyms (ASCII or otherwise).
+4. Keysym+IME-guard remains only when a field exists but InsertText/verify
+   failed and the payload is ASCII.
+
+### How to verify actual widget text (not just CLI success)
+
+1. Leave IBus `libpinyin` on. Focus the isolated gnome-text-editor.
+2. `agentlink type … '中文输入测试：你好。'` — expect exit 0.
+3. Confirm via AT-SPI `Text.GetText` on the focused EditableText **or** save
+   the buffer / full-screen screenshot of the editor — CLI “typed N” is not
+   enough.
+4. Mixed / ASCII / newlines the same way. IME engine should still be
+   `libpinyin` afterward (temporary Latin switch only on keysym fallback).
+5. Negative: focus a non-editable UI (or no window); `type` must error with
+   `no focused editable text field`.
+
+### Window-capture capability limits (unchanged)
+
+On this GNOME session, `org.gnome.Shell.Introspect.GetWindows` and
+`ScreenshotWindow` are AccessDenied to regular clients. The test editor is
+Wayland-native (no X11 drawable). Mutter `RecordWindow` needs Introspect ids.
+xdg-desktop-portal Screenshot is full-session only here — not a silent
+single-window path. Do not crop a full desktop and call it a window. The
+client gets a clear capability error; full-screen/monitor capture still works.
+No GNOME security policy was loosened.
+
+`cargo test -p agentlink-desktop --lib`: 73 passed locally (includes
+byte-length + landed-text + no-editable classifier tests).

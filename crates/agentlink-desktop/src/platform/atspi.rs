@@ -41,6 +41,11 @@ pub async fn tree(max_depth: u32, max_nodes: u32) -> Result<UiNode> {
 
 /// Insert `text` at the caret of the focused editable accessible, if any.
 /// Used by Linux `type` so committed text bypasses the session IME.
+///
+/// Success requires the text to actually appear in the widget (`GetText`),
+/// not merely a true D-Bus return from `InsertText`. GTK treats the length
+/// argument as a UTF-8 byte count; a too-small length returns true while
+/// inserting nothing (and may log `g_utf8_validate` critically).
 pub async fn insert_text_at_focus(text: &str) -> Result<()> {
     let conn = atspi_bus().await?;
     let root = desktop_root(&conn).await?;
@@ -58,8 +63,9 @@ pub async fn insert_text_at_focus(text: &str) -> Result<()> {
     )
     .await
     .map_err(|err| msg(format!("AT-SPI EditableText: {err}")))?;
-    // AT-SPI InsertText `length` is a character count, not UTF-8 bytes.
-    // Passing text.len() worked for ASCII and silently failed for CJK.
+    // AT-SPI InsertText `length` is the UTF-8 byte count to take from `text`
+    // ("number of characters … in bytes"). Unicode scalar count is wrong for
+    // CJK: InsertText returns true, GTK rejects the truncated bytes, nothing lands.
     let length = insert_text_length(text);
     let ok: bool = proxy
         .call("InsertText", &(caret, text, length))
@@ -67,6 +73,19 @@ pub async fn insert_text_at_focus(text: &str) -> Result<()> {
         .map_err(|err| msg(format!("AT-SPI InsertText: {err}")))?;
     if !ok {
         return Err(msg("AT-SPI InsertText returned false"));
+    }
+    let after = text_content(&conn, &focused).await.map_err(|err| {
+        msg(format!(
+            "AT-SPI InsertText returned true but GetText failed ({err}); cannot verify committed text"
+        ))
+    })?;
+    if !inserted_text_landed(&after, caret, text) {
+        return Err(msg(format!(
+            "AT-SPI InsertText returned true but the focused field did not contain the committed text \
+             (caret={caret}, inserted_chars={}, field_chars={})",
+            text.chars().count(),
+            after.chars().count()
+        )));
     }
     Ok(())
 }
@@ -468,6 +487,23 @@ async fn caret_offset(conn: &Connection, object: &ObjectRef) -> Result<i32> {
     }
 }
 
+async fn text_content(conn: &Connection, object: &ObjectRef) -> Result<String> {
+    let proxy = Proxy::new(
+        conn,
+        object.bus.as_str(),
+        object.path.as_str(),
+        "org.a11y.atspi.Text",
+    )
+    .await
+    .map_err(|err| msg(format!("AT-SPI Text: {err}")))?;
+    // GetText end=-1 means "through the end" on AT-SPI.
+    let text: String = proxy
+        .call("GetText", &(0i32, -1i32))
+        .await
+        .map_err(|err| msg(format!("AT-SPI GetText: {err}")))?;
+    Ok(text)
+}
+
 async fn role_of(conn: &Connection, object: &ObjectRef) -> Result<u32> {
     let proxy = accessible(conn, object).await?;
     let role: u32 = proxy
@@ -592,10 +628,33 @@ fn _map_unused(map: HashMap<String, String>) -> usize {
 }
 
 
-/// AT-SPI EditableText.InsertText length is Unicode scalar values (BMP
-/// CJK equals UTF-16 units). Never use UTF-8 byte length here.
+/// AT-SPI EditableText.InsertText `length` is the UTF-8 byte count to consume
+/// from `text` (libatspi: "number of characters of text to insert, in bytes").
+/// Passing Unicode scalar count truncates multi-byte CJK and can return true
+/// without modifying the widget.
 pub fn insert_text_length(text: &str) -> i32 {
-    i32::try_from(text.chars().count()).unwrap_or(i32::MAX)
+    i32::try_from(text.len()).unwrap_or(i32::MAX)
+}
+
+/// True when `GetText` after `InsertText` shows `inserted` at character offset
+/// `caret`. Distinguishes a true D-Bus return from text that never landed.
+pub fn inserted_text_landed(after: &str, caret: i32, inserted: &str) -> bool {
+    if inserted.is_empty() {
+        return true;
+    }
+    let start = usize::try_from(caret.max(0)).unwrap_or(0);
+    let after_chars: Vec<char> = after.chars().collect();
+    let needle: Vec<char> = inserted.chars().collect();
+    if start > after_chars.len() || needle.len() > after_chars.len().saturating_sub(start) {
+        return false;
+    }
+    after_chars[start..start + needle.len()] == needle[..]
+}
+
+/// Classify InsertText failures so callers can refuse keysym "success" when
+/// there was never a writable focused field.
+pub fn is_no_editable_insert_error(message: &str) -> bool {
+    message.contains("no focused editable text field")
 }
 
 #[cfg(test)]
@@ -628,12 +687,38 @@ mod tests {
     }
 
     #[test]
-    fn insert_text_length_uses_unicode_scalars_not_utf8_bytes() {
+    fn insert_text_length_uses_utf8_bytes_not_unicode_scalars() {
         assert_eq!(insert_text_length("ABC"), 3);
         let cjk = "中文输入测试：你好。";
         assert_eq!(cjk.chars().count(), 10);
-        assert!(cjk.len() > 10, "the CJK fixture must be multi-byte UTF-8");
-        assert_eq!(insert_text_length(cjk), 10);
+        assert_eq!(cjk.len(), 30, "the CJK fixture must be multi-byte UTF-8");
+        assert_eq!(insert_text_length(cjk), 30);
+        // The previous (wrong) scalar count is what made InsertText return true
+        // while GTK dropped the truncated bytes.
+        assert_ne!(insert_text_length(cjk), cjk.chars().count() as i32);
+    }
+
+    #[test]
+    fn inserted_text_landed_requires_actual_widget_text() {
+        let cjk = "中文输入测试：你好。";
+        assert!(inserted_text_landed("BYTE:中文输入测试：你好。", 5, cjk));
+        assert!(inserted_text_landed(cjk, 0, cjk));
+        assert!(inserted_text_landed("ascii\n", 0, "ascii\n"));
+        // RPC-true / text-not-landed: caret unchanged, CJK missing.
+        assert!(!inserted_text_landed("CHAR:", 5, cjk));
+        assert!(!inserted_text_landed("BYTE:", 5, cjk));
+        assert!(!inserted_text_landed("hello", 0, "hello!"));
+        assert!(inserted_text_landed("ok", 0, ""));
+    }
+
+    #[test]
+    fn no_editable_error_is_detected_for_negative_type_path() {
+        assert!(is_no_editable_insert_error(
+            "AT-SPI capability: no focused editable text field for InsertText"
+        ));
+        assert!(!is_no_editable_insert_error(
+            "AT-SPI InsertText returned true but the focused field did not contain the committed text"
+        ));
     }
 
     #[test]
