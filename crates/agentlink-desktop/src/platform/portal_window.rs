@@ -45,22 +45,125 @@ pub fn picker_timeout() -> Duration {
     }
 }
 
-/// Generation + notify so `call_and_wait` can abort a live picker when the
-/// client sends `Cancel` (including unary timeout) and close the portal request.
-fn portal_abort_notify() -> &'static tokio::sync::Notify {
-    static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
-    NOTIFY.get_or_init(tokio::sync::Notify::new)
-}
-
+/// Generation so the desktop current-thread runtime can notice a cancel even
+/// if a cross-runtime `Notify` wake is lost. The official picker is also
+/// closed from a helper thread via a fresh session-bus connection, because
+/// the capture wait lives in `Runtime::new_current_thread().block_on` and a
+/// `Notify` from the node runtime did not Close the GNOME dialog in live tests.
 fn portal_abort_gen() -> &'static std::sync::atomic::AtomicU64 {
     static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     &GEN
 }
 
-/// Ask every in-flight ScreenCast `call_and_wait` to close its Request.
+#[derive(Default, Clone)]
+struct LivePortalPaths {
+    requests: Vec<String>,
+    sessions: Vec<String>,
+}
+
+fn live_portal_paths() -> &'static std::sync::Mutex<LivePortalPaths> {
+    static LIVE: std::sync::OnceLock<std::sync::Mutex<LivePortalPaths>> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(|| std::sync::Mutex::new(LivePortalPaths::default()))
+}
+
+fn register_live_portal_path(kind: &str, path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    if let Ok(mut live) = live_portal_paths().lock() {
+        let list = if kind == "session" {
+            &mut live.sessions
+        } else {
+            &mut live.requests
+        };
+        if !list.iter().any(|p| p == path) {
+            list.push(path.to_string());
+        }
+    }
+}
+
+fn unregister_live_portal_path(kind: &str, path: &str) {
+    if let Ok(mut live) = live_portal_paths().lock() {
+        let list = if kind == "session" {
+            &mut live.sessions
+        } else {
+            &mut live.requests
+        };
+        list.retain(|p| p != path);
+    }
+}
+
+fn snapshot_live_portal_paths() -> LivePortalPaths {
+    live_portal_paths()
+        .lock()
+        .map(|live| live.clone())
+        .unwrap_or_default()
+}
+
+/// Close portal Request + Session objects from a *new* session-bus connection.
+/// This must not depend on the desktop current-thread runtime being polled.
+fn close_portal_paths_blocking(paths: LivePortalPaths) {
+    let conn = match zbus::blocking::Connection::session() {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not open a session bus to close a cancelled ScreenCast");
+            return;
+        }
+    };
+    for path in &paths.requests {
+        match zbus::blocking::Proxy::new(
+            &conn,
+            "org.freedesktop.portal.Desktop",
+            path.as_str(),
+            "org.freedesktop.portal.Request",
+        ) {
+            Ok(proxy) => match proxy.call::<_, (), ()>("Close", &()) {
+                Ok(()) => tracing::info!(path, "closed portal Request after cancel/timeout"),
+                Err(err) => {
+                    tracing::info!(path, error = %err, "portal Request.Close after cancel (already gone is ok)")
+                }
+            },
+            Err(err) => tracing::info!(path, error = %err, "portal Request proxy on cancel"),
+        }
+    }
+    for path in &paths.sessions {
+        match zbus::blocking::Proxy::new(
+            &conn,
+            "org.freedesktop.portal.Desktop",
+            path.as_str(),
+            "org.freedesktop.portal.Session",
+        ) {
+            Ok(proxy) => match proxy.call::<_, (), ()>("Close", &()) {
+                Ok(()) => tracing::info!(path, "closed portal Session after cancel/timeout"),
+                Err(err) => {
+                    tracing::info!(path, error = %err, "portal Session.Close after cancel (already gone is ok)")
+                }
+            },
+            Err(err) => tracing::info!(path, error = %err, "portal Session proxy on cancel"),
+        }
+    }
+}
+
+/// Ask every in-flight ScreenCast wait to stop, and Close its Request/Session
+/// on the session bus immediately (not after the picker timeout).
 pub fn request_portal_cleanup() {
-    portal_abort_gen().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    portal_abort_notify().notify_waiters();
+    let gen = portal_abort_gen().fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let paths = snapshot_live_portal_paths();
+    tracing::info!(
+        gen,
+        requests = paths.requests.len(),
+        sessions = paths.sessions.len(),
+        "client cancelled or unary timed out; closing live portal ScreenCast handles"
+    );
+    if paths.requests.is_empty() && paths.sessions.is_empty() {
+        return;
+    }
+    // A helper thread so the node event loop does not block on D-Bus, and so
+    // Close does not have to wait for the desktop `block_on` to wake.
+    let _ = std::thread::Builder::new()
+        .name("portal-cancel-close".into())
+        .spawn(move || close_portal_paths_blocking(paths));
 }
 
 /// Identity of one PipeWire stream from `ScreenCast.Start` results.
@@ -588,8 +691,10 @@ pub struct PortalSessionCleanup {
 #[cfg_attr(not(pipewire_headers), allow(dead_code))]
 impl PortalSessionCleanup {
     pub fn new(path: impl Into<String>) -> Self {
+        let path = path.into();
+        register_live_portal_path("session", &path);
         Self {
-            path: path.into(),
+            path,
             closed: false,
         }
     }
@@ -599,6 +704,7 @@ impl PortalSessionCleanup {
             return;
         }
         self.closed = true;
+        unregister_live_portal_path("session", &self.path);
         if let Ok(proxy) = Proxy::new(
             conn,
             "org.freedesktop.portal.Desktop",
@@ -609,6 +715,12 @@ impl PortalSessionCleanup {
         {
             let _ = proxy.call::<_, _, ()>("Close", &()).await;
         }
+    }
+}
+
+impl Drop for PortalSessionCleanup {
+    fn drop(&mut self) {
+        unregister_live_portal_path("session", &self.path);
     }
 }
 
@@ -669,6 +781,14 @@ fn owned_object_path(path: &str) -> Result<OwnedObjectPath> {
 }
 
 #[cfg_attr(not(pipewire_headers), allow(dead_code))]
+struct LiveRequestGuard(String);
+
+impl Drop for LiveRequestGuard {
+    fn drop(&mut self) {
+        unregister_live_portal_path("request", &self.0);
+    }
+}
+
 async fn call_and_wait(
     conn: &Connection,
     path: &str,
@@ -687,14 +807,27 @@ async fn call_and_wait(
         .receive_signal("Response")
         .await
         .map_err(|err| msg(format!("portal signal: {err}")))?;
+    register_live_portal_path("request", path);
+    let unregister = LiveRequestGuard(path.to_string());
     invoke.await?;
     let start_gen = portal_abort_gen().load(std::sync::atomic::Ordering::SeqCst);
+    if start_gen != portal_abort_gen().load(std::sync::atomic::Ordering::SeqCst) {
+        close_portal_request(conn, path).await;
+        drop(unregister);
+        return Err(msg(
+            "xdg-desktop-portal ScreenCast request cancelled; closed the portal request",
+        ));
+    }
+    // Poll the generation on this current-thread runtime. Do not depend only
+    // on a cross-runtime Notify: 15d9a5e sent Cancel but the GNOME picker stayed.
     let abort = async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            interval.tick().await;
             if portal_abort_gen().load(std::sync::atomic::Ordering::SeqCst) != start_gen {
                 break;
             }
-            portal_abort_notify().notified().await;
         }
     };
     let message = tokio::select! {
@@ -703,6 +836,7 @@ async fn call_and_wait(
                 Some(message) => message,
                 None => {
                     close_portal_request(conn, path).await;
+                    drop(unregister);
                     return Err(msg(
                         "desktop portal closed the ScreenCast request before responding",
                     ));
@@ -711,6 +845,7 @@ async fn call_and_wait(
         }
         _ = tokio::time::sleep(timeout) => {
             close_portal_request(conn, path).await;
+            drop(unregister);
             return Err(msg(format!(
                 "xdg-desktop-portal ScreenCast timed out after {}s waiting for the                  window picker. Cancelled the request and released the session.                  On the GNOME seat, select the target window in the Share dialog and Allow,                  then retry.",
                 timeout.as_secs()
@@ -718,6 +853,7 @@ async fn call_and_wait(
         }
         _ = abort => {
             close_portal_request(conn, path).await;
+            drop(unregister);
             return Err(msg(
                 "xdg-desktop-portal ScreenCast request cancelled; closed the portal request"
             ));
@@ -1406,6 +1542,34 @@ mod tests {
         let cleanup = PortalSessionCleanup::new("/org/freedesktop/portal/desktop/session/x/y");
         assert!(!cleanup.closed);
         assert!(cleanup.path.contains("session"));
+    }
+
+    #[test]
+    fn live_portal_registry_increments_abort_gen() {
+        let req = "/org/freedesktop/portal/desktop/request/test/agentlink-cancel-unit";
+        let sess = "/org/freedesktop/portal/desktop/session/test/agentlink-cancel-unit";
+        register_live_portal_path("request", req);
+        register_live_portal_path("session", sess);
+        let snap = snapshot_live_portal_paths();
+        assert!(
+            snap.requests.iter().any(|p| p == req),
+            "{:?}",
+            snap.requests
+        );
+        assert!(
+            snap.sessions.iter().any(|p| p == sess),
+            "{:?}",
+            snap.sessions
+        );
+        let before = portal_abort_gen().load(std::sync::atomic::Ordering::SeqCst);
+        request_portal_cleanup();
+        let after = portal_abort_gen().load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after > before, "gen {before} -> {after}");
+        unregister_live_portal_path("request", req);
+        unregister_live_portal_path("session", sess);
+        let snap = snapshot_live_portal_paths();
+        assert!(!snap.requests.iter().any(|p| p == req));
+        assert!(!snap.sessions.iter().any(|p| p == sess));
     }
 
     #[test]

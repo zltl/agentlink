@@ -858,14 +858,23 @@ async fn handle_env(
             live.sessions.note_cursors(&pairs);
         }
         Envelope::Cancel { request_id, .. } => {
-            if let Ok(map) = cancels.lock() {
+            let known = if let Ok(map) = cancels.lock() {
                 if let Some(token) = map.get(&request_id) {
                     token.cancel();
+                    true
+                } else {
+                    false
                 }
-            }
-            // Screenshot / window capture waits on a separate desktop runtime,
-            // so the op CancellationToken alone will not close the official
-            // picker. Ask the portal wait to Close the Request immediately.
+            } else {
+                false
+            };
+            tracing::info!(
+                %request_id,
+                known,
+                "received Cancel; aborting the op and closing any live portal ScreenCast handles"
+            );
+            // Capture waits on a current-thread desktop runtime, so the
+            // CancellationToken alone will not Close the official picker.
             agentlink_desktop::abort_live_portal_pickers();
         }
         Envelope::Invoke {

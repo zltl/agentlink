@@ -38,8 +38,7 @@
 
 不能再靠环境变量。需要真正的 OS 隔离，使**远程 exec 身份**读不到签发私钥、写不了权威目录。可选方案（都不在本变更中实施；不改系统全局安全策略，不擅自加 root daemon）：
 
-1. **首选、范围最小：对 exec/pty/shell 子进程施加 Landlock（或等价 LSM）**，拒绝打开 `grant-issuer.json`、`issued-grants/`、`grant-requests/`、`revoked-grants.json`、`used-nonces.json`、`owner-keys.json`。由节点在 spawn 时应用，不需要新用户或 root 服务。限制：只约束这条 agentlink exec 谱系；同用户的本地 shell / 独立 SSH 仍可按设计做本地批准。若主机 `ptrace_scope` 允许同用户附着节点进程，仍有读内存风险，需一并评估。
-2. **更强：独立 issuer 用户或席位绑定签发助手**。私钥只属于该用户或只对图形席位上的本地助手可访问；远程 exec 的 UID 不可读。助手通过 unix socket + `SO_PEERCRED` + 登录席位校验接受本地批准。这比 Landlock 更清晰，但要新增组件，需单独授权后再做。
+Landlock **单独**限制 issuer 文件路径**不足以**称为已解决：同 UID 进程仍可能 ptrace / 读 `/proc`、经会话 D-Bus 驱动本地 UI、改 shell rc / autostart。完整方案、能力收窄、以及需要用户二选一的 A1/A2（独立 authority 与受约束 exec，或承认已获 exec 可代签）见 `docs/grant-local-authority.md`。该架构不在本轮默认部署，也不修改生产用户或 sudo。
 
 不要再增加可清除标志，也不要把上述方案未落地时的状态标成“已防自授权”。
 
