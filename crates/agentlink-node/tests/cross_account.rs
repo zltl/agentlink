@@ -138,7 +138,11 @@ async fn flow() -> anyhow::Result<()> {
         )
         .await;
     let own_err = match own {
-        Ok(done) => format!("exit {:?} stdout {}", done.exit_code, String::from_utf8_lossy(&done.stdout)),
+        Ok(done) => format!(
+            "exit {:?} stdout {}",
+            done.exit_code,
+            String::from_utf8_lossy(&done.stdout)
+        ),
         Err(err) => err.to_string(),
     };
     assert!(
@@ -221,7 +225,9 @@ async fn flow() -> anyhow::Result<()> {
         } => {
             let error = error.unwrap_or_default();
             assert!(
-                error.contains("cannot route") || error.contains("not allowed") || error.contains("signed grant"),
+                error.contains("cannot route")
+                    || error.contains("not allowed")
+                    || error.contains("signed grant"),
                 "{error}"
             );
         }
@@ -334,11 +340,8 @@ async fn dial(
     fingerprint: &str,
     token: &str,
     identity: &Identity,
-) -> anyhow::Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_rustls::client::TlsStream<TcpStream>,
-    >,
-> {
+) -> anyhow::Result<tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>>
+{
     let relay = agentlink_core::parse_relay_url(url)?;
     let trust = agentlink_core::tls::RelayTrust::parse(fingerprint, None)?;
     let tcp = TcpStream::connect((relay.host.as_str(), relay.port)).await?;
@@ -347,9 +350,12 @@ async fn dial(
     let name = agentlink_core::tls::server_name(&relay.host, &trust)?;
     let tls = connector.connect(name, tcp).await?;
     let ws_url = format!("ws://{}:{}{}", relay.bracket_host(), relay.port, relay.path);
-    let (mut ws, _) =
-        tokio_tungstenite::client_async_with_config(ws_url, tls, Some(agentlink_core::ws::ws_config()))
-            .await?;
+    let (mut ws, _) = tokio_tungstenite::client_async_with_config(
+        ws_url,
+        tls,
+        Some(agentlink_core::ws::ws_config()),
+    )
+    .await?;
     let hello = Envelope::Hello {
         role: Role::Client,
         protocol: PROTOCOL_VERSION,
@@ -393,6 +399,7 @@ async fn send(
         ws::Outbound::Text(text) => Message::Text(text.into()),
         ws::Outbound::Binary(bytes) => Message::Binary(bytes.into()),
         ws::Outbound::Pong(bytes) => Message::Pong(bytes.into()),
+        ws::Outbound::Flush(_) => anyhow::bail!("encode() does not yield Flush"),
     };
     ws.send(msg).await?;
     Ok(())

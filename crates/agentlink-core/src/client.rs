@@ -1516,7 +1516,25 @@ impl Client {
             request_id: request_id.to_string(),
             node_id: node_id.to_string(),
         })
-        .await
+        .await?;
+        // Queueing Cancel on the app channel is not enough: the CLI can exit
+        // and drop the writer before the frame reaches the relay. Flush the
+        // websocket so the node actually receives Cancel and can Close the
+        // official ScreenCast picker.
+        self.flush_out().await
+    }
+
+    async fn flush_out(&self) -> Result<()> {
+        let (done, rx) = tokio::sync::oneshot::channel();
+        self.inner
+            .tx
+            .send(ws::Outbound::Flush(done))
+            .await
+            .map_err(|_| Error::Message("connection closed".into()))?;
+        tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::Message("connection closed".into()))
     }
 
     async fn roundtrip<F>(&self, build: F, limit: Duration) -> Result<Envelope>

@@ -160,6 +160,8 @@ pub enum Outbound {
     Text(String),
     Binary(Vec<u8>),
     Pong(Vec<u8>),
+    /// Completes after earlier frames have been written and the socket flushed.
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 pub enum Incoming {
@@ -236,6 +238,11 @@ where
     S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let msg = match out {
+        Outbound::Flush(done) => {
+            let ok = sink.flush().await.is_ok();
+            let _ = done.send(());
+            return ok;
+        }
         Outbound::Text(s) => Message::Text(s.into()),
         Outbound::Binary(b) => Message::Binary(b.into()),
         Outbound::Pong(p) => Message::Pong(p.into()),
