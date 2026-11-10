@@ -212,3 +212,43 @@ is not a test failure — cancel path must release the session.
 `cargo test -p agentlink-desktop --lib`: 85 passed locally (73 prior + portal
 window matcher/cleanup/no-monitor-fallback tests; CJK byte-length + landed-text
 + no-editable classifier tests remain).
+
+## Live portal WINDOW picker (sufa iso, 22:42–22:44 Asia/Shanghai)
+
+Isolated node only: `agentlink-b976f64` →
+`0.1.0 (b976f648fceb7d5027da99f0b28e4c3b9d0fa229)`, PipeWire linked,
+sha256 `9007207ecd9d6105490a2c772d90b83dca7d7a061ece73243206dc2cec015b0d`.
+Relay `127.0.0.1:18443`, name `sufa-t417-9bf95e3-test`. Production
+`/home/ltl/.local/bin/agentlink` still `abf86f1` (PID 725567) untouched.
+Leftover `:17443` iso untouched.
+
+`cargo test --release -p agentlink-desktop --lib` on sufa: **85 passed**.
+
+### What happened
+
+1. First portal attempt (`c58e3e5`) failed before the picker:
+   `SelectSources` InvalidArgs `(sa{sv})` vs `(oa{sv})` — session handle must
+   be D-Bus type `o`. Fixed in `b976f64`.
+2. After the fix, node log:
+   `portal ScreenCast WINDOW picker starting; … timeout_secs=60 query=t417-iso-editor`
+3. Full-screen evidence `evidence-b976f64/picker-or-desktop.png` (2736×1824)
+   shows the official GNOME **共享屏幕** (Share Screen) dialog over the
+   isolated editor. Window list includes
+   `t417-iso-editor-wMn95K.txt (/tmp) - Text Editor` (also other apps).
+4. No automation clicked Allow/Share. After 60s the client got a clear timeout:
+   cancelled Request + released Session; **no** `window.png` was written.
+   **Window screenshot success is not claimed.**
+
+### One step for the operator on sufa
+
+In the **共享屏幕** dialog: select
+`t417-iso-editor-wMn95K.txt (/tmp) - Text Editor`, then **Share / 共享**.
+Re-run:
+
+```bash
+# from the iso client flags in runtime-iso (do not print tokens)
+agentlink screenshot sufa-t417-9bf95e3-test --target window --window-id t417-iso-editor
+```
+
+Optional longer wait: start the iso node with
+`AGENTLINK_PORTAL_PICKER_TIMEOUT_SECS=300`.
