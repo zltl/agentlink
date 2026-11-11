@@ -53,7 +53,7 @@ impl Identity {
             }
         }
         if path.exists() {
-            return Self::load_existing(path);
+            return Self::load_existing_retry(path);
         }
         let signing = SigningKey::generate(&mut OsRng);
         let public_hex = hex::encode(signing.verifying_key().to_bytes());
@@ -70,25 +70,47 @@ impl Identity {
         }
         // Another process created the file first. Load that identity; never
         // overwrite or keep a private key that is not on disk.
-        Self::load_existing(path)
+        Self::load_existing_retry(path)
+    }
+
+    /// Retry only when the file looks mid-publish (empty or JSON EOF). A
+    /// stable damaged file still fails without rotation, after a short wait.
+    fn load_existing_retry(path: &Path) -> Result<Self> {
+        let mut last = None;
+        for attempt in 0..8 {
+            match Self::load_existing(path) {
+                Ok(id) => return Ok(id),
+                Err(err) if Self::incomplete_identity_file(path, &err) && attempt + 1 < 8 => {
+                    last = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last.expect("retry loop"))
+    }
+
+    fn incomplete_identity_file(path: &Path, err: &Error) -> bool {
+        let empty = std::fs::read(path)
+            .map(|bytes| bytes.is_empty())
+            .unwrap_or(true);
+        if empty {
+            return true;
+        }
+        let text = err.to_string();
+        text.contains("EOF while parsing") || text.contains("EOF")
     }
 
     fn load_existing(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(|err| {
-            Error::Message(format!("身份文件无法读取，未重新生成：{err}"))
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| Error::Message(format!("身份文件无法读取，未重新生成：{err}")))?;
         let file: IdentityFile = serde_json::from_str(&text).map_err(|err| {
-            Error::Message(format!(
-                "身份文件已损坏或不是有效 JSON，未重新生成：{err}"
-            ))
+            Error::Message(format!("身份文件已损坏或不是有效 JSON，未重新生成：{err}"))
         })?;
-        let bytes = hex::decode(file.secret_hex.trim()).map_err(|err| {
-            Error::Message(format!("身份密钥无法解码，未重新生成：{err}"))
-        })?;
+        let bytes = hex::decode(file.secret_hex.trim())
+            .map_err(|err| Error::Message(format!("身份密钥无法解码，未重新生成：{err}")))?;
         if bytes.len() != 32 {
-            return Err(Error::Message(
-                "身份密钥必须是 32 字节，未重新生成".into(),
-            ));
+            return Err(Error::Message("身份密钥必须是 32 字节，未重新生成".into()));
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
@@ -289,8 +311,14 @@ mod tests {
     fn load_or_create_ensure_rereads_without_rotating() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.json");
-        let first = Identity::load_or_create(&path).unwrap().public_hex().to_string();
-        let again = Identity::load_or_create(&path).unwrap().public_hex().to_string();
+        let first = Identity::load_or_create(&path)
+            .unwrap()
+            .public_hex()
+            .to_string();
+        let again = Identity::load_or_create(&path)
+            .unwrap()
+            .public_hex()
+            .to_string();
         assert_eq!(first, again);
         assert_eq!(Identity::load(&path).unwrap().public_hex(), first);
     }
@@ -325,7 +353,10 @@ mod tests {
         assert!(err.contains("未重新生成"), "{err}");
         assert!(err.contains("不匹配"), "{err}");
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("bbbbbbbb"), "must not replace the damaged file");
+        assert!(
+            text.contains("bbbbbbbb"),
+            "must not replace the damaged file"
+        );
         assert!(!text.contains(&original));
     }
 
@@ -350,7 +381,10 @@ mod tests {
             .into_iter()
             .map(|h| h.join().unwrap().expect("load_or_create"))
             .collect();
-        let disk = Identity::load_or_create(&path).unwrap().public_hex().to_string();
+        let disk = Identity::load_or_create(&path)
+            .unwrap()
+            .public_hex()
+            .to_string();
         assert!(ids.iter().all(|id| id == &disk), "got {ids:?} disk {disk}");
     }
 }

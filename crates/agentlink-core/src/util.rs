@@ -176,7 +176,6 @@ fn diagnose_create_dir_all(path: &Path, err: std::io::Error) -> Error {
     err.into()
 }
 
-
 /// Create `path` as a new 0700 directory if it is missing.
 ///
 /// Existing parents are left alone. `write_secret("/tmp/card")` must not
@@ -199,7 +198,10 @@ pub fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     // A shared `*.tmp` name lets two writers rename the same file and then
     // delete the winner (`No such file or directory` on the loser).
-    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("secret");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("secret");
     let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", random_hex(8)));
     // The bytes are written only after the destination DACL/mode is set, so a
     // permissive inherited ACL cannot cover the secret even briefly.
@@ -211,29 +213,72 @@ pub fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Create `path` exclusively (0600). Returns `Ok(true)` if this caller wrote
 /// the file, or `Ok(false)` if it already existed (no overwrite).
+///
+/// The destination is published atomically as a complete file. Creating the
+/// dest first and then writing left an empty (or partial) file that concurrent
+/// `load_or_create` readers parsed as `EOF while parsing a value`.
 pub fn write_secret_exclusive(path: &Path, bytes: &[u8]) -> Result<bool> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             ensure_secret_parent(parent)?;
         }
     }
-    match open_new_secret(path) {
-        Ok(mut file) => {
-            if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-                drop(file);
-                let _ = fs::remove_file(path);
-                return Err(err.into());
-            }
-            drop(file);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("secret");
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", random_hex(8)));
+    write_private_bytes(&tmp, bytes)?;
+    match publish_exclusive(&tmp, path) {
+        Ok(true) => {
             restrict_file(path)?;
             Ok(true)
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(err) => Err(err.into()),
+        other => other,
+    }
+}
+
+/// Make `dest` appear in one step, already holding `tmp`'s complete bytes.
+/// Never creates an empty destination that another process could parse.
+fn publish_exclusive(tmp: &Path, dest: &Path) -> Result<bool> {
+    // Same-directory hard link is atomic and fails if dest already exists.
+    // The dest name only becomes visible with the full contents.
+    match fs::hard_link(tmp, dest) {
+        Ok(()) => {
+            let _ = fs::remove_file(tmp);
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(tmp);
+            Ok(false)
+        }
+        Err(_) => publish_exclusive_rename(tmp, dest),
+    }
+}
+
+fn publish_exclusive_rename(tmp: &Path, dest: &Path) -> Result<bool> {
+    // Unix `rename` replaces an existing dest, so only use this fallback when
+    // dest is absent. The remaining race is decided by the filesystem: a
+    // loser that loses the rename must not overwrite.
+    if dest.exists() {
+        let _ = fs::remove_file(tmp);
+        return Ok(false);
+    }
+    match fs::rename(tmp, dest) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(tmp);
+            Ok(false)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(tmp);
+            Err(err.into())
+        }
     }
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
@@ -244,11 +289,9 @@ fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 #[cfg(not(windows))]
@@ -359,9 +402,7 @@ fn windows_path_is_under(path: &Path, root: &Path) -> bool {
 /// and Administrators only.
 pub fn windows_private_sddl(scope: WindowsAclScope, user_sid: &str) -> Result<String> {
     match scope {
-        WindowsAclScope::SystemService => {
-            Ok("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_string())
-        }
+        WindowsAclScope::SystemService => Ok("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_string()),
         WindowsAclScope::User => {
             if !acceptable_user_sid(user_sid) {
                 return Err(Error::Message(
@@ -391,9 +432,7 @@ fn acceptable_user_sid(sid: &str) -> bool {
         return false;
     };
     !rest.is_empty()
-        && rest
-            .chars()
-            .all(|ch| ch.is_ascii_digit() || ch == '-')
+        && rest.chars().all(|ch| ch.is_ascii_digit() || ch == '-')
         && rest.split('-').all(|part| !part.is_empty())
 }
 
@@ -633,7 +672,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("exists but is not a directory"), "{msg}");
         assert!(msg.contains("write/cp"), "{msg}");
-        assert!(msg.contains(blocker.file_name().unwrap().to_str().unwrap()), "{msg}");
+        assert!(
+            msg.contains(blocker.file_name().unwrap().to_str().unwrap()),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -671,7 +713,10 @@ mod tests {
         fs::write(&file, b"keep-me").unwrap();
         let err = create_dir_all_as_dir(&file).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("refusing to copy a directory onto a file"), "{msg}");
+        assert!(
+            msg.contains("refusing to copy a directory onto a file"),
+            "{msg}"
+        );
         assert_eq!(fs::read_to_string(&file).unwrap(), "keep-me");
     }
 
@@ -742,7 +787,10 @@ mod tests {
         let err = create_dir_all_as_dir(&link).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exists but is not a directory"), "{msg}");
-        assert!(msg.contains("refusing to copy a directory onto a file"), "{msg}");
+        assert!(
+            msg.contains("refusing to copy a directory onto a file"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -756,10 +804,7 @@ mod tests {
             WindowsAclScope::SystemService
         );
         assert_eq!(
-            windows_acl_scope(
-                Path::new(r"C:\ProgramData\agentlink"),
-                Some(program_data)
-            ),
+            windows_acl_scope(Path::new(r"C:\ProgramData\agentlink"), Some(program_data)),
             WindowsAclScope::SystemService
         );
         assert_eq!(
@@ -834,5 +879,44 @@ mod tests {
         assert!(write_secret_exclusive(&path, b"first").unwrap());
         assert!(!write_secret_exclusive(&path, b"second").unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    }
+
+    #[test]
+    fn write_secret_exclusive_is_never_observed_empty() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let payload = b"{\"ok\":true,\"pad\":\"".to_vec();
+        let mut payload = payload;
+        payload.extend(std::iter::repeat(b'x').take(32 * 1024));
+        payload.extend(b"\"}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen_empty = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let stop = stop.clone();
+                let seen_empty = seen_empty.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if bytes.is_empty() {
+                                seen_empty.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        assert!(write_secret_exclusive(&path, &payload).unwrap());
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert!(!seen_empty.load(Ordering::Relaxed), "dest appeared empty");
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
     }
 }
