@@ -31,6 +31,7 @@ pub mod node_pin;
 pub mod operate_guide;
 pub mod p2p;
 pub mod paths;
+pub mod pending;
 pub mod permissions;
 pub mod process;
 pub mod protocol;
@@ -47,7 +48,8 @@ pub mod util;
 pub mod ws;
 
 pub use client::{
-    Client, ExecOutput, ExecRequest, PairingInfo, PtyEvent, PtyRead, PtySession, PtyWriter,
+    Client, ExecOutput, ExecRequest, PairingInfo, PtyEvent, PtyRead, PtySession, PtyTestIo,
+    PtyWriter,
 };
 pub use config::{
     apply_relay_defaults, is_public_relay, load_settings, save_settings, ClientSettings,

@@ -286,3 +286,126 @@ Untested still: real phone, screenshots, IME/hand-feel, production E2E
 RTT, CJK two-cell width, remote PTY pause/ack, a bound on
 `PtySession.rx`. Controller `::` tests were not re-run in this
 correctness pass (no desktop-controller code change).
+
+
+## Local-chain backpressure (2026-11-12 Asia/Shanghai)
+
+The previous correctness patch bounded only the FFI poll `EventQueue`.
+`PtySession.rx` was still `mpsc::unbounded_channel`, so a slow Android
+consumer could pause FFI `recv` while the socket receive task kept
+enqueueing envelopes without limit. That is **not** complete backpressure.
+This follow-up bounds that waiter queue and makes the existing receive
+task wait when it is full.
+
+### Official sources (exact URLs actually fetched earlier)
+
+Nothing new was invented, and WezTerm `multiplexing.html` remains a 404
+and is not used.
+
+| Exact URL | Mechanism | What this follow-up / earlier t443 patches changed |
+| --- | --- | --- |
+| https://code.visualstudio.com/docs/terminal/advanced | Persistent PTY host, flow control described with the source constants below; remote local echo is optional and cautious (30 ms threshold; default exclude `vim` / `vi` / `nano` / `tmux`) | Still no blanket optimistic echo. Flow control on the **local client chain** only. |
+| https://github.com/microsoft/vscode/blob/main/src/vs/platform/terminal/common/terminal.ts (`FlowControlConstants`: `HighWatermarkChars=100000`, `LowWatermarkChars=5000`, `CharCountAckSize=5000`) | High/low watermarks and hysteresis so outstanding output is bounded | `pending` queue: high 512 events **and** 256 KiB payload bytes; low 128 events / 64 KiB. Same numbers remain on the FFI `EventQueue`. |
+| https://github.com/microsoft/vscode/blob/main/src/vs/platform/terminal/node/terminalProcess.ts (`pause` / `resume` / `acknowledgeDataEvent`) | Pause the producer instead of dropping bytes; ack from the consumer | `dispatch` now **awaits** `PendingSender::send` after releasing the pending map lock, so a full queue pauses `run_socket` (it stops reading the local WebSocket). **No remote PTY pause/ack protocol was added.** |
+| https://github.com/xtermjs/xterm.js/blob/master/typings/xterm.d.ts | `write()` is a contiguous UTF-8 byte stream | The waiter queue never drops a queued `Chunk`. Tests push split `你` (`0xe4` then `0xbd 0xa0`) and CSI `\x1b[2;3HZ` through core `dispatch` and the core+FFI pump. |
+| https://mosh.org/ and https://mosh.org/mosh-paper.pdf | Speculative echo / screen-state protocol, not a drop-in for this byte stream | Still not implemented. |
+| https://sw.kovidgoyal.net/kitty/keyboard-protocol/ | Unambiguous keys; IME as UTF-8 | Not this patch. The earlier IME composing overlay is unchanged. |
+
+### What is bounded, and what is not
+
+- `ClientInner.pending` (including `PtySession.rx`, unary waiters, and
+  `stream_op`) uses `pending::channel`: event count + total `data_b64`
+  bytes, reserved 1 event / up to 1024 bytes for `End` / `Result { ok:
+  false }`, hysteresis, `WouldBlock` waits, `Overflow` (a chunk larger
+  than the data-byte cap) keeps prior data, enqueues an explicit error,
+  and closes that waiter.
+- `dispatch` clones the sender, drops the mutex, then `select!`s the
+  send against shutdown so a full queue does not deadlock
+  `PendingGuard` / session drop, and shutdown does not sit forever
+  inside a send.
+- `fail_waiters` drains the map first, `try_send_error`s, then closes
+  senders — never a blocking send under the lock.
+- The FFI pump additionally `select!`s `EventQueue` close while waiting
+  on `session.recv()`, so a consumer disconnect does not hang behind a
+  full write command channel.
+- Writes keep flowing while output is blocked (input-first; hook /
+  `PtyCmd` still selected). A full write channel still fail-closes.
+
+**Residual, not claimed as end-to-end flow control:** there is still no
+application pause/ack to the node PTY. Pausing `run_socket` applies TCP
+backpressure on this socket. The node's live outbound channel is already
+`mpsc::channel(256)` (`emit_blocking` uses `blocking_send`). The node's
+**replay ring** (`crates/agentlink-node/src/resume.rs`) is a separate
+reconnect buffer that evicts oldest frames at 1024 frames or 4 MiB; this
+patch does not change it. Kernel and relay buffers also sit outside the
+client caps. Worst-case **client** buffering for one PTY is the pending
+queue plus the FFI `EventQueue` plus one held event (each 512 events /
+256 KiB class), not an unbounded process heap.
+
+A pre-existing `read_available` path can still truncate a decoded chunk
+to `max_bytes` and drop the remainder of that already-received envelope.
+That API is not the interactive FFI pump and was not changed here.
+
+### CJK cell width (existing, not changed)
+
+`TerminalScreen` already documents and implements “CJK characters occupy
+one cell”: `putChar` stores one `Char` and advances `cursorCol` by 1,
+including for code points such as `你`. East Asian Width typically needs
+two terminal cells, so cursor, wrap, and full-screen programs can
+misalign with a real xterm. This predates t443. Recording it here is
+deliberate; it is **not** fixed in this patch and is not expanded into
+a terminal-emulator rewrite.
+
+### Controller UI
+
+Still a **first-pass hierarchy revision**, not a complete redesign. No
+new screenshots were taken in this environment. No real-device hand-feel.
+Do not invent figures.
+
+### Tests this pass (separate from 16+28+34 and from the prior 20/29)
+
+- `cargo test -p agentlink-core --lib pending::`: **6 passed** (count
+  cap, byte cap, overflow without evicting, >512 order with split UTF-8
+  / CSI, drop-receiver unblocks send, reserved error slot).
+- Additional core tests: `pending_dispatch_backs_up_the_receive_task_without_dropping_bytes`,
+  `dropping_a_pty_session_unblocks_a_full_pending_send`, plus existing
+  `device_list_reaches_the_waiter_instead_of_timing_out` and
+  `transfer_inbox_keeps_stream_ready_ahead_of_its_chunk` after the
+  async `dispatch` change.
+- Full `cargo test -p agentlink-core --lib` on this revision: **263
+  passed, 1 failed**. The failure is `identity::tests::concurrent_first_create_converges_on_one_identity`
+  (identity file “EOF while parsing a value”). Re-runs both passed and
+  failed; it is a pre-existing flake, not a pending-queue assertion,
+  and was not “fixed” as part of this change.
+- `cargo test -p agentlink-ffi --lib`: **23 passed** (previous 20 plus
+  3 new chain tests):
+  `core_and_ffi_chain_preserves_order_past_512_with_slow_consumer`,
+  `core_and_ffi_chain_close_does_not_deadlock`,
+  `core_and_ffi_chain_propagates_remote_error`. These drive a real
+  `PtySession::test_io` + `pump_session`, not only a mock `EventQueue`.
+
+Native APK / official script (2026-11-12 00:21–00:22 Asia/Shanghai):
+
+- Installed NDK `27.2.12479018` on the box with the official SDK
+  manager (`sdkmanager "ndk;27.2.12479018"`), matching
+  `android/build-native.sh`. Rust targets added:
+  `aarch64-linux-android`, `armv7-linux-androideabi`,
+  `x86_64-linux-android` on toolchain 1.99.1.
+- `bash android/build-native.sh` exited 0. UniFFI Kotlin bindings were
+  regenerated with `--no-format` and **did not change** (git clean).
+  arm64-v8a `libagentlink_ffi.so` exports **132** `uniffi_agentlink_ffi_*`
+  symbols; they are a **1:1 match** with names referenced in
+  `android/app/src/main/java/uniffi/agentlink_ffi/agentlink_ffi.kt`.
+- `jniLibs` (gitignored) produced:
+  - `arm64-v8a` ELF64 AArch64, 21,520,632 bytes — the ABI that applies
+    to current user phones
+  - `armeabi-v7a` ELF32 ARM, 14,370,516 bytes
+  - `x86_64` ELF64 x86-64, 23,178,376 bytes (emulator / some tablets)
+  The official script does **not** build `x86` or 32-bit `armeabi`.
+- `:app:assembleDebug` succeeded. `app-debug.apk` is 75M and contains
+  `lib/arm64-v8a/libagentlink_ffi.so` (21,520,632),
+  `lib/armeabi-v7a/libagentlink_ffi.so` (14,370,516), and
+  `lib/x86_64/libagentlink_ffi.so` (23,178,376). This is a **native
+  candidate**, not the earlier 19M APK that lacked the Agentlink
+  library. **Not installed** on any device. No real-phone run, no
+  screenshot, no hand-feel claim.

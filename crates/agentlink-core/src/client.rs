@@ -15,6 +15,8 @@ use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedSender};
+
+use crate::pending::{self, PendingSender, SendError as PendingSendError};
 use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -38,7 +40,7 @@ const UNARY_TIMEOUT: Duration = Duration::from_secs(120);
 const INITIAL_CONNECT_GIVE_UP: Duration = Duration::from_secs(5);
 
 struct PendingGuard {
-    map: Arc<Mutex<HashMap<String, UnboundedSender<Envelope>>>>,
+    map: Arc<Mutex<HashMap<String, PendingSender>>>,
     id: String,
 }
 
@@ -63,7 +65,7 @@ pub(crate) enum TransferInbound {
 
 pub(crate) struct ClientInner {
     pub(crate) tx: mpsc::Sender<Outbound>,
-    pub(crate) pending: Arc<Mutex<HashMap<String, UnboundedSender<Envelope>>>>,
+    pub(crate) pending: Arc<Mutex<HashMap<String, PendingSender>>>,
     /// Per-request queue shared by transfer control messages and binary frames.
     pub(crate) binary: Arc<Mutex<HashMap<String, UnboundedSender<TransferInbound>>>>,
     pub(crate) alive: Arc<AtomicBool>,
@@ -84,6 +86,8 @@ pub(crate) struct ClientInner {
     pub(crate) grant_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
     resend: Notify,
     fast: AtomicBool,
+    /// Test hook: PTY writes skip E2E and land here. Production stays None.
+    write_hook: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
 
 impl ClientInner {
@@ -181,7 +185,7 @@ pub struct PtySession {
     node_id: String,
     client_id: String,
     inner: Arc<ClientInner>,
-    rx: mpsc::UnboundedReceiver<Envelope>,
+    rx: crate::pending::PendingReceiver,
     finished: Option<std::result::Result<i32, String>>,
     _guard: PendingGuard,
 }
@@ -427,6 +431,72 @@ impl PtySession {
     }
 }
 
+/// A [`PtySession`] fed by tests, plus a hook that records writes.
+pub struct PtyTestIo {
+    pub tx: PendingSender,
+    pub session: PtySession,
+    pub writes: mpsc::Receiver<Vec<u8>>,
+}
+
+impl PtySession {
+    /// Local session whose output comes from [`PtyTestIo::tx`].
+    ///
+    /// Used to pressure-test the core pending queue together with the FFI
+    /// pump. Drop does not contact a relay: the close frame is tried on a
+    /// detached outbound channel and ignored if that channel is closed.
+    pub fn test_io() -> PtyTestIo {
+        let (app_tx, _app_rx) = mpsc::channel(8);
+        let (hook_tx, hook_rx) = mpsc::channel(256);
+        let pending: std::sync::Arc<Mutex<HashMap<String, PendingSender>>> =
+            std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let identity = crate::identity::Identity::generate();
+        let inner = std::sync::Arc::new(ClientInner {
+            tx: app_tx,
+            pending: pending.clone(),
+            binary: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            alive: std::sync::Arc::new(AtomicBool::new(true)),
+            shutdown: CancellationToken::new(),
+            relay_addr: None,
+            direct_id: OnceLock::new(),
+            quic: Mutex::new(None),
+            e2e: crate::e2e::Endpoint::new(identity),
+            routes: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            gates: Mutex::new(HashMap::new()),
+            session_id: "test-session".into(),
+            inflight: Mutex::new(HashMap::new()),
+            cursors: Mutex::new(crate::resume::Cursors::default()),
+            transfers: std::sync::Arc::new(Mutex::new(HashSet::new())),
+            grant_dir: std::sync::Arc::new(Mutex::new(None)),
+            resend: Notify::new(),
+            fast: AtomicBool::new(false),
+            write_hook: Mutex::new(Some(hook_tx)),
+        });
+        let session_id = "pty-test".to_string();
+        let (wait_tx, rx) = pending::channel();
+        pending
+            .lock()
+            .expect("pending test map")
+            .insert(session_id.clone(), wait_tx.clone());
+        let session = PtySession {
+            session_id: session_id.clone(),
+            node_id: "test-node".into(),
+            client_id: "test-client".into(),
+            inner,
+            rx,
+            finished: None,
+            _guard: PendingGuard {
+                map: pending,
+                id: session_id,
+            },
+        };
+        PtyTestIo {
+            tx: wait_tx,
+            session,
+            writes: hook_rx,
+        }
+    }
+}
+
 /// Send side of a [`PtySession`]. Safe to clone; does not own `recv`.
 #[derive(Clone)]
 pub struct PtyWriter {
@@ -455,6 +525,25 @@ impl PtyWriter {
     }
 
     async fn send_op(&self, op: Op) -> Result<()> {
+        let hooked = self
+            .inner
+            .write_hook
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(hook) = hooked {
+            match &op {
+                Op::PtyInput { data_b64, .. } => {
+                    let bytes = util::b64_decode(data_b64)?;
+                    hook.send(bytes)
+                        .await
+                        .map_err(|_| Error::Message("connection closed".into()))?;
+                    return Ok(());
+                }
+                Op::PtyResize { .. } => return Ok(()),
+                _ => {}
+            }
+        }
         let env = Envelope::Invoke {
             request_id: uuid::Uuid::new_v4().to_string(),
             node_id: self.node_id.clone(),
@@ -473,7 +562,6 @@ impl PtyWriter {
             .map_err(|_| Error::Message("connection closed".into()))
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct PairingInfo {
@@ -515,7 +603,7 @@ impl Client {
             .ok()
             .and_then(|mut it| it.next());
         let (tx, app_rx) = mpsc::channel(64);
-        let pending: Arc<Mutex<HashMap<String, UnboundedSender<Envelope>>>> =
+        let pending: Arc<Mutex<HashMap<String, PendingSender>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let binary: Arc<Mutex<HashMap<String, UnboundedSender<TransferInbound>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -541,6 +629,7 @@ impl Client {
             grant_dir: Arc::new(Mutex::new(None)),
             resend: Notify::new(),
             fast: AtomicBool::new(false),
+            write_hook: Mutex::new(None),
         });
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let supervised = inner.clone();
@@ -1230,7 +1319,7 @@ impl Client {
     ) -> Result<PtySession> {
         let node_id = self.online_id(node).await?;
         let request_id = uuid::Uuid::new_v4().to_string();
-        let (wait_tx, mut rx) = mpsc::unbounded_channel();
+        let (wait_tx, rx) = pending::channel();
         {
             let mut map = self
                 .inner
@@ -1396,7 +1485,7 @@ impl Client {
         let client_id = self.client_id.clone();
         let node_id = node_id.to_string();
         let request_id = uuid::Uuid::new_v4().to_string();
-        let (wait_tx, mut rx) = mpsc::unbounded_channel();
+        let (wait_tx, rx) = pending::channel();
         {
             let mut map = self
                 .inner
@@ -1476,7 +1565,7 @@ impl Client {
     {
         let request_id = uuid::Uuid::new_v4().to_string();
         let authz = self.inner.authz_for(node_id)?;
-        let (wait_tx, mut rx) = mpsc::unbounded_channel();
+        let (wait_tx, rx) = pending::channel();
         {
             let mut map = self
                 .inner
@@ -1590,7 +1679,7 @@ impl Client {
             return Err(Error::Message("connection closed".into()));
         }
         let request_id = uuid::Uuid::new_v4().to_string();
-        let (wait_tx, mut rx) = mpsc::unbounded_channel();
+        let (wait_tx, rx) = pending::channel();
         {
             let mut map = self
                 .inner
@@ -2110,7 +2199,7 @@ pub(crate) async fn ensure_e2e(
     }
     let pending_hello = inner.e2e.client_hello(node_id)?;
     let request_id = uuid::Uuid::new_v4().to_string();
-    let (wait_tx, mut rx) = mpsc::unbounded_channel();
+    let (wait_tx, rx) = pending::channel();
     {
         let mut map = inner
             .pending
@@ -2186,10 +2275,11 @@ fn unwrap_client(endpoint: &crate::e2e::Endpoint, env: Envelope) -> Envelope {
     }
 }
 
-fn dispatch(
-    pending: &Mutex<HashMap<String, UnboundedSender<Envelope>>>,
+async fn dispatch(
+    pending: &Mutex<HashMap<String, PendingSender>>,
     transfers: &Mutex<HashMap<String, UnboundedSender<TransferInbound>>>,
     env: Envelope,
+    shutdown: &CancellationToken,
 ) {
     let Some(id) = env.request_id().map(|s| s.to_string()) else {
         return;
@@ -2200,11 +2290,31 @@ fn dispatch(
             return;
         }
     }
-    let Ok(map) = pending.lock() else {
+    let tx = {
+        let Ok(map) = pending.lock() else {
+            return;
+        };
+        map.get(&id).cloned()
+    };
+    let Some(tx) = tx else {
         return;
     };
-    if let Some(tx) = map.get(&id) {
-        let _ = tx.send(env);
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {}
+        result = tx.send(env) => {
+            if let Err(PendingSendError::Overflow(env)) = result {
+                let id = env
+                    .request_id()
+                    .unwrap_or("pty")
+                    .to_string();
+                let _ = tx.try_send_error(
+                    &id,
+                    "remote output chunk exceeds the client pending buffer",
+                );
+                tx.close();
+            }
+        }
     }
 }
 
@@ -2228,8 +2338,8 @@ mod tests {
     use super::*;
     use crate::protocol::TransferMsg;
 
-    #[test]
-    fn transfer_inbox_keeps_stream_ready_ahead_of_its_chunk() {
+    #[tokio::test]
+    async fn transfer_inbox_keeps_stream_ready_ahead_of_its_chunk() {
         let mut frame = vec![0u8; crate::frame::HEADER_LEN];
         frame[0] = crate::frame::FRAME_VERSION;
         frame[1] = crate::frame::KIND_DATA;
@@ -2251,7 +2361,8 @@ mod tests {
             },
             authz: None,
         };
-        dispatch(&pending, &transfers, ready);
+        let shutdown = CancellationToken::new();
+        dispatch(&pending, &transfers, ready, &shutdown).await;
         dispatch_binary(&transfers, frame);
         match rx.try_recv() {
             Ok(TransferInbound::Env(Envelope::Transfer {
@@ -2263,9 +2374,9 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(TransferInbound::Frame(_))));
     }
 
-    #[test]
-    fn device_list_reaches_the_waiter_instead_of_timing_out() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+    #[tokio::test]
+    async fn device_list_reaches_the_waiter_instead_of_timing_out() {
+        let (tx, rx) = pending::channel();
         let pending = Mutex::new(HashMap::from([("dev-1".to_string(), tx)]));
         let transfers = Mutex::new(HashMap::new());
         let env = Envelope::DeviceList {
@@ -2280,9 +2391,10 @@ mod tests {
             }],
         };
         assert_eq!(env.request_id(), Some("dev-1"));
-        dispatch(&pending, &transfers, env);
+        let shutdown = CancellationToken::new();
+        dispatch(&pending, &transfers, env, &shutdown).await;
         match rx.try_recv() {
-            Ok(Envelope::DeviceList {
+            Some(Envelope::DeviceList {
                 request_id,
                 devices,
             }) => {
@@ -2293,6 +2405,114 @@ mod tests {
             }
             other => panic!("device list was dropped: {other:?}"),
         }
+    }
+
+    fn pty_test_chunk(data: &[u8]) -> Envelope {
+        Envelope::Chunk {
+            request_id: "pty-test".into(),
+            stream: "pty".into(),
+            data_b64: crate::util::b64_encode(data),
+            seq: 0,
+        }
+    }
+
+    fn pty_test_end(code: i32) -> Envelope {
+        Envelope::End {
+            request_id: "pty-test".into(),
+            exit_code: Some(code),
+            error: None,
+            seq: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_dispatch_backs_up_the_receive_task_without_dropping_bytes() {
+        let io = PtySession::test_io();
+        let mut session = io.session;
+        let mut writes = io.writes;
+        let tx = io.tx;
+        let pending = Mutex::new(HashMap::from([("pty-test".to_string(), tx)]));
+        let transfers: Mutex<HashMap<String, UnboundedSender<TransferInbound>>> =
+            Mutex::new(HashMap::new());
+        let shutdown = CancellationToken::new();
+        let n = 600u32;
+        let producer = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                dispatch(&pending, &transfers, pty_test_chunk(&[0xe4]), &shutdown).await;
+                dispatch(
+                    &pending,
+                    &transfers,
+                    pty_test_chunk(&[0xbd, 0xa0]),
+                    &shutdown,
+                )
+                .await;
+                dispatch(
+                    &pending,
+                    &transfers,
+                    pty_test_chunk(b"\x1b[2;3H"),
+                    &shutdown,
+                )
+                .await;
+                dispatch(&pending, &transfers, pty_test_chunk(b"Z"), &shutdown).await;
+                for i in 0..n {
+                    dispatch(
+                        &pending,
+                        &transfers,
+                        pty_test_chunk(&[(i % 251) as u8]),
+                        &shutdown,
+                    )
+                    .await;
+                }
+                dispatch(&pending, &transfers, pty_test_end(7), &shutdown).await;
+            }
+        });
+        // Prove writes still flow while output is backing up.
+        session.writer().write(b"k").await.unwrap();
+        let written = tokio::time::timeout(std::time::Duration::from_secs(1), writes.recv())
+            .await
+            .expect("write hook should accept input while output is queued")
+            .expect("write hook closed");
+        assert_eq!(written, b"k");
+
+        let mut got = Vec::new();
+        let exit;
+        loop {
+            tokio::task::yield_now().await;
+            match session.recv().await.unwrap() {
+                PtyEvent::Data(bytes) => got.extend(bytes),
+                PtyEvent::Exit(code) => {
+                    exit = Some(code);
+                    break;
+                }
+                PtyEvent::Error(err) => panic!("unexpected error {err}"),
+            }
+        }
+        producer.await.unwrap();
+        assert_eq!(got[0], 0xe4);
+        assert_eq!(&got[1..3], &[0xbd, 0xa0]);
+        assert_eq!(&got[3..9], b"\x1b[2;3H");
+        assert_eq!(got[9], b'Z');
+        assert_eq!(got[10..].len(), n as usize);
+        for (i, b) in got[10..].iter().enumerate() {
+            assert_eq!(*b, (i % 251) as u8, "byte {i}");
+        }
+        assert_eq!(exit, Some(7));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pty_session_unblocks_a_full_pending_send() {
+        let io = PtySession::test_io();
+        let tx = io.tx.clone();
+        while tx.try_send(pty_test_chunk(b"ab")) == crate::pending::TrySend::Queued {}
+        let blocked = tokio::spawn(async move { tx.send(pty_test_chunk(b"cd")).await });
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        drop(io.session);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+            .await
+            .expect("session drop must not deadlock a blocked dispatch send")
+            .unwrap();
+        assert!(matches!(result, Err(crate::pending::SendError::Closed)));
     }
 }
 
@@ -2594,7 +2814,7 @@ async fn run_socket(
                         Ok(Incoming::Env(Envelope::Session { .. } | Envelope::Pong | Envelope::Ping)) => {}
                         Ok(Incoming::Env(env)) => {
                             for env in take_ready(inner, env) {
-                                dispatch(&inner.pending, &inner.binary, env);
+                                dispatch(&inner.pending, &inner.binary, env, &inner.shutdown).await;
                             }
                         }
                         Ok(Incoming::Binary(bytes)) => {
@@ -2612,7 +2832,8 @@ async fn run_socket(
                                                     &inner.pending,
                                                     &inner.binary,
                                                     Envelope::result_err(id, err.to_string()),
-                                                );
+                                                    &inner.shutdown,
+                                                ).await;
                                             }
                                         }
                                     }
@@ -2626,7 +2847,8 @@ async fn run_socket(
                                                 id,
                                                 "file frame has no end-to-end peer",
                                             ),
-                                        );
+                                            &inner.shutdown,
+                                        ).await;
                                     }
                                 }
                             }
@@ -2794,14 +3016,16 @@ fn fail_waiters(inner: &ClientInner) {
 
 fn fail_waiters_with(inner: &ClientInner, message: Option<&str>) {
     inner.alive.store(false, Ordering::SeqCst);
-    if let Ok(mut map) = inner.pending.lock() {
+    let waiters = if let Ok(mut map) = inner.pending.lock() {
+        map.drain().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    for (id, tx) in waiters {
         if let Some(message) = message {
-            for (id, tx) in map.drain() {
-                let _ = tx.send(Envelope::result_err(id, message.to_string()));
-            }
-        } else {
-            map.clear();
+            let _ = tx.try_send_error(&id, message);
         }
+        tx.close();
     }
     if let Ok(mut map) = inner.binary.lock() {
         map.clear();
@@ -3186,7 +3410,6 @@ fn kind(env: &Envelope) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod session_maintain_tests {
     use super::*;
@@ -3261,7 +3484,13 @@ mod session_maintain_tests {
         save_session(dir.path(), &settings, "alice", "refresh-old", 1).unwrap();
         let out = maintain_session_with(dir.path(), &dummy_identity(), |req, _id| {
             assert_eq!(req.refresh_token, "refresh-old");
-            async { Ok(dummy_session("access-new", "refresh-new", crate::util::unix_now() + 3_600)) }
+            async {
+                Ok(dummy_session(
+                    "access-new",
+                    "refresh-new",
+                    crate::util::unix_now() + 3_600,
+                ))
+            }
         })
         .await
         .unwrap()
