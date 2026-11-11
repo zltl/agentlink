@@ -38,6 +38,12 @@ pub struct DebugLayout {
     pub toolbar_items: Vec<(String, [f32; 4])>,
     pub pane_rect: [f32; 4],
     pub content_rect: [f32; 4],
+    /// Session machine rail slot when visible; otherwise zeros.
+    pub rail_rect: [f32; 4],
+    /// Main column beside the rail (or the full chrome column when the rail is folded).
+    pub main_rect: [f32; 4],
+    /// Primary page body (machines list / terminal / files pane).
+    pub page_rect: [f32; 4],
     pub texts: Vec<String>,
 }
 
@@ -48,6 +54,9 @@ impl DebugLayout {
         self.toolbar_items.clear();
         self.pane_rect = [0.0; 4];
         self.content_rect = [0.0; 4];
+        self.rail_rect = [0.0; 4];
+        self.main_rect = [0.0; 4];
+        self.page_rect = [0.0; 4];
         self.texts.clear();
     }
 
@@ -1132,40 +1141,67 @@ impl ControllerApp {
                 .frame(egui::Frame::NONE.fill(theme::BG_PAGE))
                 .show(ctx, |ui| {
                     if show_rail {
-                        // Paint the rail inside the central panel at a fixed
-                        // width. A SidePanel used the overflowing button
-                        // response rect to place the main column, which left
-                        // a wide black gap next to clipped "View desktop"
-                        // labels (0133 session retest).
+                        // Full-height left-to-right split inside the central
+                        // panel. `ui.horizontal()` only seeds interact_size.y
+                        // height, which crushed Terminal/Files into a thin
+                        // strip and left the rest of the window as empty
+                        // BG_PAGE (black) at 1280×800. SidePanel also advanced
+                        // the main column from overflowing button rects.
+                        // Claim an exact rail slot, clip overflow, and keep
+                        // the main column at the remaining width.
+                        let avail = ui.available_size();
                         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                        ui.horizontal(|ui| {
-                            let rail_w = model::MACHINE_RAIL_WIDTH;
-                            let rail_h = ui.available_height();
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(rail_w, rail_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    ui.set_width(rail_w);
-                                    ui.set_max_width(rail_w);
-                                    ui.set_clip_rect(ui.max_rect());
+                        ui.allocate_ui_with_layout(
+                            avail,
+                            egui::Layout::left_to_right(egui::Align::Min),
+                            |ui| {
+                                let rail_w = model::MACHINE_RAIL_WIDTH;
+                                let row_h = ui.max_rect().height().max(1.0);
+                                let (rail_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(rail_w, row_h),
+                                    egui::Sense::hover(),
+                                );
+                                {
+                                    let mut rail_ui = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .id_salt("machine-rail")
+                                            .max_rect(rail_rect)
+                                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                                    );
+                                    rail_ui.set_clip_rect(rail_rect);
                                     egui::Frame::NONE
                                         .fill(theme::BG_SURFACE)
                                         .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
                                         .stroke(theme::stroke_border_subtle())
-                                        .show(ui, |ui| {
-                                            ui.set_width(ui.available_width());
-                                            ui.set_max_width(ui.available_width());
-                                            ui.set_min_height(ui.available_height());
+                                        .show(&mut rail_ui, |ui| {
+                                            ui.set_min_size(ui.max_rect().size());
+                                            ui.set_max_size(ui.max_rect().size());
                                             self.machine_rail(ui);
                                         });
-                                },
-                            );
-                            egui::Frame::NONE
-                                .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
-                                .show(ui, |ui| {
-                                    self.chrome_and_page(ui);
-                                });
-                        });
+                                }
+                                let main_w = ui.available_width().max(1.0);
+                                let (main_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(main_w, row_h),
+                                    egui::Sense::hover(),
+                                );
+                                {
+                                    let mut main_ui = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .id_salt("session-main")
+                                            .max_rect(main_rect)
+                                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                                    );
+                                    main_ui.set_clip_rect(main_rect);
+                                    egui::Frame::NONE
+                                        .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
+                                        .show(&mut main_ui, |ui| {
+                                            self.chrome_and_page(ui);
+                                        });
+                                }
+                                self.debug_layout.rail_rect = rect_xywh(rail_rect);
+                                self.debug_layout.main_rect = rect_xywh(main_rect);
+                            },
+                        );
                     } else {
                         let margin = match self.screen {
                             Screen::Machines => egui::Margin::symmetric(
@@ -1174,6 +1210,8 @@ impl ControllerApp {
                             ),
                             _ => egui::Margin::same(theme::SPACE_LG as i8),
                         };
+                        let main_rect = ui.available_rect_before_wrap();
+                        self.debug_layout.main_rect = rect_xywh(main_rect);
                         egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
                             self.chrome_and_page(ui);
                         });
@@ -1364,7 +1402,7 @@ impl ControllerApp {
             && (link_is_connecting(&self.link) || self.link == "relay");
         if self.nodes.is_empty() {
             let avail = ui.available_size();
-            ui.allocate_ui_with_layout(
+            let empty = ui.allocate_ui_with_layout(
                 avail,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
                 |ui| {
@@ -1379,9 +1417,10 @@ impl ControllerApp {
                     });
                 },
             );
+            self.debug_layout.page_rect = rect_xywh(empty.response.rect);
         } else {
             let nodes = self.nodes.clone();
-            egui::ScrollArea::vertical()
+            let list = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -1391,6 +1430,7 @@ impl ControllerApp {
                         ui.add_space(theme::SPACE_SM);
                     }
                 });
+            self.debug_layout.page_rect = rect_xywh(list.inner_rect);
         }
         ui.add_space(theme::SPACE_MD);
         if ui
@@ -1551,10 +1591,9 @@ impl ControllerApp {
     }
 
     fn machine_rail(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .add(theme::secondary_button("Back to machines"))
-            .clicked()
-        {
+        let back = ui.add(theme::secondary_button("Back to machines"));
+        self.debug_layout.note_item("rail_back", back.rect);
+        if back.clicked() {
             self.back_to_machines();
             return;
         }
@@ -1660,22 +1699,18 @@ impl ControllerApp {
     }
 
     fn session_back_row(&mut self, ui: &mut egui::Ui, title: String) {
-        let wide = ui.available_width() >= 700.0
-            && matches!(self.screen, Screen::Terminal { .. } | Screen::Files { .. });
         ui.horizontal(|ui| {
             // On a wide window the machine list stays in the left rail, but
             // the back button remains so a narrow layout (or a resized
             // window) never strands the user in a session.
-            if ui
-                .add(theme::secondary_button("Back to machines"))
-                .clicked()
-            {
+            let back = ui.add(theme::secondary_button("Back to machines"));
+            self.debug_layout.note_item("back", back.rect);
+            if back.clicked() {
                 self.back_to_machines();
             }
             ui.label(theme::section_text(title));
         });
         ui.label(theme::muted_text(format!("connection {}", self.link)));
-        let _ = wide;
     }
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
@@ -1709,15 +1744,15 @@ impl ControllerApp {
             .stroke(theme::stroke_border_subtle())
             .inner_margin(egui::Margin::same(theme::SPACE_XS as i8))
             .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD));
-        let output = frame
-            .show(ui, |ui| {
-                ui.set_min_size(egui::vec2(
-                    ui.available_width(),
-                    ui.available_height().max(120.0),
-                ));
-                self.terminal.show(ui)
-            })
-            .inner;
+        let shown = frame.show(ui, |ui| {
+            ui.set_min_size(egui::vec2(
+                ui.available_width(),
+                ui.available_height().max(120.0),
+            ));
+            self.terminal.show(ui)
+        });
+        self.debug_layout.page_rect = rect_xywh(shown.response.rect);
+        let output = shown.inner;
         if let Some((rows, cols)) = output.resized {
             self.term_size = (rows, cols);
             self.send(Cmd::PtyResize { rows, cols });
@@ -1771,7 +1806,7 @@ impl ControllerApp {
             ui.label(theme::muted_text("This folder is empty."));
         }
         let list_h = (ui.available_height() - 160.0).max(160.0);
-        egui::ScrollArea::vertical()
+        let list = egui::ScrollArea::vertical()
             .max_height(list_h)
             .show(ui, |ui| {
                 let mut entries = self.files.clone();
@@ -1815,6 +1850,7 @@ impl ControllerApp {
                     });
                 }
             });
+        self.debug_layout.page_rect = rect_xywh(list.inner_rect);
         if can_write {
             ui.horizontal_wrapped(|ui| {
                 ui.add(
@@ -3421,6 +3457,11 @@ impl ControllerApp {
                 "image_rect": self.debug_layout.pane_rect,
                 "content_rect": self.debug_layout.content_rect,
             },
+            "session": {
+                "rail_rect": self.debug_layout.rail_rect,
+                "main_rect": self.debug_layout.main_rect,
+                "page_rect": self.debug_layout.page_rect,
+            },
             "window": {
                 "w": self.logical_size.0,
                 "h": self.logical_size.1,
@@ -3913,5 +3954,217 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
         }
     } else {
         n
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct Harness {
+        app: ControllerApp,
+        _cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+        _tmpdir: TempDir,
+        ctx: egui::Context,
+        time: f64,
+    }
+
+    impl Harness {
+        fn new(w: f32, h: f32) -> Self {
+            let tmp = TempDir::new().expect("tmpdir");
+            let config = tmp.path().join("config");
+            let data = tmp.path().join("data");
+            std::fs::create_dir_all(&config).expect("config dir");
+            std::fs::create_dir_all(&data).expect("data dir");
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let shared = Arc::new(Shared::new());
+            let flags = TrayFlags {
+                open: Arc::new(AtomicBool::new(false)),
+                quit: Arc::new(AtomicBool::new(false)),
+            };
+            let mut app = ControllerApp::new_debug(
+                tx,
+                shared,
+                config,
+                data,
+                false,
+                flags,
+                true,
+                (w, h),
+                false,
+                12,
+                30,
+            );
+            app.user = Some("debug".into());
+            app.nodes.push(mock_node("box"));
+            app.control.insert("box".into(), true);
+            app.screen = Screen::Machines;
+            let ctx = egui::Context::default();
+            apply_theme_public(&ctx);
+            Self {
+                app,
+                _cmd_rx: rx,
+                _tmpdir: tmp,
+                ctx,
+                time: 0.0,
+            }
+        }
+
+        fn pass(&mut self) {
+            let (w, h) = self.app.debug_window_size();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(w, h),
+                )),
+                time: Some(self.time),
+                predicted_dt: 1.0 / 60.0,
+                focused: true,
+                ..Default::default()
+            };
+            self.time += 1.0 / 60.0;
+            let _ = self.ctx.run(raw, |ctx| {
+                self.app.ui_frame(ctx);
+            });
+        }
+    }
+
+    fn item_rect(layout: &DebugLayout, id: &str) -> Option<[f32; 4]> {
+        layout
+            .toolbar_items
+            .iter()
+            .find(|(key, _)| key == id)
+            .map(|(_, rect)| *rect)
+    }
+
+    fn assert_back_visible(layout: &DebugLayout, window: (f32, f32)) {
+        let back = item_rect(layout, "back")
+            .or_else(|| item_rect(layout, "rail_back"))
+            .expect("Back to machines rect");
+        assert!(
+            back[2] >= 120.0,
+            "back width clipped: {back:?} win={window:?}"
+        );
+        assert!(
+            back[3] >= 20.0,
+            "back height clipped: {back:?} win={window:?}"
+        );
+        assert!(
+            back[0] + back[2] <= window.0 + 1.0,
+            "back past right edge: {back:?} win={window:?}"
+        );
+        assert!(
+            back[1] + back[3] <= window.1 + 1.0,
+            "back past bottom edge: {back:?} win={window:?}"
+        );
+    }
+
+    fn assert_session_geometry(layout: &DebugLayout, w: f32, h: f32, expect_rail: bool) {
+        let main = layout.main_rect;
+        assert!(
+            main[2] >= model::session_main_min_width(w),
+            "main width crushed: {main:?} at {w}x{h}"
+        );
+        assert!(
+            main[3] >= model::session_page_min_height(h),
+            "main height crushed (black remainder): {main:?} at {w}x{h}"
+        );
+        if expect_rail {
+            let rail = layout.rail_rect;
+            assert!(
+                (rail[2] - model::MACHINE_RAIL_WIDTH).abs() < 1.0,
+                "rail width: {rail:?}"
+            );
+            assert!(
+                rail[3] >= model::session_page_min_height(h),
+                "rail height crushed: {rail:?} at {w}x{h}"
+            );
+            assert!(
+                (rail[0] + rail[2] - main[0]).abs() < 2.0,
+                "black gap between rail and main: rail={rail:?} main={main:?}"
+            );
+        } else {
+            assert_eq!(
+                layout.rail_rect,
+                [0.0; 4],
+                "rail should fold below show-at"
+            );
+        }
+        let page = layout.page_rect;
+        assert!(page[2] > 80.0, "page width: {page:?} at {w}x{h}");
+        assert!(
+            page[3] >= 100.0,
+            "page height too small (black pane): {page:?} at {w}x{h}"
+        );
+        assert_back_visible(layout, (w, h));
+    }
+
+    #[test]
+    fn session_geometry_terminal_files_machines_desktop_wide_and_narrow() {
+        for &(w, h) in &[(1280.0_f32, 800.0_f32), (725.0_f32, 800.0_f32)] {
+            let mut harn = Harness::new(w, h);
+            harn.pass();
+            harn.pass();
+
+            harn.app.screen = Screen::Machines;
+            harn.pass();
+            let main = harn.app.debug_layout.main_rect;
+            assert!(
+                main[2] > w * 0.5,
+                "machines main width {main:?} at {w}x{h}"
+            );
+            assert!(
+                main[3] > h * 0.5,
+                "machines main height {main:?} at {w}x{h}"
+            );
+            assert!(
+                harn.app.debug_layout.page_rect[3] > 80.0,
+                "machines page {:?}",
+                harn.app.debug_layout.page_rect
+            );
+
+            let node = harn.app.nodes[0].clone();
+            let expect_rail = model::machine_rail_visible(w);
+
+            harn.app.open_terminal(&node);
+            harn.pass();
+            harn.pass();
+            assert_session_geometry(&harn.app.debug_layout, w, h, expect_rail);
+
+            harn.app.open_files(&node);
+            harn.pass();
+            harn.pass();
+            assert_session_geometry(&harn.app.debug_layout, w, h, expect_rail);
+
+            harn.app.open_desktop(&node, true);
+            harn.pass();
+            harn.pass();
+            let pane = harn.app.debug_layout.pane_rect;
+            assert!(
+                pane[2] > w * 0.5,
+                "desktop pane width {pane:?} at {w}x{h}"
+            );
+            assert!(
+                pane[3] > h * 0.4,
+                "desktop pane height {pane:?} at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn crushed_horizontal_session_row_would_fail_geometry_gates() {
+        // Baseline 7c8b04d failure: ui.horizontal() only seeds interact_size.y,
+        // so Terminal/Files occupied a thin strip and the rest stayed BG_PAGE.
+        let interact = theme::BTN_TOOLBAR_H;
+        assert!(interact < 64.0);
+        assert!(model::session_page_min_height(800.0) > interact * 2.0);
+        let fake_main = [model::MACHINE_RAIL_WIDTH, 0.0, 1020.0, interact];
+        assert!(
+            fake_main[3] < model::session_page_min_height(800.0),
+            "gates must reject the crushed session row height"
+        );
     }
 }
