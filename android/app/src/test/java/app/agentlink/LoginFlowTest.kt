@@ -79,11 +79,12 @@ class LoginFlowTest {
         assertAbsent("server")
         assertAbsent("fingerprint")
         assertAbsent("totp")
+        enterFixtureRelay()
         rule.onNodeWithTag("username").performTextInput("alice")
         rule.onNodeWithTag("password").performTextInput("password-alice")
         rule.onNodeWithTag("login").activate()
         assertEquals(1, api.loginCalls)
-        assertEquals("", api.lastServer)
+        assertEquals(FIXTURE_RELAY, api.lastServer)
         assertEquals("", api.lastFingerprint)
         assertEquals("android", api.lastDevice)
         assertEquals("alice", sessions.load()?.user)
@@ -119,6 +120,7 @@ class LoginFlowTest {
             }
         }
         assertAbsent("totp")
+        enterFixtureRelay()
         rule.onNodeWithTag("username").performTextInput("alice")
         rule.onNodeWithTag("password").performTextInput("password-alice")
         rule.onNodeWithTag("login").activate()
@@ -157,6 +159,78 @@ class LoginFlowTest {
         assertEquals("wss://relay.example:7443", api.lastServer)
         assertEquals("webpki", api.lastFingerprint)
         assertEquals("alice", sessions.load()?.user)
+    }
+
+    @Test
+    fun emptyRelayIsRejectedAndDoesNotCallLogin() {
+        rule.setContent {
+            AgentTheme {
+                UserLogin(
+                    api,
+                    sessions,
+                    onConnected = {},
+                    onActAsNode = {},
+                    onAdmin = {},
+                    background = immediate,
+                    ui = immediate,
+                )
+            }
+        }
+        rule.onNodeWithTag("username").performTextInput("alice")
+        rule.onNodeWithTag("password").performTextInput("password-alice")
+        rule.onNodeWithTag("login").activate()
+        rule.onNodeWithTag("status").assertTextEquals("Relay URL must start with wss://")
+        assertEquals(0, api.loginCalls)
+        assertEquals(null, sessions.load())
+        assertAbsent("totp")
+    }
+
+    @Test
+    fun insecureWsRelayIsRejectedAndDoesNotCallLogin() {
+        rule.setContent {
+            AgentTheme {
+                UserLogin(
+                    api,
+                    sessions,
+                    onConnected = {},
+                    onActAsNode = {},
+                    onAdmin = {},
+                    background = immediate,
+                    ui = immediate,
+                )
+            }
+        }
+        enterFixtureRelay("ws://relay.example:7443")
+        rule.onNodeWithTag("username").performTextInput("alice")
+        rule.onNodeWithTag("password").performTextInput("password-alice")
+        rule.onNodeWithTag("login").activate()
+        rule.onNodeWithTag("status").assertTextEquals("Relay URL must start with wss://")
+        assertEquals(0, api.loginCalls)
+        assertEquals(null, sessions.load())
+    }
+
+    @Test
+    fun incompleteRelayIsRejectedAndDoesNotCallLogin() {
+        rule.setContent {
+            AgentTheme {
+                UserLogin(
+                    api,
+                    sessions,
+                    onConnected = {},
+                    onActAsNode = {},
+                    onAdmin = {},
+                    background = immediate,
+                    ui = immediate,
+                )
+            }
+        }
+        enterFixtureRelay("wss://")
+        rule.onNodeWithTag("username").performTextInput("alice")
+        rule.onNodeWithTag("password").performTextInput("password-alice")
+        rule.onNodeWithTag("login").activate()
+        rule.onNodeWithTag("status").assertTextEquals("Relay URL is incomplete")
+        assertEquals(0, api.loginCalls)
+        assertEquals(null, sessions.load())
     }
 
     @Test
@@ -234,6 +308,13 @@ private class FakeAccount : AccountApi {
 }
 
 private fun SemanticsNodeInteraction.activate() = performSemanticsAction(SemanticsActions.OnClick)
+
+private const val FIXTURE_RELAY = "wss://relay.example:7443"
+
+private fun LoginFlowTest.enterFixtureRelay(url: String = FIXTURE_RELAY) {
+    rule.onNodeWithTag("advanced-relay").performScrollTo().activate()
+    rule.onNodeWithTag("server").performTextReplacement(url)
+}
 
 private fun LoginFlowTest.assertAbsent(tag: String) {
     assertEquals(0, rule.onAllNodesWithTag(tag).fetchSemanticsNodes().size)

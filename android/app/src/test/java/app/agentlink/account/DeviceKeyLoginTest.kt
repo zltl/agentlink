@@ -7,8 +7,10 @@ import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
 import androidx.test.core.app.ApplicationProvider
 import app.agentlink.bridge.ClientSession
 import app.agentlink.ui.AgentTheme
@@ -210,6 +212,8 @@ class DeviceKeyLoginTest {
                 )
             }
         }
+        rule.onNodeWithTag("advanced-relay").performScrollTo().activate()
+        rule.onNodeWithTag("server").performTextReplacement("wss://relay.example:7443")
         rule.onNodeWithTag("username").performTextInput("alice")
         rule.onNodeWithTag("password").performTextInput("password-alice")
         rule.onNodeWithTag("login").activate()
@@ -217,6 +221,7 @@ class DeviceKeyLoginTest {
         val account = sessions.load()
         assertNotNull(account)
         assertEquals("alice", account!!.user)
+        assertEquals("wss://relay.example:7443", account.server)
         assertEquals(64, account.deviceId.length)
         assertEquals(1, api.loginCalls)
         assertTrue(jca.verify(account.deviceId, api.signedMessage, api.signature))
