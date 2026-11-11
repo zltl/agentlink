@@ -36,12 +36,12 @@
 
 ## 若要坚持“grant（含 shell）必须本地批准、无 agentlink 自授权”
 
-不能再靠环境变量。需要真正的 OS 隔离，使**远程 exec 身份**读不到签发私钥、写不了权威目录。可选方案（都不在本变更中实施；不改系统全局安全策略，不擅自加 root daemon）：
+那是 **A1**，需要真正的 OS 隔离。2026-11-11 08:17（Asia/Shanghai, UTC+8）用户已明确选择 **A2**：保留当前 OS 用户完整 shell，接受获准后可读取密钥并签发其他授权。本轮**不**实施独立 issuer 用户、受限 shell 或新特权服务，也不修改生产 sudo/权限。
 
-Landlock **单独**限制 issuer 文件路径**不足以**称为已解决：同 UID 进程仍可能 ptrace / 读 `/proc`、经会话 D-Bus 驱动本地 UI、改 shell rc / autostart。完整方案、能力收窄、以及需要用户二选一的 A1/A2（独立 authority 与受约束 exec，或承认已获 exec 可代签）见 `docs/grant-local-authority.md`。该架构不在本轮默认部署，也不修改生产用户或 sudo。
+Landlock **单独**限制 issuer 文件路径**不足以**称为已解决：同 UID 进程仍可能 ptrace / 读 `/proc`、经会话 D-Bus 驱动本地 UI、改 shell rc / autostart。A1 方案仍留在 `docs/grant-local-authority.md` 供日后改选，当前不部署。
 
-不要再增加可清除标志，也不要把上述方案未落地时的状态标成“已防自授权”。
+不要再增加可清除标志，也不要把 `AGENTLINK_REMOTE_EXEC` 守卫宣传成防自授权。选择完整 shell **不是**取消首次本地 grant：未获准控制端仍不能 exec。撤销原 grant 不能撤销已经据此另建的授权或已做的系统改动。`env -u` / `setsid` 在已有 exec/full 之后能够代签，是被接受的能力，回归按此记录，而不是当成应失败的用例。
 
 ## 与灰度的关系
 
-在 issuer 对 exec UID 仍可读可写的情况下，**不能**把“无 agentlink 自授权”当作已通过的安全门槛，也因此不能以该声明为依据做生产灰度。其它互不依赖的修复（超时与 Cancel 清理、paste-ui 缩小权限链、诚实文档、负例重测）可以在隔离节点上继续验证。
+“无 agentlink 自授权”在 A2 下**不是**可宣称已通过的门槛，也不能用它来拒绝或代替其它门槛。可发布的前提是：首次未授权/过期/撤销/伪造等拒绝仍然成立；文档与 UI 诚实写出获准后的固有全权与撤销的极限；其它互不依赖的修复（门户 Cancel/Close、paste-ui、CJK、窗口 letterbox 诚实标记）在最终候选上实测通过。不得承诺不可能的回收或隔离能力，不得输出密钥。

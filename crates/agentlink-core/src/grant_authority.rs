@@ -1,9 +1,13 @@
-//! Policy for a *future* local grant authority. Not wired into `grant allow`
-//! and not installed on any host.
+//! Policy for a *future* A1 local grant authority helper. Not wired into
+//! `grant allow` and not installed on any host.
 //!
-//! Same-UID unrestricted exec cannot be promised to be unable to mint grants.
-//! Landlock on the issuer file alone is not a complete boundary. See
-//! `docs/grant-local-authority.md`.
+//! On 2026-11-11 08:17 (Asia/Shanghai, UTC+8) the owner chose A2: keep this
+//! OS user's full shell and accept that a controller who already has
+//! exec/full can read the issuer and mint further grants. This module stays
+//! in-tree only so an A1 helper is not later mistaken for production policy.
+//! Production contract: first unauthenticated grant is still local-only;
+//! env-cleared exec after a valid grant is accepted inherent power; revoke
+//! does not undo later grants. See `docs/grant-local-authority.md`.
 
 /// How the process asking the helper to sign a grant was classified.
 #[derive(Debug, Clone, PartialEq, Eq)]

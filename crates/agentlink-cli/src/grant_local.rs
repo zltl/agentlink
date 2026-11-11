@@ -5,10 +5,14 @@
 //!
 //! `refuse_if_remote_exec` is only a misuse guard: the CLI refuses mutating
 //! grant commands while `AGENTLINK_REMOTE_EXEC` is set (the node injects it
-//! on exec/pty/shell). It is not a self-authorization boundary. A controller
-//! that already has exec/full as this OS user can clear the variable, spawn
-//! detached, read `grant-issuer.json`, or write grant-authority directories.
-//! See `docs/grant-authorization-boundary.md`.
+//! on exec/pty/shell). It is not a self-authorization boundary. On 2026-11-11
+//! 08:17 (Asia/Shanghai, UTC+8) the owner chose to keep this OS user's full
+//! shell: after a first local grant of exec/full, the same-UID controller can
+//! clear the variable, read `grant-issuer.json`, and mint further grants.
+//! That is accepted inherent power, not a bug to green-wash. Revoking the
+//! original grant does not undo grants or OS changes already made. The first
+//! unauthenticated controller is still refused. See
+//! `docs/grant-authorization-boundary.md`.
 
 use agentlink_core::permissions::parse_access;
 use anyhow::{anyhow, Result};
@@ -21,7 +25,13 @@ pub const REMOTE_EXEC_REFUSAL: &str = "已拒绝：检测到 AGENTLINK_REMOTE_EX
 pub const SIGNATURE_DISCLAIMER: &str = "签名只证明控制端持有对应私钥，不证明屏幕上的名称或人员真实性。请用带外渠道核对该 SHA256 指纹后再批准。";
 
 pub const SCOPE_NOTE: &str =
-    "请求的 ttl 只约束这份待批，并不强迫目标机授权。目标机可以缩小权限或缩短有效期，不能无声加大。";
+    "请求的 ttl 只约束这份待批，并不强迫目标机授权。目标机可以缩小权限或缩短有效期，不能无声加大。首次批准必须在目标机本地做出；仅粘贴身份码不授权。";
+
+/// Honest contract after the 2026-11-11 08:17 (Asia/Shanghai, UTC+8) choice:
+/// keep this OS user's full shell. Shown when the issued or requested policy
+/// includes exec/shell. Do not promise that revoke undoes later grants.
+pub const EXEC_POWER_NOTE: &str =
+    "若签发 exec/shell 或包含它们的权限（如 desktop/full），获准后的控制端与本机同 UID，具有该用户的固有全权，包括读取 issuer 并签发其他授权。撤销本 grant 不能撤销已经据此另建的授权，也不能撤销已经做过的系统改动。AGENTLINK_REMOTE_EXEC 只是防误用，不是防自授权。不承诺不可能的隔离。";
 
 pub fn remote_exec_is_set() -> bool {
     std::env::var_os(REMOTE_EXEC_ENV).is_some()
@@ -52,8 +62,9 @@ pub fn request_prompt_body(
          若同意，grant 有效期: {ttl_secs} 秒\n\
          请求过期 unix: {exp_unix}\n\n\
          {SIGNATURE_DISCLAIMER}\n\
-         {SCOPE_NOTE}\n\n\
-         Allow 使用本机 issuer 签发 grant。Deny 拒绝。都不是 `agentlink approve allow`（危险操作确认）。issuer 密钥不离开本机。"
+         {SCOPE_NOTE}\n\
+         {EXEC_POWER_NOTE}\n\n\
+         Allow 使用本机 issuer 签发 grant。Deny 拒绝。都不是 `agentlink approve allow`（危险操作确认）。issuer 密钥不离开本机，也不会被打印。"
     )
 }
 
@@ -339,7 +350,8 @@ pub fn issue_confirm_body(policy: &str, ttl_secs: u64) -> String {
         "即将签发的权限如下（以此为准，不是上一步未改动的提示）：\n\n\
          权限: {summary}\n\
          有效期: {ttl_secs} 秒\n\n\
-         取消签发不授权，待批请求仍保留。"
+         {EXEC_POWER_NOTE}\n\n\
+         取消签发不授权，待批请求仍保留。issuer 密钥不会被打印。"
     )
 }
 
@@ -608,6 +620,16 @@ mod tests {
     fn remote_exec_refusal_is_honest_about_the_guard() {
         assert!(REMOTE_EXEC_REFUSAL.contains("AGENTLINK_REMOTE_EXEC"));
         assert!(REMOTE_EXEC_REFUSAL.contains("不是防自授权"));
+        assert!(EXEC_POWER_NOTE.contains("固有全权"));
+        assert!(EXEC_POWER_NOTE.contains("不能撤销已经据此另建的授权"));
+        assert!(EXEC_POWER_NOTE.contains("不是防自授权"));
+        assert!(SCOPE_NOTE.contains("仅粘贴身份码不授权"));
+        let body = request_prompt_body("r", "SHA256:x", "ab", "desktop", 60, 1);
+        assert!(body.contains(EXEC_POWER_NOTE));
+        assert!(body.contains("仅粘贴身份码不授权"));
+        let confirm = issue_confirm_body("exec", 300);
+        assert!(confirm.contains(EXEC_POWER_NOTE));
+        assert!(confirm.contains("取消签发不授权"));
         assert!(SIGNATURE_DISCLAIMER.contains("不证明"));
         assert!(SCOPE_NOTE.contains("不能无声加大"));
     }

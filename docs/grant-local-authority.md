@@ -1,6 +1,6 @@
 # 本地签发隔离：边界前提、方案与需用户决定的事项
 
-本文是设计与沙盒策略代码（`agentlink_core::grant_authority`）的说明，**不是**已部署架构。默认节点与 `grant allow` / `paste-ui` 仍按现有同 UID issuer 工作。不修改生产用户、sudo 或权限，不安装特权 daemon。
+本文记录本地签发隔离的设计选项，以及 **2026-11-11 08:17（Asia/Shanghai, UTC+8）已做出的选择**。`agentlink_core::grant_authority` 仍只是未接线的沙盒策略代码，**没有**也**不会**在本轮安装独立 issuer 用户、受限 shell 或特权服务。默认节点与 `grant allow` / `paste-ui` 继续按现有同 UID issuer、完整登录用户 shell 工作。不修改生产用户、sudo 或权限。
 
 ## 必须先说清的冲突
 
@@ -60,7 +60,7 @@ Windows / Android **不能**用 Linux Landlock、logind 或 polkit 冒充为全�
 
 ## 需要用户决定的事项（具体选项，不是“授权后再说”）
 
-**决定 A — 远程 shell 的含义（必选，否则硬门槛无法落地）**
+**决定 A — 远程 shell 的含义（已于 2026-11-11 08:17 选择 A2）**
 
 - **A1（可证明边界）**：新的 exec/shell 以独立用户或等价沙箱运行；不能 ptrace 登录会话、不能写 login 用户 autostart、不能操作 seat 总线去点批准。issuer 迁到独立用户。本地 `grant allow` / `paste-ui` / 托盘仍以登录用户在 seat 或经 polkit 批准。
 - **A2（维持现状的固有全权）**：exec 继续以登录用户无限制运行。则文档与 UI 必须持续写明：**已获 exec/full 的控制端可以代签**；“必须本地批准、无自授权”对这类控制端不成立。不要部署独立 issuer 来假装解决。
@@ -109,6 +109,16 @@ Windows / Android 的等价物见下节，不能套用上述命令。
 
 批准通道应是应用内必须可见的 Activity（用户手势），而不是一个可被 shell 直接调用的无 UI 接口。Linux 的系统用户方案在此不适用。无 USB/在线设备时只记录可行性，不强推安装。
 
-## 与现网灰度的关系
+## 已做出的选择（2026-11-11 08:17，Asia/Shanghai, UTC+8）
 
-在决定 A 未选 A1 并完成迁移之前，生产继续使用旧二进制，**不做全机灰度**。本轮只修门户 Cancel/Close、paste-ui 全链，以及把上述边界写进仓库。`env -u` / `setsid` 负例必须保留，不为了“全绿”删除。
+用户明确选择 **A2：保留当前 OS 用户的完整 shell**，并接受：一旦首次在目标机本地批准了 exec/full（或其它包含 shell 的权限），获准控制端与节点同 UID，具有该用户的固有全权，包括读取 issuer 并签发其他授权。
+
+因此：
+
+- **不**实施 A1：不创建独立 issuer 用户、不改受限 shell、不安装新的特权服务、不迁移生产 sudo/权限。
+- **首次未授权必须拒绝。** 选择完整 shell **不是**取消首次本地 grant。身份码不是 bearer；relay 不能签发；owner/share 不能绕过。未获准、已过期、已撤销且未曾另建授权的控制端仍然不能 exec。
+- **获准同 UID 之后的代签是被接受的固有能力，不是要修掉的失败。** `env -u` / `setsid` 绕过 `AGENTLINK_REMOTE_EXEC` 防误用守卫后可以签发；回归应把它记为接受行为（在已有有效 exec/full grant 的前提下），而不是当作“应失败”的漏洞用例删改到全绿，也不得把该守卫宣传成防自授权。
+- **撤销原 grant 不能撤销**已经用完整 shell 另建的授权，也不能撤销已经做过的 OS 改动。UI 与文档必须写明，不承诺不可能的回收能力。不打印 issuer 私钥。
+- `grant_authority` 助手方案保留在仓库里，仅供日后若改选 A1 时对照；当前生产路径不启用。
+
+在上述诚实边界下，本选择**解除**此前“未选 A1 则不得灰度”的阻塞。其它互不依赖的门槛（首次拒绝、过期/撤销/跨 target、E2E、门户 Cancel/Close、CJK、窗口 letterbox 诚实标记等）仍须在最终候选上实测后，才能逐台更新。
