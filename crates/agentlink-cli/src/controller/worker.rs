@@ -9,16 +9,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::client::{login_user, maintain_session};
 use agentlink_core::{
-    apply_relay_defaults, parse_access, Client, ClientSettings, DirEntry, Identity, NodeInfo, Op,
-    PtyEvent, PtySession, RelayTrust, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT,
-    PHASE3_WEBRTC_SIGNAL,
+    Client, ClientSettings, DirEntry, Identity, NodeInfo, Op, PHASE2_INJECT_INPUT,
+    PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL, PtyEvent, PtySession, RelayTrust,
+    apply_relay_defaults, parse_access,
 };
 use agentlink_view::{LiveOptions, Signal, Viewer};
 use base64::Engine;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use super::decode::{decode_image, H264Decoder};
+use super::decode::{H264Decoder, decode_image};
 use super::model::enroll_command;
 
 pub struct Picture {
@@ -125,15 +125,23 @@ fn update_ema(slot: &AtomicU64, sample: u64) {
 }
 
 pub enum UiEvent {
-    Ready { user: Option<String> },
+    Ready {
+        user: Option<String>,
+    },
     Nodes(Vec<NodeInfo>),
     Failed(String),
     TotpRequired(String),
     Notice(String),
     Pty(Vec<u8>),
     PtyDone,
-    Dir { path: String, entries: Vec<DirEntry> },
-    File { path: String, text: String },
+    Dir {
+        path: String,
+        entries: Vec<DirEntry>,
+    },
+    File {
+        path: String,
+        text: String,
+    },
     Enrolled(String),
     Link(String),
     Pins(Vec<String>),
@@ -153,15 +161,40 @@ pub enum Cmd {
     },
     Logout,
     Refresh,
-    PtyOpen { node: String, rows: u16, cols: u16 },
-    PtyWrite { data: Vec<u8> },
-    PtyResize { rows: u16, cols: u16 },
+    PtyOpen {
+        node: String,
+        rows: u16,
+        cols: u16,
+    },
+    PtyWrite {
+        data: Vec<u8>,
+    },
+    PtyResize {
+        rows: u16,
+        cols: u16,
+    },
     PtyClose,
-    List { node: String, path: String },
-    Read { node: String, path: String },
-    Write { node: String, path: String, text: String },
-    Mkdir { node: String, path: String },
-    Remove { node: String, path: String },
+    List {
+        node: String,
+        path: String,
+    },
+    Read {
+        node: String,
+        path: String,
+    },
+    Write {
+        node: String,
+        path: String,
+        text: String,
+    },
+    Mkdir {
+        node: String,
+        path: String,
+    },
+    Remove {
+        node: String,
+        path: String,
+    },
     /// Start or restart a live session. Offer carries `monitor`; `quality`
     /// maps to bitrate when `max_fps` is zero. `scale` downscales capture.
     Live {
@@ -174,16 +207,33 @@ pub enum Cmd {
         max_fps: u32,
     },
     LiveStop,
-    Input { node: String, live: String, inject: String },
-    Monitors { node: String },
-    Clipboard { node: String, text: String },
-    Shot { node: String, path: String },
-    Enroll { name: String, access: String, minutes: u64 },
+    Input {
+        node: String,
+        live: String,
+        inject: String,
+    },
+    Monitors {
+        node: String,
+    },
+    Clipboard {
+        node: String,
+        text: String,
+    },
+    Shot {
+        node: String,
+        path: String,
+    },
+    Enroll {
+        name: String,
+        access: String,
+        minutes: u64,
+    },
 }
 
 enum PtyCmd {
     Write(Vec<u8>),
     Resize(u16, u16),
+    Close(Option<tokio::sync::oneshot::Sender<()>>),
 }
 
 pub struct Shared {
@@ -324,7 +374,16 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     relay,
                     pin,
                     trust,
-                } => match sign_in(&config_dir, &username, &password, &totp, &relay, &pin, &trust).await
+                } => match sign_in(
+                    &config_dir,
+                    &username,
+                    &password,
+                    &totp,
+                    &relay,
+                    &pin,
+                    &trust,
+                )
+                .await
                 {
                     Ok((next, user)) => {
                         client = Some(next);
@@ -344,7 +403,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 },
                 Cmd::Logout => {
                     stop_live(&mut live, &mut shots);
-                    pty = None;
+                    close_pty(&mut pty).await;
                     client = None;
                     if let Err(err) = crate::tray::sign_out(&config_dir).await {
                         shared.push(UiEvent::Failed(err.to_string()));
@@ -354,14 +413,16 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 }
                 Cmd::Refresh => refresh(client.as_ref(), &shared).await,
                 Cmd::PtyOpen { node, rows, cols } => {
-                    pty = None;
+                    close_pty(&mut pty).await;
                     match client.as_ref() {
-                        Some(current) => match current.open_pty(&node, None, None, rows, cols).await {
-                            Ok(session) => {
-                                pty = Some(spawn_pty(session, Arc::clone(&shared)));
+                        Some(current) => {
+                            match current.open_pty(&node, None, None, rows, cols).await {
+                                Ok(session) => {
+                                    pty = Some(spawn_pty(session, Arc::clone(&shared)));
+                                }
+                                Err(err) => shared.push(UiEvent::Failed(err.to_string())),
                             }
-                            Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                        },
+                        }
                         None => shared.push(UiEvent::Failed("Sign in first.".into())),
                     }
                 }
@@ -375,7 +436,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         let _ = tx.send(PtyCmd::Resize(rows, cols));
                     }
                 }
-                Cmd::PtyClose => pty = None,
+                Cmd::PtyClose => close_pty(&mut pty).await,
                 Cmd::List { node, path } => match client.as_ref() {
                     Some(current) => match current.list_dir(&node, &path).await {
                         Ok(entries) => shared.push(UiEvent::Dir { path, entries }),
@@ -397,13 +458,15 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     None => shared.push(UiEvent::Failed("Sign in first.".into())),
                 },
                 Cmd::Write { node, path, text } => match client.as_ref() {
-                    Some(current) => match current.write_file(&node, &path, text.as_bytes()).await {
-                        Ok(()) => {
-                            shared.push(UiEvent::Notice(format!("Saved {path}")));
-                            shared.push(UiEvent::File { path, text });
+                    Some(current) => {
+                        match current.write_file(&node, &path, text.as_bytes()).await {
+                            Ok(()) => {
+                                shared.push(UiEvent::Notice(format!("Saved {path}")));
+                                shared.push(UiEvent::File { path, text });
+                            }
+                            Err(err) => shared.push(UiEvent::Failed(err.to_string())),
                         }
-                        Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                    },
+                    }
                     None => shared.push(UiEvent::Failed("Sign in first.".into())),
                 },
                 Cmd::Mkdir { node, path } => match client.as_ref() {
@@ -474,7 +537,11 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     shared.set_hud(LiveHud::default());
                     shared.push(UiEvent::Link("relay".into()));
                 }
-                Cmd::Input { node, live: body, inject } => {
+                Cmd::Input {
+                    node,
+                    live: body,
+                    inject,
+                } => {
                     let sent = live
                         .as_ref()
                         .and_then(|session| session.viewer.lock().ok())
@@ -528,7 +595,11 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     },
                     None => shared.push(UiEvent::Failed("Sign in first.".into())),
                 },
-                Cmd::Enroll { name, access, minutes } => match client.as_ref() {
+                Cmd::Enroll {
+                    name,
+                    access,
+                    minutes,
+                } => match client.as_ref() {
                     Some(current) => match parse_access(&access) {
                         Ok(policy) => {
                             let ttl = minutes.clamp(1, 7 * 24 * 60) * 60;
@@ -939,7 +1010,8 @@ async fn save_screenshot(client: &Client, node: &str, path: &str) -> Result<Stri
         )
         .await
         .map_err(|err| err.to_string())?;
-    let bytes = screenshot_bytes(&value).ok_or_else(|| "screenshot response has no image".to_string())?;
+    let bytes =
+        screenshot_bytes(&value).ok_or_else(|| "screenshot response has no image".to_string())?;
     if let Some(parent) = std::path::Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -966,6 +1038,17 @@ fn stop_live(live: &mut Option<Live>, shots: &mut Option<tokio::task::JoinHandle
 fn screenshot_bytes(value: &Value) -> Option<Vec<u8>> {
     let text = value.get("data_b64")?.as_str()?;
     base64::engine::general_purpose::STANDARD.decode(text).ok()
+}
+
+async fn close_pty(pty: &mut Option<UnboundedSender<PtyCmd>>) {
+    let Some(tx) = pty.take() else {
+        return;
+    };
+    let (done, done_rx) = tokio::sync::oneshot::channel();
+    if tx.send(PtyCmd::Close(Some(done))).is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
 }
 
 fn spawn_pty(mut session: PtySession, shared: Arc<Shared>) -> UnboundedSender<PtyCmd> {
@@ -1003,7 +1086,17 @@ fn spawn_pty(mut session: PtySession, shared: Arc<Shared>) -> UnboundedSender<Pt
                         Some(PtyCmd::Resize(rows, cols)) => {
                             let _ = session.resize(rows, cols).await;
                         }
-                        None => break,
+                        Some(PtyCmd::Close(ack)) => {
+                            let _ = session.close().await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(());
+                            }
+                            break;
+                        }
+                        None => {
+                            let _ = session.close().await;
+                            break;
+                        }
                     }
                 }
             }
@@ -1020,9 +1113,10 @@ async fn refresh(client: Option<&Arc<Client>>, shared: &Shared) {
     match client.list_nodes().await {
         Ok(mut nodes) => {
             nodes.sort_by(|left, right| {
-                right.online.cmp(&left.online).then_with(|| {
-                    left.name.to_lowercase().cmp(&right.name.to_lowercase())
-                })
+                right
+                    .online
+                    .cmp(&left.online)
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
             });
             let pins = client.node_pin_warnings();
             if !pins.is_empty() {
@@ -1034,7 +1128,9 @@ async fn refresh(client: Option<&Arc<Client>>, shared: &Shared) {
     }
 }
 
-async fn saved_client(config_dir: &std::path::Path) -> Result<Option<(Arc<Client>, String)>, String> {
+async fn saved_client(
+    config_dir: &std::path::Path,
+) -> Result<Option<(Arc<Client>, String)>, String> {
     let identity = Identity::load_or_create(&config_dir.join("identity.json"))
         .map_err(|err| err.to_string())?;
     let _ = maintain_session(config_dir, &identity)
@@ -1081,11 +1177,7 @@ async fn sign_in(
     let parsed = RelayTrust::parse(pin, trust.as_deref()).map_err(|err| err.to_string())?;
     let totp = {
         let code = totp.trim();
-        if code.is_empty() {
-            None
-        } else {
-            Some(code)
-        }
+        if code.is_empty() { None } else { Some(code) }
     };
     let session = login_user(
         &relay,

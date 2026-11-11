@@ -436,3 +436,21 @@ primary input.
 Tests (no window): byte order, 中 = two cells, split UTF-8 / split CSI,
 SGR + cursor address, backspace + resize, key encoding. A parent GUI retest
 on the new candidate is still required for focus, IME, and a full-screen TUI.
+
+## t447 follow-up (keyboard isolation, reopen, CJK font)
+
+0111 retest: a focused terminal must consume Enter / Backspace / arrows
+so they cannot activate another machine's Terminal button in the left
+rail. `Emulator::consume_focused_keys` drains those events from the egui
+context before the rail is painted. Pointer events are left alone so an
+explicit click can still change the session target.
+
+Reopen stays blank when the previous `PtyClose` is only a `Drop` /
+`try_send`. The worker now awaits a reliable close before the next
+`open_pty`, the UI shows starting/waiting state, and `PtyDone` without
+output is an error — not a hidden refresh control.
+
+CJK tofu in the Alacritty grid was missing glyphs, not only cell width
+(Alacritty already gives 中 two cells). Font fallback is documented in
+`docs/controller-layout-t444.md` (Noto Sans CJK, SIL OFL 1.1; no
+rebundle of the collection).

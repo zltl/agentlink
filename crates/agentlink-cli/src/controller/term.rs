@@ -77,6 +77,9 @@ pub struct Emulator {
     ime_preedit: String,
     pub focused: bool,
     selecting: bool,
+    /// GUI keystrokes already taken this frame (so show() does not double-read).
+    keys_taken: bool,
+    pending_gui_writes: Vec<u8>,
 }
 
 impl Default for Emulator {
@@ -106,6 +109,8 @@ impl Emulator {
             ime_preedit: String::new(),
             focused: false,
             selecting: false,
+            keys_taken: false,
+            pending_gui_writes: Vec::new(),
         }
     }
 
@@ -342,6 +347,196 @@ impl Emulator {
         out
     }
 
+    /// Drop Text events that would double-type an IME commit, a composing
+    /// preview, or a special key already encoded in this frame.
+    pub fn skip_duplicate_text(
+        text: &str,
+        ime_commits: &[String],
+        preedit_active: bool,
+        control_key_sent: bool,
+    ) -> bool {
+        if preedit_active {
+            return true;
+        }
+        if ime_commits.iter().any(|commit| commit == text) {
+            return true;
+        }
+        control_key_sent && matches!(text, "\n" | "\r" | "\t" | "\u{1b}")
+    }
+
+    /// Strip inner bracketed-paste delimiters so a clipboard payload cannot
+    /// close the wrapping sequence and inject raw CSI into the PTY.
+    pub fn sanitize_bracketed_paste(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] == 0x1b
+                && i + 6 <= data.len()
+                && data[i + 1] == b'['
+                && data[i + 5] == b'~'
+                && (data[i + 2..i + 5] == *b"200" || data[i + 2..i + 5] == *b"201")
+            {
+                i += 6;
+                continue;
+            }
+            out.push(data[i]);
+            i += 1;
+        }
+        out
+    }
+
+    pub fn wrap_paste(data: &[u8], bracketed: bool) -> Vec<u8> {
+        if bracketed {
+            let mut out = b"[200~".to_vec();
+            out.extend(Self::sanitize_bracketed_paste(data));
+            out.extend_from_slice(b"[201~");
+            out
+        } else {
+            data.to_vec()
+        }
+    }
+
+    pub fn history_lines(&self) -> usize {
+        self.term.history_size()
+    }
+
+    /// Keyboard, IME, and clipboard events that belong to a focused terminal.
+    /// Pointer and scroll events are not captured so machine-rail clicks still work.
+    pub fn is_captured_event(event: &GuiEvent) -> bool {
+        matches!(
+            event,
+            GuiEvent::Key { .. }
+                | GuiEvent::Text(_)
+                | GuiEvent::Ime(_)
+                | GuiEvent::Copy
+                | GuiEvent::Cut
+                | GuiEvent::Paste(_)
+        )
+    }
+
+    /// Drain captured events from the egui context *before* any other widget
+    /// is drawn. This stops Enter / arrows from activating a default or
+    /// colliding machine-rail button (a cross-node session switch).
+    pub fn consume_focused_keys(&mut self, ctx: &egui::Context) {
+        if !self.focused {
+            return;
+        }
+        let modifiers = ctx.input(|i| i.modifiers);
+        let mut captured = Vec::new();
+        ctx.input_mut(|i| {
+            let mut rest = Vec::new();
+            for event in i.events.drain(..) {
+                if Self::is_captured_event(&event) {
+                    captured.push(event);
+                } else {
+                    rest.push(event);
+                }
+            }
+            i.events = rest;
+        });
+        let (writes, copy_text, paste_text, want_paste) = self.collect_writes(&captured, modifiers);
+        if let Some(text) = copy_text {
+            ctx.copy_text(text);
+        }
+        if let Some(text) = paste_text {
+            self.pending_gui_writes.extend(Self::wrap_paste(
+                text.as_bytes(),
+                self.term.mode().contains(TermMode::BRACKETED_PASTE),
+            ));
+        }
+        if want_paste {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        }
+        self.pending_gui_writes.extend(writes);
+        self.keys_taken = true;
+    }
+
+    fn collect_writes(
+        &mut self,
+        events: &[GuiEvent],
+        modifiers: egui::Modifiers,
+    ) -> (Vec<u8>, Option<String>, Option<String>, bool) {
+        let app_cursor = self.app_cursor();
+        let mut writes: Vec<u8> = Vec::new();
+        let mut copy_text: Option<String> = None;
+        let mut paste_text: Option<String> = None;
+        let mut want_paste = false;
+        let mut ime_commits: Vec<String> = Vec::new();
+        let mut preedit_active = false;
+        let mut control_key_sent = false;
+        let mut preedit = None;
+        for event in events {
+            match event {
+                GuiEvent::Copy | GuiEvent::Cut => {
+                    copy_text = self.term.selection_to_string();
+                }
+                GuiEvent::Paste(text) => {
+                    paste_text = Some(text.clone());
+                }
+                GuiEvent::Ime(ImeEvent::Enabled) => {}
+                GuiEvent::Ime(ImeEvent::Preedit(text)) => {
+                    if !text.is_empty() {
+                        preedit_active = true;
+                    }
+                    preedit = Some(text.clone());
+                }
+                GuiEvent::Ime(ImeEvent::Commit(text)) => {
+                    ime_commits.push(text.clone());
+                    writes.extend(Self::encode_text(text, false));
+                    preedit = Some(String::new());
+                }
+                GuiEvent::Ime(ImeEvent::Disabled) => {
+                    preedit = Some(String::new());
+                }
+                GuiEvent::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } if *pressed => {
+                    let name = key_name(*key);
+                    if modifiers.ctrl && modifiers.shift && matches!(key, Key::C) {
+                        copy_text = self.term.selection_to_string();
+                        continue;
+                    }
+                    if modifiers.ctrl && modifiers.shift && matches!(key, Key::V) {
+                        want_paste = true;
+                        continue;
+                    }
+                    if matches!(key, Key::Enter | Key::Tab) && !modifiers.ctrl {
+                        control_key_sent = true;
+                    }
+                    if let Some(bytes) = Self::encode_key(
+                        name,
+                        modifiers.ctrl,
+                        modifiers.alt,
+                        modifiers.shift,
+                        app_cursor,
+                    ) {
+                        writes.extend(bytes);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for event in events {
+            let GuiEvent::Text(text) = event else {
+                continue;
+            };
+            if modifiers.ctrl || modifiers.command {
+                continue;
+            }
+            if Self::skip_duplicate_text(text, &ime_commits, preedit_active, control_key_sent) {
+                continue;
+            }
+            writes.extend(Self::encode_text(text, modifiers.alt));
+        }
+        if let Some(text) = preedit {
+            self.ime_preedit = text;
+        }
+        (writes, copy_text, paste_text, want_paste)
+    }
+
     /// Draw the emulator and collect PTY input for this frame.
     pub fn show(&mut self, ui: &mut egui::Ui) -> TermOutput {
         let mut out = TermOutput {
@@ -365,6 +560,9 @@ impl Emulator {
         let desired = Vec2::new(cols as f32 * cell_w, rows as f32 * cell_h);
         let (id, rect) = ui.allocate_space(desired);
         let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+        if self.focused && !response.has_focus() {
+            response.request_focus();
+        }
         if response.clicked() || response.dragged() {
             response.request_focus();
             self.focused = true;
@@ -542,112 +740,33 @@ impl Emulator {
             }
         }
 
-        if response.has_focus() || self.focused {
-            let app_cursor = self.app_cursor();
-            let mut writes: Vec<u8> = Vec::new();
-            let mut copy_text: Option<String> = None;
-            let mut paste_text: Option<String> = None;
-            ui.input(|input| {
-                for event in &input.events {
-                    match event {
-                        GuiEvent::Copy => {
-                            copy_text = self.term.selection_to_string();
-                        }
-                        GuiEvent::Paste(text) => {
-                            paste_text = Some(text.clone());
-                        }
-                        GuiEvent::Ime(ImeEvent::Enabled) => {}
-                        GuiEvent::Ime(ImeEvent::Preedit(text)) => {
-                            // Don't send composing text to the PTY.
-                        }
-                        GuiEvent::Ime(ImeEvent::Commit(text)) => {
-                            writes.extend(Self::encode_text(text, false));
-                        }
-                        GuiEvent::Ime(ImeEvent::Disabled) => {}
-                        GuiEvent::Text(text) => {
-                            if input.modifiers.ctrl || input.modifiers.command {
-                                continue;
-                            }
-                            writes.extend(Self::encode_text(text, input.modifiers.alt));
-                        }
-                        GuiEvent::Key {
-                            key,
-                            pressed,
-                            modifiers,
-                            ..
-                        } if *pressed => {
-                            let name = key_name(*key);
-                            // Terminal copy/paste: Ctrl+Shift+C/V (not Ctrl+C).
-                            if modifiers.ctrl && modifiers.shift && matches!(key, Key::C) {
-                                copy_text = self.term.selection_to_string();
-                                continue;
-                            }
-                            if modifiers.ctrl && modifiers.shift && matches!(key, Key::V) {
-                                // paste comes via Event::Paste when we request it; also
-                                // handle if the integration already delivered it.
-                                continue;
-                            }
-                            if let Some(bytes) = Self::encode_key(
-                                name,
-                                modifiers.ctrl,
-                                modifiers.alt,
-                                modifiers.shift,
-                                app_cursor,
-                            ) {
-                                writes.extend(bytes);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            });
-            // IME preedit is read separately so the closure can be Fn, not FnMut on self.ime
-            let preedit = ui.input(|input| {
-                input.events.iter().rev().find_map(|event| match event {
-                    GuiEvent::Ime(ImeEvent::Preedit(text)) => Some(text.clone()),
-                    GuiEvent::Ime(ImeEvent::Commit(_)) | GuiEvent::Ime(ImeEvent::Disabled) => {
-                        Some(String::new())
-                    }
-                    _ => None,
-                })
-            });
-            if let Some(text) = preedit {
-                self.ime_preedit = text;
-            }
+        if (response.has_focus() || self.focused) && !self.keys_taken {
+            let events = ui.input(|i| i.events.clone());
+            let modifiers = ui.input(|i| i.modifiers);
+            let (writes, copy_text, paste_text, want_paste) =
+                self.collect_writes(&events, modifiers);
             if let Some(text) = copy_text {
                 ui.ctx().copy_text(text);
             }
             if let Some(text) = paste_text {
-                // Bracketed paste if the mode is on.
-                if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
-                    out.writes.extend_from_slice(b"\x1b[200~");
-                    out.writes.extend(text.into_bytes());
-                    out.writes.extend_from_slice(b"\x1b[201~");
-                } else {
-                    out.writes.extend(text.into_bytes());
-                }
+                out.writes.extend(Self::wrap_paste(
+                    text.as_bytes(),
+                    self.term.mode().contains(TermMode::BRACKETED_PASTE),
+                ));
             }
-            // Ctrl+Shift+V: ask egui integration by reading clipboard if no Paste event.
-            let want_paste = ui.input(|input| {
-                input.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        GuiEvent::Key {
-                            key: Key::V,
-                            pressed: true,
-                            modifiers,
-                            ..
-                        } if modifiers.ctrl && modifiers.shift
-                    )
-                })
-            });
-            if want_paste && !ui.input(|i| i.events.iter().any(|e| matches!(e, GuiEvent::Paste(_))))
+            if want_paste
+                && !events
+                    .iter()
+                    .any(|event| matches!(event, GuiEvent::Paste(_)))
             {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
             out.writes.extend(writes);
         }
+        out.writes
+            .extend(std::mem::take(&mut self.pending_gui_writes));
+        self.keys_taken = false;
 
         if let Some(osc) = self.take_osc52_copy() {
             ui.ctx().copy_text(osc);
@@ -949,5 +1068,94 @@ mod tests {
             b"\x1bOA"
         );
         assert_eq!(Emulator::encode_text("hi", false), b"hi");
+        assert_ne!(
+            Emulator::encode_key("c", true, false, false, false).unwrap(),
+            Emulator::encode_text("c", false)
+        );
+    }
+
+    #[test]
+    fn ime_commit_is_not_repeated_and_preedit_is_not_sent() {
+        let commits = vec!["中".to_string()];
+        assert!(Emulator::skip_duplicate_text("中", &commits, false, false));
+        assert!(Emulator::skip_duplicate_text("ni", &[], true, false));
+        assert!(!Emulator::skip_duplicate_text("a", &commits, false, false));
+        assert!(Emulator::skip_duplicate_text("\n", &[], false, true));
+        assert!(!Emulator::skip_duplicate_text("a", &[], false, true));
+    }
+
+    #[test]
+    fn bracketed_paste_strips_inner_terminators() {
+        let dirty = b"hello\x1b[201~rm -rf /\x1b[200~";
+        let wrapped = Emulator::wrap_paste(dirty, true);
+        assert!(wrapped.starts_with(b"\x1b[200~"));
+        assert!(wrapped.ends_with(b"\x1b[201~"));
+        let inner = &wrapped[6..wrapped.len() - 6];
+        assert_eq!(inner, b"hellorm -rf /");
+        assert_eq!(inner.iter().filter(|b| **b == 0x1b).count(), 0);
+        assert_eq!(Emulator::wrap_paste(b"plain", false), b"plain");
+    }
+
+    #[test]
+    fn combining_mark_stays_in_the_base_cell() {
+        let mut term = Emulator::new(24, 80);
+        term.feed(b"e");
+        term.feed("\u{0301}".as_bytes());
+        assert_eq!(term.cursor_pos(), (0, 1));
+        // Combining marks attach to the base cell; the next column is a
+        // normal empty cell, not a wide-char spacer.
+        assert_eq!(term.cell_width_at(0, 0), 1);
+        assert_ne!(term.cell_width_at(0, 1), 2);
+        let text = term.viewport_text();
+        assert!(
+            text.contains('\u{0301}') || text.contains('é') || text.starts_with('e'),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn scrollback_history_is_capped() {
+        let mut term = Emulator::new(24, 80);
+        let mut bytes = Vec::new();
+        for i in 0..6000 {
+            bytes.extend(format!("L{i}\n").into_bytes());
+        }
+        bytes.extend(b"TAIL");
+        term.feed(&bytes);
+        assert!(
+            term.history_lines() <= 5000,
+            "history {} exceeded the configured cap",
+            term.history_lines()
+        );
+        assert!(
+            term.viewport_text().contains("TAIL"),
+            "{}",
+            term.viewport_text()
+        );
+    }
+
+    #[test]
+    fn enter_and_arrows_are_captured_keyboard_events() {
+        assert!(Emulator::is_captured_event(&GuiEvent::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }));
+        assert!(Emulator::is_captured_event(&GuiEvent::Key {
+            key: Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }));
+        assert!(Emulator::is_captured_event(&GuiEvent::Text("a".into())));
+        assert!(!Emulator::is_captured_event(&GuiEvent::PointerButton {
+            pos: egui::pos2(0.0, 0.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }));
     }
 }

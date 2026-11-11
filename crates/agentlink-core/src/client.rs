@@ -26,7 +26,7 @@ use crate::config::ClientSettings;
 use crate::error::{Error, Result};
 use crate::permissions::NodePolicy;
 use crate::protocol::{
-    resolve_node, DeviceInfo, DirEntry, Envelope, FileStat, NodeInfo, Op, Role, PROTOCOL_VERSION,
+    DeviceInfo, DirEntry, Envelope, FileStat, NodeInfo, Op, PROTOCOL_VERSION, Role, resolve_node,
 };
 use crate::tls::{self, client_config_for};
 use crate::util::{self, FILE_CHUNK, READ_WINDOW};
@@ -187,6 +187,7 @@ pub struct PtySession {
     inner: Arc<ClientInner>,
     rx: crate::pending::PendingReceiver,
     finished: Option<std::result::Result<i32, String>>,
+    close_sent: bool,
     _guard: PendingGuard,
 }
 
@@ -200,6 +201,10 @@ pub struct PtyRead {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        if self.close_sent {
+            return;
+        }
+        self.close_sent = true;
         let env = Envelope::Invoke {
             request_id: uuid::Uuid::new_v4().to_string(),
             node_id: self.node_id.clone(),
@@ -267,9 +272,18 @@ impl PtySession {
         .await
     }
 
-    pub async fn close(self) -> Result<()> {
-        // Drop sends PtyClose.
-        Ok(())
+    /// Send `PtyClose` over the reliable outbound channel and suppress the
+    /// `Drop` `try_send` so a follow-up `open_pty` is not racing a lost close.
+    pub async fn close(mut self) -> Result<()> {
+        if self.close_sent || self.finished.is_some() {
+            self.close_sent = true;
+            return Ok(());
+        }
+        self.close_sent = true;
+        self.send_op(Op::PtyClose {
+            session_id: self.session_id.clone(),
+        })
+        .await
     }
 
     /// Read whatever the PTY has produced, waiting up to `wait` for the first byte.
@@ -484,6 +498,7 @@ impl PtySession {
             inner,
             rx,
             finished: None,
+            close_sent: false,
             _guard: PendingGuard {
                 map: pending,
                 id: session_id,
@@ -1360,6 +1375,7 @@ impl Client {
                 inner: self.inner.clone(),
                 rx,
                 finished: None,
+                close_sent: false,
                 _guard: guard,
             }),
             Envelope::Result {
@@ -3287,7 +3303,7 @@ async fn finish_login(
                 return Err(Error::Protocol(format!(
                     "unexpected {} during login",
                     kind(&other)
-                )))
+                )));
             }
         }
     }
@@ -3413,7 +3429,7 @@ fn kind(env: &Envelope) -> &'static str {
 #[cfg(test)]
 mod session_maintain_tests {
     use super::*;
-    use crate::config::{load_file, save_session, ClientSettings};
+    use crate::config::{ClientSettings, load_file, save_session};
     use crate::identity::Identity;
 
     fn dummy_identity() -> Identity {

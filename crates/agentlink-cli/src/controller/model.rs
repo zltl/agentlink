@@ -310,6 +310,40 @@ pub fn looks_textual(bytes: &[u8]) -> bool {
     !bytes.contains(&0)
 }
 
+/// True when the open editor is the deleted path, or a file inside a deleted folder.
+pub fn editor_is_stale(editor_path: &str, deleted: &str) -> bool {
+    let editor = editor_path.trim();
+    let deleted = deleted.trim().trim_end_matches(['/', '\\']);
+    if editor.is_empty() || deleted.is_empty() {
+        return false;
+    }
+    if editor == deleted {
+        return true;
+    }
+    let slash = format!("{deleted}/");
+    let back = format!("{deleted}\\");
+    editor.starts_with(&slash) || editor.starts_with(&back)
+}
+
+/// "Saved <path>" notices that should disappear with the editor.
+pub fn notice_refers_to_path(notice: &str, path: &str) -> bool {
+    let notice = notice.trim();
+    let path = path.trim();
+    !path.is_empty() && notice.starts_with("Saved ") && notice.contains(path)
+}
+
+/// Two columns on a wide Machines list; one column when the window is narrow.
+pub fn machine_card_columns(available_width: f32) -> usize {
+    if available_width >= 860.0 { 2 } else { 1 }
+}
+
+/// Content width for one Machines card so labels and actions keep a real row.
+pub fn machine_card_width(available_width: f32, columns: usize, gap: f32) -> f32 {
+    let columns = columns.max(1) as f32;
+    let inner = (available_width - gap * (columns - 1.0)).max(1.0);
+    (inner / columns).floor().max(240.0)
+}
+
 /// Plain-text terminal with a fixed scrollback. Cursor motion is enough for
 /// shells and progress lines; full-screen TUI apps stay on the web viewer.
 #[derive(Clone, Debug)]
@@ -475,9 +509,11 @@ mod tests {
         let buttons = card_buttons(true, Some(false), full);
         let labels: Vec<_> = buttons.iter().map(|b| b.label).collect();
         assert_eq!(labels, ["Terminal", "Files"]);
-        assert!(!labels
-            .iter()
-            .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop")));
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop"))
+        );
     }
 
     #[test]
@@ -587,5 +623,27 @@ mod tests {
         assert!(enroll_command("tok'en", "lab top", "exec").contains("--token 'tok'\\''en'"));
         assert!(looks_textual(b"hi"));
         assert!(!looks_textual(b"a\0b"));
+    }
+    #[test]
+    fn editor_clears_when_its_file_or_folder_is_deleted() {
+        assert!(editor_is_stale("dir/probe.txt", "dir/probe.txt"));
+        assert!(editor_is_stale("dir/probe.txt", "dir"));
+        assert!(!editor_is_stale("dir/probe.txt", "dir/other.txt"));
+        assert!(!editor_is_stale("directory/a.txt", "dir"));
+        assert!(notice_refers_to_path(
+            "Saved dir/probe.txt",
+            "dir/probe.txt"
+        ));
+        assert!(!notice_refers_to_path("Copied.", "dir/probe.txt"));
+    }
+
+    #[test]
+    fn machine_cards_use_two_content_columns_on_a_wide_list() {
+        assert_eq!(machine_card_columns(1080.0), 2);
+        assert_eq!(machine_card_columns(800.0), 1);
+        let wide = machine_card_width(1080.0, 2, 16.0);
+        assert!(wide > 500.0 && wide < 540.0, "{wide}");
+        let narrow = machine_card_width(800.0, 1, 16.0);
+        assert_eq!(narrow, 800.0);
     }
 }

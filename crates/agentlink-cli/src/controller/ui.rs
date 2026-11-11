@@ -4,24 +4,24 @@
 //! [`super::worker`] on the same client the phone uses. Visual tokens live in
 //! [`super::theme`].
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentlink_core::{NodeInfo, NodePolicy};
 use eframe::egui;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::chrome::{
+    BAR_HEIGHT, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
     classify_connect_error, connection_bar_visible, encoder_label, estimate_right_width_with,
     link_is_connecting, pick_bar_density, session_chrome_top_height, session_phase, stats_chip,
-    stats_line, text_advance, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
-    BAR_HEIGHT,
+    stats_line, text_advance,
 };
 use super::model::{
-    self, card_buttons, connection_label, display_note, has_saved_session, Action, CardButtonKind,
+    self, Action, CardButtonKind, card_buttons, connection_label, display_note, has_saved_session,
 };
 use super::term::Emulator;
 use super::theme;
@@ -144,6 +144,9 @@ pub struct ControllerApp {
     pins: Vec<String>,
     terminal: Emulator,
     term_size: (u16, u16),
+    /// When the current shell open was requested; None once output arrives.
+    term_open: Option<Instant>,
+    term_got_output: bool,
     file_path: String,
     files: Vec<agentlink_core::DirEntry>,
     files_loading: bool,
@@ -369,6 +372,8 @@ impl ControllerApp {
             pins: Vec::new(),
             terminal: Emulator::new(24, 80),
             term_size: (24, 80),
+            term_open: None,
+            term_got_output: false,
             file_path: ".".into(),
             files: Vec::new(),
             files_loading: false,
@@ -512,17 +517,30 @@ impl ControllerApp {
                     }
                 }
                 UiEvent::Pty(bytes) => {
+                    if !bytes.is_empty() {
+                        self.term_got_output = true;
+                        self.term_open = None;
+                    }
                     self.terminal.feed(&bytes);
                     let replies = self.terminal.take_writes();
                     if !replies.is_empty() {
                         self.send(Cmd::PtyWrite { data: replies });
                     }
                 }
-                UiEvent::PtyDone => {}
+                UiEvent::PtyDone => {
+                    self.term_open = None;
+                    if !self.term_got_output
+                        && matches!(self.screen, Screen::Terminal { .. })
+                        && self.error.is_empty()
+                    {
+                        self.error = "The shell session ended before any output arrived.".into();
+                    }
+                }
                 UiEvent::Dir { path, entries } => {
                     self.file_path = path;
                     self.files = entries;
                     self.files_loading = false;
+                    self.forget_missing_editor();
                 }
                 UiEvent::File { path, text } => {
                     self.editor = Some(Editor { path, text });
@@ -688,7 +706,16 @@ impl ControllerApp {
     }
 
     fn open_terminal(&mut self, node: &NodeInfo) {
+        if let Screen::Terminal { id, .. } = &self.screen {
+            if id == &node.id {
+                self.terminal.focused = true;
+                return;
+            }
+        }
         self.terminal = Emulator::new(self.term_size.0, self.term_size.1);
+        self.terminal.focused = true;
+        self.term_got_output = false;
+        self.term_open = Some(Instant::now());
         self.error.clear();
         self.send(Cmd::PtyOpen {
             node: node.id.clone(),
@@ -715,6 +742,39 @@ impl ControllerApp {
             id: node.id.clone(),
             name: node.name.clone(),
         };
+    }
+
+    fn clear_editor_if_deleted(&mut self, deleted: &str) {
+        let Some(path) = self.editor.as_ref().map(|editor| editor.path.clone()) else {
+            return;
+        };
+        if !model::editor_is_stale(&path, deleted) {
+            return;
+        }
+        if model::notice_refers_to_path(&self.notice, &path) {
+            self.notice.clear();
+        }
+        self.editor = None;
+    }
+
+    fn forget_missing_editor(&mut self) {
+        let Some(path) = self.editor.as_ref().map(|editor| editor.path.clone()) else {
+            return;
+        };
+        let parent = model::parent_path(&path);
+        let same_dir = parent == self.file_path
+            || (parent == "." && (self.file_path == "." || self.file_path.is_empty()));
+        if !same_dir {
+            return;
+        }
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path.as_str());
+        if self.files.iter().any(|entry| entry.name == name) {
+            return;
+        }
+        if model::notice_refers_to_path(&self.notice, &path) {
+            self.notice.clear();
+        }
+        self.editor = None;
     }
 
     /// `--open-desktop <node>`: jump straight into a session as soon as the
@@ -1040,6 +1100,9 @@ impl ControllerApp {
         }
         self.debug_layout.clear();
         self.pump(ctx);
+        if matches!(self.screen, Screen::Terminal { .. }) && self.terminal.focused {
+            self.terminal.consume_focused_keys(ctx);
+        }
         if self.mock {
             self.refresh_mock_picture(ctx);
         }
@@ -1263,25 +1326,31 @@ impl ControllerApp {
             );
         } else {
             let nodes = self.nodes.clone();
-            let wide = ui.available_width() > 860.0;
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_LG, theme::SPACE_MD);
-                let card_w = if wide {
-                    ((ui.available_width() - theme::SPACE_LG) * 0.5).clamp(320.0, 520.0)
-                } else {
-                    ui.available_width()
-                };
-                for node in &nodes {
-                    // Size the card to its content. allocate_ui(width, 0) was
-                    // giving the leftover panel height to each wrapped row,
-                    // which showed up as huge vertical gaps between cards.
-                    ui.scope(|ui| {
-                        ui.set_width(card_w);
-                        ui.set_max_width(card_w);
-                        self.node_card(ui, node);
-                    });
-                }
-            });
+            let available = ui.available_width();
+            let cols = model::machine_card_columns(available);
+            let gap = theme::SPACE_LG;
+            let card_w = model::machine_card_width(available, cols, gap);
+            egui::Grid::new("machine-cards")
+                .num_columns(cols)
+                .min_col_width(card_w)
+                .max_col_width(card_w)
+                .spacing([gap, theme::SPACE_MD])
+                .show(ui, |ui| {
+                    for (index, node) in nodes.iter().enumerate() {
+                        // Grid rows size to the card content. The main-list
+                        // horizontal_wrapped row previously inherited the
+                        // leftover panel height, which stretched cards and
+                        // wrapped each action label into a letter column.
+                        ui.scope(|ui| {
+                            ui.set_width(card_w);
+                            ui.set_max_width(card_w);
+                            self.node_card(ui, node);
+                        });
+                        if (index + 1) % cols == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
         }
         ui.add_space(theme::SPACE_MD);
         if ui
@@ -1427,7 +1496,8 @@ impl ControllerApp {
                             enabled: button.enabled,
                             reason: button.reason,
                         };
-                        if action_button(ui, button.label, &action) {
+                        let id = format!("{}:{}", node.id, button.label);
+                        if action_button(ui, &id, button.label, &action) {
                             self.activate(node, &action, button.kind);
                         }
                     }
@@ -1511,6 +1581,9 @@ impl ControllerApp {
                             online_pill(ui, node.online);
                         });
                     });
+                    if active {
+                        ui.label(theme::muted_text("This session"));
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing =
                             egui::vec2(theme::SPACE_XS, theme::SPACE_XS);
@@ -1519,7 +1592,8 @@ impl ControllerApp {
                                 enabled: button.enabled,
                                 reason: button.reason,
                             };
-                            if action_button(ui, button.label, &action) {
+                            let id = format!("rail:{}:{}", node.id, button.label);
+                            if action_button(ui, &id, button.label, &action) {
                                 self.activate(node, &action, button.kind);
                             }
                         }
@@ -1610,6 +1684,23 @@ impl ControllerApp {
         ui.label(theme::muted_text(
             "Type in the terminal. Ctrl+Shift+C copies, Ctrl+Shift+V pastes. Ctrl+C sends interrupt.",
         ));
+        if !self.term_got_output {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                let waited = self
+                    .term_open
+                    .map(|started| started.elapsed().as_secs())
+                    .unwrap_or(0);
+                if waited >= 8 {
+                    ui.label(theme::muted_text(
+                        "The shell has not sent any output yet. Waiting for the node to open a session…",
+                    ));
+                } else {
+                    ui.label(theme::muted_text("Starting shell…"));
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            });
+        }
         let frame = egui::Frame::new()
             .fill(egui::Color32::from_rgb(0x0D, 0x0D, 0x12))
             .stroke(theme::stroke_border_subtle())
@@ -1712,6 +1803,7 @@ impl ControllerApp {
                         }
                         if can_write && ui.add(theme::secondary_button("Delete")).clicked() {
                             let path = model::child_path(&self.file_path, &entry.name);
+                            self.clear_editor_if_deleted(&path);
                             self.send(Cmd::Remove {
                                 node: id.clone(),
                                 path,
@@ -3698,22 +3790,32 @@ fn style_text_edit(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> egui::Respons
     .inner
 }
 
-fn action_button(ui: &mut egui::Ui, label: &str, action: &Action) -> bool {
-    let mut btn = theme::secondary_button(label);
-    if !action.enabled {
-        btn = egui::Button::new(
-            egui::RichText::new(label.to_owned())
-                .size(theme::SECONDARY_SIZE)
-                .color(theme::TEXT_FAINT),
-        )
-        .fill(theme::BG_PANEL)
-        .stroke(theme::stroke_border_subtle())
-        .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
-        .min_size(egui::vec2(0.0, theme::BTN_TOOLBAR_H));
+fn action_button(ui: &mut egui::Ui, id: &str, label: &str, action: &Action) -> bool {
+    let (fill, color) = if action.enabled {
+        (theme::BG_SURFACE, theme::TEXT_BODY)
+    } else {
+        (theme::BG_PANEL, theme::TEXT_FAINT)
+    };
+    let btn = egui::Button::new(
+        egui::RichText::new(label.to_owned())
+            .size(theme::SECONDARY_SIZE)
+            .color(color),
+    )
+    .fill(fill)
+    .stroke(theme::stroke_border_subtle())
+    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
+    .wrap_mode(egui::TextWrapMode::Extend)
+    .min_size(egui::vec2(88.0, theme::BTN_TOOLBAR_H));
+    let response = ui
+        .push_id(id, |ui| ui.add_enabled(action.enabled, btn))
+        .inner
+        .on_hover_text(action.reason);
+    // These starts are click actions only. Enter in a focused terminal must
+    // never activate a rail or card button and switch the session target.
+    if response.has_focus() {
+        response.surrender_focus();
     }
-    ui.add_enabled(action.enabled, btn)
-        .on_hover_text(action.reason)
-        .clicked()
+    response.clicked()
 }
 
 fn node_summary(data_dir: &std::path::Path, config_dir: &std::path::Path) -> String {
@@ -3747,11 +3849,7 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
     }
     let n = delta / 120;
     if n == 0 {
-        if delta > 0 {
-            1
-        } else {
-            -1
-        }
+        if delta > 0 { 1 } else { -1 }
     } else {
         n
     }

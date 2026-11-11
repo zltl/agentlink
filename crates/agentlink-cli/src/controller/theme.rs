@@ -3,7 +3,10 @@
 //! This module is the **only** color / type / spacing source for egui UI code.
 //! Pages must reference `theme::…` instead of hardcoding `Color32::from_rgb`.
 
-use eframe::egui::{self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Shadow, Stroke, Style, TextStyle, Visuals};
+use eframe::egui::{
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Shadow, Stroke,
+    Style, TextStyle, Visuals,
+};
 
 /// Shared Linear dark palette + layout metrics.
 #[derive(Clone, Copy, Debug)]
@@ -226,7 +229,9 @@ pub fn title_text(text: impl Into<String>) -> egui::RichText {
 }
 
 pub fn section_text(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text).size(SECTION_SIZE).color(TEXT_PRIMARY)
+    egui::RichText::new(text)
+        .size(SECTION_SIZE)
+        .color(TEXT_PRIMARY)
 }
 
 pub fn body_text(text: impl Into<String>) -> egui::RichText {
@@ -234,7 +239,9 @@ pub fn body_text(text: impl Into<String>) -> egui::RichText {
 }
 
 pub fn muted_text(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text).size(SECONDARY_SIZE).color(TEXT_MUTED)
+    egui::RichText::new(text)
+        .size(SECONDARY_SIZE)
+        .color(TEXT_MUTED)
 }
 
 pub fn bar_text(text: impl Into<String>) -> egui::RichText {
@@ -398,16 +405,40 @@ fn install_fonts(ctx: &egui::Context) {
         .or_default()
         .insert(0, "JetBrainsMono".into());
 
+    // CJK glyphs are not in Inter or JetBrains Mono. Load one system face
+    // (Noto Sans Mono CJK when the OFL package is installed) as a fallback
+    // for both families. See fonts.rs for sources and licenses.
+    if let Some(cjk) = super::fonts::load_cjk_face() {
+        fonts.font_data.insert(
+            "CjkFallback".into(),
+            std::sync::Arc::new(FontData::from_owned(cjk)),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .push("CjkFallback".into());
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .push("CjkFallback".into());
+    }
+
     ctx.set_fonts(fonts);
 }
 
 /// Secondary toolbar / card action button (28px).
 pub fn secondary_button(label: &str) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(label.to_owned()).size(SECONDARY_SIZE).color(TEXT_BODY))
-        .fill(BG_SURFACE)
-        .stroke(stroke_border_subtle())
-        .corner_radius(CornerRadius::same(RADIUS_CONTROL))
-        .min_size(egui::vec2(0.0, BTN_TOOLBAR_H))
+    egui::Button::new(
+        egui::RichText::new(label.to_owned())
+            .size(SECONDARY_SIZE)
+            .color(TEXT_BODY),
+    )
+    .fill(BG_SURFACE)
+    .stroke(stroke_border_subtle())
+    .corner_radius(CornerRadius::same(RADIUS_CONTROL))
+    .min_size(egui::vec2(0.0, BTN_TOOLBAR_H))
 }
 
 /// Primary filled button (36px).
@@ -426,9 +457,13 @@ pub fn primary_button(label: &str) -> egui::Button<'static> {
 /// 28×28 icon/text toolbar control on the connection bar.
 pub fn icon_button(label: impl Into<String>, active: bool) -> egui::Button<'static> {
     let color = if active { ACCENT } else { TEXT_BODY };
-    egui::Button::new(egui::RichText::new(label.into()).size(BAR_SIZE).color(color))
-        .fill(if active { BG_HOVER } else { BG_PANEL })
-        .stroke(Stroke::NONE)
-        .corner_radius(CornerRadius::same(RADIUS_CONTROL))
-        .min_size(egui::vec2(ICON_BTN, ICON_BTN))
+    egui::Button::new(
+        egui::RichText::new(label.into())
+            .size(BAR_SIZE)
+            .color(color),
+    )
+    .fill(if active { BG_HOVER } else { BG_PANEL })
+    .stroke(Stroke::NONE)
+    .corner_radius(CornerRadius::same(RADIUS_CONTROL))
+    .min_size(egui::vec2(ICON_BTN, ICON_BTN))
 }

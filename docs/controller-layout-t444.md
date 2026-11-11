@@ -280,3 +280,48 @@ This revision is desktop Controller work, not an Android typography tweak:
 
 Unit tests cover the visible button set. They do not replace a GUI retest
 of the new candidate.
+
+## t447 GUI retest (0111) and follow-up fixes (2026-11-12 Asia/Shanghai)
+
+The 0111 candidate confirmed real progress: quant67 `hostname` / `whoami` (root)
+/ `printf` worked; Files could create a folder and `probe.txt`, save, close,
+reopen with matching content, and delete the file and empty folder through the
+UI; sufa View showed a read-only remote desktop (no portal, input not
+captured). Five defects remained and are addressed in this revision:
+
+- **C (first).** Enter in a focused quant67 terminal could open another node's
+  Terminal (sufa). Keyboard, IME, and clipboard events are now consumed
+  at the start of the frame, before the machine rail or any default button
+  is drawn. Card and rail actions have unique ids, do not wrap label
+  letters, and surrender focus so they are click-only. Switching nodes
+  requires an explicit click. The current session is labeled
+  `{name} · terminal` and the matching rail card shows **This session**.
+- **D.** Reopening a Terminal no longer just drops the previous PTY sender
+  (`try_send` close could be lost, and a second `open_pty` can wait on the
+  30s client timeout with a blank grid). The worker now awaits
+  `PtySession::close` before `open_pty`. Clicking Terminal on the already
+  open node keeps the session. The pane shows **Starting shell…**, and after
+  8s without output a waiting message — not a silent refresh. A `PtyDone`
+  with no output becomes a visible error.
+- **A.** The main Machines list uses a content-sized grid (two columns when
+  the list is ≥ 860 px). Action buttons have a minimum width and
+  `TextWrapMode::Extend`, so labels stay on one line. The session rail
+  already laid out correctly and is unchanged in that respect.
+- **B.** Inter and JetBrains Mono (both SIL OFL 1.1, bundled under
+  `crates/agentlink-cli/assets/`) have no CJK coverage, so `printf` of
+  中文 showed tofu boxes even when cell width was correct. The Controller
+  now loads a system CJK face as a fallback for both families. Preferred
+  source: Noto Sans Mono CJK (SIL OFL 1.1,
+  <https://github.com/notofonts/noto-cjk>, typically the `fonts-noto-cjk`
+  Debian/Ubuntu package). TrueType Collections are unpacked to a single
+  standalone face at runtime. The 19 MiB collection is **not** rebundled.
+  Platform UI fonts (PingFang, YaHei, Yu Gothic) are used only when present
+  on the local OS, and are not redistributed.
+- **E.** Deleting the open file (or its folder) clears the editor, a leftover
+  **Saved** notice, and the stale selection as soon as Delete is clicked,
+  and again when the refreshed directory listing no longer contains that
+  path.
+
+A new candidate directory will be built for parent GUI retest. Unit tests
+do not replace that retest. Android CJK typography is intentionally not
+part of this desktop pass.

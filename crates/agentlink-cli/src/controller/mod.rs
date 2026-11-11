@@ -13,10 +13,11 @@ mod debug;
 #[cfg(not(target_env = "musl"))]
 mod decode;
 #[cfg(not(target_env = "musl"))]
+mod fonts;
+#[cfg(not(target_env = "musl"))]
 mod indicator;
 #[cfg(not(target_env = "musl"))]
 mod term;
-#[cfg(not(target_env = "musl"))]
 mod theme;
 #[cfg(not(target_env = "musl"))]
 mod ui;
