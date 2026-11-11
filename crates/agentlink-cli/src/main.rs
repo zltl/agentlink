@@ -963,6 +963,7 @@ enum GrantCommand {
     /// 控制端（远程）：生成一张身份码，复制到【目标机】本地粘贴。
     ///
     /// 公开身份不是凭证，身份码不是 grant，relay 不能据此授权。
+    /// 此命令只使用本机身份文件，不需要 relay 登录。
     Offer {
         /// 请求的权限预设。`desktop` 含 exec 与文件读写，会写在码里并在目标机展示。
         #[arg(long, default_value = "desktop")]

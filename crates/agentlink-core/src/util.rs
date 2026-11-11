@@ -177,10 +177,24 @@ fn diagnose_create_dir_all(path: &Path, err: std::io::Error) -> Error {
 }
 
 
+/// Create `path` as a new 0700 directory if it is missing.
+///
+/// Existing parents are left alone. `write_secret("/tmp/card")` must not
+/// `chmod 0700 /tmp` (EPERM on a shared sticky directory).
+pub fn ensure_secret_parent(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if path.exists() {
+        return Ok(());
+    }
+    ensure_dir(path)
+}
+
 pub fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            ensure_dir(parent)?;
+            ensure_secret_parent(parent)?;
         }
     }
     // A shared `*.tmp` name lets two writers rename the same file and then
@@ -193,6 +207,48 @@ pub fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
     replace_file(&tmp, path)?;
     restrict_file(path)?;
     Ok(())
+}
+
+/// Create `path` exclusively (0600). Returns `Ok(true)` if this caller wrote
+/// the file, or `Ok(false)` if it already existed (no overwrite).
+pub fn write_secret_exclusive(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            ensure_secret_parent(parent)?;
+        }
+    }
+    match open_new_secret(path) {
+        Ok(mut file) => {
+            if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                return Err(err.into());
+            }
+            drop(file);
+            restrict_file(path)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(unix)]
+fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 #[cfg(not(windows))]
@@ -745,5 +801,38 @@ mod tests {
         assert!(!service.contains("BU"));
         assert!(!service.contains("WD"));
         assert!(!service.contains("AU"));
+    }
+
+    #[test]
+    fn write_secret_does_not_chmod_an_existing_shared_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            let dest = shared.join("card.txt");
+            write_secret(&dest, b"offer").unwrap();
+            let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o1777, "must not chmod an existing shared parent");
+            let file_mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600);
+        }
+        #[cfg(not(unix))]
+        {
+            let dest = shared.join("card.txt");
+            write_secret(&dest, b"offer").unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), b"offer");
+        }
+    }
+
+    #[test]
+    fn write_secret_exclusive_loser_does_not_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        assert!(write_secret_exclusive(&path, b"first").unwrap());
+        assert!(!write_secret_exclusive(&path, b"second").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
     }
 }

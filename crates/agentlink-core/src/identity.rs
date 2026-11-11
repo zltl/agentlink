@@ -35,27 +35,13 @@ pub struct Identity {
 
 impl Identity {
     pub fn load_or_create(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                util::ensure_secret_parent(parent)?;
+            }
+        }
         if path.exists() {
-            let text = std::fs::read_to_string(path)?;
-            let file: IdentityFile = serde_json::from_str(&text)?;
-            let bytes = hex::decode(file.secret_hex.trim())
-                .map_err(|e| Error::Message(format!("identity key: {e}")))?;
-            if bytes.len() != 32 {
-                return Err(Error::Message("identity key must be 32 bytes".into()));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            let signing = SigningKey::from_bytes(&arr);
-            let public_hex = hex::encode(signing.verifying_key().to_bytes());
-            if public_hex != file.public_hex.trim() {
-                return Err(Error::Message(
-                    "identity public key does not match the secret".into(),
-                ));
-            }
-            return Ok(Self {
-                secret: Secret::Local(signing),
-                public_hex,
-            });
+            return Self::load_existing(path);
         }
         let signing = SigningKey::generate(&mut OsRng);
         let public_hex = hex::encode(signing.verifying_key().to_bytes());
@@ -63,7 +49,44 @@ impl Identity {
             secret_hex: hex::encode(signing.to_bytes()),
             public_hex: public_hex.clone(),
         };
-        util::write_secret(path, serde_json::to_string_pretty(&file)?.as_bytes())?;
+        let bytes = serde_json::to_string_pretty(&file)?;
+        if util::write_secret_exclusive(path, bytes.as_bytes())? {
+            return Ok(Self {
+                secret: Secret::Local(signing),
+                public_hex,
+            });
+        }
+        // Another process created the file first. Load that identity; never
+        // overwrite or keep a private key that is not on disk.
+        Self::load_existing(path)
+    }
+
+    fn load_existing(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            Error::Message(format!("身份文件无法读取，未重新生成：{err}"))
+        })?;
+        let file: IdentityFile = serde_json::from_str(&text).map_err(|err| {
+            Error::Message(format!(
+                "身份文件已损坏或不是有效 JSON，未重新生成：{err}"
+            ))
+        })?;
+        let bytes = hex::decode(file.secret_hex.trim()).map_err(|err| {
+            Error::Message(format!("身份密钥无法解码，未重新生成：{err}"))
+        })?;
+        if bytes.len() != 32 {
+            return Err(Error::Message(
+                "身份密钥必须是 32 字节，未重新生成".into(),
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        let signing = SigningKey::from_bytes(&arr);
+        let public_hex = hex::encode(signing.verifying_key().to_bytes());
+        if public_hex != file.public_hex.trim() {
+            return Err(Error::Message(
+                "身份文件已损坏：公钥与私钥不匹配，未重新生成。请检查或从备份恢复。".into(),
+            ));
+        }
         Ok(Self {
             secret: Secret::Local(signing),
             public_hex,
@@ -217,5 +240,83 @@ mod tests {
         );
         let sig = bytes.sign_nonce("nonce");
         verify_nonce(local.public_hex(), "nonce", &sig).unwrap();
+    }
+
+    #[test]
+    fn load_or_create_keeps_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let first = Identity::load_or_create(&path).unwrap();
+        let again = Identity::load_or_create(&path).unwrap();
+        assert_eq!(first.public_hex(), again.public_hex());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600);
+            let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+            // tempdir is not necessarily 0700; we must not have failed, and we
+            // must not have required chmod of a pre-existing parent.
+            let _ = dir_mode;
+        }
+    }
+
+    #[test]
+    fn damaged_identity_is_not_silently_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let first = Identity::load_or_create(&path).unwrap();
+        let original = first.public_hex().to_string();
+        std::fs::write(&path, "{not-json").unwrap();
+        let err = match Identity::load_or_create(&path) {
+            Ok(_) => panic!("damaged json must not load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("未重新生成"), "{err}");
+        assert!(err.contains("损坏") || err.contains("JSON"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
+
+        std::fs::write(
+            &path,
+            r#"{
+  "secret_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "public_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}"#,
+        )
+        .unwrap();
+        let err = match Identity::load_or_create(&path) {
+            Ok(_) => panic!("mismatched identity must not load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("未重新生成"), "{err}");
+        assert!(err.contains("不匹配"), "{err}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("bbbbbbbb"), "must not replace the damaged file");
+        assert!(!text.contains(&original));
+    }
+
+    #[test]
+    fn concurrent_first_create_converges_on_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let workers = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let path = std::sync::Arc::new(path);
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Identity::load_or_create(&path).map(|id| id.public_hex().to_string())
+                })
+            })
+            .collect();
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().expect("load_or_create"))
+            .collect();
+        let disk = Identity::load_or_create(&path).unwrap().public_hex().to_string();
+        assert!(ids.iter().all(|id| id == &disk), "got {ids:?} disk {disk}");
     }
 }
