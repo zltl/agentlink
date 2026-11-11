@@ -26,7 +26,7 @@ use crate::config::ClientSettings;
 use crate::error::{Error, Result};
 use crate::permissions::NodePolicy;
 use crate::protocol::{
-    DeviceInfo, DirEntry, Envelope, FileStat, NodeInfo, Op, PROTOCOL_VERSION, Role, resolve_node,
+    resolve_node, DeviceInfo, DirEntry, Envelope, FileStat, NodeInfo, Op, Role, PROTOCOL_VERSION,
 };
 use crate::tls::{self, client_config_for};
 use crate::util::{self, FILE_CHUNK, READ_WINDOW};
@@ -2530,6 +2530,24 @@ mod tests {
             .unwrap();
         assert!(matches!(result, Err(crate::pending::SendError::Closed)));
     }
+
+    /// close() is async and safe on a runtime; Drop after close must not
+    /// block_on or send a second close. A follow-up session can start.
+    /// This does not cover the GUI Quit/X path.
+    #[tokio::test]
+    async fn close_then_drop_allows_a_second_session_to_start() {
+        let first = PtySession::test_io();
+        let _ = first.session.close().await;
+        drop(first.tx);
+        let second = PtySession::test_io();
+        let _ = second.session.close().await;
+    }
+
+    #[tokio::test]
+    async fn drop_without_close_does_not_panic_inside_the_runtime() {
+        let io = PtySession::test_io();
+        drop(io.session);
+    }
 }
 
 async fn next_env<S>(stream: &mut S) -> Result<Envelope>
@@ -3429,7 +3447,7 @@ fn kind(env: &Envelope) -> &'static str {
 #[cfg(test)]
 mod session_maintain_tests {
     use super::*;
-    use crate::config::{ClientSettings, load_file, save_session};
+    use crate::config::{load_file, save_session, ClientSettings};
     use crate::identity::Identity;
 
     fn dummy_identity() -> Identity {

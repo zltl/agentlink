@@ -1182,4 +1182,27 @@ mod tests {
         });
         runtime.shutdown_timeout(Duration::from_secs(2));
     }
+
+    /// Mirrors the worker path: stop_live (Viewer::close/drop) then open a
+    /// PTY and close it, all on agentlink-controller-net. This is not a
+    /// GUI test and does not cover every Quit/X path.
+    #[test]
+    fn stop_live_then_open_pty_on_controller_net_does_not_panic() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("agentlink-controller-net")
+            .build()
+            .expect("controller-net runtime");
+        runtime.block_on(async {
+            let (viewer, _rx) = test_viewer(1);
+            viewer.close();
+            drop(viewer);
+            let first = agentlink_core::client::PtySession::test_io();
+            let _ = first.session.close().await;
+            let second = agentlink_core::client::PtySession::test_io();
+            let _ = second.session.close().await;
+        });
+        runtime.shutdown_timeout(Duration::from_secs(2));
+    }
 }

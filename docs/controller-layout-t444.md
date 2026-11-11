@@ -344,20 +344,44 @@ autostart case.
 
 ## CJK font availability (not only this box)
 
-The desktop terminal still uses a system / drop-in CJK face as an egui
-fallback (Noto Sans CJK, SIL OFL 1.1). The 19 MiB collection is not
-rebundled. Search order:
+The desktop Controller ships Inter and JetBrains Mono (SIL OFL 1.1,
+bundled under `crates/agentlink-cli/assets/`). Those faces have no CJK
+glyphs. A CJK fallback is loaded at runtime and registered on both the
+proportional and monospace egui families. The 19 MiB Noto CJK collection
+is **not** rebundled, not copied into the repo, and **never downloaded
+or installed by the Controller**. There is no network font fetch and no
+silent package install.
 
-1. `AGENTLINK_CJK_FONT` (a `.ttf`, `.otf`, or `.ttc` path)
-2. Fonts in `$AGENTLINK_CONFIG_DIR/fonts`, `~/.config/agentlink/fonts`,
-   or `~/.local/share/agentlink/fonts` (font files only; identity files
-   in those trees are not read)
-3. Packaged OS fonts (Noto CJK, Droid Sans Fallback, PingFang, Yu Gothic,
-   Microsoft YaHei, Malgun)
+Search order (first readable face wins):
 
-When none of those are present, the window shows a visible hint. ASCII
-still works. Operators can drop an OFL font into the fonts directory or
-install `fonts-noto-cjk`.
+1. `AGENTLINK_CJK_FONT` — a `.ttf`, `.otf`, or `.ttc` path
+2. Drop-in directories (font files only; identity files in those trees
+   are not read): `$AGENTLINK_CONFIG_DIR/fonts`,
+   `~/.config/agentlink/fonts`, `~/.local/share/agentlink/fonts`
+3. Packaged OS fonts already on the machine: Noto Sans Mono CJK /
+   Noto Sans CJK (typical Debian/Ubuntu package `fonts-noto-cjk`,
+   SIL OFL 1.1, <https://github.com/notofonts/noto-cjk>), Droid Sans
+   Fallback, PingFang, Yu Gothic, Microsoft YaHei, Malgun
+
+How operators ship it:
+
+- Linux: install the distro package (`fonts-noto-cjk` or equivalent), or
+  copy an OFL `.ttf`/`.otf`/`.ttc` into one of the drop-in directories.
+- macOS / Windows: the listed system UI fonts are used when present; if
+  not, use `AGENTLINK_CJK_FONT` or the drop-in directory. Platform fonts
+  are not redistributed.
+- TTC collections are unpacked to a single standalone face at runtime.
+
+When none of those are present, the window shows a visible hint
+(`missing_font_hint`): it names Noto Sans CJK, SIL OFL 1.1, the drop-in
+path, and `AGENTLINK_CJK_FONT`, and states that this build does not
+bundle the collection. ASCII still works. The operator chooses how to
+install a font; the app does not do it for them.
+
+The Android terminal is a separate typography path: cell width and
+combining marks in `TerminalScreen` / `CellWidth` (Unicode 16.0.0
+East Asian Width W/F). It uses the device's fonts, not this egui
+fallback.
 
 ## 0133 GUI retest — list and rail overflow (2026-11-12 Asia/Shanghai)
 
