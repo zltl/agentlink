@@ -281,7 +281,9 @@ impl NodePolicy {
     ///
     /// The short [`Self::preset_name`] (`desktop`, `exec`, …) is not enough:
     /// `desktop` also includes file read, write, and exec, and it does not
-    /// include a live desktop stream.
+    /// include a live desktop stream. Always includes an honesty tag: shell
+    /// grants are local full control of this OS user; narrower presets are
+    /// experimental and not isolation.
     pub fn capability_summary(self) -> String {
         let mut parts = Vec::new();
         match (self.allow_read, self.allow_write) {
@@ -310,7 +312,31 @@ impl NodePolicy {
         } else {
             parts.push("no remote desktop control");
         }
-        format!("{} ({})", self.preset_name(), parts.join("; "))
+        format!(
+            "{} ({}; {})",
+            self.preset_name(),
+            parts.join("; "),
+            self.honesty_label()
+        )
+    }
+
+    /// True when this policy includes exec/shell: after a local grant, the
+    /// controller has this OS user's inherent full power (A2 contract).
+    pub fn is_local_full_control(self) -> bool {
+        self.allow_exec
+    }
+
+    /// Product honesty label. Does not change bitmasks or stored meaning.
+    ///
+    /// The main promised mode is local full control of the current OS user
+    /// (any grant that includes exec/shell). Narrower presets are experimental
+    /// and must not be advertised as a security sandbox or isolation.
+    pub fn honesty_label(self) -> &'static str {
+        if self.is_local_full_control() {
+            "local full control of the current OS user (not isolation)"
+        } else {
+            "experimental / not isolation (not a security sandbox; file write can change later execution)"
+        }
     }
 
     pub fn preset_name(self) -> &'static str {
@@ -608,6 +634,40 @@ mod tests {
         assert!(!view.allows_input());
         assert!(view.allows_screenshot());
         assert_eq!(view.preset_name(), "remote-view");
+    }
+
+    #[test]
+    fn honesty_labels_full_control_vs_experimental_without_changing_bits() {
+        let full = NodePolicy::full();
+        assert!(full.is_local_full_control());
+        assert!(full.honesty_label().contains("local full control"));
+        assert!(full.honesty_label().contains("not isolation"));
+        assert!(full.capability_summary().contains("exec/shell"));
+        assert!(full.capability_summary().contains("local full control"));
+
+        let desktop = NodePolicy::desktop();
+        assert!(desktop.is_local_full_control());
+        assert!(desktop.capability_summary().contains("exec/shell"));
+        assert!(desktop.capability_summary().contains("no live desktop stream"));
+        assert!(desktop.capability_summary().contains("local full control"));
+        // Stored desktop must not be renamed or enlarged to full.
+        assert_ne!(desktop, full);
+        assert!(!desktop.allow_desktop_stream);
+
+        let ro = NodePolicy::read_only();
+        assert!(!ro.is_local_full_control());
+        assert!(ro.honesty_label().contains("experimental"));
+        assert!(ro.honesty_label().contains("not isolation"));
+        assert!(ro.capability_summary().contains("no exec/shell"));
+        assert!(ro.capability_summary().contains("experimental"));
+
+        let rw = NodePolicy::read_write();
+        assert!(!rw.is_local_full_control());
+        assert!(rw.honesty_label().contains("file write can change later execution"));
+        assert!(rw.is_subset_of(NodePolicy::exec()));
+        assert!(!NodePolicy::exec().is_subset_of(rw));
+        assert!(!NodePolicy::full().is_subset_of(desktop));
+        assert!(desktop.is_subset_of(full));
     }
 
     #[test]

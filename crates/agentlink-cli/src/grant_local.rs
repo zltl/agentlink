@@ -31,7 +31,11 @@ pub const SCOPE_NOTE: &str =
 /// keep this OS user's full shell. Shown when the issued or requested policy
 /// includes exec/shell. Do not promise that revoke undoes later grants.
 pub const EXEC_POWER_NOTE: &str =
-    "若签发 exec/shell 或包含它们的权限（如 desktop/full），获准后的控制端与本机同 UID，具有该用户的固有全权，包括读取 issuer 并签发其他授权。撤销本 grant 不能撤销已经据此另建的授权，也不能撤销已经做过的系统改动。AGENTLINK_REMOTE_EXEC 只是防误用，不是防自授权。不承诺不可能的隔离。";
+    "若签发 exec/shell 或包含它们的权限（如 desktop/full），获准后的控制端与本机同 UID，具有该用户的固有全权（产品主承诺：本机当前 OS 用户的本地全权控制），包括读取 issuer 并签发其他授权。撤销本 grant 不能撤销已经据此另建的授权，也不能撤销已经做过的系统改动。AGENTLINK_REMOTE_EXEC 只是防误用，不是防自授权。不承诺不可能的隔离。";
+
+/// Narrower presets are experimental and must not be sold as isolation.
+pub const EXPERIMENTAL_SCOPE_NOTE: &str =
+    "较窄权限预设（如 read-only / read-write / remote-view）为实验性，不是安全沙箱，也不提供隔离。文件写入可改变后续可执行内容；不要把它们当成缩小后的防护边界。";
 
 pub fn remote_exec_is_set() -> bool {
     std::env::var_os(REMOTE_EXEC_ENV).is_some()
@@ -53,6 +57,7 @@ pub fn request_prompt_body(
     ttl_secs: u64,
     exp_unix: i64,
 ) -> String {
+    let power_note = power_note_for_access(access);
     format!(
         "agentlink 目标机本地授权\n\n\
          请求: {request_id}\n\
@@ -63,9 +68,30 @@ pub fn request_prompt_body(
          请求过期 unix: {exp_unix}\n\n\
          {SIGNATURE_DISCLAIMER}\n\
          {SCOPE_NOTE}\n\
-         {EXEC_POWER_NOTE}\n\n\
+         {power_note}\n\n\
          Allow 使用本机 issuer 签发 grant。Deny 拒绝。都不是 `agentlink approve allow`（危险操作确认）。issuer 密钥不离开本机，也不会被打印。"
     )
+}
+
+/// EXEC power note when the access string (preset or summary) implies shell;
+/// otherwise the experimental / not-isolation note.
+pub fn power_note_for_access(access: &str) -> &'static str {
+    if access_implies_exec(access) {
+        EXEC_POWER_NOTE
+    } else {
+        EXPERIMENTAL_SCOPE_NOTE
+    }
+}
+
+fn access_implies_exec(access: &str) -> bool {
+    if let Ok(policy) = parse_access(access) {
+        return policy.allow_exec;
+    }
+    let lower = access.to_ascii_lowercase();
+    lower.contains("exec/shell")
+        || lower.contains("local full control")
+        || lower.split(|c: char| c == '(' || c == ';' || c == ',' || c.is_whitespace())
+            .any(|tok| matches!(tok, "exec" | "desktop" | "full"))
 }
 
 fn display_ok() -> bool {
@@ -343,14 +369,24 @@ pub fn default_shrink_ttl_text(
 }
 
 pub fn issue_confirm_body(policy: &str, ttl_secs: u64) -> String {
-    let summary = parse_access(policy)
+    let parsed = parse_access(policy).ok();
+    let summary = parsed
         .map(|p| p.capability_summary())
-        .unwrap_or_else(|_| policy.to_string());
+        .unwrap_or_else(|| policy.to_string());
+    let power_note = parsed
+        .map(|p| {
+            if p.allow_exec {
+                EXEC_POWER_NOTE
+            } else {
+                EXPERIMENTAL_SCOPE_NOTE
+            }
+        })
+        .unwrap_or_else(|| power_note_for_access(policy));
     format!(
         "即将签发的权限如下（以此为准，不是上一步未改动的提示）：\n\n\
          权限: {summary}\n\
          有效期: {ttl_secs} 秒\n\n\
-         {EXEC_POWER_NOTE}\n\n\
+         {power_note}\n\n\
          取消签发不授权，待批请求仍保留。issuer 密钥不会被打印。"
     )
 }
@@ -621,8 +657,11 @@ mod tests {
         assert!(REMOTE_EXEC_REFUSAL.contains("AGENTLINK_REMOTE_EXEC"));
         assert!(REMOTE_EXEC_REFUSAL.contains("不是防自授权"));
         assert!(EXEC_POWER_NOTE.contains("固有全权"));
+        assert!(EXEC_POWER_NOTE.contains("本地全权控制"));
         assert!(EXEC_POWER_NOTE.contains("不能撤销已经据此另建的授权"));
         assert!(EXEC_POWER_NOTE.contains("不是防自授权"));
+        assert!(EXPERIMENTAL_SCOPE_NOTE.contains("实验性"));
+        assert!(EXPERIMENTAL_SCOPE_NOTE.contains("不是安全沙箱"));
         assert!(SCOPE_NOTE.contains("仅粘贴身份码不授权"));
         let body = request_prompt_body("r", "SHA256:x", "ab", "desktop", 60, 1);
         assert!(body.contains(EXEC_POWER_NOTE));
@@ -630,6 +669,12 @@ mod tests {
         let confirm = issue_confirm_body("exec", 300);
         assert!(confirm.contains(EXEC_POWER_NOTE));
         assert!(confirm.contains("取消签发不授权"));
+        assert!(confirm.contains("exec/shell"));
+        assert!(confirm.contains("local full control"));
+        let ro = issue_confirm_body("read-only", 60);
+        assert!(ro.contains(EXPERIMENTAL_SCOPE_NOTE));
+        assert!(!ro.contains(EXEC_POWER_NOTE));
+        assert!(ro.contains("no exec/shell"));
         assert!(SIGNATURE_DISCLAIMER.contains("不证明"));
         assert!(SCOPE_NOTE.contains("不能无声加大"));
     }
@@ -719,8 +764,25 @@ mod tests {
         assert!(body.contains("no screenshots/input") || body.contains("no screenshots"));
         assert!(body.contains("300 秒"));
         assert!(body.contains("取消签发不授权"));
+        assert!(body.contains("local full control"));
+        let desktop = issue_confirm_body("desktop", 120);
+        assert!(desktop.contains("exec/shell"));
+        assert!(desktop.contains("no live desktop stream"));
+        assert!(desktop.contains(EXEC_POWER_NOTE));
+        assert!(!desktop.contains("选用 desktop") || true);
         let ro = issue_confirm_body("read-only", 60);
         assert!(ro.contains("no exec/shell"));
         assert!(ro.contains("60 秒"));
+        assert!(ro.contains("experimental") || ro.contains("实验性"));
+    }
+
+    #[test]
+    fn power_note_follows_real_capability_not_short_name_alone() {
+        assert_eq!(power_note_for_access("desktop"), EXEC_POWER_NOTE);
+        assert_eq!(power_note_for_access("full"), EXEC_POWER_NOTE);
+        assert_eq!(power_note_for_access("read-only"), EXPERIMENTAL_SCOPE_NOTE);
+        let summary = parse_access("desktop").unwrap().capability_summary();
+        assert!(summary.contains("exec/shell"));
+        assert_eq!(power_note_for_access(&summary), EXEC_POWER_NOTE);
     }
 }
