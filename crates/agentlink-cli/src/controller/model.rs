@@ -391,40 +391,6 @@ pub fn machine_rail_visible(window_width: f32) -> bool {
     window_width >= MACHINE_RAIL_SHOW_AT
 }
 
-/// Expected `[x, y, w, h]` slots for the session rail + main column.
-///
-/// Used by offscreen geometry regressions so a crushed `ui.horizontal()`
-/// strip (≈ interact height) cannot pass as a full-window session layout.
-pub fn session_split_rects(window_width: f32, window_height: f32) -> Option<([f32; 4], [f32; 4])> {
-    if !machine_rail_visible(window_width) {
-        return None;
-    }
-    let rail = [0.0, 0.0, MACHINE_RAIL_WIDTH, window_height];
-    let main = [
-        MACHINE_RAIL_WIDTH,
-        0.0,
-        (window_width - MACHINE_RAIL_WIDTH).max(1.0),
-        window_height,
-    ];
-    Some((rail, main))
-}
-
-/// Minimum main-column width once the rail is showing. A black-gap / crushed
-/// layout leaves far less than this beside the rail.
-pub fn session_main_min_width(window_width: f32) -> f32 {
-    if machine_rail_visible(window_width) {
-        (window_width - MACHINE_RAIL_WIDTH) * 0.5
-    } else {
-        window_width * 0.5
-    }
-}
-
-/// Minimum page-body height. The broken session row used ~interact_size.y and
-/// left the rest of the CentralPanel empty (BG_PAGE black).
-pub fn session_page_min_height(window_height: f32) -> f32 {
-    (window_height * 0.35).max(120.0)
-}
-
 /// Plain-text terminal with a fixed scrollback. Cursor motion is enough for
 /// shells and progress lines; full-screen TUI apps stay on the web viewer.
 #[derive(Clone, Debug)]
@@ -734,14 +700,6 @@ mod tests {
             "iZ7xv88es0z…"
         );
         assert_eq!(ellipsize_chars("short", 12), "short");
-        let (rail, main) = session_split_rects(1280.0, 800.0).expect("wide split");
-        assert_eq!(rail, [0.0, 0.0, MACHINE_RAIL_WIDTH, 800.0]);
-        assert_eq!(main, [MACHINE_RAIL_WIDTH, 0.0, 1280.0 - MACHINE_RAIL_WIDTH, 800.0]);
-        assert!(session_split_rects(725.0, 800.0).is_none());
-        assert!(session_main_min_width(1280.0) > 400.0);
-        assert!(session_page_min_height(800.0) > 200.0);
-        // Crushed ui.horizontal() rows (~interact height) must not pass.
-        assert!(session_page_min_height(800.0) > 64.0);
     }
 
     #[test]

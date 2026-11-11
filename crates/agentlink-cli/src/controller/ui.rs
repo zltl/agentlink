@@ -43,6 +43,9 @@ pub struct DebugLayout {
     /// Main column beside the rail (or the full chrome column when the rail is folded).
     pub main_rect: [f32; 4],
     /// Primary page body (machines list / terminal / files pane).
+    /// Stored as the widget rect intersected with the active clip rect so a
+    /// crushed `ui.horizontal()` row cannot report a large raw rect that is
+    /// mostly invisible (parent saw black after wide→narrow resize).
     pub page_rect: [f32; 4],
     pub texts: Vec<String>,
 }
@@ -63,10 +66,23 @@ impl DebugLayout {
     fn note_item(&mut self, id: &str, rect: egui::Rect) {
         self.toolbar_items.push((id.to_string(), rect_xywh(rect)));
     }
+
+    /// Record the clip-visible bounds of a widget (`rect ∩ clip`).
+    fn note_visible(&mut self, id: &str, rect: egui::Rect, clip: egui::Rect) {
+        self.note_item(id, visible_rect(rect, clip));
+    }
+
+    fn set_page_visible(&mut self, rect: egui::Rect, clip: egui::Rect) {
+        self.page_rect = rect_xywh(visible_rect(rect, clip));
+    }
 }
 
 fn rect_xywh(rect: egui::Rect) -> [f32; 4] {
     [rect.min.x, rect.min.y, rect.width(), rect.height()]
+}
+
+fn visible_rect(rect: egui::Rect, clip: egui::Rect) -> egui::Rect {
+    rect.intersect(clip)
 }
 
 /// One debug-bus request delivered from the Unix socket thread.
@@ -1417,7 +1433,8 @@ impl ControllerApp {
                     });
                 },
             );
-            self.debug_layout.page_rect = rect_xywh(empty.response.rect);
+            self.debug_layout
+                .set_page_visible(empty.response.rect, ui.clip_rect());
         } else {
             let nodes = self.nodes.clone();
             let list = egui::ScrollArea::vertical()
@@ -1430,7 +1447,8 @@ impl ControllerApp {
                         ui.add_space(theme::SPACE_SM);
                     }
                 });
-            self.debug_layout.page_rect = rect_xywh(list.inner_rect);
+            self.debug_layout
+                .set_page_visible(list.inner_rect, ui.clip_rect());
         }
         ui.add_space(theme::SPACE_MD);
         if ui
@@ -1592,7 +1610,8 @@ impl ControllerApp {
 
     fn machine_rail(&mut self, ui: &mut egui::Ui) {
         let back = ui.add(theme::secondary_button("Back to machines"));
-        self.debug_layout.note_item("rail_back", back.rect);
+        self.debug_layout
+            .note_visible("rail_back", back.rect, ui.clip_rect());
         if back.clicked() {
             self.back_to_machines();
             return;
@@ -1704,7 +1723,8 @@ impl ControllerApp {
             // the back button remains so a narrow layout (or a resized
             // window) never strands the user in a session.
             let back = ui.add(theme::secondary_button("Back to machines"));
-            self.debug_layout.note_item("back", back.rect);
+            self.debug_layout
+                .note_visible("back", back.rect, ui.clip_rect());
             if back.clicked() {
                 self.back_to_machines();
             }
@@ -1751,7 +1771,8 @@ impl ControllerApp {
             ));
             self.terminal.show(ui)
         });
-        self.debug_layout.page_rect = rect_xywh(shown.response.rect);
+        self.debug_layout
+            .set_page_visible(shown.response.rect, ui.clip_rect());
         let output = shown.inner;
         if let Some((rows, cols)) = output.resized {
             self.term_size = (rows, cols);
@@ -1850,7 +1871,8 @@ impl ControllerApp {
                     });
                 }
             });
-        self.debug_layout.page_rect = rect_xywh(list.inner_rect);
+        let clip = ui.clip_rect();
+        let mut page = visible_rect(list.inner_rect, clip);
         if can_write {
             ui.horizontal_wrapped(|ui| {
                 ui.add(
@@ -1887,12 +1909,15 @@ impl ControllerApp {
         }
         let save = if let Some(editor) = &mut self.editor {
             ui.label(&editor.path);
-            ui.add(
+            let edit = ui.add(
                 egui::TextEdit::multiline(&mut editor.text)
                     .desired_width(f32::INFINITY)
                     .desired_rows(12)
                     .font(egui::TextStyle::Monospace),
             );
+            self.debug_layout
+                .note_visible("editor", edit.rect, ui.clip_rect());
+            page = page.union(visible_rect(edit.rect, ui.clip_rect()));
             can_write
                 .then(|| ui.add(theme::primary_button("Save")).clicked())
                 .unwrap_or(false)
@@ -1900,6 +1925,7 @@ impl ControllerApp {
         } else {
             None
         };
+        self.debug_layout.page_rect = rect_xywh(page);
         if let Some((path, text)) = save {
             self.send(Cmd::Write {
                 node: id,
@@ -3964,6 +3990,25 @@ mod geometry_tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// Visible page / Back must cover a real fraction of the window.
+    /// A crushed `ui.horizontal()` row leaves ≈ interact height; raw widget
+    /// rects alone can still look tall while clip-visible bounds are tiny.
+    fn min_page_visible_h(window_h: f32) -> f32 {
+        (window_h * 0.35).max(160.0)
+    }
+
+    fn min_main_visible_w(window_w: f32) -> f32 {
+        if model::machine_rail_visible(window_w) {
+            (window_w - model::MACHINE_RAIL_WIDTH) * 0.45
+        } else {
+            window_w * 0.55
+        }
+    }
+
+    fn min_back_visible_w() -> f32 {
+        120.0
+    }
+
     struct Harness {
         app: ControllerApp,
         _cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
@@ -4013,6 +4058,10 @@ mod geometry_tests {
             }
         }
 
+        fn resize(&mut self, w: f32, h: f32) {
+            self.app.debug_resize(w, h);
+        }
+
         fn pass(&mut self) {
             let (w, h) = self.app.debug_window_size();
             let raw = egui::RawInput {
@@ -4030,6 +4079,35 @@ mod geometry_tests {
                 self.app.ui_frame(ctx);
             });
         }
+
+        fn populate_files(&mut self) {
+            self.app.files_loading = false;
+            self.app.file_path = ".".into();
+            self.app.files = vec![
+                agentlink_core::DirEntry {
+                    name: "src".into(),
+                    is_dir: true,
+                    is_file: false,
+                    is_symlink: false,
+                    size: 0,
+                    modified_unix_ms: None,
+                    mode: None,
+                },
+                agentlink_core::DirEntry {
+                    name: "readme.txt".into(),
+                    is_dir: false,
+                    is_file: true,
+                    is_symlink: false,
+                    size: 12,
+                    modified_unix_ms: None,
+                    mode: None,
+                },
+            ];
+            self.app.editor = Some(Editor {
+                path: "readme.txt".into(),
+                text: "hello from geometry test\n".into(),
+            });
+        }
     }
 
     fn item_rect(layout: &DebugLayout, id: &str) -> Option<[f32; 4]> {
@@ -4040,36 +4118,40 @@ mod geometry_tests {
             .map(|(_, rect)| *rect)
     }
 
-    fn assert_back_visible(layout: &DebugLayout, window: (f32, f32)) {
+    fn assert_back_clip_visible(layout: &DebugLayout, window: (f32, f32)) {
         let back = item_rect(layout, "back")
             .or_else(|| item_rect(layout, "rail_back"))
-            .expect("Back to machines rect");
+            .expect("Back to machines visible rect");
         assert!(
-            back[2] >= 120.0,
-            "back width clipped: {back:?} win={window:?}"
+            back[2] >= min_back_visible_w(),
+            "back clip-visible width too small: {back:?} win={window:?}"
         );
         assert!(
             back[3] >= 20.0,
-            "back height clipped: {back:?} win={window:?}"
+            "back clip-visible height too small: {back:?} win={window:?}"
+        );
+        assert!(
+            back[0] >= -1.0 && back[1] >= -1.0,
+            "back visible origin off-screen: {back:?}"
         );
         assert!(
             back[0] + back[2] <= window.0 + 1.0,
-            "back past right edge: {back:?} win={window:?}"
+            "back visible past right: {back:?} win={window:?}"
         );
         assert!(
             back[1] + back[3] <= window.1 + 1.0,
-            "back past bottom edge: {back:?} win={window:?}"
+            "back visible past bottom: {back:?} win={window:?}"
         );
     }
 
-    fn assert_session_geometry(layout: &DebugLayout, w: f32, h: f32, expect_rail: bool) {
+    fn assert_session_clip_geometry(layout: &DebugLayout, w: f32, h: f32, expect_rail: bool) {
         let main = layout.main_rect;
         assert!(
-            main[2] >= model::session_main_min_width(w),
+            main[2] >= min_main_visible_w(w),
             "main width crushed: {main:?} at {w}x{h}"
         );
         assert!(
-            main[3] >= model::session_page_min_height(h),
+            main[3] >= min_page_visible_h(h),
             "main height crushed (black remainder): {main:?} at {w}x{h}"
         );
         if expect_rail {
@@ -4079,12 +4161,12 @@ mod geometry_tests {
                 "rail width: {rail:?}"
             );
             assert!(
-                rail[3] >= model::session_page_min_height(h),
+                rail[3] >= min_page_visible_h(h),
                 "rail height crushed: {rail:?} at {w}x{h}"
             );
             assert!(
                 (rail[0] + rail[2] - main[0]).abs() < 2.0,
-                "black gap between rail and main: rail={rail:?} main={main:?}"
+                "gap between rail and main: rail={rail:?} main={main:?}"
             );
         } else {
             assert_eq!(
@@ -4094,12 +4176,19 @@ mod geometry_tests {
             );
         }
         let page = layout.page_rect;
-        assert!(page[2] > 80.0, "page width: {page:?} at {w}x{h}");
         assert!(
-            page[3] >= 100.0,
-            "page height too small (black pane): {page:?} at {w}x{h}"
+            page[2] >= 80.0,
+            "page clip-visible width: {page:?} at {w}x{h}"
         );
-        assert_back_visible(layout, (w, h));
+        assert!(
+            page[3] >= min_page_visible_h(h) * 0.55,
+            "page clip-visible height too small (black pane): {page:?} at {w}x{h}"
+        );
+        assert!(
+            page[1] + page[3] <= h + 1.0,
+            "page visible past bottom: {page:?} at {w}x{h}"
+        );
+        assert_back_clip_visible(layout, (w, h));
     }
 
     #[test]
@@ -4132,12 +4221,18 @@ mod geometry_tests {
             harn.app.open_terminal(&node);
             harn.pass();
             harn.pass();
-            assert_session_geometry(&harn.app.debug_layout, w, h, expect_rail);
+            assert_session_clip_geometry(&harn.app.debug_layout, w, h, expect_rail);
 
             harn.app.open_files(&node);
+            harn.populate_files();
             harn.pass();
             harn.pass();
-            assert_session_geometry(&harn.app.debug_layout, w, h, expect_rail);
+            assert_session_clip_geometry(&harn.app.debug_layout, w, h, expect_rail);
+            assert!(
+                item_rect(&harn.app.debug_layout, "editor").is_some_and(|r| r[2] > 80.0 && r[3] > 40.0),
+                "editor clip-visible missing/small: {:?}",
+                harn.app.debug_layout.toolbar_items
+            );
 
             harn.app.open_desktop(&node, true);
             harn.pass();
@@ -4155,16 +4250,61 @@ mod geometry_tests {
     }
 
     #[test]
-    fn crushed_horizontal_session_row_would_fail_geometry_gates() {
-        // Baseline 7c8b04d failure: ui.horizontal() only seeds interact_size.y,
-        // so Terminal/Files occupied a thin strip and the rest stayed BG_PAGE.
+    fn session_geometry_survives_wide_narrow_wide_resize_on_terminal_and_files() {
+        // Parent saw black after resizing a wide session down to ~725; a fresh
+        // narrow window alone does not reproduce that path.
+        let mut harn = Harness::new(1280.0, 800.0);
+        harn.pass();
+        harn.pass();
+        let node = harn.app.nodes[0].clone();
+
+        for kind in ["terminal", "files"] {
+            match kind {
+                "terminal" => harn.app.open_terminal(&node),
+                _ => {
+                    harn.app.open_files(&node);
+                    harn.populate_files();
+                }
+            }
+            harn.resize(1280.0, 800.0);
+            harn.pass();
+            harn.pass();
+            assert_session_clip_geometry(&harn.app.debug_layout, 1280.0, 800.0, true);
+
+            harn.resize(725.0, 800.0);
+            harn.pass();
+            harn.pass();
+            assert_session_clip_geometry(&harn.app.debug_layout, 725.0, 800.0, false);
+            if kind == "files" {
+                assert!(
+                    item_rect(&harn.app.debug_layout, "editor")
+                        .is_some_and(|r| r[2] > 80.0 && r[3] > 40.0),
+                    "editor vanished after narrow resize"
+                );
+            }
+
+            harn.resize(1280.0, 800.0);
+            harn.pass();
+            harn.pass();
+            assert_session_clip_geometry(&harn.app.debug_layout, 1280.0, 800.0, true);
+        }
+    }
+
+    #[test]
+    fn clip_visible_gates_reject_interact_height_strip() {
+        // Documents what the old ui.horizontal() strip looks like once clipped:
+        // Back/page visible height collapses near interact_size.y while the
+        // rest of the CentralPanel stays BG_PAGE.
         let interact = theme::BTN_TOOLBAR_H;
-        assert!(interact < 64.0);
-        assert!(model::session_page_min_height(800.0) > interact * 2.0);
-        let fake_main = [model::MACHINE_RAIL_WIDTH, 0.0, 1020.0, interact];
+        let fake_page = [280.0, 40.0, 900.0, interact];
+        let fake_back = [280.0, 8.0, 40.0, interact.min(24.0)];
         assert!(
-            fake_main[3] < model::session_page_min_height(800.0),
-            "gates must reject the crushed session row height"
+            fake_page[3] < min_page_visible_h(800.0) * 0.55,
+            "gates must reject crushed page visible height"
+        );
+        assert!(
+            fake_back[2] < min_back_visible_w(),
+            "gates must reject clipped Back width"
         );
     }
 }
