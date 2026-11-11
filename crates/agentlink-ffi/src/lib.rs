@@ -14,6 +14,7 @@ mod live;
 mod node;
 mod paths;
 mod pty;
+mod pty_pump;
 mod resume;
 mod tools;
 mod transfer;

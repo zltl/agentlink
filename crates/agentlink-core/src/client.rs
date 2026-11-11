@@ -411,6 +411,50 @@ impl PtySession {
     }
 
     async fn send_op(&self, op: Op) -> Result<()> {
+        self.writer().send_op(op).await
+    }
+
+    /// Write/resize handle that does not borrow the receive half, so a PTY
+    /// pump can pin `recv()` across keystroke writes without losing a ready
+    /// output chunk when `select!` prefers input.
+    pub fn writer(&self) -> PtyWriter {
+        PtyWriter {
+            session_id: self.session_id.clone(),
+            node_id: self.node_id.clone(),
+            client_id: self.client_id.clone(),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// Send side of a [`PtySession`]. Safe to clone; does not own `recv`.
+#[derive(Clone)]
+pub struct PtyWriter {
+    session_id: String,
+    node_id: String,
+    client_id: String,
+    inner: Arc<ClientInner>,
+}
+
+impl PtyWriter {
+    pub async fn write(&self, data: &[u8]) -> Result<()> {
+        self.send_op(Op::PtyInput {
+            session_id: self.session_id.clone(),
+            data_b64: util::b64_encode(data),
+        })
+        .await
+    }
+
+    pub async fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        self.send_op(Op::PtyResize {
+            session_id: self.session_id.clone(),
+            rows,
+            cols,
+        })
+        .await
+    }
+
+    async fn send_op(&self, op: Op) -> Result<()> {
         let env = Envelope::Invoke {
             request_id: uuid::Uuid::new_v4().to_string(),
             node_id: self.node_id.clone(),
@@ -429,6 +473,7 @@ impl PtySession {
             .map_err(|_| Error::Message("connection closed".into()))
     }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct PairingInfo {

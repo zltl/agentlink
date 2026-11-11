@@ -14,12 +14,13 @@ use std::time::Duration;
 use agentlink_core::engine::XferOpts;
 use agentlink_core::protocol::Op;
 use agentlink_core::{
-    apply_relay_defaults, Client, ClientSettings, ExecRequest, Identity, NodePolicy, PtyEvent,
-    PtySession, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
+    apply_relay_defaults, Client, ClientSettings, ExecRequest, Identity, NodePolicy, PtySession,
+    PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::pty_pump::{pump_session, PtyCmd};
 use crate::LinkError;
 
 #[derive(uniffi::Record, Clone)]
@@ -781,12 +782,6 @@ impl Drop for MobileClient {
     }
 }
 
-enum PtyCmd {
-    Write(Vec<u8>),
-    Resize(u16, u16),
-    Close,
-}
-
 #[derive(uniffi::Object)]
 pub struct PtyHandle {
     cmd: mpsc::UnboundedSender<PtyCmd>,
@@ -794,56 +789,14 @@ pub struct PtyHandle {
 }
 
 impl PtyHandle {
-    fn spawn(handle: tokio::runtime::Handle, mut session: PtySession) -> Arc<Self> {
-        let (cmd, mut cmd_rx) = mpsc::unbounded_channel();
+    fn spawn(handle: tokio::runtime::Handle, session: PtySession) -> Arc<Self> {
+        let (cmd, cmd_rx) = mpsc::unbounded_channel();
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let queue = events.clone();
+        let writer = session.writer();
         handle.spawn(async move {
-            loop {
-                if let Ok(command) = cmd_rx.try_recv() {
-                    match command {
-                        PtyCmd::Write(data) => {
-                            if session.write(&data).await.is_err() {
-                                push_event(
-                                    &queue,
-                                    json!({"event":"error","message":"write failed"}),
-                                );
-                                break;
-                            }
-                        }
-                        PtyCmd::Resize(rows, cols) => {
-                            let _ = session.resize(rows, cols).await;
-                        }
-                        PtyCmd::Close => break,
-                    }
-                    continue;
-                }
-                match tokio::time::timeout(Duration::from_millis(40), session.recv()).await {
-                    Ok(Ok(PtyEvent::Data(bytes))) => {
-                        push_event(
-                            &queue,
-                            json!({
-                                "event": "data",
-                                "data_b64": agentlink_core::util::b64_encode(&bytes),
-                            }),
-                        );
-                    }
-                    Ok(Ok(PtyEvent::Exit(code))) => {
-                        push_event(&queue, json!({"event":"exit","code": code}));
-                        break;
-                    }
-                    Ok(Ok(PtyEvent::Error(message)))
-                    | Ok(Err(agentlink_core::Error::Message(message))) => {
-                        push_event(&queue, json!({"event":"error","message": message}));
-                        break;
-                    }
-                    Ok(Err(err)) => {
-                        push_event(&queue, json!({"event":"error","message": err.to_string()}));
-                        break;
-                    }
-                    Err(_) => {}
-                }
-            }
+            // Input-first, pinned recv (see docs/terminal-ux-t443.md and pty_pump.rs).
+            pump_session(cmd_rx, session, writer, queue).await;
         });
         Arc::new(Self { cmd, events })
     }
@@ -877,12 +830,6 @@ impl PtyHandle {
 
     pub fn shutdown(&self) {
         let _ = self.cmd.send(PtyCmd::Close);
-    }
-}
-
-fn push_event(queue: &Mutex<VecDeque<String>>, value: Value) {
-    if let Ok(mut queue) = queue.lock() {
-        queue.push_back(value.to_string());
     }
 }
 

@@ -88,6 +88,7 @@ import app.agentlink.model.liveFailureShouldRetry
 import app.agentlink.model.liveStatus
 import app.agentlink.model.looksTextual
 import app.agentlink.model.parentPath
+import app.agentlink.model.PtyClientPolicy
 import app.agentlink.model.ptySequence
 import app.agentlink.model.ptyText
 import app.agentlink.model.searchFiles
@@ -95,11 +96,13 @@ import app.agentlink.model.webrtcFallsBackToScreenshot
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
 import org.json.JSONObject
 import java.io.File
@@ -489,12 +492,25 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
         }
         return decorateGrantFailure(message, machine.id, deviceKey, identityDir.absolutePath)
     }
-    fun writePty(bytes: ByteArray) {
-        val handle = pty ?: return
-        scope.launch(Dispatchers.IO) {
-            runCatching { handle.write(bytes) }.onFailure {
-                note = it.message ?: "Couldn't send that keystroke."
+    val ptyRef = remember { AtomicReference<PtySession?>(null) }
+    ptyRef.set(pty)
+    val ptyWrites = remember { Channel<ByteArray>(PtyClientPolicy.WRITE_QUEUE_CAP) }
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            for (bytes in ptyWrites) {
+                val handle = ptyRef.get() ?: continue
+                runCatching { handle.write(bytes) }.onFailure {
+                    withContext(Dispatchers.Main) {
+                        note = it.message ?: "Couldn't send that keystroke."
+                    }
+                }
             }
+        }
+    }
+    fun writePty(bytes: ByteArray) {
+        if (bytes.isEmpty() || ptyRef.get() == null) return
+        if (ptyWrites.trySend(bytes).isFailure) {
+            note = "Couldn't send that keystroke."
         }
     }
     fun openShell() {
@@ -516,7 +532,10 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
         }
     }
     DisposableEffect(Unit) {
-        onDispose { pty?.close() }
+        onDispose {
+            ptyWrites.close()
+            pty?.close()
+        }
     }
     LaunchedEffect(copied) {
         if (copied) {
@@ -532,41 +551,55 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
     LaunchedEffect(pty, view) {
         val handle = pty ?: return@LaunchedEffect
         val terminal = view ?: return@LaunchedEffect
-        while (isActive) {
-            val polled = withContext(Dispatchers.IO) { runCatching { handle.poll() } }
-            if (polled.isFailure) {
-                note = grantNote(polled.exceptionOrNull()?.message ?: "The shell connection dropped.")
-                phase = ShellPhase.Failed
-                break
-            }
-            val event = polled.getOrThrow()
-            when (jsonField(event, "event")) {
-                "data" -> {
-                    val raw = jsonField(event, "data_b64").orEmpty()
-                    if (raw.isNotEmpty()) {
-                        val bytes = Base64.decode(raw, Base64.DEFAULT)
-                        withContext(Dispatchers.Main) { terminal.feed(bytes) }
-                    }
-                }
-                "exit" -> {
-                    val code = runCatching { JSONObject(event).optInt("code") }.getOrDefault(-1)
-                    phase = ShellPhase.Closed
-                    note = "Shell exited ($code)"
-                    handle.close()
-                    pty = null
-                    withContext(Dispatchers.Main) { terminal.feed("\r\n[exit $code]\r\n".encodeToByteArray()) }
+        var finished = false
+        while (isActive && !finished) {
+            var pending = false
+            var drained = 0
+            do {
+                val polled = withContext(Dispatchers.IO) { runCatching { handle.poll() } }
+                if (polled.isFailure) {
+                    note = grantNote(polled.exceptionOrNull()?.message ?: "The shell connection dropped.")
+                    phase = ShellPhase.Failed
+                    finished = true
                     break
                 }
-                "error" -> {
-                    val message = grantNote(
-                        jsonField(event, "message").orEmpty().ifBlank { "The shell reported an error." },
-                    )
-                    phase = ShellPhase.Failed
-                    note = message
-                    withContext(Dispatchers.Main) { terminal.feed("\r\n$message\r\n".encodeToByteArray()) }
+                val event = polled.getOrThrow()
+                when (jsonField(event, "event")) {
+                    "pending" -> pending = true
+                    "data" -> {
+                        val raw = jsonField(event, "data_b64").orEmpty()
+                        if (raw.isNotEmpty()) {
+                            val bytes = Base64.decode(raw, Base64.DEFAULT)
+                            withContext(Dispatchers.Main) { terminal.feed(bytes) }
+                        }
+                    }
+                    "exit" -> {
+                        val code = runCatching { JSONObject(event).optInt("code") }.getOrDefault(-1)
+                        phase = ShellPhase.Closed
+                        note = "Shell exited ($code)"
+                        handle.close()
+                        pty = null
+                        withContext(Dispatchers.Main) { terminal.feed("\r\n[exit $code]\r\n".encodeToByteArray()) }
+                        finished = true
+                    }
+                    "error" -> {
+                        val message = grantNote(
+                            jsonField(event, "message").orEmpty().ifBlank { "The shell reported an error." },
+                        )
+                        phase = ShellPhase.Failed
+                        note = message
+                        withContext(Dispatchers.Main) { terminal.feed("\r\n$message\r\n".encodeToByteArray()) }
+                    }
                 }
-            }
-            delay(30)
+                drained++
+            } while (
+                isActive &&
+                    !finished &&
+                    !pending &&
+                    drained < PtyClientPolicy.MAX_DRAIN_EVENTS
+            )
+            if (finished || !isActive) break
+            if (pending) delay(PtyClientPolicy.POLL_IDLE_MS)
         }
     }
     Column(modifier = Modifier.fillMaxSize()) {

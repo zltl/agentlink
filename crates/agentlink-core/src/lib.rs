@@ -46,7 +46,9 @@ pub mod turn;
 pub mod util;
 pub mod ws;
 
-pub use client::{Client, ExecOutput, ExecRequest, PairingInfo, PtyEvent, PtyRead, PtySession};
+pub use client::{
+    Client, ExecOutput, ExecRequest, PairingInfo, PtyEvent, PtyRead, PtySession, PtyWriter,
+};
 pub use config::{
     apply_relay_defaults, is_public_relay, load_settings, save_settings, ClientSettings,
     FileConfig, DEFAULT_RELAY_TRUST,

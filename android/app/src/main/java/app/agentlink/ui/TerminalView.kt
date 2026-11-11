@@ -14,6 +14,7 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import app.agentlink.model.ImeComposing
 import app.agentlink.model.PtyKey
 import app.agentlink.model.TerminalScreen
 import app.agentlink.model.ptySequence
@@ -38,6 +39,8 @@ class TerminalView @JvmOverloads constructor(
     private val lock = Any()
     private var scrollOffset = 0
     private var scrolledAway = false
+    /** Uncommitted IME text, drawn at the cursor and sent only on commit. */
+    private val composing = ImeComposing()
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = Typeface.MONOSPACE
         color = PALETTE[TerminalScreen.DEFAULT_FG]
@@ -114,12 +117,29 @@ class TerminalView @JvmOverloads constructor(
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
         return object : BaseInputConnection(this, false) {
             override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
+                discardComposing()
                 send(ptyText(text.toString(), ctrl = false))
                 return true
             }
 
+            override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
+                updateComposing(text.toString())
+                return true
+            }
+
+            override fun finishComposingText(): Boolean {
+                flushComposing()
+                return true
+            }
+
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                repeat(beforeLength.coerceAtLeast(0)) { send(ptySequence(PtyKey.Backspace, false)) }
+                var before = beforeLength.coerceAtLeast(0)
+                if (composing.text.isNotEmpty() && before > 0) {
+                    val left = composing.delete(before)
+                    postInvalidateOnAnimation()
+                    before = left
+                }
+                repeat(before) { send(ptySequence(PtyKey.Backspace, false)) }
                 return true
             }
 
@@ -133,6 +153,11 @@ class TerminalView @JvmOverloads constructor(
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (composing.text.isNotEmpty() && keyCode == KeyEvent.KEYCODE_DEL) {
+            composing.delete(1)
+            postInvalidateOnAnimation()
+            return true
+        }
         val bytes = bytesFor(event) ?: return super.onKeyDown(keyCode, event)
         send(bytes)
         return true
@@ -193,10 +218,45 @@ class TerminalView @JvmOverloads constructor(
                     drawGridRow(canvas, viewRow, source - history, cols)
                 }
             }
-            if (offset == 0 && screen.cursorVisible) {
+            if (offset == 0 && screen.cursorVisible && composing.text.isEmpty()) {
                 bgPaint.color = 0x66FFFFFF
                 val x = screen.cursorCol * cellW
                 val y = screen.cursorRow * cellH
+                canvas.drawRect(x, y, x + cellW, y + cellH, bgPaint)
+            }
+            if (offset == 0 && composing.text.isNotEmpty()) {
+                drawComposing(canvas, screen.cursorRow, screen.cursorCol)
+            }
+        }
+    }
+
+    private fun drawComposing(canvas: Canvas, startRow: Int, startCol: Int) {
+        textPaint.color = PALETTE[TerminalScreen.DEFAULT_FG]
+        textPaint.isFakeBoldText = false
+        textPaint.isUnderlineText = true
+        var col = startCol
+        var row = startRow
+        for (ch in composing.text) {
+            if (row >= screen.rows) break
+            if (col >= screen.cols) {
+                col = 0
+                row++
+                if (row >= screen.rows) break
+            }
+            canvas.drawText(ch.toString(), col * cellW, row * cellH + baseline, textPaint)
+            col++
+        }
+        textPaint.isUnderlineText = false
+        // Caret after the preview, not under the first composing cell.
+        if (row < screen.rows) {
+            if (col >= screen.cols) {
+                col = 0
+                row++
+            }
+            if (row < screen.rows) {
+                bgPaint.color = 0x66FFFFFF
+                val x = col * cellW
+                val y = row * cellH
                 canvas.drawRect(x, y, x + cellW, y + cellH, bgPaint)
             }
         }
@@ -246,7 +306,24 @@ class TerminalView @JvmOverloads constructor(
     private var dragging = false
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
+    private fun updateComposing(text: String) {
+        if (composing.set(text)) postInvalidateOnAnimation()
+    }
+
+    private fun discardComposing() {
+        if (composing.discard()) postInvalidateOnAnimation()
+    }
+
+    private fun flushComposing() {
+        val text = composing.finish()
+        if (text.isNotEmpty()) {
+            postInvalidateOnAnimation()
+            onBytes(ptyText(text, ctrl = false))
+        }
+    }
+
     private fun send(bytes: ByteArray) {
+        if (composing.text.isNotEmpty()) flushComposing()
         if (bytes.isNotEmpty()) onBytes(bytes)
     }
 
