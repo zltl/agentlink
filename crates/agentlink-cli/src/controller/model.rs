@@ -346,9 +346,20 @@ pub fn notice_refers_to_path(notice: &str, path: &str) -> bool {
 /// Width of the session machine rail, including its frame margin.
 pub const MACHINE_RAIL_WIDTH: f32 = 260.0;
 
+/// Comfortable main-column width beside the rail (terminal/files chrome).
+///
+/// Parent GUI at a restored ~1085 px window still showed the rail with the
+/// old 980 show-at. That was the threshold policy, not a viewport min-size
+/// pin (screenshot physical width ≈ 1085; Read preview 1280-wide made it
+/// look like ~725). Fold when the window cannot keep rail + this main.
+pub const SESSION_MAIN_COMFORT_WIDTH: f32 = 840.0;
+
 /// Hide the session rail below this window width; the session page still
 /// has an explicit Back to machines button.
-pub const MACHINE_RAIL_SHOW_AT: f32 = 980.0;
+///
+/// Intentional breakpoint: `MACHINE_RAIL_WIDTH + SESSION_MAIN_COMFORT_WIDTH`
+/// (1100). Distinct from the View-desktop rail clipping bug.
+pub const MACHINE_RAIL_SHOW_AT: f32 = MACHINE_RAIL_WIDTH + SESSION_MAIN_COMFORT_WIDTH;
 
 /// The Machines list is a single compact column.
 ///
@@ -692,7 +703,13 @@ mod tests {
         assert_eq!(wide, 1216.0);
         let narrow = machine_card_width(736.0, 1, 16.0);
         assert_eq!(narrow, 736.0);
+        // Intentional fold below rail + comfortable main (1100), so a restored
+        // ~1080 window hides the sidebar. 1280/1920 keep the rail.
+        assert_eq!(MACHINE_RAIL_SHOW_AT, 1100.0);
         assert!(machine_rail_visible(1280.0));
+        assert!(machine_rail_visible(1920.0));
+        assert!(!machine_rail_visible(1080.0));
+        assert!(!machine_rail_visible(1085.0));
         assert!(!machine_rail_visible(800.0));
         assert!(!machine_rail_visible(725.0));
         assert_eq!(

@@ -72,6 +72,12 @@ impl DebugLayout {
         self.note_item(id, visible_rect(rect, clip));
     }
 
+    /// Raw widget rect plus clip-visible rect for label/button regressions.
+    fn note_button_raw_vis(&mut self, id: &str, rect: egui::Rect, clip: egui::Rect) {
+        self.note_item(&format!("{id}:raw"), rect);
+        self.note_item(&format!("{id}:vis"), visible_rect(rect, clip));
+    }
+
     fn set_page_visible(&mut self, rect: egui::Rect, clip: egui::Rect) {
         self.page_rect = rect_xywh(visible_rect(rect, clip));
     }
@@ -322,10 +328,13 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
     app.debug_inbox = opts.debug_inbox;
     app.open_desktop = opts.open_desktop;
     let (iw, ih) = opts.logical_size;
+    // Min size stays below the intentional rail fold breakpoint and below the
+    // 725-wide narrow layout parent uses in GUI. Not a root cause of the
+    // ~1085 restored-window rail (that was SHOW_AT=980 < 1085).
     let viewport = egui::ViewportBuilder::default()
         .with_title(app.window_title.clone())
         .with_inner_size([iw, ih])
-        .with_min_inner_size([960.0, 600.0])
+        .with_min_inner_size([640.0, 480.0])
         .with_visible(!opts.background);
     let options = eframe::NativeOptions {
         viewport,
@@ -1626,43 +1635,70 @@ impl ControllerApp {
             _ => None,
         };
         let nodes = self.nodes.clone();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for node in &nodes {
-                let active = current.as_deref() == Some(node.id.as_str());
-                let frame = egui::Frame::new()
-                    .fill(if active {
-                        theme::BG_HOVER
-                    } else {
-                        theme::BG_PANEL
-                    })
-                    .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
-                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD));
-                frame.show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.set_max_width(ui.available_width());
-                    name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
-                    if active {
-                        ui.label(theme::muted_text("This session"));
-                    }
-                    ui.horizontal_wrapped(|ui| {
-                        ui.set_max_width(ui.available_width());
-                        ui.spacing_mut().item_spacing =
-                            egui::vec2(theme::SPACE_XS, theme::SPACE_XS);
-                        for button in card_buttons(node.online, node.has_display, node.effective) {
-                            let action = Action {
-                                enabled: button.enabled,
-                                reason: button.reason,
-                            };
-                            let id = format!("rail:{}:{}", node.id, button.label);
-                            if action_button(ui, &id, button.label, &action) {
-                                self.activate(node, &action, button.kind);
-                            }
+        // Fixed inner width from rail constants — do not trust ScrollArea
+        // max_rect (it expands past the 260pt clip, which kept View desktop
+        // on one row until the clip ate the last glyph).
+        let rail_clip = ui.clip_rect();
+        let rail_inner_w = (model::MACHINE_RAIL_WIDTH - theme::SPACE_MD * 2.0)
+            .floor()
+            .max(1.0);
+        let card_inner_w = (rail_inner_w - theme::SPACE_SM * 2.0).floor().max(1.0);
+        ui.set_max_width(rail_inner_w);
+        egui::ScrollArea::vertical()
+            .max_width(rail_inner_w)
+            .show(ui, |ui| {
+                ui.set_max_width(rail_inner_w);
+                for node in &nodes {
+                    let active = current.as_deref() == Some(node.id.as_str());
+                    let frame = egui::Frame::new()
+                        .fill(if active {
+                            theme::BG_HOVER
+                        } else {
+                            theme::BG_PANEL
+                        })
+                        .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
+                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD));
+                    frame.show(ui, |ui| {
+                        ui.set_max_width(card_inner_w);
+                        ui.set_width(card_inner_w);
+                        name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
+                        if active {
+                            ui.label(theme::muted_text("This session"));
                         }
+                        // Vertical stack keeps every full label inside the
+                        // 260pt rail clip; horizontal_wrapped could still
+                        // place View desktop past the clip when max_rect grew.
+                        ui.vertical(|ui| {
+                            ui.set_max_width(card_inner_w);
+                            ui.spacing_mut().item_spacing =
+                                egui::vec2(0.0, theme::SPACE_XS);
+                            for button in
+                                card_buttons(node.online, node.has_display, node.effective)
+                            {
+                                let action = Action {
+                                    enabled: button.enabled,
+                                    reason: button.reason,
+                                };
+                                let id = format!("rail:{}:{}", node.id, button.label);
+                                let response =
+                                    action_button_response(ui, &id, button.label, &action);
+                                self.debug_layout.note_button_raw_vis(
+                                    &format!("rail_btn:{}:{}", node.id, button.label),
+                                    response.rect,
+                                    rail_clip,
+                                );
+                                if response.has_focus() {
+                                    response.surrender_focus();
+                                }
+                                if response.clicked() {
+                                    self.activate(node, &action, button.kind);
+                                }
+                            }
+                        });
                     });
-                });
-                ui.add_space(theme::SPACE_SM);
-            }
-        });
+                    ui.add_space(theme::SPACE_SM);
+                }
+            });
     }
 
     fn enroll(&mut self, ui: &mut egui::Ui) {
@@ -3908,18 +3944,30 @@ Click to copy"
     }
 }
 
-fn action_button(ui: &mut egui::Ui, id: &str, label: &str, action: &Action) -> bool {
+/// Full on-screen width of an action label, including pad + stroke.
+///
+/// Under-counting (pad only) let Terminal|Files|View desktop share one rail
+/// row by a few pixels; the rail clip then ate the final glyph of
+/// "View desktop" (max-session GUI screenshot).
+fn action_button_min_width(ui: &egui::Ui, label: &str, color: egui::Color32) -> f32 {
+    let font = egui::FontId::proportional(theme::SECONDARY_SIZE);
+    let text_w = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, color).size().x);
+    let stroke = theme::stroke_border_subtle().width;
+    (text_w + theme::BTN_PAD_X * 2.0 + stroke * 2.0).ceil()
+}
+
+fn action_button_response(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    action: &Action,
+) -> egui::Response {
     let (fill, color) = if action.enabled {
         (theme::BG_SURFACE, theme::TEXT_BODY)
     } else {
         (theme::BG_PANEL, theme::TEXT_FAINT)
     };
-    let font = egui::FontId::proportional(theme::SECONDARY_SIZE);
-    let text_w = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, color).size().x);
-    // Min width is the whole label plus padding, so horizontal_wrapped
-    // moves "View desktop" to the next line instead of parking it in a
-    // leftover 88px slot and clipping it to "View d...".
-    let min_w = text_w + theme::BTN_PAD_X * 2.0;
+    let min_w = action_button_min_width(ui, label, color);
     let btn = egui::Button::new(
         egui::RichText::new(label.to_owned())
             .size(theme::SECONDARY_SIZE)
@@ -3930,10 +3978,13 @@ fn action_button(ui: &mut egui::Ui, id: &str, label: &str, action: &Action) -> b
     .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
     .wrap_mode(egui::TextWrapMode::Extend)
     .min_size(egui::vec2(min_w, theme::BTN_TOOLBAR_H));
-    let response = ui
-        .push_id(id, |ui| ui.add_enabled(action.enabled, btn))
+    ui.push_id(id, |ui| ui.add_enabled(action.enabled, btn))
         .inner
-        .on_hover_text(action.reason);
+        .on_hover_text(action.reason)
+}
+
+fn action_button(ui: &mut egui::Ui, id: &str, label: &str, action: &Action) -> bool {
+    let response = action_button_response(ui, id, label, action);
     // These starts are click actions only. Enter in a focused terminal must
     // never activate a rail or card button and switch the session target.
     if response.has_focus() {
@@ -4044,8 +4095,12 @@ mod geometry_tests {
                 30,
             );
             app.user = Some("debug".into());
-            app.nodes.push(mock_node("box"));
-            app.control.insert("box".into(), true);
+            // Realistic session rail: exec-only + full-capability desktop node
+            // (sufa) so "View desktop" is present for clip regressions.
+            app.nodes = realistic_nodes();
+            for node in &app.nodes {
+                app.control.insert(node.id.clone(), true);
+            }
             app.screen = Screen::Machines;
             let ctx = egui::Context::default();
             apply_theme_public(&ctx);
@@ -4108,6 +4163,38 @@ mod geometry_tests {
                 text: "hello from geometry test\n".into(),
             });
         }
+
+        fn open_quant_terminal(&mut self) {
+            let node = self
+                .app
+                .nodes
+                .iter()
+                .find(|n| n.id == "quant67")
+                .cloned()
+                .expect("quant67");
+            self.app.open_terminal(&node);
+        }
+    }
+
+    fn realistic_nodes() -> Vec<NodeInfo> {
+        let mut quant = mock_node("quant67");
+        quant.has_display = Some(false);
+        quant.policy = NodePolicy::exec();
+        quant.effective = NodePolicy::exec();
+        quant.access = "exec".into();
+
+        let mut sufa = mock_node("sufa");
+        sufa.has_display = Some(true);
+        sufa.policy = NodePolicy::full();
+        sufa.effective = NodePolicy::full();
+        sufa.access = "full".into();
+
+        let mut tccn = mock_node("tc-cn");
+        tccn.has_display = Some(false);
+        tccn.policy = NodePolicy::exec();
+        tccn.effective = NodePolicy::exec();
+
+        vec![quant, sufa, tccn]
     }
 
     fn item_rect(layout: &DebugLayout, id: &str) -> Option<[f32; 4]> {
@@ -4191,9 +4278,34 @@ mod geometry_tests {
         assert_back_clip_visible(layout, (w, h));
     }
 
+    fn assert_view_desktop_fully_in_clip(layout: &DebugLayout) {
+        let raw = item_rect(layout, "rail_btn:sufa:View desktop:raw")
+            .expect("sufa View desktop raw rect");
+        let vis = item_rect(layout, "rail_btn:sufa:View desktop:vis")
+            .expect("sufa View desktop vis rect");
+        assert!(
+            raw[2] >= 90.0,
+            "View desktop raw width too small (label incomplete?): {raw:?}"
+        );
+        assert!(
+            (vis[2] - raw[2]).abs() <= 1.0 && (vis[3] - raw[3]).abs() <= 1.0,
+            "View desktop clipped: raw={raw:?} vis={vis:?}"
+        );
+        assert!(
+            vis[0] >= 0.0 && vis[0] + vis[2] <= model::MACHINE_RAIL_WIDTH + 1.0,
+            "View desktop vis outside rail: {vis:?}"
+        );
+    }
+
     #[test]
     fn session_geometry_terminal_files_machines_desktop_wide_and_narrow() {
-        for &(w, h) in &[(1280.0_f32, 800.0_f32), (725.0_f32, 800.0_f32)] {
+        // 725 (true narrow), 1080 (restored ≈1085 physical), 1280, 1920.
+        for &(w, h) in &[
+            (725.0_f32, 800.0_f32),
+            (1080.0_f32, 800.0_f32),
+            (1280.0_f32, 800.0_f32),
+            (1920.0_f32, 1200.0_f32),
+        ] {
             let mut harn = Harness::new(w, h);
             harn.pass();
             harn.pass();
@@ -4209,32 +4321,38 @@ mod geometry_tests {
                 main[3] > h * 0.5,
                 "machines main height {main:?} at {w}x{h}"
             );
-            assert!(
-                harn.app.debug_layout.page_rect[3] > 80.0,
-                "machines page {:?}",
-                harn.app.debug_layout.page_rect
-            );
 
-            let node = harn.app.nodes[0].clone();
             let expect_rail = model::machine_rail_visible(w);
-
-            harn.app.open_terminal(&node);
+            harn.open_quant_terminal();
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, w, h, expect_rail);
+            if expect_rail {
+                assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
+            } else {
+                assert_eq!(harn.app.debug_layout.rail_rect, [0.0; 4]);
+            }
 
+            let node = harn.app.nodes[0].clone();
             harn.app.open_files(&node);
             harn.populate_files();
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, w, h, expect_rail);
             assert!(
-                item_rect(&harn.app.debug_layout, "editor").is_some_and(|r| r[2] > 80.0 && r[3] > 40.0),
-                "editor clip-visible missing/small: {:?}",
-                harn.app.debug_layout.toolbar_items
+                item_rect(&harn.app.debug_layout, "editor")
+                    .is_some_and(|r| r[2] > 80.0 && r[3] > 40.0),
+                "editor clip-visible missing/small at {w}"
             );
 
-            harn.app.open_desktop(&node, true);
+            let desk = harn
+                .app
+                .nodes
+                .iter()
+                .find(|n| n.id == "sufa")
+                .cloned()
+                .unwrap();
+            harn.app.open_desktop(&desk, true);
             harn.pass();
             harn.pass();
             let pane = harn.app.debug_layout.pane_rect;
@@ -4250,9 +4368,51 @@ mod geometry_tests {
     }
 
     #[test]
-    fn session_geometry_survives_wide_narrow_wide_resize_on_terminal_and_files() {
-        // Parent saw black after resizing a wide session down to ~725; a fresh
-        // narrow window alone does not reproduce that path.
+    fn rail_view_desktop_label_fully_visible_when_rail_shown() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        harn.open_quant_terminal();
+        harn.pass();
+        harn.pass();
+        assert!(model::machine_rail_visible(1280.0));
+        assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
+        // Control desktop (4th action) must also stay inside the rail clip.
+        let raw = item_rect(&harn.app.debug_layout, "rail_btn:sufa:Control desktop:raw")
+            .expect("control raw");
+        let vis = item_rect(&harn.app.debug_layout, "rail_btn:sufa:Control desktop:vis")
+            .expect("control vis");
+        assert!(
+            (vis[2] - raw[2]).abs() <= 1.0,
+            "Control desktop clipped: raw={raw:?} vis={vis:?}"
+        );
+    }
+
+    #[test]
+    fn restored_1080_and_true_725_fold_rail_1280_keeps_it() {
+        // Screenshot fact: restored window ≈1085 physical (preview looked like
+        // ~725). Old SHOW_AT=980 kept the rail — policy, not min-size pinning.
+        // Intentional SHOW_AT=1100 folds ≤1085; 1280/1920 keep the rail.
+        for &(w, expect_rail) in &[
+            (725.0_f32, false),
+            (1080.0_f32, false),
+            (1085.0_f32, false),
+            (1280.0_f32, true),
+            (1920.0_f32, true),
+        ] {
+            assert_eq!(
+                model::machine_rail_visible(w),
+                expect_rail,
+                "rail policy at {w}"
+            );
+            let mut harn = Harness::new(w, 800.0);
+            harn.open_quant_terminal();
+            harn.pass();
+            harn.pass();
+            assert_session_clip_geometry(&harn.app.debug_layout, w, 800.0, expect_rail);
+        }
+    }
+
+    #[test]
+    fn session_geometry_survives_wide_restored_narrow_wide_resize() {
         let mut harn = Harness::new(1280.0, 800.0);
         harn.pass();
         harn.pass();
@@ -4270,6 +4430,13 @@ mod geometry_tests {
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, 1280.0, 800.0, true);
+            assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
+
+            // Restored-window size from screenshot (~1085), not the preview 725.
+            harn.resize(1080.0, 800.0);
+            harn.pass();
+            harn.pass();
+            assert_session_clip_geometry(&harn.app.debug_layout, 1080.0, 800.0, false);
 
             harn.resize(725.0, 800.0);
             harn.pass();
@@ -4283,6 +4450,12 @@ mod geometry_tests {
                 );
             }
 
+            harn.resize(1920.0, 1200.0);
+            harn.pass();
+            harn.pass();
+            assert_session_clip_geometry(&harn.app.debug_layout, 1920.0, 1200.0, true);
+            assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
+
             harn.resize(1280.0, 800.0);
             harn.pass();
             harn.pass();
@@ -4291,10 +4464,7 @@ mod geometry_tests {
     }
 
     #[test]
-    fn clip_visible_gates_reject_interact_height_strip() {
-        // Documents what the old ui.horizontal() strip looks like once clipped:
-        // Back/page visible height collapses near interact_size.y while the
-        // rest of the CentralPanel stays BG_PAGE.
+    fn clip_visible_gates_reject_interact_height_strip_and_partial_label() {
         let interact = theme::BTN_TOOLBAR_H;
         let fake_page = [280.0, 40.0, 900.0, interact];
         let fake_back = [280.0, 8.0, 40.0, interact.min(24.0)];
@@ -4305,6 +4475,13 @@ mod geometry_tests {
         assert!(
             fake_back[2] < min_back_visible_w(),
             "gates must reject clipped Back width"
+        );
+        // Partial "View deskto" visible width must not pass full-label gate.
+        let raw = [12.0, 40.0, 118.0, 28.0];
+        let vis = [12.0, 40.0, 96.0, 28.0];
+        assert!(
+            f32::abs(vis[2] - raw[2]) > 1.0,
+            "partial label fixture must differ raw vs vis"
         );
     }
 }
