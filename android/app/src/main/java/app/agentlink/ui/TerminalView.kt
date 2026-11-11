@@ -14,6 +14,7 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import app.agentlink.model.CellWidth
 import app.agentlink.model.ImeComposing
 import app.agentlink.model.PtyKey
 import app.agentlink.model.TerminalScreen
@@ -220,9 +221,11 @@ class TerminalView @JvmOverloads constructor(
             }
             if (offset == 0 && screen.cursorVisible && composing.text.isEmpty()) {
                 bgPaint.color = 0x66FFFFFF
-                val x = screen.cursorCol * cellW
+                val col = screen.cursorDisplayCol()
+                val width = screen.cursorDisplayWidth()
+                val x = col * cellW
                 val y = screen.cursorRow * cellH
-                canvas.drawRect(x, y, x + cellW, y + cellH, bgPaint)
+                canvas.drawRect(x, y, x + cellW * width, y + cellH, bgPaint)
             }
             if (offset == 0 && composing.text.isNotEmpty()) {
                 drawComposing(canvas, screen.cursorRow, screen.cursorCol)
@@ -238,13 +241,14 @@ class TerminalView @JvmOverloads constructor(
         var row = startRow
         for (ch in composing.text) {
             if (row >= screen.rows) break
-            if (col >= screen.cols) {
+            val width = CellWidth.of(ch.code).coerceAtLeast(1)
+            if (col + width > screen.cols) {
                 col = 0
                 row++
                 if (row >= screen.rows) break
             }
             canvas.drawText(ch.toString(), col * cellW, row * cellH + baseline, textPaint)
-            col++
+            col += width
         }
         textPaint.isUnderlineText = false
         // Caret after the preview, not under the first composing cell.
@@ -272,17 +276,26 @@ class TerminalView @JvmOverloads constructor(
     private fun drawGridRow(canvas: Canvas, viewRow: Int, gridRow: Int, cols: Int) {
         var col = 0
         while (col < cols) {
+            if (screen.isSpacer(gridRow, col)) {
+                col++
+                continue
+            }
+            val cellWidth = screen.widthAt(gridRow, col).coerceAtLeast(1)
             val fg = screen.fgAt(gridRow, col)
             val bg = screen.bgAt(gridRow, col)
             val bold = screen.boldAt(gridRow, col)
-            var end = col + 1
-            while (
-                end < cols &&
-                screen.fgAt(gridRow, end) == fg &&
-                screen.bgAt(gridRow, end) == bg &&
-                screen.boldAt(gridRow, end) == bold
-            ) {
-                end++
+            var end = col + cellWidth
+            if (cellWidth == 1) {
+                while (
+                    end < cols &&
+                    !screen.isSpacer(gridRow, end) &&
+                    screen.widthAt(gridRow, end) == 1 &&
+                    screen.fgAt(gridRow, end) == fg &&
+                    screen.bgAt(gridRow, end) == bg &&
+                    screen.boldAt(gridRow, end) == bold
+                ) {
+                    end++
+                }
             }
             val top = viewRow * cellH
             if (bg != TerminalScreen.DEFAULT_BG) {
@@ -290,7 +303,17 @@ class TerminalView @JvmOverloads constructor(
                 canvas.drawRect(col * cellW, top, end * cellW, top + cellH, bgPaint)
             }
             val text = buildString {
-                for (c in col until end) append(screen.charAt(gridRow, c))
+                var c = col
+                while (c < end) {
+                    if (screen.isSpacer(gridRow, c)) {
+                        c++
+                        continue
+                    }
+                    append(screen.charAt(gridRow, c))
+                    append(screen.combiningAt(gridRow, c))
+                    val w = screen.widthAt(gridRow, c).coerceAtLeast(1)
+                    c += w
+                }
             }
             if (text.any { it != ' ' }) {
                 textPaint.color = colorOf(fg)

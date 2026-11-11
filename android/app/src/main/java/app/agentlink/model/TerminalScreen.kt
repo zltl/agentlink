@@ -6,7 +6,10 @@ package app.agentlink.model
  * The grid, alternate buffer, scroll region, and SGR colors are enough for a
  * shell and for full-screen programs (cursor addressing, erase, alt screen).
  * Replies such as a cursor-position report are returned from [feed] so the
- * caller can write them back to the PTY. CJK characters occupy one cell.
+ * caller can write them back to the PTY.
+ *
+ * East Asian Wide/Fullwidth characters occupy two cells; combining marks
+ * attach to the preceding base cell and have width 0. See [CellWidth].
  */
 class TerminalScreen(rows: Int = 24, cols: Int = 80) {
     var rows: Int = rows.coerceIn(2, 200)
@@ -72,6 +75,11 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
         cursorRow = cursorRow.coerceIn(0, rows - 1)
         cursorCol = cursorCol.coerceIn(0, cols - 1)
         pendingWrap = false
+        primary.repairWideAtEdge()
+        alternate.repairWideAtEdge()
+        if (grid.width[cursorRow][cursorCol].toInt() == 0 && cursorCol > 0) {
+            cursorCol--
+        }
     }
 
     /** Apply terminal bytes. The returned bytes are replies the PTY must see. */
@@ -85,8 +93,19 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
 
     fun rowText(row: Int): String {
         if (row !in 0 until rows) return ""
-        val chars = CharArray(cols) { grid.ch[row][it] }
-        return String(chars).trimEnd()
+        val out = StringBuilder()
+        var col = 0
+        while (col < cols) {
+            val width = grid.width[row][col].toInt()
+            if (width == 0) {
+                col++
+                continue
+            }
+            out.append(grid.ch[row][col])
+            grid.marks[row][col]?.let { out.append(it) }
+            col += if (width <= 0) 1 else width
+        }
+        return out.toString().trimEnd()
     }
 
     fun fgAt(row: Int, col: Int): Int = if (inGrid(row, col)) grid.fg[row][col] else DEFAULT_FG
@@ -96,6 +115,27 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
     fun boldAt(row: Int, col: Int): Boolean = inGrid(row, col) && grid.bold[row][col]
 
     fun charAt(row: Int, col: Int): Char = if (inGrid(row, col)) grid.ch[row][col] else ' '
+
+    fun widthAt(row: Int, col: Int): Int = if (inGrid(row, col)) grid.width[row][col].toInt() else 1
+
+    fun isSpacer(row: Int, col: Int): Boolean = widthAt(row, col) == 0
+
+    fun combiningAt(row: Int, col: Int): String = if (inGrid(row, col)) grid.marks[row][col] ?: "" else ""
+
+    /** Column to draw the caret, snapped off a wide-character spacer. */
+    fun cursorDisplayCol(): Int {
+        var col = cursorCol.coerceIn(0, cols - 1)
+        if (widthAt(cursorRow, col) == 0 && col > 0 && widthAt(cursorRow, col - 1) == 2) {
+            col -= 1
+        }
+        return col
+    }
+
+    fun cursorDisplayWidth(): Int {
+        val col = cursorDisplayCol()
+        val width = widthAt(cursorRow, col)
+        return if (width == 2) 2 else 1
+    }
 
     private fun inGrid(row: Int, col: Int) = row in 0 until rows && col in 0 until cols
 
@@ -108,8 +148,7 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
                 pendingWrap = false
             }
             '\b'.code -> {
-                if (cursorCol > 0) cursorCol--
-                pendingWrap = false
+                backspace()
             }
             '\t'.code -> {
                 val next = ((cursorCol / 8) + 1) * 8
@@ -125,20 +164,104 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
     }
 
     private fun putChar(cp: Int, @Suppress("UNUSED_PARAMETER") replies: ArrayList<Byte>) {
+        val width = CellWidth.of(cp)
+        if (width == 0) {
+            attachCombining(cp)
+            return
+        }
         val ch = if (cp in 0x20..0xFFFF) cp.toChar() else '?'
         if (pendingWrap && wrap) {
             pendingWrap = false
             carriageReturn()
             index()
         }
+        if (width == 2 && cursorCol + 2 > cols) {
+            if (wrap) {
+                pendingWrap = false
+                carriageReturn()
+                index()
+            } else {
+                return
+            }
+        }
+        clearClusterAt(cursorRow, cursorCol)
+        if (width == 2 && cursorCol + 1 < cols) {
+            clearClusterAt(cursorRow, cursorCol + 1)
+        }
         grid.ch[cursorRow][cursorCol] = ch
         grid.fg[cursorRow][cursorCol] = fg
         grid.bg[cursorRow][cursorCol] = bg
         grid.bold[cursorRow][cursorCol] = bold
-        if (cursorCol + 1 >= cols) {
+        grid.width[cursorRow][cursorCol] = width.toByte()
+        grid.marks[cursorRow][cursorCol] = null
+        if (width == 2 && cursorCol + 1 < cols) {
+            grid.ch[cursorRow][cursorCol + 1] = ' '
+            grid.fg[cursorRow][cursorCol + 1] = fg
+            grid.bg[cursorRow][cursorCol + 1] = bg
+            grid.bold[cursorRow][cursorCol + 1] = bold
+            grid.width[cursorRow][cursorCol + 1] = 0
+            grid.marks[cursorRow][cursorCol + 1] = null
+        }
+        val next = cursorCol + width
+        if (next >= cols) {
             pendingWrap = true
+            cursorCol = cols - 1
         } else {
-            cursorCol++
+            cursorCol = next
+        }
+    }
+
+    private fun attachCombining(cp: Int) {
+        if (cp !in 0x20..0xFFFF) return
+        val mark = cp.toChar().toString()
+        val base = baseCellForCombining() ?: return
+        val existing = grid.marks[base.first][base.second] ?: ""
+        if (existing.length < 8) {
+            grid.marks[base.first][base.second] = existing + mark
+        }
+    }
+
+    private fun baseCellForCombining(): Pair<Int, Int>? {
+        if (pendingWrap) {
+            var col = cols - 1
+            while (col >= 0 && grid.width[cursorRow][col].toInt() == 0) col--
+            if (col >= 0) return cursorRow to col
+        }
+        var row = cursorRow
+        var col = cursorCol - 1
+        if (col < 0 && row > 0) {
+            row--
+            col = cols - 1
+        }
+        if (col < 0) return null
+        if (grid.width[row][col].toInt() == 0 && col > 0) col--
+        if (col < 0) return null
+        return row to col
+    }
+
+    private fun clearClusterAt(row: Int, col: Int) {
+        if (!inGrid(row, col)) return
+        var start = col
+        if (grid.width[row][col].toInt() == 0 && col > 0 && grid.width[row][col - 1].toInt() == 2) {
+            start = col - 1
+        }
+        val width = grid.width[row][start].toInt().coerceAtLeast(1)
+        for (c in start until (start + width).coerceAtMost(cols)) {
+            grid.ch[row][c] = ' '
+            grid.fg[row][c] = fg
+            grid.bg[row][c] = bg
+            grid.bold[row][c] = false
+            grid.width[row][c] = 1
+            grid.marks[row][c] = null
+        }
+    }
+
+    private fun backspace() {
+        pendingWrap = false
+        if (cursorCol <= 0) return
+        cursorCol--
+        if (grid.width[cursorRow][cursorCol].toInt() == 0 && cursorCol > 0) {
+            cursorCol--
         }
     }
 
@@ -330,6 +453,14 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
                 grid.fg[row][col] = fg
                 grid.bg[row][col] = bg
                 grid.bold[row][col] = false
+                grid.width[row][col] = 1
+                grid.marks[row][col] = null
+            }
+            if (start > 0 && grid.width[row][start - 1].toInt() == 2) {
+                // A wide character lost its spacer; drop the dangling start.
+                grid.ch[row][start - 1] = ' '
+                grid.width[row][start - 1] = 1
+                grid.marks[row][start - 1] = null
             }
         }
     }
@@ -522,16 +653,34 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
         var fg: Array<IntArray> = Array(rows) { IntArray(cols) { DEFAULT_FG } }
         var bg: Array<IntArray> = Array(rows) { IntArray(cols) { DEFAULT_BG } }
         var bold: Array<BooleanArray> = Array(rows) { BooleanArray(cols) }
+        var width: Array<ByteArray> = Array(rows) { ByteArray(cols) { 1 } }
+        var marks: Array<Array<String?>> = Array(rows) { arrayOfNulls(cols) }
 
         fun resize(rows: Int, cols: Int) {
             val nextCh = Array(rows) { r -> CharArray(cols) { c -> if (r < ch.size && c < ch[r].size) ch[r][c] else ' ' } }
             val nextFg = Array(rows) { r -> IntArray(cols) { c -> if (r < fg.size && c < fg[r].size) fg[r][c] else DEFAULT_FG } }
             val nextBg = Array(rows) { r -> IntArray(cols) { c -> if (r < bg.size && c < bg[r].size) bg[r][c] else DEFAULT_BG } }
             val nextBold = Array(rows) { r -> BooleanArray(cols) { c -> r < bold.size && c < bold[r].size && bold[r][c] } }
+            val nextWidth = Array(rows) { r -> ByteArray(cols) { c -> if (r < width.size && c < width[r].size) width[r][c] else 1 } }
+            val nextMarks = Array(rows) { r -> Array(cols) { c -> if (r < marks.size && c < marks[r].size) marks[r][c] else null } }
             ch = nextCh
             fg = nextFg
             bg = nextBg
             bold = nextBold
+            width = nextWidth
+            marks = nextMarks
+            repairWideAtEdge()
+        }
+
+        fun repairWideAtEdge() {
+            for (row in ch.indices) {
+                val last = ch[row].lastIndex
+                if (last >= 0 && width[row][last].toInt() == 2) {
+                    ch[row][last] = ' '
+                    width[row][last] = 1
+                    marks[row][last] = null
+                }
+            }
         }
 
         fun clear() {
@@ -540,6 +689,8 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
                 fg[row].fill(DEFAULT_FG)
                 bg[row].fill(DEFAULT_BG)
                 bold[row].fill(false)
+                width[row].fill(1)
+                marks[row].fill(null)
             }
         }
 
@@ -549,16 +700,22 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
             val savedFg = fg[top]
             val savedBg = bg[top]
             val savedBold = bold[top]
+            val savedWidth = width[top]
+            val savedMarks = marks[top]
             for (row in top until bottom) {
                 ch[row] = ch[row + 1]
                 fg[row] = fg[row + 1]
                 bg[row] = bg[row + 1]
                 bold[row] = bold[row + 1]
+                width[row] = width[row + 1]
+                marks[row] = marks[row + 1]
             }
             ch[bottom] = savedCh
             fg[bottom] = savedFg
             bg[bottom] = savedBg
             bold[bottom] = savedBold
+            width[bottom] = savedWidth
+            marks[bottom] = savedMarks
             blank(bottom)
         }
 
@@ -568,16 +725,22 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
             val savedFg = fg[bottom]
             val savedBg = bg[bottom]
             val savedBold = bold[bottom]
+            val savedWidth = width[bottom]
+            val savedMarks = marks[bottom]
             for (row in bottom downTo top + 1) {
                 ch[row] = ch[row - 1]
                 fg[row] = fg[row - 1]
                 bg[row] = bg[row - 1]
                 bold[row] = bold[row - 1]
+                width[row] = width[row - 1]
+                marks[row] = marks[row - 1]
             }
             ch[top] = savedCh
             fg[top] = savedFg
             bg[top] = savedBg
             bold[top] = savedBold
+            width[top] = savedWidth
+            marks[top] = savedMarks
             blank(top)
         }
 
@@ -591,38 +754,69 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
 
         fun deleteChars(row: Int, col: Int, count: Int) {
             if (row !in ch.indices) return
+            var start = col.coerceIn(0, ch[row].lastIndex)
+            if (width[row][start].toInt() == 0 && start > 0) start--
             val n = count.coerceAtLeast(0)
             val line = ch[row]
-            for (c in col until line.size) {
+            for (c in start until line.size) {
                 val src = c + n
                 line[c] = if (src < line.size) line[src] else ' '
                 fg[row][c] = if (src < line.size) fg[row][src] else DEFAULT_FG
                 bg[row][c] = if (src < line.size) bg[row][src] else DEFAULT_BG
                 bold[row][c] = src < line.size && bold[row][src]
+                width[row][c] = if (src < line.size) width[row][src] else 1
+                marks[row][c] = if (src < line.size) marks[row][src] else null
+            }
+            repairWideAtEdge()
+            if (start > 0 && width[row][start].toInt() == 0) {
+                ch[row][start - 1] = ' '
+                width[row][start - 1] = 1
+                marks[row][start - 1] = null
             }
         }
 
         fun insertChars(row: Int, col: Int, count: Int) {
             if (row !in ch.indices) return
+            val start = col.coerceIn(0, ch[row].size)
             val n = count.coerceAtLeast(0)
             val line = ch[row]
-            for (c in line.lastIndex downTo col) {
+            for (c in line.lastIndex downTo start) {
                 val src = c - n
-                line[c] = if (src >= col) line[src] else ' '
-                fg[row][c] = if (src >= col) fg[row][src] else DEFAULT_FG
-                bg[row][c] = if (src >= col) bg[row][src] else DEFAULT_BG
-                bold[row][c] = src >= col && bold[row][src]
+                line[c] = if (src >= start) line[src] else ' '
+                fg[row][c] = if (src >= start) fg[row][src] else DEFAULT_FG
+                bg[row][c] = if (src >= start) bg[row][src] else DEFAULT_BG
+                bold[row][c] = src >= start && bold[row][src]
+                width[row][c] = if (src >= start) width[row][src] else 1
+                marks[row][c] = if (src >= start) marks[row][src] else null
             }
+            for (c in start until (start + n).coerceAtMost(line.size)) {
+                line[c] = ' '
+                fg[row][c] = DEFAULT_FG
+                bg[row][c] = DEFAULT_BG
+                bold[row][c] = false
+                width[row][c] = 1
+                marks[row][c] = null
+            }
+            repairWideAtEdge()
         }
 
         fun eraseChars(row: Int, col: Int, count: Int) {
             if (row !in ch.indices) return
-            val end = (col + count).coerceAtMost(ch[row].size)
-            for (c in col until end) {
+            var start = col.coerceAtLeast(0)
+            if (start < ch[row].size && width[row][start].toInt() == 0 && start > 0) start--
+            val end = (start + count).coerceAtMost(ch[row].size)
+            for (c in start until end) {
                 ch[row][c] = ' '
                 fg[row][c] = DEFAULT_FG
                 bg[row][c] = DEFAULT_BG
                 bold[row][c] = false
+                width[row][c] = 1
+                marks[row][c] = null
+            }
+            if (end < ch[row].size && width[row][end].toInt() == 0) {
+                ch[row][end] = ' '
+                width[row][end] = 1
+                marks[row][end] = null
             }
         }
 
@@ -631,6 +825,8 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
             fg[row] = IntArray(fg[row].size) { DEFAULT_FG }
             bg[row] = IntArray(bg[row].size) { DEFAULT_BG }
             bold[row] = BooleanArray(bold[row].size)
+            width[row] = ByteArray(width[row].size) { 1 }
+            marks[row] = arrayOfNulls(marks[row].size)
         }
     }
 

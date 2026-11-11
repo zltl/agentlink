@@ -15,7 +15,9 @@ class TerminalScreenPumpTest {
         assertEquals(0, screen.cursorCol)
         screen.feed(byteArrayOf(ni[1], ni[2]))
         assertEquals("你", screen.rowText(0))
-        assertEquals(1, screen.cursorCol)
+        assertEquals(2, screen.cursorCol)
+        assertEquals(2, screen.widthAt(0, 0))
+        assertEquals(0, screen.widthAt(0, 1))
     }
 
     @Test
@@ -66,6 +68,89 @@ class TerminalScreenPumpTest {
         assertEquals(30L, PtyClientPolicy.POLL_IDLE_MS)
         assertEquals(32, PtyClientPolicy.MAX_DRAIN_EVENTS)
         assertEquals(256, PtyClientPolicy.WRITE_QUEUE_CAP)
+    }
+
+    @Test
+    fun cjkIdeographOccupiesTwoCellsAndAsciiFollows() {
+        val screen = TerminalScreen(3, 8)
+        screen.feed("中A".encodeToByteArray())
+        assertEquals("中A", screen.rowText(0))
+        assertEquals(2, screen.widthAt(0, 0))
+        assertEquals(0, screen.widthAt(0, 1))
+        assertEquals(1, screen.widthAt(0, 2))
+        assertEquals(3, screen.cursorCol)
+        assertEquals('中', screen.charAt(0, 0))
+        assertEquals('A', screen.charAt(0, 2))
+    }
+
+    @Test
+    fun combiningMarkStaysInTheBaseCell() {
+        val screen = TerminalScreen(3, 8)
+        screen.feed("e".encodeToByteArray())
+        screen.feed("\u0301".encodeToByteArray())
+        assertEquals(1, screen.cursorCol)
+        assertEquals(1, screen.widthAt(0, 0))
+        assertEquals("\u0301", screen.combiningAt(0, 0))
+        assertTrue(screen.rowText(0).startsWith("e"))
+        assertTrue(screen.rowText(0).contains("\u0301") || screen.rowText(0).startsWith("é"))
+    }
+
+    @Test
+    fun backspaceOverAWideCharacterLandsOnItsStart() {
+        val screen = TerminalScreen(3, 8)
+        screen.feed("中A".encodeToByteArray())
+        assertEquals(3, screen.cursorCol)
+        screen.feed(byteArrayOf('\b'.code.toByte()))
+        assertEquals(2, screen.cursorCol)
+        screen.feed(byteArrayOf('\b'.code.toByte()))
+        assertEquals(0, screen.cursorCol)
+        assertEquals(0, screen.cursorDisplayCol())
+        assertEquals(2, screen.cursorDisplayWidth())
+        screen.feed("X".encodeToByteArray())
+        // Replacing a wide cell leaves a one-column gap, as in a typical VT.
+        assertEquals('X', screen.charAt(0, 0))
+        assertEquals('A', screen.charAt(0, 2))
+        assertEquals(1, screen.cursorCol)
+    }
+
+    @Test
+    fun enterMovesToTheNextLineAndKeepsWideText() {
+        val screen = TerminalScreen(4, 8)
+        screen.feed("你好".encodeToByteArray())
+        assertEquals(4, screen.cursorCol)
+        screen.feed(byteArrayOf('\r'.code.toByte(), '\n'.code.toByte()))
+        assertEquals(1, screen.cursorRow)
+        assertEquals(0, screen.cursorCol)
+        assertEquals("你好", screen.rowText(0))
+        screen.feed("ok".encodeToByteArray())
+        assertEquals("ok", screen.rowText(1))
+    }
+
+    @Test
+    fun resizeKeepsCjkAndRepairsADanglingWideCellAtTheEdge() {
+        val screen = TerminalScreen(3, 8)
+        screen.feed("你好世界".encodeToByteArray())
+        assertEquals("你好世界", screen.rowText(0))
+        screen.resize(3, 3)
+        assertEquals(3, screen.cols)
+        // A wide character cannot start in the last column.
+        assertTrue(screen.cursorCol in 0 until screen.cols)
+        val text = screen.rowText(0)
+        assertTrue("row after shrink: $text", text.startsWith("你"))
+        assertTrue(!text.contains("好") || screen.widthAt(0, 0) == 2)
+    }
+}
+
+class CellWidthTest {
+    @Test
+    fun unicode16WideAndCombiningAndAmbiguous() {
+        assertEquals(2, CellWidth.of('你'.code))
+        assertEquals(2, CellWidth.of('中'.code))
+        assertEquals(2, CellWidth.of('　'.code)) // fullwidth space
+        assertEquals(1, CellWidth.of('A'.code))
+        assertEquals(1, CellWidth.of('©'.code)) // ambiguous
+        assertEquals(0, CellWidth.of(0x0301))
+        assertEquals(0, CellWidth.of(0xFE0F))
     }
 }
 

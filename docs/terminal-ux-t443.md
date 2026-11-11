@@ -488,3 +488,20 @@ Confirmed on both 0111 and 0133: `Viewer::close` at
 contain this fix and has not been GUI-tested for exit. Close/Drop now
 signal without parking the current runtime; tests cover close/drop
 inside a tokio context. See `docs/controller-layout-t444.md`.
+
+## Android CJK cell width, combining marks, and IME (isolated)
+
+This is the in-tree Android terminal, not the desktop egui window.
+`CellWidth` answers how many columns a code point uses, from Unicode
+16.0.0 EastAsianWidth W/F (width 2), Mn/Me plus a small format /
+variation-selector set (width 0), and Ambiguous as width 1. Combining
+marks attach to the preceding base cell. `TerminalView` draws wide
+cells and the caret with those widths. IME preview stays local until
+commit (`ImeComposing`); that is unit-tested, not a real-device IME
+acceptance.
+
+Host unit tests and a debug-signed `:app:assembleDebug` APK are the
+deliverable. The APK is not installed. No phone, no ADB, no change to
+the user app signing key. Native `libagentlink_ffi.so` is rebuilt with
+`android/build-native.sh` for arm64-v8a, armeabi-v7a, and x86_64 so the
+APK matches current ffi/core, not the 00:21 ba0eae8 objects.
