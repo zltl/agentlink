@@ -877,7 +877,9 @@ impl ControllerApp {
                 self.link = "connected · mock".into();
                 self.desk_connect_started = None;
             }
-            self.window_title = self.compute_window_title();
+            // Do not touch `window_title` here — `sync_window_title` owns the
+            // cache vs ViewportCommand::Title compare. Updating the cache first
+            // suppressed the native Title command (stale "sufa" after Back).
             return;
         }
         self.link = if control {
@@ -900,7 +902,7 @@ impl ControllerApp {
             id: node.id.clone(),
             name: node.name.clone(),
         };
-        self.window_title = self.compute_window_title();
+        // Title sync is deferred to `sync_window_title` (see mock branch).
     }
 
     fn live_scale_for_monitor(&self) -> f32 {
@@ -959,7 +961,8 @@ impl ControllerApp {
         self.desk_stats_open = false;
         self.screen = Screen::Machines;
         self.link = "relay".into();
-        self.window_title = self.compute_window_title();
+        // Leave `window_title` alone — `sync_window_title` must see a change
+        // so it can emit ViewportCommand::Title (clear / no-session default).
     }
 
     fn restart_live(&mut self, node: &str) {
@@ -1068,7 +1071,12 @@ impl ControllerApp {
                     format!("{name} — agentlink")
                 }
             }
-            _ => "agentlink controller".into(),
+            Screen::Terminal { name, .. } => format!("{name} — terminal — agentlink"),
+            Screen::Files { name, .. } => format!("{name} — files — agentlink"),
+            // Login / Restoring / Machines: no active session.
+            Screen::Login | Screen::Restoring | Screen::Machines => {
+                "agentlink controller".into()
+            }
         }
     }
 
@@ -4118,6 +4126,11 @@ mod geometry_tests {
         }
 
         fn pass(&mut self) {
+            let _ = self.pass_output();
+        }
+
+        /// One UI pass; returns egui viewport commands emitted this frame.
+        fn pass_output(&mut self) -> egui::FullOutput {
             let (w, h) = self.app.debug_window_size();
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -4130,9 +4143,44 @@ mod geometry_tests {
                 ..Default::default()
             };
             self.time += 1.0 / 60.0;
-            let _ = self.ctx.run(raw, |ctx| {
+            self.ctx.run(raw, |ctx| {
                 self.app.ui_frame(ctx);
-            });
+            })
+        }
+
+        fn titles_from(output: &egui::FullOutput) -> Vec<String> {
+            let mut titles = Vec::new();
+            for viewport in output.viewport_output.values() {
+                for cmd in &viewport.commands {
+                    if let egui::ViewportCommand::Title(title) = cmd {
+                        titles.push(title.clone());
+                    }
+                }
+            }
+            titles
+        }
+
+        fn min_inner_sizes_from(output: &egui::FullOutput) -> Vec<[f32; 2]> {
+            let mut sizes = Vec::new();
+            for viewport in output.viewport_output.values() {
+                for cmd in &viewport.commands {
+                    if let egui::ViewportCommand::MinInnerSize(size) = cmd {
+                        sizes.push([size.x, size.y]);
+                    }
+                }
+            }
+            sizes
+        }
+
+        fn open_sufa_desktop(&mut self) {
+            let desk = self
+                .app
+                .nodes
+                .iter()
+                .find(|n| n.id == "sufa")
+                .cloned()
+                .expect("sufa");
+            self.app.open_desktop(&desk, false);
         }
 
         fn populate_files(&mut self) {
@@ -4483,5 +4531,176 @@ mod geometry_tests {
             f32::abs(vis[2] - raw[2]) > 1.0,
             "partial label fixture must differ raw vs vis"
         );
+    }
+
+    /// Parent GUI: readonly sufa Desktop → Back → quant67 Terminal left the
+    /// native title stuck on "sufa — …". Transitions used to assign
+    /// `window_title` before `sync_window_title`, so the compare suppressed
+    /// ViewportCommand::Title. Assert the *outgoing* Title commands.
+    #[test]
+    fn native_title_commands_follow_session_and_clear_on_back() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        harn.pass();
+        assert_eq!(harn.app.window_title, "agentlink controller");
+
+        harn.open_sufa_desktop();
+        let out = harn.pass_output();
+        let titles = Harness::titles_from(&out);
+        assert!(
+            titles.iter().any(|t| t.starts_with("sufa —")),
+            "expected Title for sufa desktop, got {titles:?}; cache={}",
+            harn.app.window_title
+        );
+        assert!(
+            harn.app.window_title.starts_with("sufa —"),
+            "cache should match desktop: {}",
+            harn.app.window_title
+        );
+
+        // No-session: Back must emit the default title (not leave native on sufa).
+        harn.app.back_to_machines();
+        let out = harn.pass_output();
+        let titles = Harness::titles_from(&out);
+        assert_eq!(
+            titles,
+            vec!["agentlink controller".to_string()],
+            "Back must emit Title clear; cache={}",
+            harn.app.window_title
+        );
+
+        // Old → new node: quant67 Terminal must emit a quant67 Title.
+        harn.open_quant_terminal();
+        let out = harn.pass_output();
+        let titles = Harness::titles_from(&out);
+        assert_eq!(
+            titles,
+            vec!["quant67 — terminal — agentlink".to_string()],
+            "terminal Title must name quant67; cache={}",
+            harn.app.window_title
+        );
+
+        // Stable frame: no redundant Title when unchanged.
+        let out = harn.pass_output();
+        assert!(
+            Harness::titles_from(&out).is_empty(),
+            "unchanged session must not re-emit Title"
+        );
+
+        // Terminal → Files on the same node still changes the mode suffix.
+        let node = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "quant67")
+            .cloned()
+            .unwrap();
+        harn.app.open_files(&node);
+        let out = harn.pass_output();
+        assert_eq!(
+            Harness::titles_from(&out),
+            vec!["quant67 — files — agentlink".to_string()]
+        );
+
+        // Files → different node Terminal.
+        let sufa = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "sufa")
+            .cloned()
+            .unwrap();
+        harn.app.open_terminal(&sufa);
+        let out = harn.pass_output();
+        assert_eq!(
+            Harness::titles_from(&out),
+            vec!["sufa — terminal — agentlink".to_string()]
+        );
+
+        harn.app.back_to_machines();
+        let out = harn.pass_output();
+        assert_eq!(
+            Harness::titles_from(&out),
+            vec!["agentlink controller".to_string()]
+        );
+    }
+
+    /// Premature cache update used to hide Title: open_desktop assigning
+    /// window_title before sync made the compare a no-op. Mutation guard.
+    #[test]
+    fn title_sync_still_emits_when_cache_was_not_pre_assigned() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        harn.pass();
+        // Simulate the old bug: cache already matches the new screen title
+        // before the first sync after transition.
+        harn.open_sufa_desktop();
+        harn.app.window_title = harn.app.compute_window_title();
+        let out = harn.pass_output();
+        assert!(
+            Harness::titles_from(&out).is_empty(),
+            "pre-assigned cache correctly suppresses Title (documents the bug class)"
+        );
+        // A real transition that does not pre-assign must emit.
+        harn.app.back_to_machines();
+        // Intentionally leave cache as the desktop title (no pre-assign).
+        let out = harn.pass_output();
+        assert_eq!(
+            Harness::titles_from(&out),
+            vec!["agentlink controller".to_string()],
+            "sync must emit when only screen changed"
+        );
+    }
+
+    /// Offscreen raw viewport at the declared 640×480 minimum and at true
+    /// 725. Layout must stay usable; we must not emit MinInnerSize that would
+    /// raise the native floor. Does **not** claim the parent GUI's inability
+    /// to drag below ≈1080 is fixed (WM/drag may still pin).
+    #[test]
+    fn offscreen_640_and_725_session_geometry_without_raising_min_inner() {
+        for &(w, h) in &[(640.0_f32, 480.0_f32), (725.0_f32, 480.0_f32), (725.0_f32, 800.0_f32)]
+        {
+            let mut harn = Harness::new(w, h);
+            harn.pass();
+            harn.open_quant_terminal();
+            let out = harn.pass_output();
+            assert!(
+                Harness::min_inner_sizes_from(&out).is_empty(),
+                "app must not emit MinInnerSize at {w}x{h}; got {:?}",
+                Harness::min_inner_sizes_from(&out)
+            );
+            harn.pass();
+            let expect_rail = model::machine_rail_visible(w);
+            assert_session_clip_geometry(&harn.app.debug_layout, w, h, expect_rail);
+
+            let node = harn.app.nodes[0].clone();
+            harn.app.open_files(&node);
+            harn.populate_files();
+            let out = harn.pass_output();
+            assert!(
+                Harness::min_inner_sizes_from(&out).is_empty(),
+                "files session must not emit MinInnerSize at {w}x{h}"
+            );
+            harn.pass();
+            assert_session_clip_geometry(&harn.app.debug_layout, w, h, expect_rail);
+            assert!(
+                item_rect(&harn.app.debug_layout, "editor")
+                    .is_some_and(|r| r[2] > 40.0 && r[3] > 24.0),
+                "editor must remain visible at declared min {w}x{h}: {:?}",
+                item_rect(&harn.app.debug_layout, "editor")
+            );
+
+            // Page/editor must not report a raw width that exceeds the window
+            // (overflow that could pin a native resize in some WMs).
+            let page = harn.app.debug_layout.page_rect;
+            assert!(
+                page[0] + page[2] <= w + 1.0,
+                "page overflows window width at {w}: {page:?}"
+            );
+            if let Some(editor) = item_rect(&harn.app.debug_layout, "editor") {
+                assert!(
+                    editor[0] + editor[2] <= w + 1.0,
+                    "editor overflows window width at {w}: {editor:?}"
+                );
+            }
+        }
     }
 }
