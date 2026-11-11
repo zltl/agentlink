@@ -21,6 +21,8 @@ mod tray;
 mod tray_win;
 mod controller;
 mod grant_local;
+mod identity_cmd;
+mod status_cmd;
 mod update;
 mod version;
 
@@ -772,6 +774,18 @@ enum Command {
         #[command(subcommand)]
         action: signature::InternalAction,
     },
+    /// Offline diagnosis of identity, relay transport, and local grants.
+    ///
+    /// Does not contact the relay. Exit 0 when the command itself succeeds.
+    /// A relay session is not a grant. Never prints private keys or tokens.
+    Status,
+    /// Offline local identity. Not a grant and not a relay login.
+    ///
+    /// `grant offer` remains the way to produce a controller card.
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
     /// Owner-signed grants for end-to-end operations on a node.
     Grant {
         #[command(subcommand)]
@@ -782,6 +796,16 @@ enum Command {
         #[command(subcommand)]
         action: PortCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum IdentityAction {
+    /// Print the public id and fingerprint. Errors if the file is missing.
+    Show,
+    /// Create the identity file only when missing; otherwise re-read it.
+    Create,
+    /// Same as `create`: reuse a present file, never rotate, fail if corrupt.
+    Ensure,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1690,6 +1714,19 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
             )
             .await
         }
+        Command::Status => {
+            let dir = config_dir(cli)?;
+            let id_path = operator_identity_path(cli)?;
+            return status_cmd::run(&dir, &id_path, cli.json);
+        }
+        Command::Identity { action } => {
+            let path = operator_identity_path(cli)?;
+            return match action {
+                IdentityAction::Show => identity_cmd::show(&path, cli.json),
+                IdentityAction::Create => identity_cmd::create_or_ensure(&path, cli.json, "create"),
+                IdentityAction::Ensure => identity_cmd::create_or_ensure(&path, cli.json, "ensure"),
+            };
+        }
         Command::Grant { action } => grant_cmd(cli, action).await,
         Command::Port { action } => port_cmd(cli, action).await,
         other => {
@@ -1744,6 +1781,9 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                     Ok(0)
                 }
                 Command::Grant { .. } => unreachable!("grant is handled before connecting"),
+                Command::Status | Command::Identity { .. } => {
+                    unreachable!("status/identity are handled before connecting")
+                }
                 Command::Port { .. } => unreachable!("port is handled before connecting"),
                 Command::Ls { node, path } => {
                     if let Some(node) = node {
@@ -2676,6 +2716,8 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                 | Command::Update(_)
                 | Command::View { .. }
                 | Command::Guide { .. }
+                | Command::Status
+                | Command::Identity { .. }
                 | Command::Internal { .. }
                 | Command::Bench { .. } => unreachable!(),
             }
