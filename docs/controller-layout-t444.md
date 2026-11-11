@@ -223,3 +223,60 @@ A later correctness pass (terminal backpressure, same branch) ran
 sources. That is a compile result, not a visual or device acceptance
 of this UI slice. No new screenshots. No real phone. The debug APK
 was not installed.
+
+## t447 desktop Controller — real GUI acceptance (2026-11-12 00:55 Asia/Shanghai)
+
+The 0050 candidate was `ba0eae8`, binary at
+`/workspace/agentlink-t427-recovery/20261112-0050-t446-controller-candidate/`.
+Parent computerUse tested the **desktop** window, not the Android typography
+pass. Source in that build already had `action_button` labels `Terminal`,
+`Files`, and `Desktop`, plus a `View`/`Control` **mode toggle**. The live
+window did not match a naive reading of those names.
+
+Evidence (read-only screenshots, not driven from this worker):
+
+- List: `/tmp/computer-use/sand-subagent-92852702-680e-7005-f8ec-719909f8daac.9d3e7161-36b7-4756-bf2f-dc8310a62ac0.webp`
+  — visible card actions were **Terminal / Control / View**. Files and Desktop
+  were not on screen. Cards sat in two columns with large vertical gaps
+  between rows. Headless nodes (quant67, tc-cn, tc-external) still showed
+  Control/View. Signed in as ltl without a password (the earlier Sign in
+  flash was bootstrap, not a confirmed session-read defect).
+- Terminal: `...88f0fa95-8460-439f-aeab-1411ddcfe979.webp` — quant67 hostname
+  and whoami worked as root. The pane was a **line box** (“Enter sends the
+  line”), not a cell-grid emulator.
+- Control: `...9daa52c0-4ee1-40ea-8a03-cf56c1fff608.webp` — quant67 Control
+  became selected and stayed on Machines. No sub-page, no error.
+- sufa View: `...b9e541dc-454d-4842-92e4-2eedef685f4e.webp` — click stayed
+  on the list. No picture, no error, no portal prompt, no input capture.
+  Selecting View is **not** a desktop session.
+
+Cause, checked against `ba0eae8` source and that GUI:
+
+- `Control`/`View` were only `segmented_control` writing `self.control`.
+  They never called `open_desktop`. The real start button was the `Desktop`
+  action, which lived on the same horizontal row and was clipped, so testers
+  only saw Terminal plus the mode toggle.
+- `desktop_allowed(policy)` still drew the toggle on **headless** nodes.
+
+This revision is desktop Controller work, not an Android typography tweak:
+
+- Cards show wrapped **start** actions: `Terminal`, `Files`, and, when the
+  node is not headless, `View desktop` / `Control desktop`. Those last two
+  call `open_desktop` immediately (view-only vs keyboard+mouse). Headless
+  nodes do not get a fake desktop entry.
+- Card rows size to content so the leftover panel height is not turned into
+  huge gaps.
+- Saved session starts on **Restoring session…**, not a flashing Sign in
+  form. Ready with a user goes to Machines; failure goes to Sign in with
+  the error.
+- Terminal and Files keep a **Back to machines** button. Wide windows also
+  keep a left machine rail so a session does not swallow the list.
+- Files shows loading / empty states, directory listing, create folder, and
+  **New file**. The worker path (`Cmd::List` / `Read` / `Write` / `Mkdir`)
+  was already wired; the list entry was the missing piece.
+- Opening desktop still uses the existing connecting / failed chrome. The
+  mode toggle is gone, so a selected chip can no longer be mistaken for a
+  live session.
+
+Unit tests cover the visible button set. They do not replace a GUI retest
+of the new candidate.

@@ -409,3 +409,30 @@ Native APK / official script (2026-11-12 00:21–00:22 Asia/Shanghai):
   candidate**, not the earlier 19M APK that lacked the Agentlink
   library. **Not installed** on any device. No real-phone run, no
   screenshot, no hand-feel claim.
+
+## t447 desktop terminal emulator (2026-11-12 Asia/Shanghai)
+
+The 00:55 GUI test proved the quant67 shell was a real PTY (hostname / whoami
+as root) but still **line-oriented**. The desktop Controller now uses
+Alacritty’s VT/grid core and does not keep “Enter sends the line” as the
+primary input.
+
+### Official component (checked)
+
+- [`alacritty_terminal` 0.25.1](https://crates.io/crates/alacritty_terminal)
+  is the grid + VTE parser extracted from
+  [Alacritty](https://github.com/alacritty/alacritty) (Apache-2.0). Docs:
+  <https://docs.rs/alacritty_terminal/0.25.1/alacritty_terminal/term/struct.Term.html>.
+- We feed the **remote agentlink PTY** into `Processor::advance` / `Term`.
+  We do not spawn a local tty or SSH. The MIT crate `egui_term` was
+  considered; its backend is a local PTY, so only the Alacritty parser/grid
+  is reused. The egui painter is ours.
+- VS Code / xterm.js sources already listed above still apply for
+  flow-control and write-parsed framing in the shared core (t443). This
+  slice is the **desktop view**: cell grid, ANSI colors, cursor, resize,
+  per-key input, IME commit (preedit is not sent), Ctrl+Shift+C/V
+  copy/paste, CJK double-width cells.
+
+Tests (no window): byte order, 中 = two cells, split UTF-8 / split CSI,
+SGR + cursor address, backspace + resize, key encoding. A parent GUI retest
+on the new candidate is still required for focus, IME, and a full-screen TUI.

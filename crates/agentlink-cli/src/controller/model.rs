@@ -104,6 +104,110 @@ pub fn display_note(has_display: Option<bool>, policy: NodePolicy) -> Option<&'s
     None
 }
 
+/// Whether the machines card should offer desktop start buttons.
+/// Headless nodes never get a fake desktop entry, even when the account
+/// policy would allow a session on a machine that has a screen.
+pub fn show_desktop_starts(has_display: Option<bool>, policy: NodePolicy) -> bool {
+    match has_display {
+        Some(false) => false,
+        Some(true) => true,
+        None => desktop_allowed(policy),
+    }
+}
+
+pub fn view_desktop_action(online: bool, has_display: Option<bool>, policy: NodePolicy) -> Action {
+    desktop_action(online, has_display, policy)
+}
+
+pub fn control_desktop_action(
+    online: bool,
+    has_display: Option<bool>,
+    policy: NodePolicy,
+) -> Action {
+    let base = desktop_action(online, has_display, policy);
+    if !base.enabled {
+        return base;
+    }
+    if !policy.allows_remote_control() {
+        return Action {
+            enabled: false,
+            reason: "Control needs remote-control on this account. Use View desktop.",
+        };
+    }
+    Action {
+        enabled: true,
+        reason: "Open the desktop with keyboard and mouse",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardButtonKind {
+    Terminal,
+    Files,
+    ViewDesktop,
+    ControlDesktop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardButton {
+    pub label: &'static str,
+    pub kind: CardButtonKind,
+    pub enabled: bool,
+    pub reason: &'static str,
+}
+
+/// Visible primary actions on a machines card. Labels are the real start
+/// actions. There is no silent View/Control mode toggle — those words only
+/// appear as "View desktop" / "Control desktop", and only when the node
+/// actually has (or may have) a screen.
+pub fn card_buttons(
+    online: bool,
+    has_display: Option<bool>,
+    policy: NodePolicy,
+) -> Vec<CardButton> {
+    let terminal = terminal_action(online, policy);
+    let files = files_action(online, policy);
+    let mut out = vec![
+        CardButton {
+            label: "Terminal",
+            kind: CardButtonKind::Terminal,
+            enabled: terminal.enabled,
+            reason: terminal.reason,
+        },
+        CardButton {
+            label: "Files",
+            kind: CardButtonKind::Files,
+            enabled: files.enabled,
+            reason: files.reason,
+        },
+    ];
+    if !show_desktop_starts(has_display, policy) {
+        return out;
+    }
+    let view = view_desktop_action(online, has_display, policy);
+    let control = control_desktop_action(online, has_display, policy);
+    out.push(CardButton {
+        label: "View desktop",
+        kind: CardButtonKind::ViewDesktop,
+        enabled: view.enabled,
+        reason: view.reason,
+    });
+    out.push(CardButton {
+        label: "Control desktop",
+        kind: CardButtonKind::ControlDesktop,
+        enabled: control.enabled,
+        reason: control.reason,
+    });
+    out
+}
+
+/// True when the config file holds a refresh token (value is not logged).
+pub fn has_saved_session(refresh_token: Option<&str>) -> bool {
+    refresh_token
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// `host` beats `stun`, which beats `turn`. Empty input is the relay socket.
 pub fn connection_label(raw: &str) -> &'static str {
     let lower = raw.to_ascii_lowercase();
@@ -125,7 +229,13 @@ pub fn asks_for_totp(message: &str) -> bool {
     lower.contains("totp") || lower.contains("authenticator")
 }
 
-pub fn login_problem(username: &str, password: &str, relay: &str, pin: &str, trust: &str) -> Option<String> {
+pub fn login_problem(
+    username: &str,
+    password: &str,
+    relay: &str,
+    pin: &str,
+    trust: &str,
+) -> Option<String> {
     if username.trim().is_empty() {
         return Some("Username is required.".into());
     }
@@ -362,6 +472,51 @@ mod tests {
             display_note(Some(false), full),
             Some("Headless. Shell and files only.")
         );
+        let buttons = card_buttons(true, Some(false), full);
+        let labels: Vec<_> = buttons.iter().map(|b| b.label).collect();
+        assert_eq!(labels, ["Terminal", "Files"]);
+        assert!(!labels
+            .iter()
+            .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop")));
+    }
+
+    #[test]
+    fn card_buttons_start_desktop_instead_of_silent_mode_toggle() {
+        let full = NodePolicy::full();
+        let buttons = card_buttons(true, Some(true), full);
+        let labels: Vec<_> = buttons.iter().map(|b| b.label).collect();
+        assert_eq!(
+            labels,
+            ["Terminal", "Files", "View desktop", "Control desktop"]
+        );
+        assert!(buttons.iter().all(|b| b.enabled));
+        // Bare "View"/"Control" must not appear — those were a mode toggle
+        // that stayed on the machines list with no session and no error.
+        assert!(!labels.contains(&"View"));
+        assert!(!labels.contains(&"Control"));
+        assert!(!labels.contains(&"Desktop"));
+
+        let exec = NodePolicy::exec();
+        let limited = card_buttons(true, Some(true), exec);
+        let desk: Vec<_> = limited
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.kind,
+                    CardButtonKind::ViewDesktop | CardButtonKind::ControlDesktop
+                )
+            })
+            .collect();
+        assert_eq!(desk.len(), 2);
+        assert!(desk.iter().all(|b| !b.enabled));
+    }
+
+    #[test]
+    fn saved_session_looks_only_at_token_presence() {
+        assert!(has_saved_session(Some("present")));
+        assert!(!has_saved_session(Some("")));
+        assert!(!has_saved_session(Some("   ")));
+        assert!(!has_saved_session(None));
     }
 
     #[test]

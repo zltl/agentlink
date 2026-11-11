@@ -20,11 +20,11 @@ use super::chrome::{
     stats_line, text_advance, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
     BAR_HEIGHT,
 };
-use super::theme;
 use super::model::{
-    self, connection_label, desktop_action, desktop_allowed, display_note, files_action,
-    terminal_action, Action, Scrollback,
+    self, card_buttons, connection_label, display_note, has_saved_session, Action, CardButtonKind,
 };
+use super::term::Emulator;
+use super::theme;
 use super::viewport::{hit_content, native_zoom, point_to_fraction, viewport_rect};
 use super::worker::{Cmd, LiveHud, MonitorEntry, Picture, Shared, UiEvent};
 
@@ -59,7 +59,6 @@ impl DebugLayout {
 fn rect_xywh(rect: egui::Rect) -> [f32; 4] {
     [rect.min.x, rect.min.y, rect.width(), rect.height()]
 }
-
 
 /// One debug-bus request delivered from the Unix socket thread.
 pub enum DebugInbox {
@@ -108,6 +107,7 @@ pub struct TrayFlags {
 
 enum Screen {
     Login,
+    Restoring,
     Machines,
     Terminal { id: String, name: String },
     Files { id: String, name: String },
@@ -142,13 +142,14 @@ pub struct ControllerApp {
     error: String,
     notice: String,
     pins: Vec<String>,
-    terminal: Scrollback,
-    term_input: String,
+    terminal: Emulator,
     term_size: (u16, u16),
     file_path: String,
     files: Vec<agentlink_core::DirEntry>,
+    files_loading: bool,
     editor: Option<Editor>,
     folder_name: String,
+    new_file_name: String,
     link: String,
     picture: Option<Picture>,
     texture: Option<egui::TextureHandle>,
@@ -327,11 +328,18 @@ impl ControllerApp {
         flags: TrayFlags,
     ) -> Self {
         let file = agentlink_core::config::load_file(&config_dir).unwrap_or_default();
-        let relay = file.relay.filter(|value| !value.is_empty()).unwrap_or_default();
+        let relay = file
+            .relay
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default();
         let pin = file.fingerprint.unwrap_or_default();
         let trust = file.trust.unwrap_or_default();
         let node_line = node_summary(&data_dir, &config_dir);
         let autostart = start_on_login();
+        let saved_session = {
+            let file = agentlink_core::config::load_file(&config_dir).unwrap_or_default();
+            has_saved_session(file.refresh_token.as_deref())
+        };
         Self {
             tx,
             shared,
@@ -339,7 +347,11 @@ impl ControllerApp {
             data_dir,
             tray,
             flags,
-            screen: Screen::Login,
+            screen: if saved_session {
+                Screen::Restoring
+            } else {
+                Screen::Login
+            },
             username: String::new(),
             password: String::new(),
             totp: String::new(),
@@ -355,13 +367,14 @@ impl ControllerApp {
             error: String::new(),
             notice: String::new(),
             pins: Vec::new(),
-            terminal: Scrollback::default(),
-            term_input: String::new(),
+            terminal: Emulator::new(24, 80),
             term_size: (24, 80),
             file_path: ".".into(),
             files: Vec::new(),
+            files_loading: false,
             editor: None,
             folder_name: String::new(),
+            new_file_name: String::new(),
             link: "relay".into(),
             picture: None,
             texture: None,
@@ -455,14 +468,14 @@ impl ControllerApp {
             match event {
                 UiEvent::Ready { user } => {
                     self.user = user.clone();
-                    self.screen = if user.is_some() {
-                        Screen::Machines
-                    } else {
-                        Screen::Login
-                    };
                     if user.is_some() {
+                        if matches!(self.screen, Screen::Login | Screen::Restoring) {
+                            self.screen = Screen::Machines;
+                        }
                         self.password.clear();
                         self.totp.clear();
+                    } else if matches!(self.screen, Screen::Restoring | Screen::Login) {
+                        self.screen = Screen::Login;
                     }
                 }
                 UiEvent::Nodes(nodes) => {
@@ -470,7 +483,11 @@ impl ControllerApp {
                     self.maybe_auto_open_desktop();
                 }
                 UiEvent::Failed(message) => {
-                    if matches!(self.screen, Screen::Desktop { .. }) {
+                    self.files_loading = false;
+                    if matches!(self.screen, Screen::Restoring) {
+                        self.screen = Screen::Login;
+                        self.error = message;
+                    } else if matches!(self.screen, Screen::Desktop { .. }) {
                         let connecting = link_is_connecting(&self.link) || self.texture.is_none();
                         if connecting || self.desk_user_stopped || self.texture.is_none() {
                             self.fail_desktop_session(&message);
@@ -494,11 +511,18 @@ impl ControllerApp {
                         self.notice = message;
                     }
                 }
-                UiEvent::Pty(bytes) => self.terminal.push_bytes(&bytes),
+                UiEvent::Pty(bytes) => {
+                    self.terminal.feed(&bytes);
+                    let replies = self.terminal.take_writes();
+                    if !replies.is_empty() {
+                        self.send(Cmd::PtyWrite { data: replies });
+                    }
+                }
                 UiEvent::PtyDone => {}
                 UiEvent::Dir { path, entries } => {
                     self.file_path = path;
                     self.files = entries;
+                    self.files_loading = false;
                 }
                 UiEvent::File { path, text } => {
                     self.editor = Some(Editor { path, text });
@@ -507,26 +531,28 @@ impl ControllerApp {
                 UiEvent::Link(label) => self.link = label,
                 UiEvent::Pins(pins) => self.pins = pins,
                 UiEvent::Monitors(monitors) => {
-                    if let Some(blocked) = monitors
-                        .iter()
-                        .find(|m| m.capturable == Some(false))
-                    {
+                    if let Some(blocked) = monitors.iter().find(|m| m.capturable == Some(false)) {
                         self.notice = blocked
                             .reason
                             .clone()
                             .unwrap_or_else(|| "secure desktop".into());
-                        self.notice = format!(
-                            "Remote screen is not capturable ({})",
-                            self.notice
-                        );
+                        self.notice = format!("Remote screen is not capturable ({})", self.notice);
                     }
                     self.desk_monitors = monitors;
                     if let Some(primary) = self.desk_monitors.iter().find(|m| m.primary) {
-                        if !self.desk_monitors.iter().any(|m| m.index == self.desk_monitor) {
+                        if !self
+                            .desk_monitors
+                            .iter()
+                            .any(|m| m.index == self.desk_monitor)
+                        {
                             self.desk_monitor = primary.index;
                         }
                     } else if let Some(first) = self.desk_monitors.first() {
-                        if !self.desk_monitors.iter().any(|m| m.index == self.desk_monitor) {
+                        if !self
+                            .desk_monitors
+                            .iter()
+                            .any(|m| m.index == self.desk_monitor)
+                        {
                             self.desk_monitor = first.index;
                         }
                     }
@@ -662,8 +688,7 @@ impl ControllerApp {
     }
 
     fn open_terminal(&mut self, node: &NodeInfo) {
-        self.terminal = Scrollback::default();
-        self.term_input.clear();
+        self.terminal = Emulator::new(self.term_size.0, self.term_size.1);
         self.error.clear();
         self.send(Cmd::PtyOpen {
             node: node.id.clone(),
@@ -680,6 +705,7 @@ impl ControllerApp {
         self.files.clear();
         self.editor = None;
         self.file_path = ".".into();
+        self.files_loading = true;
         self.error.clear();
         self.send(Cmd::List {
             node: node.id.clone(),
@@ -713,12 +739,11 @@ impl ControllerApp {
         eprintln!("auto-open: opening desktop for '{}'", node.name);
         self.auto_opened = true;
         self.user.get_or_insert_with(|| "controller".into());
-        self.control.insert(node.id.clone(), true);
-        self.open_desktop(&node);
+        self.open_desktop(&node, true);
     }
 
-    fn open_desktop(&mut self, node: &NodeInfo) {
-        let control = self.control.get(&node.id).copied().unwrap_or(false);
+    fn open_desktop(&mut self, node: &NodeInfo, control: bool) {
+        self.control.insert(node.id.clone(), control);
         self.reset_desktop_session();
         self.error.clear();
         self.desk_connect_started = Some(Instant::now());
@@ -989,7 +1014,9 @@ impl eframe::App for ControllerApp {
         if self.flags.open.swap(false, Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
-        if self.tray && ctx.input(|input| input.viewport().close_requested()) && !self.flags.quit.load(Ordering::Relaxed)
+        if self.tray
+            && ctx.input(|input| input.viewport().close_requested())
+            && !self.flags.quit.load(Ordering::Relaxed)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1005,7 +1032,10 @@ impl ControllerApp {
             let v = ctx.style().visuals.clone();
             eprintln!(
                 "ui-style panel={:?} window={:?} dark={} theme_bg={:?}",
-                v.panel_fill, v.window_fill, v.dark_mode, theme::BG_PAGE
+                v.panel_fill,
+                v.window_fill,
+                v.dark_mode,
+                theme::BG_PAGE
             );
         }
         self.debug_layout.clear();
@@ -1021,18 +1051,32 @@ impl ControllerApp {
                     self.desktop(ui);
                 });
         } else {
+            let in_session = matches!(self.screen, Screen::Terminal { .. } | Screen::Files { .. });
+            let wide = ctx.screen_rect().width() >= 980.0;
+            if in_session && wide {
+                egui::SidePanel::left("machine-rail")
+                    .exact_width(260.0)
+                    .resizable(false)
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(theme::BG_SURFACE)
+                            .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
+                            .stroke(theme::stroke_border_subtle()),
+                    )
+                    .show(ctx, |ui| {
+                        self.machine_rail(ui);
+                    });
+            }
             let margin = match self.screen {
-                Screen::Machines => egui::Margin::symmetric(
-                    theme::SPACE_2XL as i8,
-                    theme::SPACE_LG as i8,
-                ),
+                Screen::Machines => {
+                    egui::Margin::symmetric(theme::SPACE_2XL as i8, theme::SPACE_LG as i8)
+                }
                 _ => egui::Margin::same(theme::SPACE_LG as i8),
             };
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(theme::BG_PAGE).inner_margin(margin))
                 .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing =
-                        egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
+                    ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
                     self.header(ui);
                     if !self.error.is_empty() {
                         banner(ui, &self.error, true);
@@ -1042,6 +1086,7 @@ impl ControllerApp {
                     }
                     match self.screen {
                         Screen::Login => self.login(ui),
+                        Screen::Restoring => self.restoring(ui),
                         Screen::Machines => self.machines(ui),
                         Screen::Terminal { .. } => self.terminal(ui),
                         Screen::Files { .. } => self.files(ui),
@@ -1063,7 +1108,8 @@ impl ControllerApp {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, 0.0);
-                if self.user.is_some() && !matches!(self.screen, Screen::Login) {
+                if self.user.is_some() && !matches!(self.screen, Screen::Login | Screen::Restoring)
+                {
                     if ui.add(theme::secondary_button("Log out")).clicked() {
                         self.back_to_machines();
                         self.send(Cmd::Logout);
@@ -1219,15 +1265,21 @@ impl ControllerApp {
             let nodes = self.nodes.clone();
             let wide = ui.available_width() > 860.0;
             ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing =
-                    egui::vec2(theme::SPACE_LG, theme::SPACE_LG);
+                ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_LG, theme::SPACE_MD);
                 let card_w = if wide {
                     ((ui.available_width() - theme::SPACE_LG) * 0.5).clamp(320.0, 520.0)
                 } else {
                     ui.available_width()
                 };
                 for node in &nodes {
-                    ui.allocate_ui(egui::vec2(card_w, 0.0), |ui| self.node_card(ui, node));
+                    // Size the card to its content. allocate_ui(width, 0) was
+                    // giving the leftover panel height to each wrapped row,
+                    // which showed up as huge vertical gaps between cards.
+                    ui.scope(|ui| {
+                        ui.set_width(card_w);
+                        ui.set_max_width(card_w);
+                        self.node_card(ui, node);
+                    });
                 }
             });
         }
@@ -1298,10 +1350,11 @@ impl ControllerApp {
                 theme::BG_SURFACE
             })
             .stroke(theme::stroke_border_subtle())
-            .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
+            .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
             .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+                ui.set_max_width(ui.available_width());
                 // Row 1: name + online pill
                 ui.horizontal(|ui| {
                     ui.label(
@@ -1320,10 +1373,7 @@ impl ControllerApp {
                     .filter(|part| !part.is_empty())
                     .collect::<Vec<_>>()
                     .join("/");
-                let meta = match (
-                    node.hostname.is_empty(),
-                    host.is_empty(),
-                ) {
+                let meta = match (node.hostname.is_empty(), host.is_empty()) {
                     (false, false) => format!("{} · {host}", node.hostname),
                     (false, true) => node.hostname.clone(),
                     (true, false) => host,
@@ -1350,7 +1400,8 @@ impl ControllerApp {
                 if !faint.is_empty() {
                     let max_chars = 42;
                     let shown = if faint.chars().count() > max_chars {
-                        let trimmed: String = faint.chars().take(max_chars.saturating_sub(1)).collect();
+                        let trimmed: String =
+                            faint.chars().take(max_chars.saturating_sub(1)).collect();
                         format!("{trimmed}…")
                     } else {
                         faint
@@ -1365,36 +1416,20 @@ impl ControllerApp {
                 if let Some(note) = display_note(node.has_display, node.effective) {
                     ui.label(theme::muted_text(note));
                 }
-                ui.add_space(theme::SPACE_MD);
-                // Row 3: actions + desktop session segmented control
-                let terminal = terminal_action(node.online, node.effective);
-                let files = files_action(node.online, node.effective);
-                let desktop = desktop_action(node.online, node.has_display, node.effective);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, 0.0);
-                    if action_button(ui, "Terminal", &terminal) {
-                        self.activate(node, &terminal, ScreenKind::Terminal);
-                    }
-                    if action_button(ui, "Files", &files) {
-                        self.activate(node, &files, ScreenKind::Files);
-                    }
-                    if action_button(ui, "Desktop", &desktop) {
-                        self.activate(node, &desktop, ScreenKind::Desktop);
-                    }
-                    if desktop_allowed(node.effective) {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                segmented_control(
-                                    ui,
-                                    self.control.get(&node.id).copied().unwrap_or(false),
-                                    node.effective.allows_remote_control(),
-                                    |control| {
-                                        self.control.insert(node.id.clone(), control);
-                                    },
-                                );
-                            },
-                        );
+                ui.add_space(theme::SPACE_SM);
+                // Real start actions. View/Control used to be a silent mode
+                // toggle that never opened a session; they are now start
+                // buttons, and they are omitted on headless machines.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
+                    for button in card_buttons(node.online, node.has_display, node.effective) {
+                        let action = Action {
+                            enabled: button.enabled,
+                            reason: button.reason,
+                        };
+                        if action_button(ui, button.label, &action) {
+                            self.activate(node, &action, button.kind);
+                        }
                     }
                 });
             })
@@ -1402,17 +1437,97 @@ impl ControllerApp {
         ui.data_mut(|d| d.insert_temp(hover_id, response.hovered()));
     }
 
-    fn activate(&mut self, node: &NodeInfo, action: &Action, kind: ScreenKind) {
+    fn activate(&mut self, node: &NodeInfo, action: &Action, kind: CardButtonKind) {
         if !action.enabled {
             self.error = action.reason.to_string();
             return;
         }
         self.error.clear();
         match kind {
-            ScreenKind::Terminal => self.open_terminal(node),
-            ScreenKind::Files => self.open_files(node),
-            ScreenKind::Desktop => self.open_desktop(node),
+            CardButtonKind::Terminal => self.open_terminal(node),
+            CardButtonKind::Files => self.open_files(node),
+            CardButtonKind::ViewDesktop => self.open_desktop(node, false),
+            CardButtonKind::ControlDesktop => self.open_desktop(node, true),
         }
+    }
+
+    fn restoring(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_size();
+        ui.allocate_ui_with_layout(
+            avail,
+            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(theme::SPACE_SM);
+                    ui.label(theme::title_text("Restoring session…"));
+                    ui.add_space(theme::SPACE_SM);
+                    ui.label(theme::muted_text(
+                        "You stay signed in when a saved session is still valid. The sign-in form appears only if it is not.",
+                    ));
+                });
+            },
+        );
+    }
+
+    fn machine_rail(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .add(theme::secondary_button("Back to machines"))
+            .clicked()
+        {
+            self.back_to_machines();
+            return;
+        }
+        ui.add_space(theme::SPACE_SM);
+        ui.label(theme::muted_text("Machines"));
+        ui.add_space(theme::SPACE_SM);
+        let current = match &self.screen {
+            Screen::Terminal { id, .. } | Screen::Files { id, .. } | Screen::Desktop { id, .. } => {
+                Some(id.clone())
+            }
+            _ => None,
+        };
+        let nodes = self.nodes.clone();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for node in &nodes {
+                let active = current.as_deref() == Some(node.id.as_str());
+                let frame = egui::Frame::new()
+                    .fill(if active {
+                        theme::BG_HOVER
+                    } else {
+                        theme::BG_PANEL
+                    })
+                    .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD));
+                frame.show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(&node.name)
+                                .color(theme::TEXT_PRIMARY)
+                                .strong(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            online_pill(ui, node.online);
+                        });
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing =
+                            egui::vec2(theme::SPACE_XS, theme::SPACE_XS);
+                        for button in card_buttons(node.online, node.has_display, node.effective) {
+                            let action = Action {
+                                enabled: button.enabled,
+                                reason: button.reason,
+                            };
+                            if action_button(ui, button.label, &action) {
+                                self.activate(node, &action, button.kind);
+                            }
+                        }
+                    });
+                });
+                ui.add_space(theme::SPACE_SM);
+            }
+        });
     }
 
     fn enroll(&mut self, ui: &mut egui::Ui) {
@@ -1427,7 +1542,11 @@ impl ControllerApp {
                 .selected_text(&self.enroll_access)
                 .show_ui(ui, |ui| {
                     for preset in PRESETS {
-                        ui.selectable_value(&mut self.enroll_access, (*preset).to_string(), *preset);
+                        ui.selectable_value(
+                            &mut self.enroll_access,
+                            (*preset).to_string(),
+                            *preset,
+                        );
                     }
                 });
             labeled(ui, "Minutes", &mut self.enroll_minutes, false);
@@ -1463,67 +1582,57 @@ impl ControllerApp {
         });
     }
 
+    fn session_back_row(&mut self, ui: &mut egui::Ui, title: String) {
+        let wide = ui.available_width() >= 700.0
+            && matches!(self.screen, Screen::Terminal { .. } | Screen::Files { .. });
+        ui.horizontal(|ui| {
+            // On a wide window the machine list stays in the left rail, but
+            // the back button remains so a narrow layout (or a resized
+            // window) never strands the user in a session.
+            if ui
+                .add(theme::secondary_button("Back to machines"))
+                .clicked()
+            {
+                self.back_to_machines();
+            }
+            ui.label(theme::section_text(title));
+        });
+        ui.label(theme::muted_text(format!("connection {}", self.link)));
+        let _ = wide;
+    }
+
     fn terminal(&mut self, ui: &mut egui::Ui) {
         let (id, name) = match &self.screen {
             Screen::Terminal { id, name } => (id.clone(), name.clone()),
             _ => return,
         };
-        if ui.add(theme::secondary_button("Machines")).clicked() {
-            self.back_to_machines();
-            return;
-        }
-        ui.label(theme::section_text(format!("{name} · terminal")));
-        ui.label(theme::muted_text(format!("connection {}", self.link)));
+        self.session_back_row(ui, format!("{name} · terminal"));
         ui.label(theme::muted_text(
-            "The last 1000 lines stay. Enter sends the line.",
+            "Type in the terminal. Ctrl+Shift+C copies, Ctrl+Shift+V pastes. Ctrl+C sends interrupt.",
         ));
         let frame = egui::Frame::new()
-            .fill(theme::BG_SURFACE)
+            .fill(egui::Color32::from_rgb(0x0D, 0x0D, 0x12))
             .stroke(theme::stroke_border_subtle())
-            .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
+            .inner_margin(egui::Margin::same(theme::SPACE_XS as i8))
             .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD));
-        let response = frame.show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height((ui.available_height() - 120.0).max(160.0))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(self.terminal.text())
-                                .monospace()
-                                .size(theme::BODY_SIZE)
-                                .color(theme::SUCCESS),
-                        )
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                });
-        });
-        let width = response.response.rect.width();
-        let height = response.response.rect.height();
-        let cols = (width / 8.0).floor().clamp(40.0, 400.0) as u16;
-        let rows = (height / 16.0).floor().clamp(8.0, 200.0) as u16;
-        if (rows, cols) != self.term_size {
+        let output = frame
+            .show(ui, |ui| {
+                ui.set_min_size(egui::vec2(
+                    ui.available_width(),
+                    ui.available_height().max(120.0),
+                ));
+                self.terminal.show(ui)
+            })
+            .inner;
+        if let Some((rows, cols)) = output.resized {
             self.term_size = (rows, cols);
             self.send(Cmd::PtyResize { rows, cols });
         }
-        ui.horizontal(|ui| {
-            let edit = egui::TextEdit::singleline(&mut self.term_input)
-                .desired_width(ui.available_width() - 180.0)
-                .hint_text("Command")
-                .font(egui::TextStyle::Monospace);
-            let response = ui.add(edit);
-            let send_line = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                || ui.add(theme::secondary_button("Send")).clicked();
-            if ui.add(theme::secondary_button("Ctrl-C")).clicked() {
-                self.send(Cmd::PtyWrite { data: vec![0x03] });
-            }
-            if send_line {
-                let mut line = std::mem::take(&mut self.term_input);
-                line.push('\n');
-                self.send(Cmd::PtyWrite { data: line.into_bytes() });
-                response.request_focus();
-            }
-        });
+        if !output.writes.is_empty() {
+            self.send(Cmd::PtyWrite {
+                data: output.writes,
+            });
+        }
         let _ = id;
     }
 
@@ -1540,21 +1649,18 @@ impl ControllerApp {
             }
             _ => return,
         };
-        if ui.add(theme::secondary_button("Machines")).clicked() {
-            self.back_to_machines();
-            return;
-        }
-        ui.label(theme::section_text(format!("{name} · files")));
-        ui.label(theme::muted_text("connection relay"));
+        self.session_back_row(ui, format!("{name} · files"));
         ui.horizontal_wrapped(|ui| {
             if ui.add(theme::secondary_button("Up")).clicked() {
                 let path = model::parent_path(&self.file_path);
+                self.files_loading = true;
                 self.send(Cmd::List {
                     node: id.clone(),
                     path,
                 });
             }
             if ui.add(theme::secondary_button("Refresh")).clicked() {
+                self.files_loading = true;
                 self.send(Cmd::List {
                     node: id.clone(),
                     path: self.file_path.clone(),
@@ -1562,12 +1668,24 @@ impl ControllerApp {
             }
             ui.label(theme::mono_text(&self.file_path));
         });
+        if self.files_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(theme::muted_text("Loading files…"));
+            });
+        } else if self.files.is_empty() && self.error.is_empty() {
+            ui.label(theme::muted_text("This folder is empty."));
+        }
+        let list_h = (ui.available_height() - 160.0).max(160.0);
         egui::ScrollArea::vertical()
-            .max_height((ui.available_height() * 0.45).max(120.0))
+            .max_height(list_h)
             .show(ui, |ui| {
                 let mut entries = self.files.clone();
                 entries.sort_by(|left, right| {
-                    right.is_dir.cmp(&left.is_dir).then_with(|| left.name.cmp(&right.name))
+                    right
+                        .is_dir
+                        .cmp(&left.is_dir)
+                        .then_with(|| left.name.cmp(&right.name))
                 });
                 for entry in entries {
                     ui.horizontal(|ui| {
@@ -1580,6 +1698,7 @@ impl ControllerApp {
                             let path = model::child_path(&self.file_path, &entry.name);
                             if entry.is_dir {
                                 self.editor = None;
+                                self.files_loading = true;
                                 self.send(Cmd::List {
                                     node: id.clone(),
                                     path,
@@ -1602,10 +1721,10 @@ impl ControllerApp {
                 }
             });
         if can_write {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.folder_name)
-                        .hint_text("New folder")
+                        .hint_text("New folder name")
                         .desired_width(180.0),
                 );
                 if ui.add(theme::secondary_button("Create folder")).clicked()
@@ -1616,6 +1735,21 @@ impl ControllerApp {
                     self.send(Cmd::Mkdir {
                         node: id.clone(),
                         path,
+                    });
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_file_name)
+                        .hint_text("New file name")
+                        .desired_width(180.0),
+                );
+                if ui.add(theme::secondary_button("New file")).clicked()
+                    && !self.new_file_name.trim().is_empty()
+                {
+                    let path = model::child_path(&self.file_path, self.new_file_name.trim());
+                    self.new_file_name.clear();
+                    self.editor = Some(Editor {
+                        path,
+                        text: String::new(),
                     });
                 }
             });
@@ -1636,7 +1770,11 @@ impl ControllerApp {
             None
         };
         if let Some((path, text)) = save {
-            self.send(Cmd::Write { node: id, path, text });
+            self.send(Cmd::Write {
+                node: id,
+                path,
+                text,
+            });
         }
     }
 
@@ -1715,10 +1853,9 @@ impl ControllerApp {
         // One active session today; tab strip height stays zero until multi-session lands.
         let _top_chrome = session_chrome_top_height(1, bar_visible);
 
-        let bar_fade = ui.ctx().animate_bool(
-            egui::Id::new("desktop-connection-bar-fade"),
-            bar_visible,
-        );
+        let bar_fade = ui
+            .ctx()
+            .animate_bool(egui::Id::new("desktop-connection-bar-fade"), bar_visible);
         self.debug_layout.toolbar_visible = bar_visible || bar_fade > 0.01;
         if bar_fade > 0.01 {
             let bar_resp = egui::Frame::new()
@@ -1734,7 +1871,10 @@ impl ControllerApp {
             let edge = bar_resp.response.rect;
             self.debug_layout.toolbar_rect = rect_xywh(edge);
             ui.painter().add(egui::Shape::line_segment(
-                [egui::pos2(edge.left(), edge.bottom()), egui::pos2(edge.right(), edge.bottom())],
+                [
+                    egui::pos2(edge.left(), edge.bottom()),
+                    egui::pos2(edge.right(), edge.bottom()),
+                ],
                 egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE.linear_multiply(bar_fade)),
             ));
         } else {
@@ -1940,7 +2080,10 @@ impl ControllerApp {
                                         .corner_radius(egui::CornerRadius::same(
                                             theme::RADIUS_CONTROL,
                                         ))
-                                        .min_size(egui::vec2(theme::ICON_BTN, theme::BTN_TOOLBAR_H)),
+                                        .min_size(egui::vec2(
+                                            theme::ICON_BTN,
+                                            theme::BTN_TOOLBAR_H,
+                                        )),
                                 );
                                 self.debug_layout.note_item("stats", stats_btn.rect);
                                 if stats_btn.on_hover_text("Session stats").clicked() {
@@ -1966,7 +2109,10 @@ impl ControllerApp {
                                         .corner_radius(egui::CornerRadius::same(
                                             theme::RADIUS_CONTROL,
                                         ))
-                                        .min_size(egui::vec2(theme::ICON_BTN, theme::BTN_TOOLBAR_H)),
+                                        .min_size(egui::vec2(
+                                            theme::ICON_BTN,
+                                            theme::BTN_TOOLBAR_H,
+                                        )),
                                 );
                                 self.debug_layout.note_item("stats", stats_btn.rect);
                                 if stats_btn.on_hover_text("Session stats").clicked() {
@@ -1982,14 +2128,19 @@ impl ControllerApp {
             ui.add_space(gap);
 
             ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width().max(right_need.min(avail)), theme::BAR_HEIGHT),
+                egui::vec2(
+                    ui.available_width().max(right_need.min(avail)),
+                    theme::BAR_HEIGHT,
+                ),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_XS, 0.0);
                     ui.spacing_mut().button_padding = egui::vec2(theme::SPACE_SM, 0.0);
 
                     let (fs_text, fs_tip) = match density {
-                        BarDensity::Icons | BarDensity::Minimal => ("FS", "Toggle fullscreen (F11)"),
+                        BarDensity::Icons | BarDensity::Minimal => {
+                            ("FS", "Toggle fullscreen (F11)")
+                        }
                         _ => (fs_label, "Toggle fullscreen (F11)"),
                     };
                     let (disc_label, disc_tip) = match density {
@@ -2241,8 +2392,7 @@ impl ControllerApp {
             response.context_menu(|ui| {
                 ui.set_min_width(180.0);
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                ui.spacing_mut().button_padding =
-                    egui::vec2(theme::BTN_PAD_X, theme::SPACE_XS);
+                ui.spacing_mut().button_padding = egui::vec2(theme::BTN_PAD_X, theme::SPACE_XS);
                 ui.visuals_mut().window_fill = theme::BG_SURFACE;
                 ui.visuals_mut().widgets.hovered.weak_bg_fill = theme::BG_HOVER;
                 let item = |ui: &mut egui::Ui, label: &str| {
@@ -2324,11 +2474,7 @@ impl ControllerApp {
             let size = galley.size() + pad * 2.0;
             let rect = egui::Rect::from_center_size(pane_rect.center(), size);
             let fill = egui::Color32::from_rgba_unmultiplied(0x19, 0x1a, 0x1b, 217);
-            painter.rect_filled(
-                rect,
-                egui::CornerRadius::same(theme::RADIUS_CONTROL),
-                fill,
-            );
+            painter.rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_CONTROL), fill);
             painter.rect_stroke(
                 rect,
                 egui::CornerRadius::same(theme::RADIUS_CONTROL),
@@ -2480,11 +2626,7 @@ impl ControllerApp {
                         egui::vec2(theme::SPACE_LG, theme::SPACE_LG),
                         egui::Sense::hover(),
                     );
-                    painter.circle_filled(
-                        resp.rect.center(),
-                        theme::STATUS_DOT,
-                        theme::DANGER,
-                    );
+                    painter.circle_filled(resp.rect.center(), theme::STATUS_DOT, theme::DANGER);
                     ui.add_space(theme::SPACE_SM);
                     ui.label(
                         egui::RichText::new(title)
@@ -2499,10 +2641,7 @@ impl ControllerApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, 0.0);
                         if ui
-                            .add_sized(
-                                [96.0, theme::BTN_PRIMARY_H],
-                                theme::primary_button("Retry"),
-                            )
+                            .add_sized([96.0, theme::BTN_PRIMARY_H], theme::primary_button("Retry"))
                             .clicked()
                         {
                             reconnect = true;
@@ -2614,11 +2753,7 @@ impl ControllerApp {
             egui::CornerRadius::same(theme::RADIUS_CONTROL),
             theme::OVERLAY_STRONG,
         );
-        painter.galley(
-            rect.min + egui::vec2(10.0, 6.0),
-            galley,
-            theme::TEXT_BODY,
-        );
+        painter.galley(rect.min + egui::vec2(10.0, 6.0), galley, theme::TEXT_BODY);
     }
 
     fn desktop_pointer(
@@ -2635,17 +2770,31 @@ impl ControllerApp {
             let primary = input.pointer.button_pressed(egui::PointerButton::Primary);
             let primary_up = input.pointer.button_released(egui::PointerButton::Primary);
             let secondary = input.pointer.button_pressed(egui::PointerButton::Secondary);
-            let secondary_up = input.pointer.button_released(egui::PointerButton::Secondary);
+            let secondary_up = input
+                .pointer
+                .button_released(egui::PointerButton::Secondary);
             let middle = input.pointer.button_pressed(egui::PointerButton::Middle);
             let middle_up = input.pointer.button_released(egui::PointerButton::Middle);
-            let double = input.pointer.button_double_clicked(egui::PointerButton::Primary);
+            let double = input
+                .pointer
+                .button_double_clicked(egui::PointerButton::Primary);
             let moved = input.pointer.is_moving();
             let scroll = input.raw_scroll_delta;
             let ctrl = input.modifiers.ctrl || input.modifiers.command;
             let shift = input.modifiers.shift;
             (
-                pos, primary, primary_up, secondary, secondary_up, middle, middle_up, double,
-                moved, scroll, ctrl, shift,
+                pos,
+                primary,
+                primary_up,
+                secondary,
+                secondary_up,
+                middle,
+                middle_up,
+                double,
+                moved,
+                scroll,
+                ctrl,
+                shift,
             )
         });
         let (
@@ -2772,7 +2921,10 @@ impl ControllerApp {
                 self.inject_key_edge(node, &name, false);
             }
         }
-        ui.allocate_exact_size(egui::vec2(0.0, 0.0), egui::Sense::focusable_noninteractive());
+        ui.allocate_exact_size(
+            egui::vec2(0.0, 0.0),
+            egui::Sense::focusable_noninteractive(),
+        );
     }
 
     fn release_remote_input(&mut self) {
@@ -2856,10 +3008,8 @@ impl ControllerApp {
     }
 
     fn inject_key_edge(&self, node: &str, key: &str, down: bool) {
-        let live =
-            serde_json::json!({"type": "key", "keys": [key], "down": down}).to_string();
-        let inject =
-            serde_json::json!({"action": "key", "keys": key, "down": down}).to_string();
+        let live = serde_json::json!({"type": "key", "keys": [key], "down": down}).to_string();
+        let inject = serde_json::json!({"action": "key", "keys": key, "down": down}).to_string();
         self.send(Cmd::Input {
             node: node.to_string(),
             live,
@@ -2905,7 +3055,8 @@ impl ControllerApp {
         if let Some(texture) = &mut self.texture {
             texture.set(image, egui::TextureOptions::LINEAR);
         } else {
-            self.texture = Some(ctx.load_texture("mock-desktop", image, egui::TextureOptions::LINEAR));
+            self.texture =
+                Some(ctx.load_texture("mock-desktop", image, egui::TextureOptions::LINEAR));
         }
         self.desk_last_frame = Some(Instant::now());
         self.desk_connect_started = None;
@@ -2958,7 +3109,11 @@ impl ControllerApp {
             "click" => {
                 let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                let button = match args.get("button").and_then(|v| v.as_str()).unwrap_or("left") {
+                let button = match args
+                    .get("button")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("left")
+                {
                     "right" => egui::PointerButton::Secondary,
                     "middle" => egui::PointerButton::Middle,
                     _ => egui::PointerButton::Primary,
@@ -3041,8 +3196,7 @@ impl ControllerApp {
                     }
                     None => true,
                 };
-                self.control.insert(info.id.clone(), control);
-                self.open_desktop(&info);
+                self.open_desktop(&info, control);
                 if self.mock && !self.fail_connect {
                     self.refresh_mock_picture(ctx);
                 }
@@ -3069,15 +3223,16 @@ impl ControllerApp {
         let (w, h) = self.logical_size;
         let screen = match &self.screen {
             Screen::Login => "login",
+            Screen::Restoring => "restoring",
             Screen::Machines => "machines",
             Screen::Desktop { .. } => "session",
             Screen::Terminal { .. } => "terminal",
             Screen::Files { .. } => "files",
         };
         let node = match &self.screen {
-            Screen::Desktop { id, .. }
-            | Screen::Terminal { id, .. }
-            | Screen::Files { id, .. } => Value::String(id.clone()),
+            Screen::Desktop { id, .. } | Screen::Terminal { id, .. } | Screen::Files { id, .. } => {
+                Value::String(id.clone())
+            }
             _ => Value::Null,
         };
         let phase = self.desktop_phase();
@@ -3185,14 +3340,7 @@ impl ControllerApp {
         let Some((w, h, rgba)) = self.debug_rgba.as_ref() else {
             return Err("no-renderer".into());
         };
-        image::save_buffer(
-            path,
-            rgba,
-            *w,
-            *h,
-            image::ColorType::Rgba8,
-        )
-        .map_err(|e| e.to_string())
+        image::save_buffer(path, rgba, *w, *h, image::ColorType::Rgba8).map_err(|e| e.to_string())
     }
 }
 
@@ -3290,12 +3438,6 @@ fn chrono_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-enum ScreenKind {
-    Terminal,
-    Files,
-    Desktop,
-}
-
 enum DeskMenuAction {
     Cad,
     Fullscreen,
@@ -3330,14 +3472,12 @@ impl<'a> MouseEvent<'a> {
 }
 
 fn chrome_bar_button(ui: &mut egui::Ui, label: &str, tip: &str, active: bool) -> egui::Response {
-    ui.add(theme::icon_button(label, active))
-        .on_hover_text(tip)
+    ui.add(theme::icon_button(label, active)).on_hover_text(tip)
 }
 
 fn chrome_vsep(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 16.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 0.0, theme::BORDER_SUBTLE);
+    ui.painter().rect_filled(rect, 0.0, theme::BORDER_SUBTLE);
 }
 
 fn mode_badge_widget(ui: &mut egui::Ui, control: bool) -> egui::Response {
@@ -3369,7 +3509,10 @@ fn mode_badge_widget(ui: &mut egui::Ui, control: bool) -> egui::Response {
 
 fn status_dot(ui: &mut egui::Ui, dot: ConnDot, error: &str) {
     let (response, painter) = ui.allocate_painter(
-        egui::vec2(theme::STATUS_DOT + theme::SPACE_SM, theme::STATUS_DOT + theme::SPACE_SM),
+        egui::vec2(
+            theme::STATUS_DOT + theme::SPACE_SM,
+            theme::STATUS_DOT + theme::SPACE_SM,
+        ),
         egui::Sense::hover(),
     );
     let color = match dot {
@@ -3476,14 +3619,19 @@ fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, dot: Option<
     egui::Frame::new()
         .fill(theme::BG_SURFACE)
         .stroke(theme::stroke_border_subtle())
-        .inner_margin(egui::Margin::symmetric(theme::SPACE_SM as i8, theme::SPACE_XS as i8))
+        .inner_margin(egui::Margin::symmetric(
+            theme::SPACE_SM as i8,
+            theme::SPACE_XS as i8,
+        ))
         .corner_radius(egui::CornerRadius::same(255))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_XS, 0.0);
                 if let Some(dot) = dot {
-                    let (resp, painter) =
-                        ui.allocate_painter(egui::vec2(theme::STATUS_DOT, theme::STATUS_DOT), egui::Sense::hover());
+                    let (resp, painter) = ui.allocate_painter(
+                        egui::vec2(theme::STATUS_DOT, theme::STATUS_DOT),
+                        egui::Sense::hover(),
+                    );
                     painter.circle_filled(resp.rect.center(), theme::STATUS_DOT * 0.5, dot);
                 }
                 ui.label(
@@ -3504,7 +3652,10 @@ fn online_pill(ui: &mut egui::Ui, online: bool) {
     egui::Frame::new()
         .fill(egui::Color32::TRANSPARENT)
         .stroke(theme::stroke_border_subtle())
-        .inner_margin(egui::Margin::symmetric(theme::SPACE_SM as i8, theme::SPACE_XS as i8))
+        .inner_margin(egui::Margin::symmetric(
+            theme::SPACE_SM as i8,
+            theme::SPACE_XS as i8,
+        ))
         .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -3521,76 +3672,6 @@ fn online_pill(ui: &mut egui::Ui, online: bool) {
                 );
             });
         });
-}
-
-fn segmented_control(ui: &mut egui::Ui, control_on: bool, allow_control: bool, mut set: impl FnMut(bool)) {
-    let seg_h = 32.0;
-    egui::Frame::new()
-        .fill(theme::BG_PANEL)
-        .stroke(theme::stroke_border_subtle())
-        .inner_margin(egui::Margin::same(2))
-        .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
-        .show(ui, |ui| {
-            ui.set_height(seg_h);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                let view = segment_btn(ui, "View", !control_on, seg_h - 4.0);
-                if view.clicked() {
-                    set(false);
-                }
-                view.on_hover_text("Desktop opens view-only. Keyboard and mouse stay off.");
-                let control = ui.add_enabled(
-                    allow_control,
-                    egui::Button::new(
-                        egui::RichText::new("Control")
-                            .size(theme::SECONDARY_SIZE)
-                            .color(if control_on && allow_control {
-                                theme::TEXT_ON_ACCENT
-                            } else {
-                                theme::TEXT_MUTED
-                            }),
-                    )
-                    .fill(if control_on && allow_control {
-                        theme::ACCENT_BG
-                    } else {
-                        theme::BG_PANEL
-                    })
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
-                    .min_size(egui::vec2(72.0, seg_h - 4.0)),
-                );
-                if control.clicked() {
-                    set(true);
-                }
-                control.on_hover_text(if allow_control {
-                    "Desktop opens with keyboard and mouse."
-                } else {
-                    "Control needs remote-control on this account. Desktop stays view-only."
-                });
-            });
-        });
-}
-
-fn segment_btn(ui: &mut egui::Ui, label: &str, selected: bool, height: f32) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(label.to_owned())
-                .size(theme::SECONDARY_SIZE)
-                .color(if selected {
-                    theme::TEXT_ON_ACCENT
-                } else {
-                    theme::TEXT_MUTED
-                }),
-        )
-        .fill(if selected {
-            theme::ACCENT_BG
-        } else {
-            theme::BG_PANEL
-        })
-        .stroke(egui::Stroke::NONE)
-        .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
-        .min_size(egui::vec2(72.0, height)),
-    )
 }
 
 fn labeled(ui: &mut egui::Ui, name: &str, text: &mut String, secret: bool) {
