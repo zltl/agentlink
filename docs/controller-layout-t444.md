@@ -407,3 +407,35 @@ on both a maximized / 1280×800 window and a narrow window, covering the
 Machines list **and** the session rail. Do not treat the rail as already
 visually passing. 0133 is frozen and must not be overwritten.
 
+## 0111/0133 Viewer close panic (2026-11-12 Asia/Shanghai)
+
+Parent computerUse captured a confirmed panic, not an inferred one.
+Screenshot: `/tmp/computer-use/sand-subagent-a074b9db-3273-811e-7d2a-36594901e125.8b2fa0cd-4583-4b40-a536-2a6207f0e86b.webp`
+(01:50 Asia/Shanghai). Both frozen candidates printed the same line when
+their worker thread ran:
+
+    thread 'agentlink-controller-net' panicked at
+    crates/agentlink-view/src/session.rs:214:21:
+    Cannot block the current thread from within a runtime
+
+0111 was pid 196972 on that thread; 0133 was 228114. Opening Terminal
+calls `stop_live` → `Viewer::close` on that runtime. `close` used
+`mpsc::Sender::blocking_send(Cmd::Close)` and then `thread::sleep`.
+`Drop` also called `close` and `Runtime::shutdown_timeout`, which parks
+the thread the same way. The PTY open never returned, and the process
+could stay in SL+ until SIGTERM.
+
+The 0149 candidate (`7c8b04d`) does **not** include this fix:
+`agentlink-view/src/session.rs` was unchanged from 0133. 0149 has not
+been GUI-tested for exit or Terminal-after-View. Do not treat 0149 as
+already passing this path.
+
+This follow-up: `close`/`Drop` only `try_send` Close, set a stop flag,
+and wake `drive` with `Notify`. Waiting for `stopped` or
+`shutdown_timeout` happens only off a tokio runtime. Inside a runtime,
+`Drop` uses `shutdown_background`. No `catch_unwind`, no
+`process::exit`. Regression tests construct a Viewer and call close/drop
+inside a current-thread runtime and a thread named
+`agentlink-controller-net`, including a full command channel. Unit tests
+are not a substitute for a parent GUI retest of a **new** candidate
+(Terminal after View, Quit/close, no leftover process, no panic).

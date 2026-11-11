@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rtc::peer_connection::configuration::RTCOfferOptions;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
@@ -15,7 +16,6 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
-use rtc::peer_connection::configuration::RTCOfferOptions;
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
@@ -100,6 +100,7 @@ pub trait Signal: Send + Sync {
     fn signal(&self, payload: &Value) -> Result<Value, String>;
 }
 
+#[derive(Debug)]
 enum Cmd {
     Control(String),
     Keyframe,
@@ -114,7 +115,9 @@ pub struct Viewer {
     stats: Arc<Mutex<LiveStats>>,
     input_open: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    close_notify: Arc<tokio::sync::Notify>,
     closed: AtomicBool,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
 }
@@ -136,7 +139,9 @@ impl Viewer {
             stats: built.stats,
             input_open: built.input_open,
             failed: built.failed,
+            stop: built.stop,
             stopped: built.stopped,
+            close_notify: built.close_notify,
             closed: built.closed,
             runtime: Mutex::new(Some(runtime)),
         })
@@ -208,11 +213,12 @@ impl Viewer {
     }
 
     pub fn close(&self) {
-        if self.closed.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        if self.cmd.blocking_send(Cmd::Close).is_err() {
-            self.stopped.store(true, Ordering::Relaxed);
+        self.request_close();
+        // 0111/0133 panicked here on the controller worker runtime:
+        // `blocking_send` and `thread::sleep` cannot run on
+        // `agentlink-controller-net` (session.rs:214, Cmd::PtyOpen
+        // calls stop_live → Viewer::close). Wait only off-runtime.
+        if in_tokio_runtime() {
             return;
         }
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -220,20 +226,44 @@ impl Viewer {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    fn request_close(&self) {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.stop.store(true, Ordering::Release);
+        self.close_notify.notify_waiters();
+        // Never use blocking_send. A full queue still wakes `drive` via
+        // stop + Notify, so Close cannot be lost.
+        if self.cmd.try_send(Cmd::Close).is_err() && self.cmd.is_closed() {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for Viewer {
     fn drop(&mut self) {
-        self.close();
+        self.request_close();
         if let Some(runtime) = self
             .runtime
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .take()
         {
-            runtime.shutdown_timeout(Duration::from_secs(2));
+            // shutdown_timeout also parks the thread and panics inside a
+            // runtime. The viewer runtime is not the current one, but Tokio
+            // still forbids blocking on agentlink-controller-net.
+            if in_tokio_runtime() {
+                runtime.shutdown_background();
+            } else {
+                runtime.shutdown_timeout(Duration::from_secs(2));
+            }
         }
     }
+}
+
+fn in_tokio_runtime() -> bool {
+    tokio::runtime::Handle::try_current().is_ok()
 }
 
 struct Built {
@@ -244,7 +274,9 @@ struct Built {
     stats: Arc<Mutex<LiveStats>>,
     input_open: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    close_notify: Arc<tokio::sync::Notify>,
     closed: AtomicBool,
 }
 
@@ -267,6 +299,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let failed = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
+    let close_notify = Arc::new(tokio::sync::Notify::new());
     let input_open = Arc::new(AtomicBool::new(false));
     let captured = Arc::new(AtomicI64::new(0));
     let (ice_tx, mut ice_rx) = mpsc::unbounded_channel();
@@ -431,6 +464,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let input_flag = input_open.clone();
     let stop_loop = stop.clone();
     let stopped_loop = stopped.clone();
+    let close_notify_loop = close_notify.clone();
     let failed_loop = failed.clone();
     let gather_ice = gather_done.clone();
     let disc_loop = disconnected_at_ms;
@@ -447,6 +481,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             input_flag,
             stop_loop,
             stopped_loop,
+            close_notify_loop,
             failed_loop,
             gather_ice,
             disc_loop,
@@ -488,7 +523,9 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         stats,
         input_open,
         failed,
+        stop,
         stopped,
+        close_notify,
         closed: AtomicBool::new(false),
     })
 }
@@ -505,6 +542,7 @@ async fn drive(
     input_open: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    close_notify: Arc<tokio::sync::Notify>,
     _failed: Arc<AtomicBool>,
     gather_done: Arc<AtomicBool>,
     disconnected_at_ms: Arc<AtomicI64>,
@@ -513,6 +551,17 @@ async fn drive(
     tick.tick().await;
     let mut last_ice_restart = Instant::now() - Duration::from_secs(30);
     loop {
+        if stop.load(Ordering::Relaxed) {
+            stop.store(true, Ordering::Relaxed);
+            let _ = roundtrip(
+                &signal,
+                json!({"action": "close", "session_id": session_id}),
+            )
+            .await;
+            peer.close().await;
+            stopped.store(true, Ordering::Relaxed);
+            break;
+        }
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
@@ -524,16 +573,11 @@ async fn drive(
                     }
                     Some(Cmd::Close) | None => {
                         stop.store(true, Ordering::Relaxed);
-                        let _ = roundtrip(
-                            &signal,
-                            json!({"action": "close", "session_id": session_id}),
-                        )
-                        .await;
-                        peer.close().await;
-                        stopped.store(true, Ordering::Relaxed);
-                        break;
                     }
                 }
+            }
+            _ = close_notify.notified() => {
+                stop.store(true, Ordering::Relaxed);
             }
             _ = tick.tick() => {
                 let (dropped, shown, needs) = frames.take_feedback();
@@ -831,10 +875,7 @@ trait LivePeer: Send + Sync {
     async fn create_ice_restart_offer(&self) -> Result<String, String>;
     async fn local_sdp(&self) -> Option<String>;
     async fn apply_remote_answer(&self, sdp: &str) -> Result<(), String>;
-    async fn add_ice_candidate(
-        &self,
-        candidate: RTCIceCandidateInit,
-    ) -> Result<(), String>;
+    async fn add_ice_candidate(&self, candidate: RTCIceCandidateInit) -> Result<(), String>;
 }
 
 struct OwnedPeer<P> {
@@ -874,16 +915,14 @@ where
     }
 
     async fn apply_remote_answer(&self, sdp: &str) -> Result<(), String> {
-        let remote = RTCSessionDescription::answer(sdp.to_string()).map_err(|err| err.to_string())?;
+        let remote =
+            RTCSessionDescription::answer(sdp.to_string()).map_err(|err| err.to_string())?;
         PeerConnection::set_remote_description(&self.inner, remote)
             .await
             .map_err(|err| err.to_string())
     }
 
-    async fn add_ice_candidate(
-        &self,
-        candidate: RTCIceCandidateInit,
-    ) -> Result<(), String> {
+    async fn add_ice_candidate(&self, candidate: RTCIceCandidateInit) -> Result<(), String> {
         PeerConnection::add_ice_candidate(&self.inner, candidate)
             .await
             .map_err(|err| err.to_string())
@@ -1054,5 +1093,93 @@ mod tests {
         assert!(sdp.contains("recvonly"), "{sdp}");
         assert!(sdp.contains("m=video"), "{sdp}");
         assert!(sdp.contains("m=application"), "{sdp}");
+    }
+
+    fn test_viewer(cmd_cap: usize) -> (Viewer, mpsc::Receiver<Cmd>) {
+        let (cmd, rx) = mpsc::channel(cmd_cap);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("agentlink-view-test")
+            .build()
+            .expect("test viewer runtime");
+        let viewer = Viewer {
+            cmd,
+            frames: Arc::new(FrameBus::new(1)),
+            info: LiveInfo {
+                session_id: "test".into(),
+                codec: "h264".into(),
+                encoder: "test".into(),
+                hardware: false,
+                width: 1,
+                height: 1,
+                control: false,
+                path: "relay".into(),
+            },
+            cursor: Arc::new(Mutex::new(None)),
+            stats: Arc::new(Mutex::new(LiveStats::default())),
+            input_open: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+            closed: AtomicBool::new(false),
+            runtime: Mutex::new(Some(runtime)),
+        };
+        (viewer, rx)
+    }
+
+    /// 0111/0133: `Viewer::close` used `blocking_send` at session.rs:214
+    /// and panicked on `agentlink-controller-net` when `Cmd::PtyOpen`
+    /// called `stop_live`. These tests run close/drop inside a tokio
+    /// runtime so a green suite cannot hide that panic.
+    #[test]
+    fn close_from_inside_a_tokio_runtime_does_not_panic() {
+        let (viewer, mut rx) = test_viewer(4);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            viewer.close();
+            assert!(viewer.stop.load(Ordering::Relaxed));
+            match rx.try_recv() {
+                Ok(Cmd::Close) => {}
+                other => panic!("expected Close, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn drop_from_inside_a_tokio_runtime_does_not_panic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            let (viewer, _rx) = test_viewer(1);
+            drop(viewer);
+        });
+    }
+
+    #[test]
+    fn close_then_drop_on_the_controller_net_runtime_does_not_panic() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("agentlink-controller-net")
+            .build()
+            .expect("controller-net runtime");
+        runtime.block_on(async {
+            let (viewer, mut rx) = test_viewer(1);
+            // Saturate the bounded command queue the way input events would.
+            assert!(viewer.cmd.try_send(Cmd::Control("{}".into())).is_ok());
+            viewer.close();
+            assert!(viewer.stop.load(Ordering::Relaxed));
+            let first = rx.try_recv().ok();
+            assert!(matches!(first, Some(Cmd::Control(_))), "{first:?}");
+            drop(viewer);
+        });
+        runtime.shutdown_timeout(Duration::from_secs(2));
     }
 }

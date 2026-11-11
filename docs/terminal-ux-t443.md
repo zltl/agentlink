@@ -479,3 +479,12 @@ click-to-copy, wraps whole action labels, and draws a fixed-width rail
 inside the central panel that folds below 980 px. Details and screenshot
 ids are in `docs/controller-layout-t444.md`. Real IME is still unaccepted
 (你好 in the 0133 retest was octal `printf`, not an IME commit).
+
+## Viewer close must not block a tokio runtime (0111/0133 panic)
+
+Confirmed on both 0111 and 0133: `Viewer::close` at
+`session.rs:214` used `blocking_send` on `agentlink-controller-net`
+(`Cmd::PtyOpen` → `stop_live`). The 0149 layout candidate does not
+contain this fix and has not been GUI-tested for exit. Close/Drop now
+signal without parking the current runtime; tests cover close/drop
+inside a tokio context. See `docs/controller-layout-t444.md`.
