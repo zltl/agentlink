@@ -1100,18 +1100,24 @@ impl ControllerApp {
             ui.add_space(theme::SPACE_SM);
             ui.label(theme::muted_text("Password"));
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::SPACE_SM;
+                ui.set_height(theme::BTN_PRIMARY_H);
+                let btn_w = 72.0;
                 let edit = egui::TextEdit::singleline(&mut self.password)
                     .password(!self.show_password)
-                    .desired_width(ui.available_width() - 72.0)
+                    .desired_width((ui.available_width() - btn_w - theme::SPACE_SM).max(80.0))
                     .min_size(egui::vec2(0.0, theme::BTN_PRIMARY_H))
                     .margin(egui::Margin::symmetric(theme::BTN_PAD_X as i8, 0));
                 style_text_edit(ui, edit);
                 if ui
-                    .add(theme::secondary_button(if self.show_password {
-                        "Hide"
-                    } else {
-                        "Show"
-                    }))
+                    .add_sized(
+                        [btn_w, theme::BTN_PRIMARY_H],
+                        theme::secondary_button(if self.show_password {
+                            "Hide"
+                        } else {
+                            "Show"
+                        }),
+                    )
                     .clicked()
                 {
                     self.show_password = !self.show_password;

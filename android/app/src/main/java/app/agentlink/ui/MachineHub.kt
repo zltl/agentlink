@@ -109,18 +109,18 @@ private fun MachineSummary(machine: MachineRow) {
                     if (machine.hostname.isNotBlank()) {
                         Text(
                             machine.hostname,
-                            style = MaterialTheme.typography.bodyLarge,
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
                 ConnectionStatus(machine.online)
             }
-            Text(platformLabel(machine), style = MaterialTheme.typography.bodyLarge)
+            Text(platformLabel(machine), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (machine.version.isNotBlank()) {
                 Text(
                     "Version ${machine.version}",
-                    style = MaterialTheme.typography.bodyLarge,
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -158,7 +158,7 @@ private fun ActionRow(state: ActionState, onOpen: (MachineAction) -> Unit) {
             )
             Text(
                 state.detail,
-                style = MaterialTheme.typography.bodyLarge,
+                style = MaterialTheme.typography.bodySmall,
                 color = scheme.onSurfaceVariant,
             )
         }
@@ -182,7 +182,7 @@ private fun actionIcon(action: MachineAction): ImageVector = when (action) {
 internal fun MachineContextLine(machine: MachineRow) {
     Text(
         "${machine.name} · ${if (machine.online) "Online" else "Offline"} · ${machine.preset}",
-        style = MaterialTheme.typography.bodyLarge,
+        style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
 }

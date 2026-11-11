@@ -31,19 +31,49 @@ class MachineUxTest {
     }
 
     @Test
-    fun offlineMachinesDisableActionsAndOnlineOnesAreFull() {
+    fun offlineMachinesDisableActions() {
         val offline = sample(online = false, read = true, exec = true, desktop = true)
         assertTrue(machineActions(offline).none { it.enabled })
         assertFalse(desktopCapability(offline).available)
+        assertEquals("Offline", capabilityLabels(offline))
+    }
 
-        val online = sample(online = true, read = false, exec = false, desktop = false)
-        val desktop = machineActions(online).first { it.action == MachineAction.Desktop }
-        assertTrue(desktop.enabled)
-        assertTrue(desktop.detail.contains("Live view"))
-        assertTrue(machineActions(online).first { it.action == MachineAction.Terminal }.enabled)
-        assertTrue(machineActions(online).first { it.action == MachineAction.Files }.enabled)
-        val drive = desktopCapability(online)
-        assertTrue(drive.screenshots && drive.control && drive.live)
+    @Test
+    fun actionsFollowEffectivePolicyFlags() {
+        // Backend NodePolicy::allows: PtyOpen needs allow_exec; list/read needs
+        // allow_read; screenshots are allow_desktop or remote view.
+        val none = sample(online = true, read = false, exec = false, desktop = false)
+        assertTrue(machineActions(none).none { it.enabled })
+        assertEquals("Needs exec permission", machineActions(none).first { it.action == MachineAction.Terminal }.detail)
+        assertEquals("Reading files is turned off", machineActions(none).first { it.action == MachineAction.Files }.detail)
+        assertEquals("Needs desktop permission.", machineActions(none).first { it.action == MachineAction.Desktop }.detail)
+        assertEquals("File transfer is turned off", machineActions(none).first { it.action == MachineAction.Transfer }.detail)
+        assertEquals("No actions allowed", capabilityLabels(none))
+        val drive = desktopCapability(none)
+        assertFalse(drive.available || drive.screenshots || drive.control || drive.live)
+
+        val shell = sample(online = true, read = true, exec = true, desktop = false, write = true)
+        assertTrue(machineActions(shell).first { it.action == MachineAction.Terminal }.enabled)
+        assertTrue(machineActions(shell).first { it.action == MachineAction.Files }.enabled)
+        assertTrue(machineActions(shell).first { it.action == MachineAction.Transfer }.enabled)
+        assertFalse(machineActions(shell).first { it.action == MachineAction.Desktop }.enabled)
+        assertEquals("Files · Terminal · Upload", capabilityLabels(shell))
+    }
+
+    @Test
+    fun desktopCapabilityMatchesNodePolicyHelpers() {
+        val shots = sample(online = true, read = true, exec = false, desktop = true)
+        val cap = desktopCapability(shots)
+        assertTrue(cap.available && cap.screenshots && cap.control)
+        assertFalse(cap.live)
+        assertTrue(cap.reason.contains("Screenshots and input"))
+
+        val view = sample(online = true, read = true, exec = false, desktop = false, remoteView = true)
+        val live = desktopCapability(view)
+        assertTrue(live.available && live.screenshots && live.live)
+        assertFalse(live.control)
+        assertTrue(live.reason.contains("Live view is allowed"))
+        assertFalse(live.reason.contains("and input are allowed"))
     }
 
     @Test
@@ -135,6 +165,7 @@ class MachineUxTest {
         read: Boolean,
         exec: Boolean,
         desktop: Boolean,
+        write: Boolean = false,
         remoteView: Boolean = false,
         remoteControl: Boolean = false,
         desktopStream: Boolean = false,
@@ -148,7 +179,7 @@ class MachineUxTest {
         online = online,
         preset = "exec",
         allowRead = read,
-        allowWrite = false,
+        allowWrite = write,
         allowExec = exec,
         allowDesktop = desktop,
         allowDesktopStream = desktopStream,

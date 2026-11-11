@@ -139,7 +139,7 @@ fun MachinesBody(
                     item {
                         Text(
                             "$online online · $offline offline",
-                            style = MaterialTheme.typography.bodyLarge,
+                            style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.testTag("machines-summary"),
                         )
@@ -214,7 +214,7 @@ private fun MachineCard(machine: MachineRow, onClick: () -> Unit) {
                     if (machine.hostname.isNotBlank()) {
                         Text(
                             machine.hostname,
-                            style = MaterialTheme.typography.bodyLarge,
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -222,27 +222,20 @@ private fun MachineCard(machine: MachineRow, onClick: () -> Unit) {
                 ConnectionStatus(machine.online)
                 Icon(
                     Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    contentDescription = null,
+                    contentDescription = "Open machine",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             Text(
                 platformLabel(machine),
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurface,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
                 capabilityLabels(machine),
-                style = MaterialTheme.typography.bodyLarge,
+                style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (!machine.online) {
-                Text(
-                    "Offline. Open it to see which actions are paused.",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
         }
     }
 }

@@ -41,6 +41,22 @@ data class PairFlags(
 
 fun pairFlags(): PairFlags = PairFlags(true, true, true, true, true, true, true)
 
+/**
+ * Mirrors `NodePolicy` helpers in agentlink-core. The machine list carries
+ * `node.effective` flags from the backend; this UI must not invent access.
+ */
+fun allowsRemoteView(machine: MachineRow): Boolean =
+    machine.allowRemoteView || machine.allowDesktopStream
+
+fun allowsScreenshot(machine: MachineRow): Boolean =
+    machine.allowDesktop || allowsRemoteView(machine)
+
+fun allowsDesktopInput(machine: MachineRow): Boolean =
+    machine.allowDesktop || machine.allowRemoteControl
+
+fun hasDesktopCapability(machine: MachineRow): Boolean =
+    allowsScreenshot(machine) || allowsDesktopInput(machine) || allowsRemoteView(machine)
+
 fun desktopCapability(machine: MachineRow): DesktopCapability {
     if (!machine.online) {
         return DesktopCapability(
@@ -51,12 +67,25 @@ fun desktopCapability(machine: MachineRow): DesktopCapability {
             reason = "This machine is offline. Desktop stays off until it reconnects.",
         )
     }
+    val screenshots = allowsScreenshot(machine)
+    val control = allowsDesktopInput(machine)
+    val live = allowsRemoteView(machine)
+    val available = screenshots || control || live
+    val reason = when {
+        !available -> "Needs desktop permission."
+        live && control -> "Live view and input are allowed."
+        live && !control -> "Live view is allowed. Input is not."
+        screenshots && control -> "Screenshots and input are allowed. Live stream is not."
+        screenshots -> "Screenshots are allowed. Live stream and input are not."
+        control -> "Input is allowed. Live stream is not."
+        else -> "Desktop view is allowed."
+    }
     return DesktopCapability(
-        available = true,
-        screenshots = true,
-        control = true,
-        live = true,
-        reason = "Live view and input are allowed.",
+        available = available,
+        screenshots = screenshots,
+        control = control,
+        live = live,
+        reason = reason,
     )
 }
 
@@ -67,12 +96,18 @@ fun machineActions(machine: MachineRow): List<ActionState> {
         if (!allowed) return false to blocked
         return true to ready
     }
-    val files = line(true, "Browse, open, and download", "Reading files is turned off")
-    val terminal = line(true, "Open a shell on this machine", "Needs exec permission")
+    val files = line(machine.allowRead, "Browse, open, and download", "Reading files is turned off")
+    val terminal = line(machine.allowExec, "Open a shell on this machine", "Needs exec permission")
     val desktop = desktopCapability(machine)
     val desktopDetail = if (offline) "Unavailable while offline" else desktop.reason
-    val transfer = line(true, "Upload and download whole files", "File transfer is turned off")
-    val audit = line(true, "Recent lines from the audit log", "Reading files is turned off")
+    val transfer = when {
+        offline -> false to "Unavailable while offline"
+        machine.allowRead && machine.allowWrite -> true to "Upload and download whole files"
+        machine.allowRead -> true to "Download is allowed. Upload is turned off"
+        machine.allowWrite -> true to "Upload is allowed. Download is turned off"
+        else -> false to "File transfer is turned off"
+    }
+    val audit = line(machine.allowRead, "Recent lines from the audit log", "Reading files is turned off")
     return listOf(
         ActionState(MachineAction.Terminal, terminal.first, terminal.second),
         ActionState(MachineAction.Files, files.first, files.second),
@@ -84,7 +119,13 @@ fun machineActions(machine: MachineRow): List<ActionState> {
 
 fun capabilityLabels(machine: MachineRow): String {
     if (!machine.online) return "Offline"
-    return "Files · Terminal · Upload · Desktop"
+    val parts = buildList {
+        if (machine.allowRead) add("Files")
+        if (machine.allowExec) add("Terminal")
+        if (machine.allowWrite) add("Upload")
+        if (hasDesktopCapability(machine)) add("Desktop")
+    }
+    return if (parts.isEmpty()) "No actions allowed" else parts.joinToString(" · ")
 }
 
 fun platformLabel(machine: MachineRow): String {
