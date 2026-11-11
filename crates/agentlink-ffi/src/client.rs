@@ -20,7 +20,7 @@ use agentlink_core::{
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::pty_pump::{pump_session, PtyCmd};
+use crate::pty_pump::{pump_session, EventQueue, PtyCmd, WRITE_CMD_CAP};
 use crate::LinkError;
 
 #[derive(uniffi::Record, Clone)]
@@ -784,52 +784,54 @@ impl Drop for MobileClient {
 
 #[derive(uniffi::Object)]
 pub struct PtyHandle {
-    cmd: mpsc::UnboundedSender<PtyCmd>,
-    events: Arc<Mutex<VecDeque<String>>>,
+    cmd: mpsc::Sender<PtyCmd>,
+    events: Arc<EventQueue>,
 }
 
 impl PtyHandle {
     fn spawn(handle: tokio::runtime::Handle, session: PtySession) -> Arc<Self> {
-        let (cmd, cmd_rx) = mpsc::unbounded_channel();
-        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let (cmd, cmd_rx) = mpsc::channel(WRITE_CMD_CAP);
+        let events = Arc::new(EventQueue::new());
         let queue = events.clone();
         let writer = session.writer();
         handle.spawn(async move {
-            // Input-first, pinned recv (see docs/terminal-ux-t443.md and pty_pump.rs).
+            // Input-first, pinned recv, bounded lossless queue (see docs and pty_pump.rs).
             pump_session(cmd_rx, session, writer, queue).await;
         });
         Arc::new(Self { cmd, events })
     }
 }
 
+fn send_cmd(cmd: &mpsc::Sender<PtyCmd>, value: PtyCmd) -> Result<(), LinkError> {
+    cmd.try_send(value).map_err(|err| match err {
+        mpsc::error::TrySendError::Full(_) => LinkError::Fail {
+            detail: "shell input queue is full".into(),
+        },
+        mpsc::error::TrySendError::Closed(_) => LinkError::Fail {
+            detail: "shell session closed".into(),
+        },
+    })
+}
+
 #[uniffi::export]
 impl PtyHandle {
     pub fn poll(&self) -> String {
         self.events
-            .lock()
-            .ok()
-            .and_then(|mut q| q.pop_front())
+            .pop()
             .unwrap_or_else(|| json!({"event":"pending"}).to_string())
     }
 
     pub fn write(&self, data: Vec<u8>) -> Result<(), LinkError> {
-        self.cmd
-            .send(PtyCmd::Write(data))
-            .map_err(|_| LinkError::Fail {
-                detail: "shell session closed".into(),
-            })
+        send_cmd(&self.cmd, PtyCmd::Write(data))
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), LinkError> {
-        self.cmd
-            .send(PtyCmd::Resize(rows, cols))
-            .map_err(|_| LinkError::Fail {
-                detail: "shell session closed".into(),
-            })
+        send_cmd(&self.cmd, PtyCmd::Resize(rows, cols))
     }
 
     pub fn shutdown(&self) {
-        let _ = self.cmd.send(PtyCmd::Close);
+        let _ = self.cmd.try_send(PtyCmd::Close);
+        self.events.close();
     }
 }
 

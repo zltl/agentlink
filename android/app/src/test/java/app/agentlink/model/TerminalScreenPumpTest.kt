@@ -129,3 +129,17 @@ class ImeComposingTest {
         assertEquals("", ime.text)
     }
 }
+
+class PtyWriteOfferTest {
+    @Test
+    fun fullChannelIsRejectedAndDoesNotDropSilentlyIntoASuccess() {
+        val channel = kotlinx.coroutines.channels.Channel<ByteArray>(1)
+        assertEquals(PtyWriteOffer.Queued, offerPtyWrite(channel, byteArrayOf(1)))
+        assertEquals(PtyWriteOffer.Full, offerPtyWrite(channel, byteArrayOf(2)))
+        assertEquals(PtyWriteOffer.Empty, offerPtyWrite(channel, byteArrayOf()))
+        val first = channel.tryReceive().getOrNull()
+        assertEquals(1.toByte(), first!!.first())
+        channel.close()
+        assertEquals(PtyWriteOffer.Closed, offerPtyWrite(channel, byteArrayOf(3)))
+    }
+}

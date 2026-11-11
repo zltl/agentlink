@@ -197,3 +197,92 @@ Code lands on `feat/terminal-ux-t443` only. Bundles go under
 `/workspace/agentlink-t427-recovery/` and must not overwrite the t427
 GNU candidate or `20261111-2004` artifacts. No push, merge, deploy, or
 production node restart.
+
+
+## Correctness patch (2026-11-12 Asia/Shanghai)
+
+The first batch’s client poll queue (`EVENT_QUEUE_MAX_EVENTS = 512`) **did
+drop the oldest `data` event** to make room, while keeping exit/error. That
+is not safe for a terminal byte stream: dropping an arbitrary chunk can
+split a UTF-8 sequence or a CSI, and can desync fullscreen/TUI state.
+This patch removes that behavior. It does not change grant or auth
+boundaries, and it is still **not deployed**.
+
+### Official sources → mechanism → this change
+
+Only pages actually fetched earlier; nothing is invented, and a 404 is
+not treated as a source.
+
+| Official source | Mechanism taken from it | What landed in this / the prior t443 patch |
+| --- | --- | --- |
+| [VS Code Terminal Advanced](https://code.visualstudio.com/docs/terminal/advanced) and [`FlowControlConstants`](https://github.com/microsoft/vscode/blob/main/src/vs/platform/terminal/common/terminal.ts) (`HighWatermarkChars=100000`, `LowWatermarkChars=5000`, `CharCountAckSize=5000`), implemented in [`terminalProcess.ts`](https://github.com/microsoft/vscode/blob/main/src/vs/platform/terminal/node/terminalProcess.ts) (`pause` / `resume` / `acknowledgeDataEvent`) | Bound outstanding output with **high/low watermarks**; pause producers instead of dropping bytes; hysteresis so the queue does not flap; the documented goal is to avoid flooding, not to delay input | Local `EventQueue`: high 512 events **and** 256 KiB total JSON bytes; low 128 events / 64 KiB; reserved 1 event + up to 1024 bytes for exit/error so a terminal event never evicts data. At cap, `push` returns `WouldBlock`, the event is **held**, and `recv` is paused until `poll()` / `pop()` notifies space. **No remote PTY pause/ack protocol** is implemented; this is client-side backpressure only. |
+| Same Advanced page, “Reducing remote input latency (Preview)” | Optional local echo only above a 30 ms latency threshold; default exclude `vim` / `vi` / `nano` / `tmux` | Unchanged: **no** blanket optimistic echo of committed keys. |
+| [xterm.js typings](https://github.com/xtermjs/xterm.js/blob/master/typings/xterm.d.ts) (`write()` raw UTF-8, streaming parse) | The parser consumes a **contiguous byte stream**; dropping mid-stream bytes is a correctness bug | Event queue never drops `data`. Stress tests cover order past the cap, and UTF-8 / CSI split across chunks (`你`, `\x1b[2;3HZ`). |
+| [Mosh](https://mosh.org/) / [USENIX paper](https://mosh.org/mosh-paper.pdf) | Speculative echo with epochs — a full screen-state protocol, not a drop-in for this byte stream | Still **not** implemented. Cited only as a future option. |
+| [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) | Unambiguous keys; IME/text as UTF-8 | Not this patch. The earlier IME composing overlay (local preview until commit) already follows the “don’t send incomplete composition” idea. |
+| WezTerm `multiplexing.html` | Fetch returned **404** | Not used. No WezTerm mechanism is claimed. |
+
+### Queue and write-path rules
+
+- **No unbounded memory queue** on the FFI poll path: caps are event
+  count, per-event size (a single chunk larger than the data-byte cap is
+  `Overflow`), and a total byte budget.
+- **`Overflow`** (a chunk that can never fit, or a terminal error that
+  cannot be reserved): keep already-queued data, enqueue an explicit
+  error, and **end the session**. The pump must not keep running as if
+  the stream were intact.
+- **`WouldBlock`**: hold one event, wait on `Notify` from `pop()` /
+  `close()`. Input (`PtyCmd`) is still selected while output is paused,
+  then the held event is flushed when space returns, so continuous
+  input must not permanently starve output.
+- Exit / error use the reserved slot and must not evict data.
+- Bounded write queues: FFI `WRITE_CMD_CAP = 256`, Android
+  `WRITE_QUEUE_CAP = 256`. `try_send` / `trySend` failure
+  (`Full` or `Closed`) **fail-closes** the session with an explicit
+  message. It must not look like the keystroke was accepted.
+- Remaining bound, documented and **not** fixed here: `PtySession.rx` in
+  `agentlink-core` may still grow while the FFI side is paused. That is
+  a further backpressure surface, not a claim of an end-to-end byte cap.
+
+### Isolated latency (still not a device P95)
+
+Same mock, no network, 2026-11-12 00:04 Asia/Shanghai, `cargo test -p
+agentlink-ffi pty_pump`:
+
+- Legacy baseline (write queued into a 40 ms idle `recv` timeout):
+  **34.799202 ms**
+- Input-first candidate (idle `recv`, same mock): **35.505 µs**
+
+These numbers only show the local idle-recv wait is gone. They are not
+phone RTT, IME, render time, or hand-feel.
+
+### Tests this pass (separate from the earlier 16 + 28 + 34)
+
+Earlier accepted counts stay historical: ffi lib 16, Android filtered 28,
+`controller::` 34. This pass does not relabel them as new.
+
+- `cargo test -p agentlink-ffi --lib`: **20 passed**, 0 failed (11
+  existing ffi tests + 9 `pty_pump` tests). Of the 9: 4 first-batch pump
+  tests remain; **5** are new or replaced for this correctness work:
+  `event_queue_does_not_drop_data_when_full` (replaces drop-oldest),
+  `slow_consumer_receives_more_than_cap_bytes_in_order`,
+  `continuous_input_does_not_starve_output`,
+  `close_while_blocked_does_not_hang_and_keeps_queued_data`,
+  `oversized_chunk_ends_the_session_without_dropping_prior_data`.
+- Android `:app:testDebugUnitTest` (same filters as before, plus the new
+  class): **29 passed**, 0 failed — previous 28 plus **1** new
+  `PtyWriteOfferTest`. `compileDebugKotlin` succeeded as part of this
+  run (affected Compose sources compiled).
+- `:app:assembleDebug`: **succeeded** 2026-11-12 00:05 Asia/Shanghai
+  (`app-debug.apk`, 19M). Compose UI packaged. The APK contains
+  `libjnidispatch.so` and `libandroidx.graphics.path.so` only — **no
+  `libagentlink_ffi.so`**. `android/app/src/main/jniLibs` is absent;
+  `ANDROID_NDK_HOME` is unset and `/home/box/Android/Sdk/ndk` is not
+  present, so `android/build-native.sh` was **not** run. This is a UI
+  compile, not a runnable on-device native build. The APK was **not**
+  installed.
+
+Untested still: real phone, screenshots, IME/hand-feel, production E2E
+RTT, CJK two-cell width, remote PTY pause/ack, a bound on
+`PtySession.rx`. Controller `::` tests were not re-run in this
+correctness pass (no desktop-controller code change).

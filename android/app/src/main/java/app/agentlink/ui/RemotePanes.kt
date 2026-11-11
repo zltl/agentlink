@@ -88,7 +88,11 @@ import app.agentlink.model.liveFailureShouldRetry
 import app.agentlink.model.liveStatus
 import app.agentlink.model.looksTextual
 import app.agentlink.model.parentPath
+import app.agentlink.model.PTY_WRITE_CLOSED_MESSAGE
+import app.agentlink.model.PTY_WRITE_FULL_MESSAGE
 import app.agentlink.model.PtyClientPolicy
+import app.agentlink.model.PtyWriteOffer
+import app.agentlink.model.offerPtyWrite
 import app.agentlink.model.ptySequence
 import app.agentlink.model.ptyText
 import app.agentlink.model.searchFiles
@@ -500,17 +504,31 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
             for (bytes in ptyWrites) {
                 val handle = ptyRef.get() ?: continue
                 runCatching { handle.write(bytes) }.onFailure {
+                    val message = it.message ?: PTY_WRITE_FULL_MESSAGE
                     withContext(Dispatchers.Main) {
-                        note = it.message ?: "Couldn't send that keystroke."
+                        note = message
+                        phase = ShellPhase.Failed
+                        ptyWrites.close()
+                        pty?.close()
+                        pty = null
                     }
                 }
             }
         }
     }
+    fun failWrite(message: String) {
+        note = message
+        phase = ShellPhase.Failed
+        ptyWrites.close()
+        pty?.close()
+        pty = null
+    }
     fun writePty(bytes: ByteArray) {
         if (bytes.isEmpty() || ptyRef.get() == null) return
-        if (ptyWrites.trySend(bytes).isFailure) {
-            note = "Couldn't send that keystroke."
+        when (offerPtyWrite(ptyWrites, bytes)) {
+            PtyWriteOffer.Queued, PtyWriteOffer.Empty -> Unit
+            PtyWriteOffer.Full -> failWrite(PTY_WRITE_FULL_MESSAGE)
+            PtyWriteOffer.Closed -> failWrite(PTY_WRITE_CLOSED_MESSAGE)
         }
     }
     fun openShell() {

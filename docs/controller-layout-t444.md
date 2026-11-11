@@ -208,3 +208,18 @@ visually confirm.
 If a box-browser preview is needed later, start an isolated preview
 server and give the parent the localhost URL plus the Machines / Hub
 entry; do not open a browser from this executor.
+
+
+## Scope reminder and later compile (2026-11-12 Asia/Shanghai)
+
+This Controller work is a **first-pass hierarchy revision**, not a
+complete visual redesign: typography, quieter machine cards, honest
+`node.effective` action flags, and a desktop login-row alignment. It
+does not restyle the web dashboard, does not rewrite list+detail
+layouts, and does not change grant semantics.
+
+A later correctness pass (terminal backpressure, same branch) ran
+`:app:assembleDebug` successfully and compiled the affected Compose
+sources. That is a compile result, not a visual or device acceptance
+of this UI slice. No new screenshots. No real phone. The debug APK
+was not installed.
