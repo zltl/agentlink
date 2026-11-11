@@ -2,8 +2,13 @@
 //!
 //! Flags and environment variables override `config.json`. The MCP server and
 //! the CLI read the same file, so `agentlink login` is enough for both.
+//!
+//! Session refresh (token rotation) takes an advisory lock on
+//! `config.json.lock` so two processes cannot each burn a stale refresh
+//! token. Writes use [`util::write_secret`] (unique tmp + rename).
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -71,11 +76,55 @@ pub fn default_data_dir(kind: &str) -> Result<PathBuf> {
         .ok_or_else(|| Error::Message("could not resolve a data directory".into()))
 }
 
-pub fn config_path(dir: &std::path::Path) -> PathBuf {
+pub fn config_path(dir: &Path) -> PathBuf {
     dir.join("config.json")
 }
 
-pub fn load_file(dir: &std::path::Path) -> Result<FileConfig> {
+/// Advisory lock beside `config.json` for session refresh / save.
+pub fn session_lock_path(dir: &Path) -> PathBuf {
+    dir.join("config.json.lock")
+}
+
+/// Held for the critical section that re-reads, refreshes, and saves a session.
+///
+/// Dropping releases the lock. The lock is blocking so a second refresher
+/// waits and then re-reads under the lock instead of racing the first.
+#[derive(Debug)]
+pub struct ConfigSessionLock {
+    _file: File,
+}
+
+/// Acquire an exclusive advisory lock on `config.json.lock`.
+///
+/// Creates the config directory when needed. Callers must re-load
+/// `config.json` under this lock before deciding to refresh.
+pub fn lock_session(dir: &Path) -> Result<ConfigSessionLock> {
+    if !dir.as_os_str().is_empty() {
+        util::ensure_secret_parent(dir)?;
+    }
+    let path = session_lock_path(dir);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.lock().map_err(|err| {
+        Error::Message(format!("could not lock {}: {err}", path.display()))
+    })?;
+    Ok(ConfigSessionLock { _file: file })
+}
+
+/// True when a stored access token is present and not within `skew_secs` of expiry.
+pub fn access_token_is_fresh(file: &FileConfig, now_unix: i64, skew_secs: i64) -> bool {
+    let token = file.token.as_deref().unwrap_or("");
+    if token.trim().is_empty() {
+        return false;
+    }
+    file.access_expires_unix.unwrap_or(0) > now_unix + skew_secs
+}
+
+
+pub fn load_file(dir: &Path) -> Result<FileConfig> {
     let path = config_path(dir);
     if !path.exists() {
         return Ok(FileConfig::default());
@@ -100,8 +149,22 @@ pub fn save_settings(dir: &std::path::Path, settings: &ClientSettings) -> Result
 }
 
 /// Store a username session. `settings.token` is the short-lived access token.
+///
+/// Takes [`lock_session`] so a concurrent refresher cannot interleave.
 pub fn save_session(
-    dir: &std::path::Path,
+    dir: &Path,
+    settings: &ClientSettings,
+    user: &str,
+    refresh_token: &str,
+    access_expires_unix: i64,
+) -> Result<()> {
+    let _lock = lock_session(dir)?;
+    save_session_unlocked(dir, settings, user, refresh_token, access_expires_unix)
+}
+
+/// Like [`save_session`], but the caller already holds [`lock_session`].
+pub fn save_session_unlocked(
+    dir: &Path,
     settings: &ClientSettings,
     user: &str,
     refresh_token: &str,
@@ -266,5 +329,77 @@ mod tests {
             .unwrap()
             .contains("CA-only"));
         assert!(ca_only_warning(&leaf, Some("webpki")).is_none());
+    }
+
+    #[test]
+    fn access_token_freshness_and_refresh_presence() {
+        let mut file = FileConfig::default();
+        assert!(!access_token_is_fresh(&file, 100, 60));
+        file.token = Some("access-dummy".into());
+        file.access_expires_unix = Some(200);
+        // Remaining life is 100s; skew of 60s still leaves the token fresh.
+        assert!(access_token_is_fresh(&file, 100, 60));
+        // Within the skew window (200 is not greater than 150+60).
+        assert!(!access_token_is_fresh(&file, 150, 60));
+        assert!(access_token_is_fresh(&file, 100, 0));
+        file.token = Some("   ".into());
+        assert!(!access_token_is_fresh(&file, 100, 0));
+    }
+
+    #[test]
+    fn session_lock_serializes_two_writers() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+        let first = {
+            let barrier = barrier.clone();
+            let dir_path = dir_path.clone();
+            std::thread::spawn(move || {
+                let lock = lock_session(&dir_path).unwrap();
+                barrier.wait();
+                std::thread::sleep(Duration::from_millis(80));
+                drop(lock);
+                "first"
+            })
+        };
+        let waited = {
+            let barrier = barrier.clone();
+            let dir_path = dir_path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let started = std::time::Instant::now();
+                let _lock = lock_session(&dir_path).unwrap();
+                started.elapsed()
+            })
+        };
+        assert_eq!(first.join().unwrap(), "first");
+        let waited = waited.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(50),
+            "second lock returned too early: {waited:?}"
+        );
+        assert!(session_lock_path(dir.path()).is_file());
+    }
+
+    #[test]
+    fn save_session_writes_atomically_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = ClientSettings {
+            relay: "wss://relay.example:7443".into(),
+            token: "access-dummy".into(),
+            fingerprint: format!("sha256:{}", "ab".repeat(32)),
+            trust: None,
+        };
+        save_session(dir.path(), &settings, "alice", "refresh-dummy", 9_999).unwrap();
+        let loaded = load_file(dir.path()).unwrap();
+        assert_eq!(loaded.user.as_deref(), Some("alice"));
+        assert_eq!(loaded.token.as_deref(), Some("access-dummy"));
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh-dummy"));
+        assert_eq!(loaded.access_expires_unix, Some(9_999));
+        // Never assert or print token values beyond equality above.
+        assert!(session_lock_path(dir.path()).is_file());
     }
 }

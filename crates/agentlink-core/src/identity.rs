@@ -34,6 +34,18 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Read an existing identity file. Missing or corrupt files fail; nothing
+    /// is created or rewritten.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(Error::Message(format!(
+                "身份文件不存在，未重新生成：{}",
+                path.display()
+            )));
+        }
+        Self::load_existing(path)
+    }
+
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -259,6 +271,28 @@ mod tests {
             // must not have required chmod of a pre-existing parent.
             let _ = dir_mode;
         }
+    }
+
+    #[test]
+    fn load_errors_when_missing_and_does_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let err = match Identity::load(&path) {
+            Ok(_) => panic!("expected a missing identity file to fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("不存在"), "{err}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_or_create_ensure_rereads_without_rotating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let first = Identity::load_or_create(&path).unwrap().public_hex().to_string();
+        let again = Identity::load_or_create(&path).unwrap().public_hex().to_string();
+        assert_eq!(first, again);
+        assert_eq!(Identity::load(&path).unwrap().public_hex(), first);
     }
 
     #[test]

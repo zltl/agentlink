@@ -2805,44 +2805,126 @@ pub struct UserSession {
     pub refresh_expires_unix: i64,
 }
 
+/// Inputs for a session refresh under the config-dir advisory lock.
+#[derive(Debug, Clone)]
+pub struct SessionRefreshRequest {
+    pub relay: String,
+    pub fingerprint: String,
+    pub trust: Option<String>,
+    pub refresh_token: String,
+}
+
 /// Refresh a saved access token when it expires within a minute.
 ///
-/// Returns `Ok(None)` when the config has no refresh token or the access
-/// token is still fresh. A refresh writes the new session back to `dir`.
+/// Single-writer: takes `config.json.lock`, re-loads the file under the lock,
+/// skips refresh when the access token is still fresh, otherwise refreshes and
+/// atomically saves. If refresh fails because another process already rotated
+/// the token, re-loads and adopts that session when it is usable.
+///
+/// Returns `Ok(None)` when there is no refresh token, relay/trust is missing,
+/// or the access token is still fresh (no write needed).
 pub async fn maintain_session(
     dir: &std::path::Path,
     identity: &crate::identity::Identity,
 ) -> Result<Option<crate::config::ClientSettings>> {
+    let identity = identity.clone();
+    maintain_session_with(dir, &identity, |req, identity| {
+        let SessionRefreshRequest {
+            relay,
+            fingerprint,
+            trust,
+            refresh_token,
+        } = req;
+        let identity = identity.clone();
+        async move {
+            refresh_user(
+                &relay,
+                &fingerprint,
+                trust.as_deref(),
+                &identity,
+                &refresh_token,
+            )
+            .await
+        }
+    })
+    .await
+}
+
+/// Like [`maintain_session`], but the refresh step is injectable for hermetic
+/// tests. Never copies a production session file.
+pub async fn maintain_session_with<F, Fut>(
+    dir: &std::path::Path,
+    identity: &crate::identity::Identity,
+    refresh_fn: F,
+) -> Result<Option<crate::config::ClientSettings>>
+where
+    F: FnOnce(SessionRefreshRequest, &crate::identity::Identity) -> Fut,
+    Fut: std::future::Future<Output = Result<UserSession>>,
+{
+    let _lock = crate::config::lock_session(dir)?;
     let file = crate::config::load_file(dir).unwrap_or_default();
-    let Some(refresh) = file.refresh_token.filter(|token| !token.is_empty()) else {
+    let Some(refresh) = file
+        .refresh_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+    else {
         return Ok(None);
     };
-    let relay = file.relay.unwrap_or_default();
-    let fingerprint = file.fingerprint.unwrap_or_default();
-    let trust = file.trust.filter(|value| !value.trim().is_empty());
+    let relay = file.relay.clone().unwrap_or_default();
+    let fingerprint = file.fingerprint.clone().unwrap_or_default();
+    let trust = file.trust.clone().filter(|value| !value.trim().is_empty());
     if relay.is_empty() || (fingerprint.is_empty() && trust.is_none()) {
         return Ok(None);
     }
     let now = crate::util::unix_now();
-    let expires = file.access_expires_unix.unwrap_or(0);
-    if expires > now + 60 && file.token.as_ref().is_some_and(|token| !token.is_empty()) {
+    if crate::config::access_token_is_fresh(&file, now, 60) {
         return Ok(None);
     }
-    let session = refresh_user(&relay, &fingerprint, trust.as_deref(), identity, &refresh).await?;
-    let settings = crate::config::ClientSettings {
-        relay,
-        token: session.access_token.clone(),
-        fingerprint,
-        trust,
+    let req = SessionRefreshRequest {
+        relay: relay.clone(),
+        fingerprint: fingerprint.clone(),
+        trust: trust.clone(),
+        refresh_token: refresh,
     };
-    crate::config::save_session(
-        dir,
-        &settings,
-        &session.user,
-        &session.refresh_token,
-        session.access_expires_unix,
-    )?;
-    Ok(Some(settings))
+    match refresh_fn(req, identity).await {
+        Ok(session) => {
+            let settings = crate::config::ClientSettings {
+                relay,
+                token: session.access_token.clone(),
+                fingerprint,
+                trust,
+            };
+            crate::config::save_session_unlocked(
+                dir,
+                &settings,
+                &session.user,
+                &session.refresh_token,
+                session.access_expires_unix,
+            )?;
+            Ok(Some(settings))
+        }
+        Err(err) => {
+            // Another process may have won the rotation. Re-read under the
+            // same lock and adopt a usable session instead of burning again.
+            let again = crate::config::load_file(dir).unwrap_or_default();
+            let now = crate::util::unix_now();
+            if crate::config::access_token_is_fresh(&again, now, 0) {
+                let relay = again.relay.unwrap_or_default();
+                let fingerprint = again.fingerprint.unwrap_or_default();
+                let trust = again.trust.filter(|value| !value.trim().is_empty());
+                let token = again.token.unwrap_or_default();
+                if !relay.is_empty() && !token.is_empty() {
+                    return Ok(Some(crate::config::ClientSettings {
+                        relay,
+                        token,
+                        fingerprint,
+                        trust,
+                    }));
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Username/password login. The device key is `identity`. The returned access
@@ -3056,5 +3138,131 @@ fn kind(env: &Envelope) -> &'static str {
         Envelope::SetUserAudit { .. } => "set_user_audit",
         Envelope::GoingAway { .. } => "going_away",
         Envelope::Session { .. } => "session",
+    }
+}
+
+
+#[cfg(test)]
+mod session_maintain_tests {
+    use super::*;
+    use crate::config::{load_file, save_session, ClientSettings};
+    use crate::identity::Identity;
+
+    fn dummy_identity() -> Identity {
+        Identity::from_seed(&[7u8; 32]).unwrap()
+    }
+
+    fn dummy_settings() -> ClientSettings {
+        ClientSettings {
+            relay: "wss://relay.example:7443".into(),
+            token: "access-old".into(),
+            fingerprint: format!("sha256:{}", "ab".repeat(32)),
+            trust: None,
+        }
+    }
+
+    fn dummy_session(access: &str, refresh: &str, exp: i64) -> UserSession {
+        UserSession {
+            user: "alice".into(),
+            role: "user".into(),
+            device_id: "dev1".into(),
+            access_token: access.into(),
+            access_expires_unix: exp,
+            refresh_token: refresh.into(),
+            refresh_expires_unix: exp + 86_400,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_refresh_token_returns_none_without_calling_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = called.clone();
+        let out = maintain_session_with(dir.path(), &dummy_identity(), |_req, _id| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(dummy_session("a", "r", 9_999)) }
+        })
+        .await
+        .unwrap();
+        assert!(out.is_none());
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn skips_refresh_when_access_token_is_still_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dummy_settings();
+        let far = crate::util::unix_now() + 3_600;
+        save_session(dir.path(), &settings, "alice", "refresh-old", far).unwrap();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = called.clone();
+        let out = maintain_session_with(dir.path(), &dummy_identity(), |_req, _id| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(dummy_session("access-new", "refresh-new", far)) }
+        })
+        .await
+        .unwrap();
+        assert!(out.is_none());
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        let loaded = load_file(dir.path()).unwrap();
+        assert_eq!(loaded.token.as_deref(), Some("access-old"));
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh-old"));
+    }
+
+    #[tokio::test]
+    async fn refreshes_under_lock_and_saves_new_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dummy_settings();
+        save_session(dir.path(), &settings, "alice", "refresh-old", 1).unwrap();
+        let out = maintain_session_with(dir.path(), &dummy_identity(), |req, _id| {
+            assert_eq!(req.refresh_token, "refresh-old");
+            async { Ok(dummy_session("access-new", "refresh-new", crate::util::unix_now() + 3_600)) }
+        })
+        .await
+        .unwrap()
+        .expect("refreshed");
+        assert_eq!(out.token, "access-new");
+        let loaded = load_file(dir.path()).unwrap();
+        assert_eq!(loaded.token.as_deref(), Some("access-new"));
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh-new"));
+        assert_eq!(loaded.user.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_failure_adopts_winner_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dummy_settings();
+        save_session(dir.path(), &settings, "alice", "refresh-old", 1).unwrap();
+        let winner = ClientSettings {
+            token: "access-winner".into(),
+            ..dummy_settings()
+        };
+        let dir_for_fn = dir.path().to_path_buf();
+        let out = maintain_session_with(dir.path(), &dummy_identity(), move |_req, _id| {
+            let dir_for_fn = dir_for_fn.clone();
+            let winner = winner.clone();
+            async move {
+                // Simulate the other process winning the rotation and saving
+                // under a separate lock after this caller has already decided
+                // to refresh (file already loaded). The unlock/re-lock path is
+                // the save itself; we write the winner file then fail.
+                crate::config::save_session_unlocked(
+                    &dir_for_fn,
+                    &winner,
+                    "alice",
+                    "refresh-winner",
+                    crate::util::unix_now() + 3_600,
+                )
+                .unwrap();
+                Err(Error::Auth("refresh token already used".into()))
+            }
+        })
+        .await
+        .unwrap()
+        .expect("adopted winner");
+        assert_eq!(out.token, "access-winner");
+        let loaded = load_file(dir.path()).unwrap();
+        assert_eq!(loaded.token.as_deref(), Some("access-winner"));
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh-winner"));
     }
 }
