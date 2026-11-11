@@ -4,24 +4,24 @@
 //! [`super::worker`] on the same client the phone uses. Visual tokens live in
 //! [`super::theme`].
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentlink_core::{NodeInfo, NodePolicy};
 use eframe::egui;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::chrome::{
-    BAR_HEIGHT, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
     classify_connect_error, connection_bar_visible, encoder_label, estimate_right_width_with,
     link_is_connecting, pick_bar_density, session_chrome_top_height, session_phase, stats_chip,
-    stats_line, text_advance,
+    stats_line, text_advance, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
+    BAR_HEIGHT,
 };
 use super::model::{
-    self, Action, CardButtonKind, card_buttons, connection_label, display_note, has_saved_session,
+    self, card_buttons, connection_label, display_note, has_saved_session, Action, CardButtonKind,
 };
 use super::term::Emulator;
 use super::theme;
@@ -125,6 +125,9 @@ pub struct ControllerApp {
     config_dir: std::path::PathBuf,
     data_dir: std::path::PathBuf,
     tray: bool,
+    /// When true, the title-bar close button hides to the status icon.
+    /// False for a normal foreground window so close actually quits.
+    hide_on_close: bool,
     flags: TrayFlags,
     screen: Screen,
     username: String,
@@ -275,6 +278,7 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
             opts.background = false;
         }
     }
+    let hide_on_close = model::hides_window_on_close(tray_ready, opts.background, false);
     let mut app = ControllerApp::new_debug(
         tx,
         shared,
@@ -288,6 +292,7 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
         opts.connect_timeout_secs,
         opts.max_fps,
     );
+    app.hide_on_close = hide_on_close;
     app.perf_log = opts.perf_log;
     app.debug_inbox = opts.debug_inbox;
     app.open_desktop = opts.open_desktop;
@@ -349,6 +354,7 @@ impl ControllerApp {
             config_dir,
             data_dir,
             tray,
+            hide_on_close: false,
             flags,
             screen: if saved_session {
                 Screen::Restoring
@@ -1074,14 +1080,20 @@ impl eframe::App for ControllerApp {
         if self.flags.open.swap(false, Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
-        if self.tray
-            && ctx.input(|input| input.viewport().close_requested())
+        if self.hide_on_close
             && !self.flags.quit.load(Ordering::Relaxed)
+            && ctx.input(|input| input.viewport().close_requested())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         self.ui_frame(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flags.quit.store(true, Ordering::Relaxed);
+        self.send(Cmd::PtyClose);
+        self.send(Cmd::LiveStop);
     }
 }
 
@@ -1114,46 +1126,57 @@ impl ControllerApp {
                     self.desktop(ui);
                 });
         } else {
-            let in_session = matches!(self.screen, Screen::Terminal { .. } | Screen::Files { .. });
-            let wide = ctx.screen_rect().width() >= 980.0;
-            if in_session && wide {
-                egui::SidePanel::left("machine-rail")
-                    .exact_width(260.0)
-                    .resizable(false)
-                    .frame(
-                        egui::Frame::NONE
-                            .fill(theme::BG_SURFACE)
-                            .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
-                            .stroke(theme::stroke_border_subtle()),
-                    )
-                    .show(ctx, |ui| {
-                        self.machine_rail(ui);
-                    });
-            }
-            let margin = match self.screen {
-                Screen::Machines => {
-                    egui::Margin::symmetric(theme::SPACE_2XL as i8, theme::SPACE_LG as i8)
-                }
-                _ => egui::Margin::same(theme::SPACE_LG as i8),
-            };
+            let show_rail = matches!(self.screen, Screen::Terminal { .. } | Screen::Files { .. })
+                && model::machine_rail_visible(ctx.screen_rect().width());
             egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.fill(theme::BG_PAGE).inner_margin(margin))
+                .frame(egui::Frame::NONE.fill(theme::BG_PAGE))
                 .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
-                    self.header(ui);
-                    if !self.error.is_empty() {
-                        banner(ui, &self.error, true);
-                    }
-                    if !self.notice.is_empty() {
-                        banner(ui, &self.notice, false);
-                    }
-                    match self.screen {
-                        Screen::Login => self.login(ui),
-                        Screen::Restoring => self.restoring(ui),
-                        Screen::Machines => self.machines(ui),
-                        Screen::Terminal { .. } => self.terminal(ui),
-                        Screen::Files { .. } => self.files(ui),
-                        Screen::Desktop { .. } => {}
+                    if show_rail {
+                        // Paint the rail inside the central panel at a fixed
+                        // width. A SidePanel used the overflowing button
+                        // response rect to place the main column, which left
+                        // a wide black gap next to clipped "View desktop"
+                        // labels (0133 session retest).
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        ui.horizontal(|ui| {
+                            let rail_w = model::MACHINE_RAIL_WIDTH;
+                            let rail_h = ui.available_height();
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(rail_w, rail_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_width(rail_w);
+                                    ui.set_max_width(rail_w);
+                                    ui.set_clip_rect(ui.max_rect());
+                                    egui::Frame::NONE
+                                        .fill(theme::BG_SURFACE)
+                                        .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
+                                        .stroke(theme::stroke_border_subtle())
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.set_max_width(ui.available_width());
+                                            ui.set_min_height(ui.available_height());
+                                            self.machine_rail(ui);
+                                        });
+                                },
+                            );
+                            egui::Frame::NONE
+                                .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
+                                .show(ui, |ui| {
+                                    self.chrome_and_page(ui);
+                                });
+                        });
+                    } else {
+                        let margin = match self.screen {
+                            Screen::Machines => egui::Margin::symmetric(
+                                theme::SPACE_2XL as i8,
+                                theme::SPACE_LG as i8,
+                            ),
+                            _ => egui::Margin::same(theme::SPACE_LG as i8),
+                        };
+                        egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
+                            self.chrome_and_page(ui);
+                        });
                     }
                 });
         }
@@ -1161,6 +1184,28 @@ impl ControllerApp {
 }
 
 impl ControllerApp {
+    fn chrome_and_page(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
+        self.header(ui);
+        if !self.error.is_empty() {
+            banner(ui, &self.error, true);
+        }
+        if !self.notice.is_empty() {
+            banner(ui, &self.notice, false);
+        }
+        if !super::fonts::report().loaded {
+            ui.label(theme::muted_text(super::fonts::missing_font_hint()));
+        }
+        match self.screen {
+            Screen::Login => self.login(ui),
+            Screen::Restoring => self.restoring(ui),
+            Screen::Machines => self.machines(ui),
+            Screen::Terminal { .. } => self.terminal(ui),
+            Screen::Files { .. } => self.files(ui),
+            Screen::Desktop { .. } => {}
+        }
+    }
+
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
@@ -1171,6 +1216,16 @@ impl ControllerApp {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, 0.0);
+                if ui
+                    .add(theme::secondary_button("Quit"))
+                    .on_hover_text("Exit the controller. The window close button also exits unless this was started with --background and a status icon is running.")
+                    .clicked()
+                {
+                    self.flags.quit.store(true, Ordering::Relaxed);
+                    self.send(Cmd::PtyClose);
+                    self.send(Cmd::LiveStop);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 if self.user.is_some() && !matches!(self.screen, Screen::Login | Screen::Restoring)
                 {
                     if ui.add(theme::secondary_button("Log out")).clicked() {
@@ -1326,29 +1381,14 @@ impl ControllerApp {
             );
         } else {
             let nodes = self.nodes.clone();
-            let available = ui.available_width();
-            let cols = model::machine_card_columns(available);
-            let gap = theme::SPACE_LG;
-            let card_w = model::machine_card_width(available, cols, gap);
-            egui::Grid::new("machine-cards")
-                .num_columns(cols)
-                .min_col_width(card_w)
-                .max_col_width(card_w)
-                .spacing([gap, theme::SPACE_MD])
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for (index, node) in nodes.iter().enumerate() {
-                        // Grid rows size to the card content. The main-list
-                        // horizontal_wrapped row previously inherited the
-                        // leftover panel height, which stretched cards and
-                        // wrapped each action label into a letter column.
-                        ui.scope(|ui| {
-                            ui.set_width(card_w);
-                            ui.set_max_width(card_w);
-                            self.node_card(ui, node);
-                        });
-                        if (index + 1) % cols == 0 {
-                            ui.end_row();
-                        }
+                    ui.set_width(ui.available_width());
+                    ui.set_max_width(ui.available_width());
+                    for node in &nodes {
+                        self.node_card(ui, node);
+                        ui.add_space(theme::SPACE_SM);
                     }
                 });
         }
@@ -1422,74 +1462,44 @@ impl ControllerApp {
             .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
             .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
             .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
+                // Cap to the list width. set_min_width(available_width())
+                // inside a Grid cell previously expanded the first column
+                // to the leftover panel width.
+                ui.set_width(ui.available_width());
                 ui.set_max_width(ui.available_width());
-                // Row 1: name + online pill
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&node.name)
-                            .size(theme::SECTION_SIZE)
-                            .color(theme::TEXT_PRIMARY)
-                            .strong(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        online_pill(ui, node.online);
-                    });
-                });
-                // Row 2: hostname / os·arch · version · id
+                name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
                 let host = [node.os.as_str(), node.arch.as_str()]
                     .into_iter()
                     .filter(|part| !part.is_empty())
                     .collect::<Vec<_>>()
                     .join("/");
-                let meta = match (node.hostname.is_empty(), host.is_empty()) {
+                let mut meta = match (node.hostname.is_empty(), host.is_empty()) {
                     (false, false) => format!("{} · {host}", node.hostname),
                     (false, true) => node.hostname.clone(),
                     (true, false) => host,
                     (true, true) => String::new(),
                 };
-                if !meta.is_empty() {
-                    ui.label(
-                        egui::RichText::new(meta)
-                            .size(theme::SECONDARY_SIZE)
-                            .monospace()
-                            .color(theme::TEXT_MUTED),
-                    );
-                }
-                let mut faint = String::new();
                 if !node.version.is_empty() {
-                    faint.push_str(&node.version);
+                    if !meta.is_empty() {
+                        meta.push_str(" · ");
+                    }
+                    meta.push_str(&node.version);
                 }
                 if !node.id.is_empty() {
-                    if !faint.is_empty() {
-                        faint.push_str(" · ");
+                    if !meta.is_empty() {
+                        meta.push_str(" · ");
                     }
-                    faint.push_str(&node.id);
+                    meta.push_str(&node.id);
                 }
-                if !faint.is_empty() {
-                    let max_chars = 42;
-                    let shown = if faint.chars().count() > max_chars {
-                        let trimmed: String =
-                            faint.chars().take(max_chars.saturating_sub(1)).collect();
-                        format!("{trimmed}…")
-                    } else {
-                        faint
-                    };
-                    ui.label(
-                        egui::RichText::new(shown)
-                            .size(12.0)
-                            .monospace()
-                            .color(theme::TEXT_FAINT),
-                    );
+                if !meta.is_empty() {
+                    truncated_copy_line(ui, &meta, &mut self.notice);
                 }
                 if let Some(note) = display_note(node.has_display, node.effective) {
-                    ui.label(theme::muted_text(note));
+                    ui.add(egui::Label::new(theme::muted_text(note)).wrap());
                 }
                 ui.add_space(theme::SPACE_SM);
-                // Real start actions. View/Control used to be a silent mode
-                // toggle that never opened a session; they are now start
-                // buttons, and they are omitted on headless machines.
                 ui.horizontal_wrapped(|ui| {
+                    ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
                     for button in card_buttons(node.online, node.has_display, node.effective) {
                         let action = Action {
@@ -1570,21 +1580,14 @@ impl ControllerApp {
                     .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
                     .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD));
                 frame.show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&node.name)
-                                .color(theme::TEXT_PRIMARY)
-                                .strong(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            online_pill(ui, node.online);
-                        });
-                    });
+                    ui.set_width(ui.available_width());
+                    ui.set_max_width(ui.available_width());
+                    name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
                     if active {
                         ui.label(theme::muted_text("This session"));
                     }
                     ui.horizontal_wrapped(|ui| {
+                        ui.set_max_width(ui.available_width());
                         ui.spacing_mut().item_spacing =
                             egui::vec2(theme::SPACE_XS, theme::SPACE_XS);
                         for button in card_buttons(node.online, node.has_display, node.effective) {
@@ -3735,6 +3738,32 @@ fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, dot: Option<
         });
 }
 
+/// Name on the left, status pill on the right. The name is truncated so
+/// it cannot shove the pill off the card or rail.
+fn name_and_status(ui: &mut egui::Ui, name: &str, online: bool, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        // "ONLINE" pill: padding + status dot + 11px label ≈ 92 px.
+        let pill_reserve = 96.0;
+        let name_w = (ui.available_width() - pill_reserve).max(32.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(name_w, ui.spacing().interact_size.y.max(22.0)),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(name)
+                            .size(theme::SECTION_SIZE)
+                            .color(color)
+                            .strong(),
+                    )
+                    .truncate(),
+                );
+            },
+        );
+        online_pill(ui, online);
+    });
+}
+
 fn online_pill(ui: &mut egui::Ui, online: bool) {
     let (label, color) = if online {
         ("ONLINE", theme::SUCCESS)
@@ -3790,12 +3819,40 @@ fn style_text_edit(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> egui::Respons
     .inner
 }
 
+fn truncated_copy_line(ui: &mut egui::Ui, text: &str, notice: &mut String) {
+    let response = ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(12.0)
+                .monospace()
+                .color(theme::TEXT_MUTED),
+        )
+        .truncate()
+        .sense(egui::Sense::click()),
+    );
+    let tip = format!(
+        "{text}
+Click to copy"
+    );
+    let response = response.on_hover_text(tip);
+    if response.clicked() {
+        ui.ctx().copy_text(text.to_string());
+        *notice = "Copied.".into();
+    }
+}
+
 fn action_button(ui: &mut egui::Ui, id: &str, label: &str, action: &Action) -> bool {
     let (fill, color) = if action.enabled {
         (theme::BG_SURFACE, theme::TEXT_BODY)
     } else {
         (theme::BG_PANEL, theme::TEXT_FAINT)
     };
+    let font = egui::FontId::proportional(theme::SECONDARY_SIZE);
+    let text_w = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, color).size().x);
+    // Min width is the whole label plus padding, so horizontal_wrapped
+    // moves "View desktop" to the next line instead of parking it in a
+    // leftover 88px slot and clipping it to "View d...".
+    let min_w = text_w + theme::BTN_PAD_X * 2.0;
     let btn = egui::Button::new(
         egui::RichText::new(label.to_owned())
             .size(theme::SECONDARY_SIZE)
@@ -3805,7 +3862,7 @@ fn action_button(ui: &mut egui::Ui, id: &str, label: &str, action: &Action) -> b
     .stroke(theme::stroke_border_subtle())
     .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
     .wrap_mode(egui::TextWrapMode::Extend)
-    .min_size(egui::vec2(88.0, theme::BTN_TOOLBAR_H));
+    .min_size(egui::vec2(min_w, theme::BTN_TOOLBAR_H));
     let response = ui
         .push_id(id, |ui| ui.add_enabled(action.enabled, btn))
         .inner
@@ -3849,7 +3906,11 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
     }
     let n = delta / 120;
     if n == 0 {
-        if delta > 0 { 1 } else { -1 }
+        if delta > 0 {
+            1
+        } else {
+            -1
+        }
     } else {
         n
     }

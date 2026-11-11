@@ -310,6 +310,17 @@ pub fn looks_textual(bytes: &[u8]) -> bool {
     !bytes.contains(&0)
 }
 
+/// Hide the window into the status icon only when a tray icon actually
+/// started *and* this process was launched with `--background`. A normal
+/// Controller window must quit on close so test processes do not accumulate.
+pub fn hides_window_on_close(
+    tray_icon_ready: bool,
+    background: bool,
+    quit_requested: bool,
+) -> bool {
+    tray_icon_ready && background && !quit_requested
+}
+
 /// True when the open editor is the deleted path, or a file inside a deleted folder.
 pub fn editor_is_stale(editor_path: &str, deleted: &str) -> bool {
     let editor = editor_path.trim();
@@ -332,16 +343,52 @@ pub fn notice_refers_to_path(notice: &str, path: &str) -> bool {
     !path.is_empty() && notice.starts_with("Saved ") && notice.contains(path)
 }
 
-/// Two columns on a wide Machines list; one column when the window is narrow.
-pub fn machine_card_columns(available_width: f32) -> usize {
-    if available_width >= 860.0 { 2 } else { 1 }
+/// Width of the session machine rail, including its frame margin.
+pub const MACHINE_RAIL_WIDTH: f32 = 260.0;
+
+/// Hide the session rail below this window width; the session page still
+/// has an explicit Back to machines button.
+pub const MACHINE_RAIL_SHOW_AT: f32 = 980.0;
+
+/// The Machines list is a single compact column.
+///
+/// 0133 used a two-column `Grid` once the list was ≥ 860 px. In the
+/// maximized retest the first cell inherited the leftover panel width,
+/// so cards stretched across the window, metadata overlapped, and the
+/// second column (sufa, tc-external, probe) overflowed off the right
+/// edge. A compact single column that truncates long hostnames/ids and
+/// wraps whole action buttons is the maintainable layout.
+pub fn machine_card_columns(_available_width: f32) -> usize {
+    1
 }
 
-/// Content width for one Machines card so labels and actions keep a real row.
+/// Content width for one Machines card, capped to the list's available width.
 pub fn machine_card_width(available_width: f32, columns: usize, gap: f32) -> f32 {
     let columns = columns.max(1) as f32;
     let inner = (available_width - gap * (columns - 1.0)).max(1.0);
-    (inner / columns).floor().max(240.0)
+    (inner / columns)
+        .floor()
+        .clamp(200.0, available_width.max(200.0))
+}
+
+/// Shorten a hostname, node id, or policy note for one line. The full
+/// string is kept for hover/copy in the UI.
+pub fn ellipsize_chars(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let take = max_chars.saturating_sub(1);
+    let mut out: String = text.chars().take(take).collect();
+    out.push('…');
+    out
+}
+
+pub fn machine_rail_visible(window_width: f32) -> bool {
+    window_width >= MACHINE_RAIL_SHOW_AT
 }
 
 /// Plain-text terminal with a fixed scrollback. Cursor motion is enough for
@@ -509,11 +556,9 @@ mod tests {
         let buttons = card_buttons(true, Some(false), full);
         let labels: Vec<_> = buttons.iter().map(|b| b.label).collect();
         assert_eq!(labels, ["Terminal", "Files"]);
-        assert!(
-            !labels
-                .iter()
-                .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop"))
-        );
+        assert!(!labels
+            .iter()
+            .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop")));
     }
 
     #[test]
@@ -638,12 +683,29 @@ mod tests {
     }
 
     #[test]
-    fn machine_cards_use_two_content_columns_on_a_wide_list() {
-        assert_eq!(machine_card_columns(1080.0), 2);
+    fn machine_list_stays_a_single_column_even_when_wide() {
         assert_eq!(machine_card_columns(800.0), 1);
-        let wide = machine_card_width(1080.0, 2, 16.0);
-        assert!(wide > 500.0 && wide < 540.0, "{wide}");
-        let narrow = machine_card_width(800.0, 1, 16.0);
-        assert_eq!(narrow, 800.0);
+        assert_eq!(machine_card_columns(1080.0), 1);
+        assert_eq!(machine_card_columns(1280.0), 1);
+        assert_eq!(machine_card_columns(1920.0), 1);
+        let wide = machine_card_width(1216.0, 1, 16.0);
+        assert_eq!(wide, 1216.0);
+        let narrow = machine_card_width(736.0, 1, 16.0);
+        assert_eq!(narrow, 736.0);
+        assert!(machine_rail_visible(1280.0));
+        assert!(!machine_rail_visible(800.0));
+        assert_eq!(
+            ellipsize_chars("iZ7xv88es0zy9ogs1ny63Z", 12),
+            "iZ7xv88es0z…"
+        );
+        assert_eq!(ellipsize_chars("short", 12), "short");
+    }
+
+    #[test]
+    fn window_close_quits_unless_a_background_tray_is_ready() {
+        assert!(!hides_window_on_close(false, true, false));
+        assert!(!hides_window_on_close(true, false, false));
+        assert!(hides_window_on_close(true, true, false));
+        assert!(!hides_window_on_close(true, true, true));
     }
 }

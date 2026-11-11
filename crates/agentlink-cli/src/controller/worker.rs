@@ -9,16 +9,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::client::{login_user, maintain_session};
 use agentlink_core::{
-    Client, ClientSettings, DirEntry, Identity, NodeInfo, Op, PHASE2_INJECT_INPUT,
-    PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL, PtyEvent, PtySession, RelayTrust,
-    apply_relay_defaults, parse_access,
+    apply_relay_defaults, parse_access, Client, ClientSettings, DirEntry, Identity, NodeInfo, Op,
+    PtyEvent, PtySession, RelayTrust, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
 };
 use agentlink_view::{LiveOptions, Signal, Viewer};
 use base64::Engine;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use super::decode::{H264Decoder, decode_image};
+use super::decode::{decode_image, H264Decoder};
 use super::model::enroll_command;
 
 pub struct Picture {
@@ -620,6 +619,10 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 },
             }
         }
+        // Await PTY close on this worker runtime only. Drop of PtySession
+        // never block_on (it only try_sends), so teardown cannot nest a
+        // runtime inside this one.
+        close_pty(&mut pty).await;
         stop_live(&mut live, &mut shots);
     });
 }
@@ -1177,7 +1180,11 @@ async fn sign_in(
     let parsed = RelayTrust::parse(pin, trust.as_deref()).map_err(|err| err.to_string())?;
     let totp = {
         let code = totp.trim();
-        if code.is_empty() { None } else { Some(code) }
+        if code.is_empty() {
+            None
+        } else {
+            Some(code)
+        }
     };
     let session = login_user(
         &relay,

@@ -42,8 +42,70 @@ const PREFERRED_FACES: &[&str] = &[
     "STHeiti",
 ];
 
+/// Result of the last CJK fallback lookup. Used to show a missing-font
+/// hint instead of silently rendering tofu on machines without Noto.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CjkFontReport {
+    pub loaded: bool,
+    pub source: Option<PathBuf>,
+}
+
+pub fn missing_font_hint() -> &'static str {
+    "Chinese and other CJK characters need a font such as Noto Sans CJK (SIL OFL 1.1, https://github.com/notofonts/noto-cjk). Install fonts-noto-cjk, place an OFL .ttf/.otf/.ttc in ~/.config/agentlink/fonts, or set AGENTLINK_CJK_FONT. This build does not bundle the 19 MiB collection. ASCII still works."
+}
+
+static REPORT: std::sync::OnceLock<CjkFontReport> = std::sync::OnceLock::new();
+
+pub fn report() -> CjkFontReport {
+    REPORT.get().cloned().unwrap_or(CjkFontReport {
+        loaded: false,
+        source: None,
+    })
+}
+
+fn drop_in_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("AGENTLINK_CONFIG_DIR") {
+        dirs.push(PathBuf::from(dir).join("fonts"));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        dirs.push(PathBuf::from(xdg).join("agentlink/fonts"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(&home).join(".config/agentlink/fonts"));
+        dirs.push(PathBuf::from(&home).join(".local/share/agentlink/fonts"));
+    }
+    dirs
+}
+
+fn fonts_in_dir(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
 fn search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    if let Some(explicit) = std::env::var_os("AGENTLINK_CJK_FONT") {
+        paths.push(PathBuf::from(explicit));
+    }
+    for dir in drop_in_dirs() {
+        paths.extend(fonts_in_dir(&dir));
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let linux = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -92,9 +154,17 @@ pub fn load_cjk_face() -> Option<Vec<u8>> {
             continue;
         }
         if let Some(face) = load_from_path(&path) {
+            let _ = REPORT.set(CjkFontReport {
+                loaded: true,
+                source: Some(path),
+            });
             return Some(face);
         }
     }
+    let _ = REPORT.set(CjkFontReport {
+        loaded: false,
+        source: None,
+    });
     None
 }
 
@@ -322,5 +392,18 @@ mod tests {
         assert!(!is_ttc(b"OTTO1234"));
         assert!(is_sfnt(b"OTTO1234"));
         assert!(is_sfnt(b"\0\x01\0\0xxxx"));
+    }
+
+    #[test]
+    fn missing_font_hint_names_the_license_and_drop_in_path() {
+        let hint = missing_font_hint();
+        assert!(hint.contains("SIL OFL 1.1"), "{hint}");
+        assert!(
+            hint.contains("fonts-noto-cjk") || hint.contains("Noto Sans CJK"),
+            "{hint}"
+        );
+        assert!(hint.contains("AGENTLINK_CJK_FONT"), "{hint}");
+        assert!(hint.contains(".config/agentlink/fonts"), "{hint}");
+        assert!(hint.contains("does not bundle"), "{hint}");
     }
 }

@@ -13,15 +13,22 @@ pub fn spawn(open: Arc<AtomicBool>, quit: Arc<AtomicBool>) -> bool {
         return false;
     }
     let reveal = Arc::clone(&open);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     match std::thread::Builder::new()
         .name("agentlink-tray".into())
         .spawn(move || {
-            if let Err(err) = run(open, quit) {
+            if let Err(err) = run(open, quit, ready_tx) {
                 tracing::warn!(error = %err, "status icon is not available");
                 reveal.store(true, Ordering::Relaxed);
             }
         }) {
-        Ok(_) => true,
+        Ok(_) => match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            // Only treat the tray as ready when ksni actually registered.
+            // Returning true just because the thread started used to hide the
+            // window on close with no Quit icon, leaving a background worker.
+            Ok(true) => true,
+            _ => false,
+        },
         Err(_) => false,
     }
 }
@@ -32,7 +39,11 @@ pub fn spawn(_open: Arc<AtomicBool>, _quit: Arc<AtomicBool>) -> bool {
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-fn run(open: Arc<AtomicBool>, quit: Arc<AtomicBool>) -> Result<(), String> {
+fn run(
+    open: Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
+    ready_tx: std::sync::mpsc::SyncSender<bool>,
+) -> Result<(), String> {
     use ksni::TrayMethods;
 
     let quit_flag = Arc::clone(&quit);
@@ -41,15 +52,24 @@ fn run(open: Arc<AtomicBool>, quit: Arc<AtomicBool>) -> Result<(), String> {
         .build()
         .map_err(|err| err.to_string())?;
     runtime.block_on(async move {
-        let handle = AgentTray {
+        let spawned = AgentTray {
             open,
             quit,
             pending: load_pending(),
             on_node: agentlink_core::grant_request::default_node_data_dir().is_some(),
         }
         .spawn()
-        .await
-        .map_err(|err| err.to_string())?;
+        .await;
+        let handle = match spawned {
+            Ok(handle) => {
+                let _ = ready_tx.send(true);
+                handle
+            }
+            Err(err) => {
+                let _ = ready_tx.send(false);
+                return Err(err.to_string());
+            }
+        };
         while !quit_flag.load(Ordering::Relaxed) && !handle.is_closed() {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let pending = load_pending();
@@ -103,7 +123,6 @@ fn load_pending() -> Vec<PendingItem> {
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn launch_paste_ui() {
     if crate::grant_local::remote_exec_is_set() {
@@ -117,7 +136,10 @@ fn launch_paste_ui() {
             return;
         }
     };
-    match std::process::Command::new(exe).args(["grant", "paste-ui"]).spawn() {
+    match std::process::Command::new(exe)
+        .args(["grant", "paste-ui"])
+        .spawn()
+    {
         Ok(_) => {}
         Err(err) => tracing::warn!(error = %err, "failed to open grant paste-ui"),
     }

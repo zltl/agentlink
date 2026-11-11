@@ -325,3 +325,85 @@ captured). Five defects remained and are addressed in this revision:
 A new candidate directory will be built for parent GUI retest. Unit tests
 do not replace that retest. Android CJK typography is intentionally not
 part of this desktop pass.
+
+## Close / Quit and leftover Controller processes (2026-11-12 Asia/Shanghai)
+
+Closing the 0050 and 0111 windows left those candidate processes running
+(PIDs later confirmed by `/proc/exe` and SIGTERM'd as test processes, not
+production). `controller` always passed `tray: true`. The status-icon
+thread was treated as ready as soon as it started, even if ksni never
+registered, and a ready tray cancelled the window close (hide only). Quit
+lived only in that icon menu, which was easy to miss or missing entirely.
+The header had Log out and Refresh, but no Quit.
+
+0133 used the same close-to-tray path. A normal foreground window now
+quits when the title-bar close button or the header **Quit** control is
+used. Hide-on-close happens only with `--background` *and* a status icon
+that actually registered. The tray menu still has Quit for that
+autostart case.
+
+## CJK font availability (not only this box)
+
+The desktop terminal still uses a system / drop-in CJK face as an egui
+fallback (Noto Sans CJK, SIL OFL 1.1). The 19 MiB collection is not
+rebundled. Search order:
+
+1. `AGENTLINK_CJK_FONT` (a `.ttf`, `.otf`, or `.ttc` path)
+2. Fonts in `$AGENTLINK_CONFIG_DIR/fonts`, `~/.config/agentlink/fonts`,
+   or `~/.local/share/agentlink/fonts` (font files only; identity files
+   in those trees are not read)
+3. Packaged OS fonts (Noto CJK, Droid Sans Fallback, PingFang, Yu Gothic,
+   Microsoft YaHei, Malgun)
+
+When none of those are present, the window shows a visible hint. ASCII
+still works. Operators can drop an OFL font into the fonts directory or
+install `fonts-noto-cjk`.
+
+## 0133 GUI retest — list and rail overflow (2026-11-12 Asia/Shanghai)
+
+Parent computerUse retested the 0133 candidate (`c77b0a3`). C, D, E, and
+glyph rendering of 你好 passed. Real IME input was **not** accepted: the
+你好 text came from `printf` with octal bytes, which only proves the CJK
+fallback face is loaded.
+
+**A failed**, and the session rail failed with it. Screenshots (read-only):
+
+- Maximized Machines (`4b1ea262-…webp`): short full-width card bars,
+  overlapping hostname / id / “Headless. Shell and files only.”, and a
+  second column (sufa, tc-external, probe) clipped off the right edge.
+- Session (`cff5c06a-…webp`): sufa **View desktop** clipped to **View d…**
+  past the 260 px rail, plus a wide black gap between the gray rail and
+  the terminal.
+
+Cause, from those frames and the 0133 source:
+
+- The Machines list used a two-column `Grid`. Each card called
+  `set_min_width(ui.available_width())`. Inside a Grid cell that width is
+  often the leftover CentralPanel, so column 1 became the full window
+  width and column 2 overflowed.
+- `action_button` used `min_size(88, …)` and `TextWrapMode::Extend`.
+  `horizontal_wrapped` parked “View desktop” in the leftover rail width
+  (narrower than the label) and clipped it letter-by-letter.
+- `SidePanel::left` placed the main column at the overflowing button
+  response rect, not at the 260 px frame, which is the black gap.
+
+This follow-up (not a constant-only tweak):
+
+- Machines is a compact **single column**. Long hostname / os / version /
+  id text truncates on one line; hover shows the full string, click copies
+  it. Title and status pill no longer use a right-to-left row.
+- Action buttons measure the whole label plus padding and keep
+  `Extend`, so `horizontal_wrapped` moves a complete button to the next
+  line instead of clipping mid-word. The same helper is used on the list
+  and the rail.
+- The session rail is painted inside the CentralPanel at a fixed
+  `MACHINE_RAIL_WIDTH` (260). It is hidden below `MACHINE_RAIL_SHOW_AT`
+  (980); **Back to machines** remains. The main column starts at that
+  fixed width, so a clipped child cannot open a gap.
+
+Unit tests record the single-column policy and the rail visibility
+threshold. They do not replace a parent GUI retest on a new candidate,
+on both a maximized / 1280×800 window and a narrow window, covering the
+Machines list **and** the session rail. Do not treat the rail as already
+visually passing. 0133 is frozen and must not be overwritten.
+

@@ -454,3 +454,28 @@ CJK tofu in the Alacritty grid was missing glyphs, not only cell width
 (Alacritty already gives 中 two cells). Font fallback is documented in
 `docs/controller-layout-t444.md` (Noto Sans CJK, SIL OFL 1.1; no
 rebundle of the collection).
+
+## Quit and PTY teardown (0133 follow-up)
+
+0133's `PtySession::close` awaits `PtyClose` on the controller worker
+runtime, then sets `close_sent` so `Drop` only `try_send`s if close did
+not already run. That path does not `block_on` from `Drop` or from the
+UI thread, so it is not a "runtime inside runtime" close. A confirmed
+0111 in-terminal runtime panic was reported, but no panic log was in
+the frozen 0050/0111 candidate data dirs (those launches do not write
+`tray.log`). 0133 keeps the same "no block_on in Drop" rule; this is
+not claimed fixed from the absence of a log. The leftover processes
+after closing the window were the hide-to-tray path, which 0133 still
+had and is fixed in this follow-up (visible Quit; close exits unless
+`--background` and a real tray icon).
+
+## Layout: Machines list and session rail (0133 retest)
+
+0133's two-column Machines grid overflowed when maximized, and the
+session rail clipped **View desktop** to **View d…**, which also pushed
+the main column right and left a black gap. The follow-up uses a compact
+single-column list, truncates long host/id lines with hover and
+click-to-copy, wraps whole action labels, and draws a fixed-width rail
+inside the central panel that folds below 980 px. Details and screenshot
+ids are in `docs/controller-layout-t444.md`. Real IME is still unaccepted
+(你好 in the 0133 retest was octal `printf`, not an IME commit).
