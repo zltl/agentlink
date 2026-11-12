@@ -520,6 +520,40 @@ pub fn stats_line(width: u32, height: u32, fps: f32, latency_ms: i64) -> Option<
     }
 }
 
+/// Session-stats popover rate line. JPEG stills that are actually
+/// refreshing must not be labeled `fps  0.0` (that reads as a stalled
+/// video). A measured stills rate is shown in Hz; an unmeasured window
+/// is `n/a`, never a fabricated zero.
+pub fn session_stats_rate_line(kind: &str, fps: f32) -> String {
+    if kind.eq_ignore_ascii_case("jpeg") {
+        if fps > 0.05 {
+            format!("stills  {:.1} Hz", fps)
+        } else {
+            "stills  n/a".into()
+        }
+    } else {
+        format!("fps  {:.1}", fps)
+    }
+}
+
+/// Bitrate is a live-video statistic. JPEG stills do not invent a kbps.
+pub fn session_stats_bitrate_line(kind: &str, bitrate_kbps: u32) -> String {
+    if kind.eq_ignore_ascii_case("jpeg") {
+        "bitrate  n/a".into()
+    } else {
+        format!("bitrate  {bitrate_kbps} kbps")
+    }
+}
+
+/// Latency is a live-video statistic. JPEG stills do not invent 0 ms.
+pub fn session_stats_latency_line(kind: &str, latency_ms: i64) -> String {
+    if kind.eq_ignore_ascii_case("jpeg") {
+        "latency  n/a".into()
+    } else {
+        format!("latency  {latency_ms} ms")
+    }
+}
+
 /// Compact fps/latency chip used as the clickable stats target.
 pub fn stats_chip(fps: f32, latency_ms: i64) -> Option<String> {
     let mut parts = Vec::new();
@@ -546,15 +580,24 @@ pub fn encoder_label(kind: &str, encoder: &str, hardware: bool) -> &'static str 
     if enc.contains("mini") || enc == "minih264" {
         return "minih264";
     }
-    if hardware || enc.contains("nvenc") || enc.contains("qsv") || enc.contains("vaapi")
-        || enc.contains("amf") || enc.contains("videotoolbox") || enc.contains("mf")
+    if hardware
+        || enc.contains("nvenc")
+        || enc.contains("qsv")
+        || enc.contains("vaapi")
+        || enc.contains("amf")
+        || enc.contains("videotoolbox")
+        || enc.contains("mf")
         || enc == "h264_hw"
     {
         return "h264_hw";
     }
     if kind == "h264" || kind == "mock" {
         if enc.is_empty() {
-            return if kind == "mock" { "minih264" } else { "h264_hw" };
+            return if kind == "mock" {
+                "minih264"
+            } else {
+                "h264_hw"
+            };
         }
         return "minih264";
     }
@@ -703,14 +746,32 @@ mod tests {
     #[test]
     fn stats_omit_empty_fields() {
         assert_eq!(stats_line(0, 0, 0.0, 0), None);
-        assert_eq!(
-            stats_line(1920, 1080, 0.0, 0).as_deref(),
-            Some("1920×1080")
-        );
+        assert_eq!(stats_line(1920, 1080, 0.0, 0).as_deref(), Some("1920×1080"));
         assert_eq!(
             stats_line(1920, 1080, 28.0, 42).as_deref(),
             Some("1920×1080  28 fps  42 ms")
         );
+    }
+
+    #[test]
+    fn session_stats_jpeg_stills_are_labeled_not_zero_fps() {
+        // 0938 GUI: refreshing JPEG stills showed `fps  0.0` / `bitrate  0`
+        // / `latency  0 ms` in the popover. Those zeros are unmeasured
+        // video metrics, not a stills rate of zero.
+        assert_eq!(session_stats_rate_line("jpeg", 0.0), "stills  n/a");
+        assert_eq!(session_stats_rate_line("JPEG", 1.25), "stills  1.2 Hz");
+        assert_eq!(session_stats_rate_line("JPEG", 1.3), "stills  1.3 Hz");
+        assert_eq!(session_stats_bitrate_line("jpeg", 0), "bitrate  n/a");
+        assert_eq!(session_stats_bitrate_line("jpeg", 400), "bitrate  n/a");
+        assert_eq!(session_stats_latency_line("jpeg", 0), "latency  n/a");
+        assert_eq!(session_stats_latency_line("jpeg", 42), "latency  n/a");
+        assert_eq!(session_stats_rate_line("h264", 28.0), "fps  28.0");
+        assert_eq!(
+            session_stats_bitrate_line("h264", 2000),
+            "bitrate  2000 kbps"
+        );
+        assert_eq!(session_stats_latency_line("h264", 42), "latency  42 ms");
+        assert_ne!(session_stats_rate_line("jpeg", 0.0), "fps  0.0");
     }
 
     #[test]

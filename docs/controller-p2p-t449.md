@@ -565,3 +565,121 @@ Read-only View of sufa. Confirm JPEG stills keep refreshing, handshake
 keeps a no-pair (or no-first-frame) terminal reason after close, no
 redundant stats `link` row, and stderr `agentlink live-ice:` / rewrite
 logs. Do not expect a selected public P2P pair.
+
+
+## 0938 GUI: `fps  0.0` on refreshing JPEG stills
+
+Frozen evidence (not modified):
+`/workspace/t449-0938-session-stats.png`,
+`/workspace/t449-0938-terminal-stages.png`,
+`/workspace/t449-0938-terminal-final.png`, and archive
+`/workspace/agentlink-t427-recovery/20261112-0938-t449-controller-p2p/`
+(debug bin SHA
+`62ca7605f131a5f19930d8bbeab4b330fe7a25cb5bb96d1354b94888ad97bd62`).
+0938 remains frozen.
+
+### Diagnosis (read-only)
+
+This was a **product statistics defect**, not a documented “fps means
+live video only” definition in the Session stats popover.
+
+Facts from the 0938 screenshots and this source:
+
+- The remote clock moved 09:40→09:42 and the popover showed
+  `path  jpeg · relay`, `encoder  jpeg`, resolution `2736×1824`, and
+  the hint “JPEG stills over the WebSocket relay — not WebRTC P2P”.
+  Stills were updating.
+- The popover still printed `fps  0.0`, `bitrate  0 kbps`,
+  `latency  0 ms`.
+- JPEG shots are taken every 800ms in production
+  (`Duration::from_millis(800)`). A counted stills rate would be
+  about 1.25 Hz, not zero. This is **not** interval rounding and
+  **not** a stale last-frame cache of a stalled video.
+- The shot loop published `LiveHud` with `..LiveHud::default()`, so
+  `fps`/`bitrate`/`latency` stayed 0. Only the H.264 decode window
+  (500ms) ever computed `fps`.
+- The compact connection-bar `stats_chip` / `stats_line` already
+  omit fps when `fps <= 0.5` (so the bar did not claim 0 fps). The
+  popover always printed `fps  0.0` with no “video only” label.
+- Fallback/timeout `set_hud(LiveHud { jpeg, ..Default })` would also
+  wipe a later measured rate and resolution until the next still.
+
+`fps  0.0` on a refreshing JPEG therefore reads as a frozen video
+stream. That is misleading.
+
+### Fix (0951 candidate; does not invent numbers)
+
+- The shot loop records actual JPEG publish timestamps over a 5s
+  window. `stills_rate_hz` requires at least two samples spanning
+  20ms; otherwise the value is unset.
+- Session stats popover, when `kind=jpeg`:
+  - measured rate → `stills  1.2 Hz` (one decimal, Hz);
+  - unmeasured → `stills  n/a`;
+  - never `fps  0.0`;
+  - `bitrate  n/a` and `latency  n/a` (those are live-video
+    metrics; they are not fabricated from stills).
+- H.264 keeps `fps` / `bitrate` / `latency` as before.
+- Timeout / connect-fail / disconnect fallback no longer publishes a
+  default JPEG HUD that would overwrite the shot loop’s stills rate.
+  Handshake, notice, and `jpeg · relay` link are unchanged.
+
+### Tests added
+
+- `stills_rate_hz_needs_a_real_span_and_does_not_invent_zero`
+- `session_stats_jpeg_stills_are_labeled_not_zero_fps`
+- `jpeg_stills_rate_is_measured_from_a_real_sequence` (injected JPEG
+  every 50ms; HUD rate tracks that interval and formats as
+  `stills  … Hz`)
+- `negotiation_hud_stays_jpeg_through_offer_answer_wait_timeout_and_close`
+  (test-only `IceFault::NoPairAfterSignaling` omits offer/answer ICE
+  candidates and trickle so a pair cannot form; no network change).
+  Sequence: JPEG already shown → offer → answer → waiting → 12s
+  no-selected-pair → close. Painted path stays `jpeg · relay`, never
+  `h264` / `connecting` / P2P. Terminal reason survives close.
+  After stills, the popover line is `stills  … Hz`, not `fps  0.0`.
+
+`IceFault::NoPairAfterSignaling` is test-only, like
+`RelayPolicyWithoutTurn`. Production is `IceFault::None`.
+
+## Local regression actually run (2026-11-12 09:51 CST)
+
+These commands were executed on this machine; this is not a claim
+that every test in the repository is green.
+
+- `cargo test -p agentlink-core --lib -- prepare_rewrites stun_rewrite rewrite_skips`:
+  **3 passed** (unchanged DNS policy tests).
+- `cargo test -p agentlink-view --lib`: **14 passed**, including
+  `strip_sdp_ice_candidates_keeps_ufrag_and_drops_candidates`.
+- `cargo test -p agentlink-view --test loopback`: **3 passed**.
+- `cargo test -p agentlink-cli --bin agentlink controller::`:
+  **71 passed**, including the four new stills/HUD tests and the
+  existing handshake-retention and live-pipeline cases.
+- `cargo test -p agentlink-cli --test controller --test controller_debug`:
+  **1 + 6 passed**.
+
+**98 passed, 0 failed** in that set. Not run: the rest of
+`agentlink-core` (267 other lib tests), other `agentlink-cli` bins
+tests outside `controller::`, deploy/functional/smoke, and any GUI.
+No new network probe, packet capture, or remote/service change.
+
+## Parent GUI path (0951 candidate only)
+
+Use
+`/workspace/agentlink-t427-recovery/20261112-0951-t449-controller-p2p/`
+once created. Launch is for the parent, not this worker:
+
+`./run-controller.sh`
+
+Do **not** reuse the 0938 binary for this stills-stats check. 0938
+is frozen and was not overwritten. Isolated `--data-dir`
+`/tmp/agentlink-t449-0951-controller-data`. Do not point it at a
+production node data dir. Do not mix with 0938/0924/0910/0851/0307.
+
+Read-only View of sufa. In Session stats, while JPEG stills are
+refreshing, expect `stills  X.X Hz` (or `stills  n/a` only before a
+second still), `bitrate  n/a`, `latency  n/a` — not `fps  0.0`.
+Open stats during offer → answer → waiting → 12s timeout → close,
+not only after timeout. Handshake should keep the no-pair (or
+no-first-frame) terminal reason after close. Path stays
+`jpeg · relay` unless a real H.264 frame arrives (do not expect a
+selected public P2P pair).

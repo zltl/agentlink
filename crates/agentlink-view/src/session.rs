@@ -76,6 +76,10 @@ pub enum IceFault {
     /// Gather only relay candidates and include no TURN server, so ICE
     /// cannot connect. Used to prove JPEG fallback without a firewall change.
     RelayPolicyWithoutTurn,
+    /// After a real offer/answer, drop remote ICE candidates so no pair
+    /// can form. Used to exercise the 12s no-pair timeout and JPEG stills
+    /// HUD without changing the network or a remote node.
+    NoPairAfterSignaling,
 }
 
 impl Default for LiveOptions {
@@ -91,6 +95,23 @@ impl Default for LiveOptions {
             ice_fault: IceFault::None,
             on_stage: None,
         }
+    }
+}
+
+/// Remove `a=candidate` lines from an SDP. Test-only helper for
+/// [`IceFault::NoPairAfterSignaling`]; production never strips a live answer.
+fn strip_sdp_ice_candidates(sdp: &str) -> String {
+    let crlf = sdp.contains("\r\n");
+    let sep = if crlf { "\r\n" } else { "\n" };
+    let text = sdp
+        .lines()
+        .filter(|line| !line.trim().to_ascii_lowercase().starts_with("a=candidate"))
+        .collect::<Vec<_>>()
+        .join(sep);
+    if sdp.ends_with('\n') && !text.ends_with('\n') {
+        format!("{text}{sep}")
+    } else {
+        text
     }
 }
 
@@ -376,6 +397,7 @@ struct Built {
 }
 
 async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Built, String> {
+    let no_pair_after_signaling = matches!(opts.ice_fault, IceFault::NoPairAfterSignaling);
     report_stage(&opts, "list_monitors sent");
     match roundtrip(&signal, json!({"action": "list_monitors"})).await {
         Ok(value) if is_screenshot_fallback(&value) => {
@@ -523,11 +545,20 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         ),
     );
     report_stage(&opts, "sending webrtc offer");
+    let offer_sdp = if no_pair_after_signaling {
+        let stripped = strip_sdp_ice_candidates(&local.sdp);
+        eprintln!(
+            "agentlink live-webrtc: test IceFault::NoPairAfterSignaling omitted local ICE candidates from the offer and will not trickle"
+        );
+        stripped
+    } else {
+        local.sdp.clone()
+    };
     let answer = roundtrip(
         &signal,
         json!({
             "action": "offer",
-            "sdp": local.sdp,
+            "sdp": offer_sdp,
             "viewer": opts.viewer,
             "monitor": opts.monitor,
             "codec": "h264",
@@ -551,11 +582,17 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         .and_then(|value| value.as_str())
         .unwrap_or("")
         .to_string();
-    let sdp = answer
+    let mut sdp = answer
         .get("sdp")
         .and_then(|value| value.as_str())
         .unwrap_or("")
         .to_string();
+    if no_pair_after_signaling {
+        sdp = strip_sdp_ice_candidates(&sdp);
+        eprintln!(
+            "agentlink live-webrtc: test IceFault::NoPairAfterSignaling stripped remote ICE candidates"
+        );
+    }
     if session_id.is_empty() || sdp.is_empty() {
         report_stage(
             &opts,
@@ -627,10 +664,12 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     PeerConnection::set_remote_description(&pc, remote)
         .await
         .map_err(|err| err.to_string())?;
-    if let Some(candidates) = answer.get("candidates").and_then(|value| value.as_array()) {
-        for candidate in candidates {
-            if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate.clone()) {
-                let _ = PeerConnection::add_ice_candidate(&pc, init).await;
+    if !no_pair_after_signaling {
+        if let Some(candidates) = answer.get("candidates").and_then(|value| value.as_array()) {
+            for candidate in candidates {
+                if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate.clone()) {
+                    let _ = PeerConnection::add_ice_candidate(&pc, init).await;
+                }
             }
         }
     }
@@ -681,10 +720,14 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let signal_ice = signal.clone();
     let session_ice = session_id.clone();
     let stop_ice = stop.clone();
+    let suppress_trickle = no_pair_after_signaling;
     tokio::spawn(async move {
         while let Some(candidate) = ice_rx.recv().await {
             if stop_ice.load(Ordering::Relaxed) {
                 break;
+            }
+            if suppress_trickle {
+                continue;
             }
             let typ_addr = candidate
                 .get("candidate")
@@ -1779,5 +1822,14 @@ mod tests {
             "runtime shutdown_timeout is 2s; drop must finish, got {drop_wait:?}"
         );
         drive.join().expect("sim drive join");
+    }
+
+    #[test]
+    fn strip_sdp_ice_candidates_keeps_ufrag_and_drops_candidates() {
+        let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=candidate:1 1 udp 2130706431 192.0.2.1 9 typ host\r\na=ice-ufrag:abc\r\n";
+        let out = super::strip_sdp_ice_candidates(sdp);
+        assert!(!out.to_ascii_lowercase().contains("a=candidate"), "{out}");
+        assert!(out.contains("a=ice-ufrag:abc"), "{out}");
+        assert!(out.contains("m=video"), "{out}");
     }
 }

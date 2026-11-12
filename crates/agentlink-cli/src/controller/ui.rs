@@ -4,24 +4,24 @@
 //! [`super::worker`] on the same client the phone uses. Visual tokens live in
 //! [`super::theme`].
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentlink_core::{NodeInfo, NodePolicy};
 use eframe::egui;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::chrome::{
-    BAR_HEIGHT, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
     classify_connect_error, connection_bar_visible, encoder_label, estimate_right_width_with,
     link_is_connecting, pick_bar_density, session_chrome_top_height, session_phase, stats_chip,
-    stats_line, text_advance,
+    stats_line, text_advance, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
+    BAR_HEIGHT,
 };
 use super::model::{
-    self, Action, CardButtonKind, card_buttons, connection_label, display_note, has_saved_session,
+    self, card_buttons, connection_label, display_note, has_saved_session, Action, CardButtonKind,
 };
 use super::term::Emulator;
 use super::theme;
@@ -2738,9 +2738,15 @@ impl ControllerApp {
                 let lines = [
                     format!("path  {path_line}"),
                     format!("handshake  {handshake}"),
-                    format!("fps  {:.1}", self.desk_hud.fps),
-                    format!("bitrate  {} kbps", self.desk_hud.bitrate_kbps),
-                    format!("latency  {} ms", self.desk_hud.latency_ms),
+                    super::chrome::session_stats_rate_line(&self.desk_hud.kind, self.desk_hud.fps),
+                    super::chrome::session_stats_bitrate_line(
+                        &self.desk_hud.kind,
+                        self.desk_hud.bitrate_kbps,
+                    ),
+                    super::chrome::session_stats_latency_line(
+                        &self.desk_hud.kind,
+                        self.desk_hud.latency_ms,
+                    ),
                     format!("encoder  {encoder}"),
                     format!("dropped  {}", self.desk_hud.frames_dropped),
                     format!(
@@ -4064,7 +4070,11 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
     }
     let n = delta / 120;
     if n == 0 {
-        if delta > 0 { 1 } else { -1 }
+        if delta > 0 {
+            1
+        } else {
+            -1
+        }
     } else {
         n
     }
@@ -4073,8 +4083,8 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     /// Visible page / Back must cover a real fraction of the window.

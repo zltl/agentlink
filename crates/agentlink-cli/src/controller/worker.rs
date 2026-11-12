@@ -337,6 +337,22 @@ pub fn handshake_is_cleanup(msg: &str) -> bool {
     routine && !lower.contains("error") && !lower.contains("fallback")
 }
 
+/// Stills refresh rate from actual JPEG publish times.
+///
+/// Needs at least two samples spanning 20ms. Otherwise `None` so the
+/// Session stats popover can show `stills  n/a` instead of a fake `fps  0.0`.
+pub fn stills_rate_hz(times: &[Instant]) -> Option<f32> {
+    let (first, last) = match (times.first(), times.last()) {
+        (Some(first), Some(last)) if times.len() >= 2 => (*first, *last),
+        _ => return None,
+    };
+    let span = last.saturating_duration_since(first);
+    if span < Duration::from_millis(20) {
+        return None;
+    }
+    Some((times.len() - 1) as f32 / span.as_secs_f32())
+}
+
 struct TracingSignal {
     inner: Arc<dyn Signal>,
     on_stage: Arc<dyn Fn(&str) + Send + Sync>,
@@ -915,13 +931,9 @@ fn start_live_from(
                         "Live video is not up ({err}). Showing JPEG over the relay."
                     )));
                     thread_shared.push(UiEvent::Link("jpeg · relay".into()));
-                    thread_shared.set_hud(LiveHud {
-                        path: "relay".into(),
-                        kind: "jpeg".into(),
-                        encoder: "jpeg".into(),
-                        path_note: super::model::connection_path_hint("jpeg", "relay").into(),
-                        ..LiveHud::default()
-                    });
+                    // JPEG stills HUD (including the measured stills rate)
+                    // stays owned by the shot loop. A default HUD here would
+                    // flash `fps  0.0` over refreshing stills.
                     let _ = control;
                     return;
                 }
@@ -976,14 +988,6 @@ fn start_live_from(
                                     .into(),
                             ));
                             thread_shared.push(UiEvent::Link("jpeg · relay".into()));
-                            thread_shared.set_hud(LiveHud {
-                                path: "relay".into(),
-                                kind: "jpeg".into(),
-                                encoder: "jpeg".into(),
-                                path_note: super::model::connection_path_hint("jpeg", "relay")
-                                    .into(),
-                                ..LiveHud::default()
-                            });
                             break;
                         }
                         thread_shared.push(UiEvent::Failed("WebRTC connection failed".into()));
@@ -1009,14 +1013,6 @@ fn start_live_from(
                                 .into(),
                         ));
                         thread_shared.push(UiEvent::Link("jpeg · relay".into()));
-                        thread_shared.set_hud(LiveHud {
-                            path: "relay".into(),
-                            kind: "jpeg".into(),
-                            encoder: "jpeg".into(),
-                            path_note: super::model::connection_path_hint("jpeg", "relay")
-                                .into(),
-                            ..LiveHud::default()
-                        });
                         break;
                     }
                     if saw_frame && last_decoded_at.elapsed() > Duration::from_secs(8) {
@@ -1030,14 +1026,6 @@ fn start_live_from(
                                     .into(),
                             ));
                             thread_shared.push(UiEvent::Link("jpeg · relay".into()));
-                            thread_shared.set_hud(LiveHud {
-                                path: "relay".into(),
-                                kind: "jpeg".into(),
-                                encoder: "jpeg".into(),
-                                path_note: super::model::connection_path_hint("jpeg", "relay")
-                                    .into(),
-                                ..LiveHud::default()
-                            });
                             break;
                         }
                     }
@@ -1134,6 +1122,7 @@ fn start_live_from(
     let shot_h264 = Arc::clone(&h264);
     let shots = tokio::spawn(async move {
         let mut tick = tokio::time::interval(shot_interval);
+        let mut still_times: Vec<Instant> = Vec::new();
         loop {
             tick.tick().await;
             if shot_stop.load(Ordering::Relaxed) {
@@ -1158,11 +1147,18 @@ fn start_live_from(
                     }
                     if let Some((rgba, width, height)) = decode_image(&bytes) {
                         shared.set_picture(rgba, width, height, "jpeg", "relay");
+                        let now = Instant::now();
+                        still_times.push(now);
+                        still_times.retain(|t| {
+                            now.saturating_duration_since(*t) <= Duration::from_secs(5)
+                        });
+                        let stills_hz = stills_rate_hz(&still_times).unwrap_or(0.0);
                         shared.set_hud(LiveHud {
                             path: "relay".into(),
                             kind: "jpeg".into(),
                             width: width as u32,
                             height: height as u32,
+                            fps: stills_hz,
                             encoder: "jpeg".into(),
                             path_note: super::model::connection_path_hint("jpeg", "relay").into(),
                             ..LiveHud::default()
@@ -1601,13 +1597,21 @@ mod live_pipeline_tests {
         handler
     }
 
+    #[derive(Debug)]
+    struct HudSnap {
+        kind: String,
+        path: String,
+        note: String,
+        fps: f32,
+    }
+
     struct Harness {
         runtime: tokio::runtime::Runtime,
         shared: Arc<Shared>,
         started: Option<Started>,
         last: Option<Picture>,
-        last_hud: Option<(String, String, String)>,
-        hud_history: Vec<(String, String)>,
+        last_hud: Option<HudSnap>,
+        hud_history: Vec<(String, String, f32)>,
         notices: Vec<String>,
         failed: Vec<String>,
         links: Vec<String>,
@@ -1661,9 +1665,14 @@ mod live_pipeline_tests {
             for ev in self.shared.drain() {
                 match ev {
                     UiEvent::Hud(hud) => {
-                        self.hud_history.push((hud.kind.clone(), hud.path.clone()));
-                        self.last_hud =
-                            Some((hud.kind.clone(), hud.path.clone(), hud.path_note.clone()));
+                        self.hud_history
+                            .push((hud.kind.clone(), hud.path.clone(), hud.fps));
+                        self.last_hud = Some(HudSnap {
+                            kind: hud.kind.clone(),
+                            path: hud.path.clone(),
+                            note: hud.path_note.clone(),
+                            fps: hud.fps,
+                        });
                     }
                     UiEvent::Handshake(text) => self.handshakes.push(text),
                     UiEvent::Notice(text) => self.notices.push(text),
@@ -1701,8 +1710,8 @@ mod live_pipeline_tests {
             let deadline = Instant::now() + timeout;
             loop {
                 self.pump();
-                if let Some((k, p, _)) = &self.last_hud {
-                    if k == kind && p == path {
+                if let Some(hud) = &self.last_hud {
+                    if hud.kind == kind && hud.path == path {
                         return;
                     }
                 }
@@ -1802,9 +1811,22 @@ mod live_pipeline_tests {
             "expected a recorded WebRTC/ICE failure notice, got notices={:?} links={:?}",
             h.notices, h.links
         );
-        if let Some((_, path, note)) = &h.last_hud {
-            assert_eq!(path, "relay");
-            assert!(note.contains("not WebRTC P2P"), "{note}");
+        if let Some(hud) = &h.last_hud {
+            assert_eq!(hud.path, "relay");
+            assert!(hud.note.contains("not WebRTC P2P"), "{}", hud.note);
+            assert!(
+                hud.fps > 0.05,
+                "refreshing JPEG stills must report a measured stills rate, got fps={}",
+                hud.fps
+            );
+            let rate = super::super::chrome::session_stats_rate_line("jpeg", hud.fps);
+            assert!(
+                rate.starts_with("stills  ") && rate.ends_with(" Hz"),
+                "0938-style popover must not show fps  0.0 for refreshing stills, got {rate}"
+            );
+            assert_ne!(rate, "fps  0.0");
+        } else {
+            panic!("expected a JPEG HUD after stills kept refreshing");
         }
         assert!(
             h.failed.is_empty(),
@@ -1815,7 +1837,7 @@ mod live_pipeline_tests {
         assert!(
             !h.hud_history
                 .iter()
-                .any(|(k, p)| k == "h264" || p == "connecting"),
+                .any(|(k, p, _)| k == "h264" || p == "connecting"),
             "handshake must not pollute the painted media path: {:?}",
             h.hud_history
         );
@@ -1866,7 +1888,7 @@ mod live_pipeline_tests {
         assert!(
             !h.hud_history
                 .iter()
-                .any(|(k, p)| k == "h264" || p == "connecting"),
+                .any(|(k, p, _)| k == "h264" || p == "connecting"),
             "must not publish h264 · connecting over a rendered JPEG path: {:?} handshakes={:?}",
             h.hud_history,
             h.handshakes
@@ -1928,8 +1950,8 @@ mod live_pipeline_tests {
             h.failed
         ));
         h.wait_hud("jpeg", "relay", Duration::from_secs(2));
-        if let Some((_, _, note)) = &h.last_hud {
-            assert!(note.contains("not WebRTC P2P"), "{note}");
+        if let Some(hud) = &h.last_hud {
+            assert!(hud.note.contains("not WebRTC P2P"), "{}", hud.note);
         }
         assert!(h
             .notices
@@ -1965,18 +1987,266 @@ mod live_pipeline_tests {
         if let Some(pic) = &h.last {
             panic!("no-grant session published a picture: {pic:?}");
         }
-        if let Some((kind, path, _)) = &h.last_hud {
-            assert_ne!(path, "host");
-            assert_ne!(path, "private");
-            assert_ne!(kind, "h264");
+        if let Some(hud) = &h.last_hud {
+            assert_ne!(hud.path, "host");
+            assert_ne!(hud.path, "private");
+            assert_ne!(hud.kind, "h264");
         }
         eprintln!("t449 harness no-grant: failed={:?}", h.failed);
+    }
+
+    #[test]
+    fn jpeg_stills_rate_is_measured_from_a_real_sequence() {
+        let (jpeg, seq) = jpeg_source();
+        let mut h = Harness::start(
+            Arc::new(NodeSignal {
+                handler: mock_handler(),
+            }),
+            jpeg,
+            IceFault::RelayPolicyWithoutTurn,
+        );
+        let first = h.wait_picture("jpeg", Duration::from_secs(4));
+        assert_eq!(first.kind, "jpeg");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut later = first.clone();
+        while Instant::now() < deadline {
+            h.pump();
+            if let Some(pic) = h.last.clone() {
+                later = pic;
+            }
+            if later.seq >= first.seq + 4 {
+                if let Some(hud) = &h.last_hud {
+                    if hud.kind == "jpeg" && hud.fps > 0.05 {
+                        break;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            later.seq >= first.seq + 4,
+            "need a real stills sequence, first={} later={}",
+            first.seq,
+            later.seq
+        );
+        let hud = h.last_hud.as_ref().expect("JPEG HUD after stills sequence");
+        assert_eq!(hud.kind, "jpeg");
+        assert_eq!(hud.path, "relay");
+        assert!(
+            hud.fps > 0.05,
+            "measured stills rate must be > 0 after several JPEGs, got {}",
+            hud.fps
+        );
+        // Harness injects stills every 50ms (~20 Hz). Allow jitter, but
+        // reject a zero / near-zero that would display as fps  0.0.
+        assert!(
+            hud.fps >= 5.0 && hud.fps <= 40.0,
+            "stills rate should track the 50ms inject interval, got {} Hz (seq {} -> {}, grabs={})",
+            hud.fps,
+            first.seq,
+            later.seq,
+            seq.load(AtomicOrdering::Relaxed)
+        );
+        let rate = super::super::chrome::session_stats_rate_line("jpeg", hud.fps);
+        assert!(
+            rate.starts_with("stills  ") && rate.ends_with(" Hz"),
+            "popover must show a stills Hz, not fps  0.0: {rate}"
+        );
+        assert_ne!(rate, "fps  0.0");
+        assert_eq!(
+            super::super::chrome::session_stats_bitrate_line("jpeg", 0),
+            "bitrate  n/a"
+        );
+        assert_eq!(
+            super::super::chrome::session_stats_latency_line("jpeg", 0),
+            "latency  n/a"
+        );
+        eprintln!(
+            "t449 harness stills-rate: seq {} -> {}, hud fps={:.1}, line={rate}",
+            first.seq, later.seq, hud.fps
+        );
+    }
+
+    #[test]
+    fn negotiation_hud_stays_jpeg_through_offer_answer_wait_timeout_and_close() {
+        // 0938 GUI path: JPEG already on screen, offer/answer complete,
+        // waiting for a pair, 12s no-pair timeout, then close. The painted
+        // path must stay jpeg · relay the whole time; stats must not say
+        // H.264 or P2P, and must not show fps  0.0 once stills are measured.
+        let (jpeg, _) = jpeg_source();
+        let mut h = Harness::start(
+            Arc::new(NodeSignal {
+                handler: mock_handler(),
+            }),
+            jpeg,
+            IceFault::NoPairAfterSignaling,
+        );
+        let first = h.wait_picture("jpeg", Duration::from_secs(4));
+        assert_eq!(first.path, "relay");
+        h.wait_hud("jpeg", "relay", Duration::from_secs(2));
+
+        let mut saw_offer = false;
+        let mut saw_answer = false;
+        let mut saw_waiting = false;
+        let mut saw_timeout = false;
+        // Connect + 12s no-pair deadline, plus slack for logging/close.
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while Instant::now() < deadline {
+            h.pump();
+            for hs in &h.handshakes {
+                let lower = hs.to_ascii_lowercase();
+                if lower.contains("sending webrtc offer")
+                    || lower.contains("signal offer")
+                    || lower.contains("local offer")
+                {
+                    saw_offer = true;
+                }
+                if lower.contains("offer answered") || lower.contains("applying remote answer") {
+                    saw_answer = true;
+                }
+                if lower.contains("waiting for ice pair") {
+                    saw_waiting = true;
+                }
+                if lower.contains("no selected ice pair") {
+                    saw_timeout = true;
+                }
+            }
+            if saw_timeout {
+                break;
+            }
+            // Mid-negotiation: already-rendered JPEG must not be overwritten
+            // by a speculative h264 / connecting / P2P HUD.
+            assert!(
+                !h.hud_history
+                    .iter()
+                    .any(|(k, p, _)| k == "h264" || p == "connecting"),
+                "HUD must stay off h264/connecting during negotiation: {:?} handshakes={:?}",
+                h.hud_history,
+                h.handshakes
+            );
+            assert!(
+                h.links
+                    .iter()
+                    .all(|l| l != "h264 · connecting" && !l.to_ascii_lowercase().contains("h264")),
+                "link must not claim H.264 before a decoded frame: {:?}",
+                h.links
+            );
+            if let Some(pic) = &h.last {
+                assert_eq!(
+                    pic.kind, "jpeg",
+                    "picture flipped off JPEG mid-negotiation: {pic:?}"
+                );
+                assert_eq!(pic.path, "relay");
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+        assert!(
+            saw_offer,
+            "expected an offer stage, handshakes={:?}",
+            h.handshakes
+        );
+        assert!(
+            saw_answer,
+            "expected an answered offer, handshakes={:?}",
+            h.handshakes
+        );
+        assert!(
+            saw_waiting,
+            "expected waiting for ICE pair / video, handshakes={:?}",
+            h.handshakes
+        );
+        assert!(
+            saw_timeout,
+            "expected 12s no-selected-pair terminal reason, handshakes={:?}",
+            h.handshakes
+        );
+        let last_hs = h.handshakes.last().cloned().unwrap_or_default();
+        assert!(
+            last_hs.contains("no selected ICE pair"),
+            "terminal handshake must keep the no-pair reason: {last_hs:?} all={:?}",
+            h.handshakes
+        );
+        assert!(
+            h.handshakes.iter().all(|hs| !hs.contains("signal close")),
+            "cleanup must not occupy handshake: {:?}",
+            h.handshakes
+        );
+        let hud = h.last_hud.as_ref().expect("HUD after timeout");
+        assert_eq!(hud.kind, "jpeg");
+        assert_eq!(hud.path, "relay");
+        assert!(hud.note.contains("not WebRTC P2P"), "{}", hud.note);
+        assert!(
+            hud.fps > 0.05,
+            "stills were refreshing through the timeout; rate must be measured, got {}",
+            hud.fps
+        );
+        let rate = super::super::chrome::session_stats_rate_line("jpeg", hud.fps);
+        assert_ne!(rate, "fps  0.0");
+        assert!(rate.starts_with("stills  "), "{rate}");
+
+        // Close the live session the same way the controller does on exit.
+        if let Some(started) = h.started.take() {
+            let _enter = h.runtime.enter();
+            started.live.stop.store(true, AtomicOrdering::Relaxed);
+            started.shots.abort();
+            if let Ok(slot) = started.live.viewer.lock() {
+                if let Some(viewer) = slot.as_ref() {
+                    viewer.close();
+                }
+            }
+        }
+        // Allow close acks to drain; handshake must stay on the terminal reason.
+        let settle = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < settle {
+            h.pump();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let last_hs = h.handshakes.last().cloned().unwrap_or_default();
+        assert!(
+            last_hs.contains("no selected ICE pair"),
+            "close must not overwrite the terminal no-pair reason: {last_hs:?} all={:?}",
+            h.handshakes
+        );
+        assert!(
+            !h.hud_history
+                .iter()
+                .any(|(k, p, _)| k == "h264" || p == "connecting"),
+            "close must not publish h264/connecting: {:?}",
+            h.hud_history
+        );
+        if let Some(pic) = &h.last {
+            assert_eq!(pic.kind, "jpeg");
+            assert_eq!(pic.path, "relay");
+        }
+        eprintln!(
+            "t449 harness negotiation-lifecycle: last_hs={last_hs:?} hud={:?} fps={:.1} stills_line={rate} pictures={} notices={:?}",
+            h.last_hud.as_ref().map(|h| format!("{} · {}", h.kind, h.path)),
+            h.last_hud.as_ref().map(|h| h.fps).unwrap_or(0.0),
+            h.last.as_ref().map(|p| p.seq).unwrap_or(0),
+            h.notices
+        );
     }
 }
 
 #[cfg(test)]
 mod handshake_retention_tests {
-    use super::{handshake_is_cleanup, Shared, UiEvent};
+    use super::{handshake_is_cleanup, stills_rate_hz, Shared, UiEvent};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn stills_rate_hz_needs_a_real_span_and_does_not_invent_zero() {
+        assert_eq!(stills_rate_hz(&[]), None);
+        let t0 = Instant::now();
+        assert_eq!(stills_rate_hz(&[t0]), None);
+        assert_eq!(stills_rate_hz(&[t0, t0]), None);
+        let t1 = t0 + Duration::from_millis(800);
+        let t2 = t0 + Duration::from_millis(1600);
+        let hz = stills_rate_hz(&[t0, t1, t2]).expect("three 800ms stills");
+        assert!(
+            (hz - 1.25).abs() < 0.01,
+            "800ms stills should be 1.25 Hz, got {hz}"
+        );
+    }
 
     #[test]
     fn cleanup_and_keyframe_acks_do_not_count_as_handshake_progress() {
