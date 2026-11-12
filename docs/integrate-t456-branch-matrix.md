@@ -1,21 +1,27 @@
 # t456 branch matrix
 
-Recorded 2026-11-12 19:55 CST (Asia/Shanghai).
+Recorded 2026-11-13 00:33 CST (Asia/Shanghai).
 
 This integration starts from `feat/controller-p2p-observe-t449`
-(`ebfb6f22cef5509fce923e77c5494a44a5d7d9f4`). Remote `main`
+(`ebfb6f22cef5509fce923e77c5494a44a5d7d9f4`). Live remote `main`
 (`602887281932d254d3d8ee1d57f8e3a305ab9bd6`) is a strict ancestor
 (42 commits through `integrate/controller-android-t447` =
-`684e1adf3cd2b441a167c735be3f9d6937d3d4b7`, then 10 P2P commits).
+`684e1adf3cd2b441a167c735be3f9d6937d3d4b7`, then 10 P2P commits,
+then the local t456/UI/reconnect/noflash line below).
 Original branches and frozen t452 artifacts were not moved or overwritten.
 
-Remote heads were re-verified read-only on 2026-11-12 20:30 CST
-(Asia/Shanghai) with the GitHub API (`list_branches` page size 100,
-page 1, plus `list_tags` page size 100). That is a live list of every
-remote head, not an assumption that `main` stands for all heads. An
-HTTPS `git fetch` of all heads still needs credentials; this check
-did not use fetch. The repository remains private. This branch is a
-local candidate and is not pushed in this step.
+Remote heads were re-verified read-only on 2026-11-13 00:31 CST
+(Asia/Shanghai) with `gh api repos/zltl/agentlink/git/ref/heads/main`,
+`repos/zltl/agentlink` (visibility), and `repos/zltl/agentlink/branches?per_page=100&page=1`
+plus `list_tags` page size 100. That is a live list of every remote
+head, not a leftover `refs/remotes/origin/main` or any other cached
+remote value treated as current. An HTTPS `git fetch` of all heads
+still needs credentials; this check did not use fetch, tokens, or
+internal APIs. The repository remains **private** (`visibility=private`).
+`pushed_at` on the GitHub API was `2026-11-12T00:40:25Z`
+(2026-11-12 08:40:25 Asia/Shanghai). This branch is a local candidate
+and is **not pushed**. Independent review of `6674388` (copy-retry
+safety and tests) is in progress and is not treated as passed.
 
 ## Live remote heads (GitHub API)
 
@@ -27,6 +33,32 @@ no tags (`list_tags` returned an empty page).
 | `main` | `602887281932d254d3d8ee1d57f8e3a305ab9bd6` | Sealed integration baseline. |
 | `integrate/controller-android-t447` | `684e1adf3cd2b441a167c735be3f9d6937d3d4b7` | Already an ancestor of the t449 baseline. |
 | `cursor/android-invite-crash-6d47` | `447fa55e96a1114e8e97ab7ef574a2f32a4a92f1` | Already an ancestor of t447 / t449. |
+
+## Current local candidate (not pushed, review in progress)
+
+Local branch `integrate/security-main-t456` in
+`/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo` was
+fast-forwarded (`merge --ff-only`, after a normal fetch of the
+reconnect worktree) from `7142d936874484b15a543d99b0ac105f317fb7dd`
+to merge tip `6674388027224441327d771e1d3e3adab0ec42f8`. The
+fast-forward keeps complete ancestry, including both merge parents:
+
+| Commit | Subject | Role |
+| --- | --- | --- |
+| `7142d936874484b15a543d99b0ac105f317fb7dd` | `ui(controller): paint inset focus rings on Details and machine rows` | Previous integrate tip; UI round-4 product. |
+| `4fef74f763b6c208c8701e80f8378fafb7befb5e` | `fix: keep relay-drop session teardown and recover via a fresh grant` | Parent 1 of the merge. Reconnect/copy. |
+| `4e677c864719809f0cb1edb917ca46e2623bacc8` | `fix(process): route leftover Command::new through hidden or reviewed exceptions` | noflash product; parent of `79f3d63`. |
+| `79f3d63bc857d6eae16ceee5128c8ec9c4baf6c5` | `docs(grant_local): correct grant_ui_command notes on hidden()` | Parent 2 of the merge. noflash docs only. |
+| `6674388027224441327d771e1d3e3adab0ec42f8` | merge of the two children of `7142d936` | Current integrate tip. |
+
+Earlier UI commits already on this line (also ancestors of `7142d936`):
+`156f49ba` (preview isolation), `5d13dfd9`, `fd033c7f`, `25eda068`.
+The UI source repo and the 7142 Linux GUI freeze were not modified in
+this docs step, and no new GUI binary was built.
+
+Independent review of `6674388` is running (copy retry safety and
+tests). A later block from that review is not auto-fixed here. Do
+not push until the parent confirms.
 
 ## Cached `origin/*` not on the live remote — do not merge
 
@@ -87,11 +119,12 @@ Security repairs from the t454 review (notification injection, grant-flag overwr
 
 ## Integration candidate (this step)
 
-Local branch `integrate/security-main-t456` in the continuation worktree
-`/workspace/agentlink-integrate-t456-cont` (the 9122522 tree stays frozen
-and clean). Security fixes, licenses, and the zstd advisory upgrades
-landed on this branch. See `docs/integrate-t456-security-status.md`.
-Still not pushed.
+The historical continuation worktree
+`/workspace/agentlink-integrate-t456-cont` and the frozen 9122522 tree
+were not rewritten. Current integrate work is
+`/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo` at
+`6674388` (see the current-candidate section above). See
+`docs/integrate-t456-security-status.md`. Still not pushed.
 
 ## Post-cd30 residual (local, not pushed)
 
@@ -108,3 +141,14 @@ A third incremental commit on the same branch fixes `real_pty_resize_changes_chi
 ## Post-40f551c ConPTY Enter handshake (local, not pushed)
 
 A further incremental commit on the same branch wakes the Windows size-helper handshake with CR/LF (`\r\n` on Windows, `\n` on Unix). `40f551c`, `8df767a`, and `8143d2ee` are not rewritten. Production resize is unchanged. Still not pushed.
+
+## Post-6674388 docs snapshot (local, not pushed)
+
+After `7142d936`, the integrate branch was fast-forwarded to
+`6674388027224441327d771e1d3e3adab0ec42f8` (parents `4fef74f7` and
+`79f3d63b`; noflash reviewed statically, reconnect independently
+reviewed but that review is still running). The preceding
+Post-40f551c / Post-8df / Post-8143 notes remain historical and
+are not the current tip. See the current-candidate section at the
+top and `docs/integrate-t456-security-status.md`. Still not pushed.
+

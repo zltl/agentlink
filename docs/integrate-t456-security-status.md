@@ -1,19 +1,117 @@
 # t456 security integration status
 
-Recorded 2026-11-12 21:00 CST (Asia/Shanghai). Local candidate only; this step did not push.
+Recorded 2026-11-13 00:33 CST (Asia/Shanghai). Local candidate only; this
+step did not push. Independent review of tip `6674388` (copy-retry
+safety and tests) is in progress and is **not** treated as passed.
 
-- Continuation worktree: `/workspace/agentlink-integrate-t456-cont`
-- Frozen 912 review tree (untouched, still clean): `/workspace/agentlink-integrate-t456` at `9122522b23846b2b6c31c640ef2928cb053dd994`
-- Branch: `integrate/security-main-t456`
+- Current worktree: `/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo`
+- Branch: `integrate/security-main-t456` at `6674388027224441327d771e1d3e3adab0ec42f8`
+  (fast-forwarded from `7142d936`; merge parents `4fef74f7` and `79f3d63b`)
+- Frozen 912 review tree (untouched): `/workspace/agentlink-integrate-t456` at `9122522b23846b2b6c31c640ef2928cb053dd994`
+- Historical continuation worktree (not the current tip): `/workspace/agentlink-integrate-t456-cont`
 - Baseline: `feat/controller-p2p-observe-t449` (`ebfb6f22cef5509fce923e77c5494a44a5d7d9f4`)
-- Remote `main` (`602887281932d254d3d8ee1d57f8e3a305ab9bd6`) is a strict ancestor
+- Live remote `main` re-verified 2026-11-13 00:31 CST (Asia/Shanghai) via
+  `gh api repos/zltl/agentlink/git/ref/heads/main`: still
+  `602887281932d254d3d8ee1d57f8e3a305ab9bd6`, a strict ancestor. A leftover
+  `refs/remotes/origin/main` was not used as the live value.
+- Repo visibility re-verified the same minute: **private**. `pushed_at`
+  `2026-11-12T00:40:25Z` (2026-11-12 08:40:25 Asia/Shanghai).
 - Frozen t452 controller bin left in place under `/workspace/agentlink-t427-recovery/20261112-1341-t452-controller-p2p/`
-- Dirty source worktrees were not touched
-- Repo visibility unchanged (private); no release; no GitHub Actions; no production deploy; no production token was changed
+- UI source repo and the 7142 Linux GUI freeze were not modified in this
+  docs step; no new GUI binary was built.
+- No production machine was upgraded. No GitHub Actions. Not public. No
+  release. This branch is not pushed. No production token was changed.
 
 Trust model is unchanged: a full current-user shell with a grant may read the same-UID issuer and countersign. The first request without a grant is still denied. Relay login is not target authorization. Public NAT P2P remains unproven. Same-account grant bypass is not restored.
 
 This revision addresses the independent review of `9122522`. Confirmed-good direction (parameterized notifications, flag overwrite, desktop owner UUID, legacy default off, QR client DOM filtering, license/no Actions) was kept and not reverted.
+
+## Current tip `6674388` — what is and is not claimed
+
+This is a status snapshot of the fast-forwarded integrate tip. It does
+**not** declare security or platform work complete.
+
+**UI (product through `7142d936`, four real-window rounds).** The last
+two defects — Details focus rings and machine-row clip — passed on a
+real window. 721 / 1024 / 1080 and max action cards at 2×2 did not
+clip. Preview isolation and permission behavior matched the isolation
+contract. Enter, mock View, Back, and exit passed. computerUse is
+**partial**: preview has no Advanced tab to inspect; the complete Tab
+order was not walked; different DPI and real (non-preview) sessions
+were not tested. This is not a full GUI acceptance. Screenshots already
+went to the user. Local evidence only (not an external URL):
+
+- `/workspace/agentlink-recovery-20261112/backups/gui-7142-computeruse/files/`
+  (durable copy of 352 webp captures, 2026-11-12 22:27–23:42 Asia/Shanghai)
+- `/tmp/computer-use/` (original ephemeral path)
+- Linux freeze used for that run:
+  `/workspace/agentlink-recovery-20261112/ui-156f49ba-backup/freeze/7142d93687-linux-gui/`
+  (also under `/workspace/agentlink-recovery-20261112/t460-ui-artifacts/freeze/7142d93687-linux-gui/`)
+
+`/tmp/t460-ui-inspect/user-controller-screenshot.png` is an earlier
+`abf86f1` product shot, not the 7142 acceptance set.
+
+**Workspace regression at `6674388` (2026-11-13 00:24–00:29 Asia/Shanghai).**
+`RUST_MIN_STACK=16777216 cargo +1.99.1 test --locked --offline --workspace --no-fail-fast -- --test-threads=1`
+on an independent target: **1548 passed, 0 failed, 2 pre-existing ignored**
+(`bench_transfer`, `agentlink-desktop` doc-test `capture.rs:11`),
+`workspace_exit=0`. This is **not** a default test-thread green.
+The default rustc test-thread stack (~2 MiB) still overflows in
+`cp_progress_tests::cp_help_documents_progress` (`Cli::command` /
+long help). The 7142 product binary
+`/workspace/agentlink-recovery-20261112/ui-rebuild-target/debug/agentlink`,
+`ulimit -s=8192` (8 MiB OS main stack), `RUST_MIN_STACK` unset:
+`agentlink --help`, `cp --help`, `help cp`, `exec --help`, and `-h`
+all exited 0 with empty stderr. Product thread stacks were not raised
+to 16 MiB; the help test source was not changed for a numeric green.
+
+**Reconnect (`4fef74f7`, still on this tip).** Relay drop still stops
+old shells, media, and inflight grant RPCs immediately (`stop_live_sessions`,
+grant watcher, revoke). Those gates were not disabled. After the node
+redials, a grant-checked fresh exec/PTY/MCP/watch can run, and
+journaled `copy_upload`/`copy_download` may retry a `cancelled` result
+only as a **new** grant-checked `open_data_link` while the client is
+still alive. `Error::is_retryable` stays false for `cancelled`, so
+exec/PTY are not silently rerun. A client without a grant, and a
+revoked jti, stay denied after reconnect. Independent review of this
+copy-retry is in progress; it is not a closed security sign-off.
+
+**no_console_flash (`4e677c86` + docs `79f3d63b`).** Static review
+passed (13 sites classified, guard not relaxed; helper stays a visible
+grant; no permission change). The merged workspace run of
+`-p agentlink-cli --test no_console_flash` passed on Linux. Windows
+visual “no console flash” behavior was **not** tested.
+
+**Android / UniFFI.** Official `uniffi-bindgen` regeneration of
+`android/app/src/main/java/uniffi/agentlink_ffi/agentlink_ffi.kt`
+against the 8143 `libagentlink_ffi.so`, plus signature/type checks,
+already landed (`8df767aa` and follow-ups). That work is done in
+source. An Android **full build** and a **phone/emulator** run were
+not done. This is not a bindgen deferral, and it is not an Android
+device sign-off.
+
+**Windows ConPTY resize / Enter handshake** (`40f551c`, `ac33c12` and
+follow-ups) still waits for an offline Windows probe retest. Linux
+passing is not Windows evidence.
+
+**NAT P2P** has not been proven across a real NAT / public network.
+
+**SQLite `RUSTSEC-2026-0459` is not patched.** `libsqlite3-sys` 0.30.1
+remains in the lock and in the default compile tree; `sqlx` has no
+compatible path to a fixed `>=0.39` in this tree. `rsa` (`RUSTSEC-2023-0071`)
+remains in `Cargo.lock` via optional `sqlx-mysql` and is unreachable
+from the default feature tree; lock presence is not a fix.
+cargo-audit is still expected exit 1, including **12 unmaintained
+warnings**. Mitigations (default-tree unreachability, documenting the
+sqlite bind) are **not** a vulnerability fix.
+
+Production machines were not upgraded. No Actions, no public repo, no
+release, no push of this branch.
+
+Trust model is unchanged: a full current-user shell with a grant may
+read the same-UID issuer and countersign. The first request without a
+grant is still denied. Relay login is not target authorization.
+Same-account grant bypass is not restored.
 
 ## Review items after the 912 follow-up
 
@@ -176,3 +274,23 @@ SQLite `RUSTSEC-2026-0459` remains accurately documented; cargo-audit is still e
 Windows probe of `40f551c` compiled the size helper and printed `AL_SIZE_BEFORE` 80x24 plus `AL_READY`. After resize the host transcript had `ESC[8;30;100t` and a redraw of the old BEFORE/READY lines, but no `AL_SIZE_AFTER` / `AL_DONE` (`wait_transcript_sentinel` timed out at 8s). The test wrote a bare LF; Windows cooked console input completes a line on CR (Enter).
 
 This commit does not change production resize. On Windows the handshake write is `\r\n`; Unix stays `\n`. The Windows helper waits for CR or LF before reading `GetConsoleScreenBufferInfo` again. Assertions are unchanged: window/winsize must be `80x24` before and `100x30` after, with `AL_DONE`. Not run on this box (no rustc 1.99). Windows worker retest is required.
+
+## Post-6674388 status snapshot (local, not pushed)
+
+The current integrate tip is `6674388027224441327d771e1d3e3adab0ec42f8`,
+not `40f551c`. The sections above stay as historical review notes.
+See **Current tip `6674388` — what is and is not claimed** for the
+live snapshot: 7142 GUI defects (focus / cards) closed on a real
+window with computerUse still partial; 16 MiB workspace 1548 / 0 / 2
+ignored; default test-thread CLI help still overflows; 8 MiB product
+help exits 0; reconnect keeps the drop-teardown gate and recovers
+via a grant-checked fresh session; noflash static review passed,
+Windows visual untested; official Kotlin regen and signature
+typecheck done, Android full build and phone untested; Windows AC
+resize still awaits an offline probe retest; NAT P2P unproven across
+networks; `RUSTSEC-2026-0459` unpatched; `rsa` lock-only and
+default-unreachable; 12 unmaintained warnings; mitigations are not a
+fix; production machines not upgraded; no Actions, not public, no
+release, not pushed. Independent review of `6674388` is in progress
+and is not treated as passed. This executor does not push `main`.
+
