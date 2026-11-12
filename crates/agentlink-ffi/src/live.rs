@@ -114,6 +114,7 @@ pub(crate) fn open(
             control: true,
             // Native pixels. The node clamps anything outside 0.25..=1.
             scale: 1.0,
+            ..LiveOptions::default()
         },
     )
     .map_err(|detail| LinkError::Fail { detail })?;

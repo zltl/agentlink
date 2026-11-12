@@ -13,7 +13,7 @@ use agentlink_core::{
     PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL, PtyEvent, PtySession, RelayTrust,
     apply_relay_defaults, parse_access,
 };
-use agentlink_view::{LiveOptions, Signal, Viewer};
+use agentlink_view::{is_screenshot_fallback, IceFault, LiveOptions, Signal, Viewer};
 use base64::Engine;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -21,6 +21,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use super::decode::{H264Decoder, decode_image};
 use super::model::enroll_command;
 
+#[derive(Clone, Debug)]
 pub struct Picture {
     pub rgba: Vec<u8>,
     pub width: usize,
@@ -56,6 +57,8 @@ pub struct LiveHud {
     pub frames_dropped: u64,
     /// Human-readable path explanation (not a candidate inventory).
     pub path_note: String,
+    /// WebRTC handshake / negotiation stage. Independent of the painted media path.
+    pub handshake: String,
 }
 
 /// Sliding client-side timing samples (microseconds / counts) for `--perf-log` and debug `state`.
@@ -149,6 +152,8 @@ pub enum UiEvent {
     Pins(Vec<String>),
     Monitors(Vec<MonitorEntry>),
     Hud(LiveHud),
+    /// Handshake/negotiation stage only; must not change the painted media path.
+    Handshake(String),
 }
 
 pub enum Cmd {
@@ -291,6 +296,70 @@ impl Shared {
 
     pub fn set_hud(&self, hud: LiveHud) {
         self.push(UiEvent::Hud(hud));
+    }
+
+    pub fn set_handshake(&self, stage: impl Into<String>) {
+        self.push(UiEvent::Handshake(stage.into()));
+    }
+}
+
+
+struct TracingSignal {
+    inner: Arc<dyn Signal>,
+    on_stage: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl Signal for TracingSignal {
+    fn signal(&self, payload: &Value) -> Result<Value, String> {
+        let action = payload
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("signal");
+        let sdp_len = payload
+            .get("sdp")
+            .and_then(|value| value.as_str())
+            .map(str::len);
+        let extra = match sdp_len {
+            Some(n) => format!(" sdp_len={n}"),
+            None => String::new(),
+        };
+        let sent = format!("signal {action} sent{extra}");
+        eprintln!("agentlink live-webrtc: {sent}");
+        (self.on_stage)(&sent);
+        let started = Instant::now();
+        let result = self.inner.signal(payload);
+        let ms = started.elapsed().as_millis();
+        match &result {
+            Ok(value) if is_screenshot_fallback(value) => {
+                let msg = format!("signal {action} screenshot-fallback {ms}ms");
+                eprintln!("agentlink live-webrtc: {msg}");
+                (self.on_stage)(&msg);
+            }
+            Ok(value) => {
+                let answer_sdp = value
+                    .get("sdp")
+                    .and_then(|item| item.as_str())
+                    .map(str::len);
+                let session_len = value
+                    .get("session_id")
+                    .and_then(|item| item.as_str())
+                    .map(str::len)
+                    .unwrap_or(0);
+                let detail = match answer_sdp {
+                    Some(n) => format!(" sdp_len={n} session_len={session_len}"),
+                    None => String::new(),
+                };
+                let msg = format!("signal {action} ok {ms}ms{detail}");
+                eprintln!("agentlink live-webrtc: {msg}");
+                (self.on_stage)(&msg);
+            }
+            Err(err) => {
+                let msg = format!("signal {action} error {ms}ms: {err}");
+                eprintln!("agentlink live-webrtc: {msg}");
+                (self.on_stage)(&msg);
+            }
+        }
+        result
     }
 }
 
@@ -671,6 +740,16 @@ fn live_path_for_hud(viewer: &Viewer) -> (String, String) {
     (path, note)
 }
 
+enum JpegSource {
+    Client {
+        client: Arc<Client>,
+        node: String,
+        monitor: u32,
+        quality: u32,
+    },
+    Injected(Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>),
+}
+
 fn start_live(
     client: Arc<Client>,
     node: String,
@@ -681,16 +760,49 @@ fn start_live(
     max_fps_override: u32,
     shared: Arc<Shared>,
 ) -> Started {
+    let handle = tokio::runtime::Handle::current();
+    start_live_from(
+        Arc::new(ClientSignal {
+            client: Arc::clone(&client),
+            handle,
+            node: node.clone(),
+        }),
+        JpegSource::Client {
+            client,
+            node,
+            monitor,
+            quality: quality.clamp(40, 95),
+        },
+        control,
+        monitor,
+        quality,
+        scale,
+        max_fps_override,
+        shared,
+        IceFault::None,
+        Duration::from_millis(800),
+    )
+}
+
+fn start_live_from(
+    signal: Arc<dyn Signal>,
+    jpeg: JpegSource,
+    control: bool,
+    monitor: u32,
+    quality: u32,
+    scale: f32,
+    max_fps_override: u32,
+    shared: Arc<Shared>,
+    ice_fault: IceFault,
+    shot_interval: Duration,
+) -> Started {
     let stop = Arc::new(AtomicBool::new(false));
     let h264 = Arc::new(AtomicBool::new(false));
     let viewer = Arc::new(Mutex::new(None));
-    let handle = tokio::runtime::Handle::current();
     let thread_stop = Arc::clone(&stop);
     let thread_h264 = Arc::clone(&h264);
     let thread_viewer = Arc::clone(&viewer);
     let thread_shared = Arc::clone(&shared);
-    let thread_client = Arc::clone(&client);
-    let thread_node = node.clone();
     let (quality_fps, bitrate) = quality_offer(quality);
     let max_fps = if max_fps_override > 0 {
         max_fps_override.min(60)
@@ -701,27 +813,67 @@ fn start_live(
     std::thread::Builder::new()
         .name("agentlink-desktop-view".into())
         .spawn(move || {
-            let connected = Viewer::connect(
-                Arc::new(ClientSignal {
-                    client: thread_client,
-                    handle,
-                    node: thread_node,
-                }),
-                LiveOptions {
-                    viewer: "desktop".into(),
-                    control,
-                    monitor,
-                    max_fps,
-                    bitrate,
-                    scale,
-                    ..LiveOptions::default()
-                },
-            );
+            const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+            let last_stage = Arc::new(Mutex::new("starting".to_string()));
+            let on_stage: Arc<dyn Fn(&str) + Send + Sync> = {
+                let last_stage = Arc::clone(&last_stage);
+                let events = Arc::clone(&thread_shared);
+                Arc::new(move |msg: &str| {
+                    if let Ok(mut slot) = last_stage.lock() {
+                        *slot = msg.to_string();
+                    }
+                    events.set_handshake(msg);
+                })
+            };
+            let traced: Arc<dyn Signal> = Arc::new(TracingSignal {
+                inner: signal,
+                on_stage: Arc::clone(&on_stage),
+            });
+            let opts = LiveOptions {
+                viewer: "desktop".into(),
+                control,
+                monitor,
+                max_fps,
+                bitrate,
+                scale,
+                ice_fault,
+                on_stage: Some(on_stage),
+                ..LiveOptions::default()
+            };
+            thread_shared.set_handshake("webrtc: starting");
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let connect_traced = Arc::clone(&traced);
+            let spawn_ok = std::thread::Builder::new()
+                .name("agentlink-desktop-connect".into())
+                .spawn(move || {
+                    let _ = tx.send(Viewer::connect(connect_traced, opts));
+                })
+                .is_ok();
+            let connected = if !spawn_ok {
+                Err("failed to start WebRTC connect thread".into())
+            } else {
+                match rx.recv_timeout(CONNECT_TIMEOUT) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let stage = last_stage
+                            .lock()
+                            .ok()
+                            .map(|slot| slot.clone())
+                            .unwrap_or_else(|| "unknown".into());
+                        Err(format!(
+                            "WebRTC connect timed out after {}s during {stage}",
+                            CONNECT_TIMEOUT.as_secs()
+                        ))
+                    }
+                }
+            };
             let viewer = match connected {
                 Ok(viewer) => Arc::new(viewer),
                 Err(err) => {
+                    thread_shared.set_handshake(format!("webrtc: failed ({err})"));
                     // Keep JPEG bootstrap for soft failures, but surface hard rejects.
                     if super::model::webrtc_connect_is_hard_reject(&err) {
+                        thread_stop.store(true, Ordering::Relaxed);
                         thread_shared.push(UiEvent::Failed(err));
                         return;
                     }
@@ -744,8 +896,10 @@ fn start_live(
                 *slot = Some(Arc::clone(&viewer));
             }
             let info = viewer.info();
-            // Do not publish an SDP inventory as the live path. JPEG stills
-            // may still be on screen until the first H.264 frame arrives.
+            // Handshake is independent of the painted media path. JPEG stills
+            // may still be on screen until the first decoded H.264 frame.
+            // Never publish kind=h264 / path=connecting here — that would
+            // overwrite an already-rendered jpeg · relay HUD.
             let encoder = if info.encoder.is_empty() {
                 if info.hardware {
                     "h264_hw".into()
@@ -755,18 +909,9 @@ fn start_live(
             } else {
                 info.encoder.clone()
             };
-            thread_shared.push(UiEvent::Link("h264 · connecting".into()));
-            thread_shared.set_hud(LiveHud {
-                path: "connecting".into(),
-                kind: "h264".into(),
-                width: info.width,
-                height: info.height,
-                bitrate_kbps: (bitrate / 1000).max(1),
-                encoder: encoder.clone(),
-                hardware: info.hardware,
-                path_note: super::model::connection_path_hint("h264", "connecting").into(),
-                ..LiveHud::default()
-            });
+            thread_shared.set_handshake(
+                "webrtc: signaling complete, waiting for video".to_string(),
+            );
             let mut decoder = H264Decoder::new();
             if !decoder.available() {
                 thread_shared.push(UiEvent::Notice(
@@ -779,12 +924,17 @@ fn start_live(
             let mut saw_frame = false;
             let mut last_recv = Instant::now();
             let mut last_frame_at = Instant::now();
+            let mut last_decoded_at = Instant::now();
             while !thread_stop.load(Ordering::Relaxed) {
                 let Some(frame) = viewer.poll_frame(Duration::from_millis(50)) else {
                     if viewer.failed() {
+                        // Direct video dropped (before or after the first
+                        // H.264 frame). Resume JPEG stills over the relay.
                         if super::model::webrtc_loss_keeps_jpeg(saw_frame) {
-                            // Offer or ICE failed before H.264; JPEG stills over
-                            // the WebSocket relay must stay usable.
+                            thread_h264.store(false, Ordering::Relaxed);
+                            thread_shared.set_handshake(
+                                "webrtc: connection lost; jpeg resumed".to_string(),
+                            );
                             thread_shared.push(UiEvent::Notice(
                                 "WebRTC live video is not up. Showing JPEG over the relay."
                                     .into(),
@@ -802,6 +952,28 @@ fn start_live(
                         }
                         thread_shared.push(UiEvent::Failed("WebRTC connection failed".into()));
                         break;
+                    }
+                    if saw_frame && last_decoded_at.elapsed() > Duration::from_secs(8) {
+                        if super::model::webrtc_loss_keeps_jpeg(saw_frame) {
+                            thread_h264.store(false, Ordering::Relaxed);
+                            thread_shared.set_handshake(
+                                "webrtc: no video for 8s; jpeg resumed".to_string(),
+                            );
+                            thread_shared.push(UiEvent::Notice(
+                                "WebRTC live video is not up. Showing JPEG over the relay."
+                                    .into(),
+                            ));
+                            thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                            thread_shared.set_hud(LiveHud {
+                                path: "relay".into(),
+                                kind: "jpeg".into(),
+                                encoder: "jpeg".into(),
+                                path_note: super::model::connection_path_hint("jpeg", "relay")
+                                    .into(),
+                                ..LiveHud::default()
+                            });
+                            break;
+                        }
                     }
                     if saw_frame && last_frame_at.elapsed() > Duration::from_millis(200) {
                         thread_shared.perf.stalls.fetch_add(1, Ordering::Relaxed);
@@ -837,6 +1009,7 @@ fn start_live(
                     let first_h264 = !saw_frame;
                     saw_frame = true;
                     last_frame_at = Instant::now();
+                    last_decoded_at = last_frame_at;
                     thread_h264.store(true, Ordering::Relaxed);
                     // Approximate input RTT: move timestamp → frame with meta latency.
                     let move_ms = thread_shared
@@ -877,6 +1050,7 @@ fn start_live(
                             hardware: info.hardware,
                             frames_dropped: stats.frames_dropped,
                             path_note,
+                            handshake: "webrtc: receiving video".into(),
                         });
                         window_start = Instant::now();
                         window_frames = 0;
@@ -889,78 +1063,50 @@ fn start_live(
         .ok();
     let shot_stop = Arc::clone(&stop);
     let shot_h264 = Arc::clone(&h264);
-    let shot_monitor = monitor;
-    let shot_quality = quality.clamp(40, 95);
     let shots = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(800));
+        let mut tick = tokio::time::interval(shot_interval);
         loop {
             tick.tick().await;
-            if shot_stop.load(Ordering::Relaxed) || shot_h264.load(Ordering::Relaxed) {
+            if shot_stop.load(Ordering::Relaxed) {
                 break;
             }
-            match client
-                .call_op(
-                    &node,
-                    Op::Extension {
-                        name: PHASE2_SCREENSHOT.to_string(),
-                        payload: json!({
-                            "target": "monitor",
-                            "monitor": shot_monitor,
-                            "format": "jpeg",
-                            "quality": shot_quality
-                        }),
-                    },
-                )
-                .await
-            {
-                Ok(value) => {
+            if shot_h264.load(Ordering::Relaxed) {
+                continue;
+            }
+            let grabbed = match &jpeg {
+                JpegSource::Injected(grab) => grab(),
+                JpegSource::Client {
+                    client,
+                    node,
+                    monitor,
+                    quality,
+                } => client_jpeg(client, node, *monitor, *quality).await,
+            };
+            match grabbed {
+                Ok(bytes) => {
                     if shot_h264.load(Ordering::Relaxed) {
-                        break;
+                        continue;
                     }
-                    if let Some(bytes) = screenshot_bytes(&value) {
-                        if let Some((rgba, width, height)) = decode_image(&bytes) {
-                            shared.set_picture(rgba, width, height, "jpeg", "relay");
-                            shared.set_hud(LiveHud {
-                                path: "relay".into(),
-                                kind: "jpeg".into(),
-                                width: width as u32,
-                                height: height as u32,
-                                encoder: "jpeg".into(),
-                                path_note: super::model::connection_path_hint("jpeg", "relay")
-                                    .into(),
-                                ..LiveHud::default()
-                            });
-                        }
+                    if let Some((rgba, width, height)) = decode_image(&bytes) {
+                        shared.set_picture(rgba, width, height, "jpeg", "relay");
+                        shared.set_hud(LiveHud {
+                            path: "relay".into(),
+                            kind: "jpeg".into(),
+                            width: width as u32,
+                            height: height as u32,
+                            encoder: "jpeg".into(),
+                            path_note: super::model::connection_path_hint("jpeg", "relay")
+                                .into(),
+                            ..LiveHud::default()
+                        });
                     }
                 }
                 Err(err) => {
-                    // Whole-desktop fallback when monitor index is unavailable.
-                    match client
-                        .call_op(
-                            &node,
-                            Op::Extension {
-                                name: PHASE2_SCREENSHOT.to_string(),
-                                payload: json!({
-                                    "target": "screen",
-                                    "format": "jpeg",
-                                    "quality": shot_quality
-                                }),
-                            },
-                        )
-                        .await
-                    {
-                        Ok(value) => {
-                            if let Some(bytes) = screenshot_bytes(&value) {
-                                if let Some((rgba, width, height)) = decode_image(&bytes) {
-                                    shared.set_picture(rgba, width, height, "jpeg", "relay");
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            shared.push(UiEvent::Failed(err.to_string()));
-                            break;
-                        }
+                    if super::model::webrtc_connect_is_hard_reject(&err) {
+                        shared.push(UiEvent::Failed(err));
+                        break;
                     }
+                    shared.push(UiEvent::Notice(format!("JPEG still failed ({err})")));
                 }
             }
         }
@@ -968,6 +1114,49 @@ fn start_live(
     Started {
         live: Live { stop, viewer },
         shots,
+    }
+}
+
+
+async fn client_jpeg(
+    client: &Client,
+    node: &str,
+    monitor: u32,
+    quality: u32,
+) -> Result<Vec<u8>, String> {
+    match client
+        .call_op(
+            node,
+            Op::Extension {
+                name: PHASE2_SCREENSHOT.to_string(),
+                payload: json!({
+                    "target": "monitor",
+                    "monitor": monitor,
+                    "format": "jpeg",
+                    "quality": quality
+                }),
+            },
+        )
+        .await
+    {
+        Ok(value) => screenshot_bytes(&value).ok_or_else(|| "screenshot missing data".into()),
+        Err(err) => {
+            let value = client
+                .call_op(
+                    node,
+                    Op::Extension {
+                        name: PHASE2_SCREENSHOT.to_string(),
+                        payload: json!({
+                            "target": "screen",
+                            "format": "jpeg",
+                            "quality": quality
+                        }),
+                    },
+                )
+                .await
+                .map_err(|inner| inner.to_string())?;
+            screenshot_bytes(&value).ok_or_else(|| err.to_string())
+        }
     }
 }
 
@@ -1273,4 +1462,395 @@ fn settings_of(file: &agentlink_core::config::FileConfig) -> Option<ClientSettin
         fingerprint,
         trust,
     })
+}
+
+
+#[cfg(test)]
+mod live_pipeline_tests {
+    use super::*;
+    use agentlink_core::{NodeExtension, NodePolicy};
+    use agentlink_desktop::{ConsentMode, Desktop, StreamHandler, StreamSettings};
+    use agentlink_view::IceFault;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct NodeSignal {
+        handler: Arc<StreamHandler>,
+    }
+
+    impl Signal for NodeSignal {
+        fn signal(&self, payload: &Value) -> Result<Value, String> {
+            self.handler.handle_peer(payload, "desktop-test")
+        }
+    }
+
+    struct DenySignal;
+
+    impl Signal for DenySignal {
+        fn signal(&self, _payload: &Value) -> Result<Value, String> {
+            Err("not allowed: missing grant".into())
+        }
+    }
+
+    fn encode_jpeg(seq: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(16, 16);
+        let v = (seq % 200 + 20) as u8;
+        for px in img.pixels_mut() {
+            *px = image::Rgb([v, 40, 80]);
+        }
+        let mut out = Vec::new();
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 70);
+        enc.encode(img.as_raw(), 16, 16, image::ExtendedColorType::Rgb8)
+            .expect("jpeg encode");
+        out
+    }
+
+    fn jpeg_source() -> (Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>, Arc<AtomicU32>) {
+        let seq = Arc::new(AtomicU32::new(0));
+        let tick = Arc::clone(&seq);
+        let grab = Arc::new(move || {
+            let n = tick.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            Ok(encode_jpeg(n))
+        });
+        (grab, seq)
+    }
+
+    fn mock_handler() -> Arc<StreamHandler> {
+        let handler = Arc::new(StreamHandler::new(Desktop::mock()));
+        handler.configure(StreamSettings {
+            policy: NodePolicy::remote_view(),
+            audit_path: std::env::temp_dir().join("agentlink-t449-live-harness.log"),
+            consent: ConsentMode::Auto,
+            on_audit: None,
+        });
+        handler
+    }
+
+    struct Harness {
+        runtime: tokio::runtime::Runtime,
+        shared: Arc<Shared>,
+        started: Option<Started>,
+        last: Option<Picture>,
+        last_hud: Option<(String, String, String)>,
+        hud_history: Vec<(String, String)>,
+        notices: Vec<String>,
+        failed: Vec<String>,
+        links: Vec<String>,
+        handshakes: Vec<String>,
+    }
+
+    impl Harness {
+        fn start(
+            signal: Arc<dyn Signal>,
+            jpeg: Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>,
+            ice_fault: IceFault,
+        ) -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("t449-live-harness")
+                .build()
+                .expect("runtime");
+            let _enter = runtime.enter();
+            let shared = Arc::new(Shared::new());
+            let started = start_live_from(
+                signal,
+                JpegSource::Injected(jpeg),
+                false,
+                0,
+                60,
+                1.0,
+                15,
+                Arc::clone(&shared),
+                ice_fault,
+                Duration::from_millis(50),
+            );
+            Self {
+                runtime,
+                shared,
+                started: Some(started),
+                last: None,
+                last_hud: None,
+                hud_history: Vec::new(),
+                notices: Vec::new(),
+                failed: Vec::new(),
+                links: Vec::new(),
+                handshakes: Vec::new(),
+            }
+        }
+
+        fn pump(&mut self) {
+            if let Some(pic) = self.shared.latest_picture() {
+                self.last = Some(pic);
+            }
+            for ev in self.shared.drain() {
+                match ev {
+                    UiEvent::Hud(hud) => {
+                        self.hud_history.push((hud.kind.clone(), hud.path.clone()));
+                        self.last_hud = Some((hud.kind.clone(), hud.path.clone(), hud.path_note.clone()));
+                    }
+                    UiEvent::Handshake(text) => self.handshakes.push(text),
+                    UiEvent::Notice(text) => self.notices.push(text),
+                    UiEvent::Failed(text) => self.failed.push(text),
+                    UiEvent::Link(text) => self.links.push(text),
+                    _ => {}
+                }
+            }
+        }
+
+        fn wait_picture(&mut self, kind: &str, timeout: Duration) -> Picture {
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.pump();
+                if let Some(pic) = self.last.clone() {
+                    if pic.kind == kind {
+                        return pic;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "timed out waiting for {kind} picture (last={:?} hud={:?} notices={:?} failed={:?} links={:?})",
+                        self.last.as_ref().map(|p| format!("{} · {} #{}", p.kind, p.path, p.seq)),
+                        self.last_hud,
+                        self.notices,
+                        self.failed,
+                        self.links
+                    );
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn wait_hud(&mut self, kind: &str, path: &str, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.pump();
+                if let Some((k, p, _)) = &self.last_hud {
+                    if k == kind && p == path {
+                        return;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "timed out waiting for hud {kind} · {path} (hud={:?} last={:?} notices={:?} failed={:?})",
+                        self.last_hud,
+                        self.last.as_ref().map(|p| format!("{} · {}", p.kind, p.path)),
+                        self.notices,
+                        self.failed
+                    );
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn close_node(&self, handler: &StreamHandler) {
+            let session_id = self
+                .started
+                .as_ref()
+                .and_then(|s| s.live.viewer.lock().ok())
+                .and_then(|slot| slot.as_ref().map(|v| v.info().session_id.clone()))
+                .unwrap_or_default();
+            if !session_id.is_empty() {
+                let _ = handler.handle_peer(
+                    &json!({"action": "close", "session_id": session_id}),
+                    "desktop-test",
+                );
+            }
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            if let Some(started) = self.started.take() {
+                let _enter = self.runtime.enter();
+                started.live.stop.store(true, AtomicOrdering::Relaxed);
+                started.shots.abort();
+            }
+        }
+    }
+
+    #[test]
+    fn jpeg_stays_visible_when_ice_cannot_connect() {
+        let (jpeg, seq) = jpeg_source();
+        let mut h = Harness::start(
+            Arc::new(NodeSignal {
+                handler: mock_handler(),
+            }),
+            jpeg,
+            IceFault::RelayPolicyWithoutTurn,
+        );
+        let first = h.wait_picture("jpeg", Duration::from_secs(4));
+        assert_eq!(first.path, "relay");
+        h.wait_hud("jpeg", "relay", Duration::from_secs(2));
+        // Real JPEG payload: decoded pixels match the encoder's marker.
+        assert_eq!(first.width, 16);
+        assert_eq!(first.height, 16);
+        assert!(first.rgba.len() == 16 * 16 * 4);
+        let first_seq = first.seq;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut later = first.clone();
+        let mut saw_webrtc_fail = false;
+        while Instant::now() < deadline {
+            h.pump();
+            if let Some(pic) = h.last.clone() {
+                later = pic;
+            }
+            if h.notices.iter().any(|n| n.contains("JPEG over the relay") || n.contains("Live video is not up"))
+                || h.links.iter().any(|l| l == "jpeg · relay")
+            {
+                saw_webrtc_fail = true;
+            }
+            if later.seq > first_seq && later.kind == "jpeg" && saw_webrtc_fail {
+                break;
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+        assert_eq!(later.kind, "jpeg", "fallback picture must stay jpeg, got {:?}", later);
+        assert_eq!(later.path, "relay");
+        assert!(
+            later.seq > first_seq,
+            "JPEG frames must keep refreshing after ICE cannot connect (first={} later={})",
+            first_seq,
+            later.seq
+        );
+        assert!(
+            saw_webrtc_fail,
+            "expected a recorded WebRTC/ICE failure notice, got notices={:?} links={:?}",
+            h.notices, h.links
+        );
+        if let Some((_, path, note)) = &h.last_hud {
+            assert_eq!(path, "relay");
+            assert!(note.contains("not WebRTC P2P"), "{note}");
+        }
+        assert!(h.failed.is_empty(), "soft ICE failure must not hard-fail: {:?}", h.failed);
+        assert!(seq.load(AtomicOrdering::Relaxed) >= 2);
+        assert!(
+            !h.hud_history.iter().any(|(k, p)| k == "h264" || p == "connecting"),
+            "handshake must not pollute the painted media path: {:?}",
+            h.hud_history
+        );
+        assert!(
+            h.links.iter().all(|l| l != "h264 · connecting"),
+            "link must not be set to h264 · connecting before a decoded frame: {:?}",
+            h.links
+        );
+        assert!(
+            !h.handshakes.is_empty(),
+            "expected visible webrtc handshake stages, got none"
+        );
+        // Same-host ICE fail is not public NAT evidence.
+        eprintln!(
+            "t449 harness ice-fail: jpeg seq {} -> {}, hud={:?}, notices={:?}, handshakes={:?}",
+            first_seq, later.seq, h.last_hud, h.notices, h.handshakes
+        );
+    }
+
+    #[test]
+    fn jpeg_resumes_after_h264_endpoint_disconnect() {
+        let (jpeg, _) = jpeg_source();
+        let handler = mock_handler();
+        let mut h = Harness::start(
+            Arc::new(NodeSignal {
+                handler: Arc::clone(&handler),
+            }),
+            jpeg,
+            IceFault::None,
+        );
+        let jpeg1 = h.wait_picture("jpeg", Duration::from_secs(4));
+        assert_eq!(jpeg1.path, "relay");
+        h.pump();
+        assert!(
+            !h.hud_history.iter().any(|(k, p)| k == "h264" || p == "connecting"),
+            "must not publish h264 · connecting over a rendered JPEG path: {:?} handshakes={:?}",
+            h.hud_history,
+            h.handshakes
+        );
+        let mut video = h.wait_picture("h264", Duration::from_secs(20));
+        // First decoded frame may precede the selected-pair observation
+        // (`unknown`). Wait briefly for a classified path; do not require
+        // the first frame's path to already be settled.
+        let settle = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < settle
+            && !matches!(
+                video.path.as_str(),
+                "loopback" | "private" | "host" | "stun"
+            )
+        {
+            h.pump();
+            if let Some(pic) = h.last.clone() {
+                if pic.kind == "h264" {
+                    video = pic;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(video.path.as_str(), "loopback" | "private" | "host" | "stun"),
+            "unexpected h264 path {} (hud={:?} handshakes={:?})",
+            video.path,
+            h.last_hud,
+            h.handshakes
+        );
+        assert_ne!(video.path, "relay", "h264 must not be labeled as websocket relay");
+        assert_ne!(video.path, "tailscale");
+        h.wait_hud("h264", &video.path, Duration::from_secs(3));
+        let before_drop = video.seq;
+        h.close_node(&handler);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut resumed = None;
+        while Instant::now() < deadline {
+            h.pump();
+            if let Some(pic) = &h.last {
+                if pic.kind == "jpeg" && pic.path == "relay" && pic.seq > before_drop {
+                    resumed = Some(pic.clone());
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+        let resumed = resumed.expect(&format!(
+            "JPEG must refresh after H.264 endpoint disconnect (before={before_drop} last={:?} hud={:?} notices={:?} failed={:?})",
+            h.last.as_ref().map(|p| format!("{} · {} #{}", p.kind, p.path, p.seq)),
+            h.last_hud,
+            h.notices,
+            h.failed
+        ));
+        h.wait_hud("jpeg", "relay", Duration::from_secs(2));
+        if let Some((_, _, note)) = &h.last_hud {
+            assert!(note.contains("not WebRTC P2P"), "{note}");
+        }
+        assert!(h.notices.iter().any(|n| n.contains("JPEG over the relay") || n.contains("Live video is not up")));
+        assert!(h.failed.is_empty(), "disconnect fallback must not hard-fail: {:?}", h.failed);
+        eprintln!(
+            "t449 harness h264-then-jpeg: h264 {} · {} #{}, resumed jpeg #{}",
+            video.kind, video.path, video.seq, resumed.seq
+        );
+    }
+
+    #[test]
+    fn missing_grant_is_rejected_and_does_not_show_p2p() {
+        let jpeg = Arc::new(|| Err("not allowed: missing grant".to_string()));
+        let mut h = Harness::start(Arc::new(DenySignal), jpeg, IceFault::None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && h.failed.is_empty() {
+            h.pump();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            h.failed.iter().any(|e| e.to_ascii_lowercase().contains("not allowed")),
+            "missing grant must fail, got {:?}",
+            h.failed
+        );
+        if let Some(pic) = &h.last {
+            panic!("no-grant session published a picture: {pic:?}");
+        }
+        if let Some((kind, path, _)) = &h.last_hud {
+            assert_ne!(path, "host");
+            assert_ne!(path, "private");
+            assert_ne!(kind, "h264");
+        }
+        eprintln!("t449 harness no-grant: failed={:?}", h.failed);
+    }
 }

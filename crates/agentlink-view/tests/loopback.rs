@@ -70,8 +70,9 @@ fn mock_desktop_delivers_an_idr_and_a_mouse() {
         audits.lock().unwrap_or_else(|err| err.into_inner())
     );
 
-    // Selected ICE pair, not the answer SDP inventory. This is a
-    // single-machine loopback; typ host here is not public NAT traversal.
+    // Selected ICE pair, not the answer SDP inventory. Addresses on this
+    // machine may be loopback or private (bridge/VPN/routed). That is not
+    // a public NAT traversal result and not automatically "same LAN".
     let path_deadline = Instant::now() + Duration::from_secs(5);
     let mut snap = viewer.transport();
     while snap.is_none() && Instant::now() < path_deadline {
@@ -90,11 +91,19 @@ fn mock_desktop_delivers_an_idr_and_a_mouse() {
         snap.sdp_inventory,
         snap.note
     );
-    assert_eq!(
-        snap.path, "host",
-        "loopback media should be typ host, got {snap:?}"
+    assert!(
+        matches!(snap.path.as_str(), "loopback" | "private" | "host"),
+        "same-host typ host should be loopback, private, or public host, got {snap:?}"
     );
-    assert_eq!(viewer.info().path, "host");
+    assert_eq!(viewer.info().path, snap.path);
+    assert_ne!(snap.path, "tailscale");
+    assert_ne!(snap.path, "cgnat");
+    if snap.path == "host" {
+        assert!(
+            snap.note.to_ascii_lowercase().contains("not a claim of public nat"),
+            "public typ host must not be reported as NAT success: {snap:?}"
+        );
+    }
     // Inventory is log-only. A host inventory is not itself the media path.
     assert!(
         !snap.sdp_inventory.is_empty(),
@@ -106,14 +115,13 @@ fn mock_desktop_delivers_an_idr_and_a_mouse() {
     let remote_is_loop = snap.remote_addr.starts_with("127.")
         || snap.remote_addr.starts_with("[::1]")
         || snap.remote_addr.starts_with("::1");
-    // Host may also be a private LAN address of this machine.
     assert!(
         local_is_loop
             || remote_is_loop
             || snap.note.contains("loopback")
             || snap.note.contains("private")
-            || snap.note.contains("LAN"),
-        "expected loopback/LAN note, got {snap:?}"
+            || snap.path == "private",
+        "expected loopback or private typ host facts, got {snap:?}"
     );
     assert_ne!(
         snap.path, "relay",

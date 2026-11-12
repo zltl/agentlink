@@ -616,7 +616,13 @@ impl ControllerApp {
                     }
                 }
                 UiEvent::Hud(hud) => {
+                    let keep = if hud.handshake.is_empty() {
+                        self.desk_hud.handshake.clone()
+                    } else {
+                        hud.handshake.clone()
+                    };
                     self.desk_hud = hud;
+                    self.desk_hud.handshake = keep;
                     if !self.desk_hud.kind.is_empty() {
                         self.link = format!(
                             "{} · {}",
@@ -628,6 +634,9 @@ impl ControllerApp {
                             }
                         );
                     }
+                }
+                UiEvent::Handshake(stage) => {
+                    self.desk_hud.handshake = stage;
                 }
             }
             ctx.request_repaint();
@@ -862,6 +871,7 @@ impl ControllerApp {
                 hardware: false,
                 frames_dropped: 0,
                 path_note: String::new(),
+                handshake: String::new(),
             };
             self.screen = Screen::Desktop {
                 id: node.id.clone(),
@@ -2685,7 +2695,7 @@ impl ControllerApp {
     }
 
     fn desktop_stats_popover(&mut self, ui: &mut egui::Ui, pane_rect: egui::Rect) {
-        let size = egui::vec2(280.0, 236.0);
+        let size = egui::vec2(280.0, 256.0);
         let origin = egui::pos2(
             (pane_rect.center().x - size.x / 2.0).max(pane_rect.left() + theme::SPACE_SM),
             pane_rect.top() + theme::SPACE_MD,
@@ -2720,8 +2730,14 @@ impl ControllerApp {
                 } else {
                     self.desk_hud.path_note.clone()
                 };
+                let handshake = if self.desk_hud.handshake.is_empty() {
+                    "idle".to_string()
+                } else {
+                    self.desk_hud.handshake.clone()
+                };
                 let lines = [
                     format!("path  {path_line}"),
+                    format!("handshake  {handshake}"),
                     format!("fps  {:.1}", self.desk_hud.fps),
                     format!("bitrate  {} kbps", self.desk_hud.bitrate_kbps),
                     format!("latency  {} ms", self.desk_hud.latency_ms),
@@ -3497,6 +3513,7 @@ impl ControllerApp {
                 "kind": self.desk_hud.kind,
                 "path": self.desk_hud.path,
                 "path_note": self.desk_hud.path_note,
+                "handshake": self.desk_hud.handshake,
                 "link": self.link,
                 "fps": self.desk_hud.fps,
                 "bitrate_kbps": bitrate,

@@ -25,13 +25,14 @@ use webrtc::runtime::default_runtime;
 
 use crate::h264::{
     AccessUnit, AddrScope, H264Depacketizer, LossWindow, addr_scope, classify_media_path,
-    classify_selected_path, feedback_ratio, is_screenshot_fallback, media_path_hint,
+    classify_selected_path, detect_tailscale_reason, feedback_ratio, is_screenshot_fallback,
+    media_path_hint,
 };
 use crate::queue::{FrameBus, Queued};
 
 const GATHER_WAIT: Duration = Duration::from_millis(1500);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LiveOptions {
     pub max_fps: u32,
     pub bitrate: u32,
@@ -43,6 +44,37 @@ pub struct LiveOptions {
     pub control: bool,
     /// Capture downscale before encode (`1.0` = native). Clamped on the node.
     pub scale: f32,
+    /// Test-only ICE fault. Production always leaves this as [`IceFault::None`].
+    /// It is never read from the environment and never forbids direct by default.
+    pub ice_fault: IceFault,
+    /// Optional handshake reporter (Controller HUD / tests). Not a media path.
+    pub on_stage: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for LiveOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveOptions")
+            .field("max_fps", &self.max_fps)
+            .field("bitrate", &self.bitrate)
+            .field("monitor", &self.monitor)
+            .field("viewer", &self.viewer)
+            .field("ice_servers", &self.ice_servers)
+            .field("control", &self.control)
+            .field("scale", &self.scale)
+            .field("ice_fault", &self.ice_fault)
+            .field("on_stage", &self.on_stage.is_some())
+            .finish()
+    }
+}
+
+/// Deterministic ICE faults for isolated tests. Not a product default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum IceFault {
+    #[default]
+    None,
+    /// Gather only relay candidates and include no TURN server, so ICE
+    /// cannot connect. Used to prove JPEG fallback without a firewall change.
+    RelayPolicyWithoutTurn,
 }
 
 impl Default for LiveOptions {
@@ -55,7 +87,16 @@ impl Default for LiveOptions {
             ice_servers: Vec::new(),
             control: true,
             scale: 1.0,
+            ice_fault: IceFault::None,
+            on_stage: None,
         }
+    }
+}
+
+fn report_stage(opts: &LiveOptions, msg: &str) {
+    eprintln!("agentlink live-webrtc: {msg}");
+    if let Some(cb) = &opts.on_stage {
+        cb(msg);
     }
 }
 
@@ -320,17 +361,28 @@ struct Built {
 }
 
 async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Built, String> {
+    report_stage(&opts, "list_monitors sent");
     match roundtrip(&signal, json!({"action": "list_monitors"})).await {
         Ok(value) if is_screenshot_fallback(&value) => {
+            report_stage(&opts, "list_monitors returned screenshot fallback");
             return Err("live video is not available; fallback screenshot".into());
         }
-        Ok(_) => {}
-        Err(err) if unknown_action(&err) => {}
-        Err(err) => return Err(err),
+        Ok(_) => report_stage(&opts, "list_monitors ok"),
+        Err(err) if unknown_action(&err) => {
+            report_stage(&opts, "list_monitors skipped (unknown action)");
+        }
+        Err(err) => {
+            report_stage(&opts, &format!("list_monitors error: {err}"));
+            return Err(err);
+        }
     }
 
     let (fps, bitrate) = crate::h264::clamp_offer(opts.max_fps, opts.bitrate);
-    let ice_servers = offer_servers(&opts.ice_servers);
+    let ice_servers = if matches!(opts.ice_fault, IceFault::RelayPolicyWithoutTurn) {
+        Vec::new()
+    } else {
+        offer_servers(&opts.ice_servers)
+    };
     let frames = Arc::new(FrameBus::new(3));
     let loss = Arc::new(Mutex::new(LossWindow::default()));
     let stats = Arc::new(Mutex::new(LiveStats::default()));
@@ -357,6 +409,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         disconnected_at_ms: disconnected_at_ms.clone(),
     });
 
+    report_stage(&opts, "building peer connection");
     let runtime =
         default_runtime().ok_or_else(|| "tokio runtime is required for WebRTC".to_string())?;
     let mut media = MediaEngine::default();
@@ -365,12 +418,16 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         .map_err(|err| err.to_string())?;
     let registry = register_default_interceptors(Registry::new(), &mut media)
         .map_err(|err| err.to_string())?;
+    let mut cfg = RTCConfigurationBuilder::new().with_ice_servers(rtc_ice(&ice_servers));
+    if matches!(opts.ice_fault, IceFault::RelayPolicyWithoutTurn) {
+        cfg = RTCConfigurationBuilder::new()
+            .with_ice_servers(Vec::new())
+            .with_ice_transport_policy(
+                rtc::peer_connection::configuration::RTCIceTransportPolicy::Relay,
+            );
+    }
     let pc = PeerConnectionBuilder::new()
-        .with_configuration(
-            RTCConfigurationBuilder::new()
-                .with_ice_servers(rtc_ice(&ice_servers))
-                .build(),
-        )
+        .with_configuration(cfg.build())
         .with_media_engine(media)
         .with_interceptor_registry(registry)
         .with_handler(handler.clone() as Arc<dyn PeerConnectionEventHandler>)
@@ -402,6 +459,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         .await
         .map_err(|err| err.to_string())?;
 
+    report_stage(&opts, "creating local offer, gathering ICE (1.5s)");
     let offer = PeerConnection::create_offer(&pc, None)
         .await
         .map_err(|err| err.to_string())?;
@@ -415,7 +473,30 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let local = PeerConnection::local_description(&pc)
         .await
         .ok_or_else(|| "local description was not set".to_string())?;
-
+    let stun_n = ice_servers
+        .iter()
+        .flat_map(|e| e.get("urls").and_then(|v| v.as_array()).cloned().unwrap_or_default())
+        .filter(|u| u.as_str().unwrap_or("").starts_with("stun:"))
+        .count();
+    let turn_n = ice_servers
+        .iter()
+        .flat_map(|e| e.get("urls").and_then(|v| v.as_array()).cloned().unwrap_or_default())
+        .filter(|u| {
+            let s = u.as_str().unwrap_or("");
+            s.starts_with("turn:") || s.starts_with("turns:")
+        })
+        .count();
+    report_stage(
+        &opts,
+        &format!(
+            "local offer ready (sdp_len={}, gather_complete={}, stun={}, turn={})",
+            local.sdp.len(),
+            gather_done.load(Ordering::Relaxed),
+            stun_n,
+            turn_n
+        ),
+    );
+    report_stage(&opts, "sending webrtc offer");
     let answer = roundtrip(
         &signal,
         json!({
@@ -434,6 +515,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     )
     .await?;
     if is_screenshot_fallback(&answer) {
+        report_stage(&opts, "offer returned screenshot fallback (no live video)");
         let _ = PeerConnection::close(&pc).await;
         return Err("live video is not available; fallback screenshot".into());
     }
@@ -448,12 +530,26 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         .unwrap_or("")
         .to_string();
     if session_id.is_empty() || sdp.is_empty() {
+        report_stage(
+            &opts,
+            &format!("offer response missing session/sdp: {}", brief(&answer)),
+        );
         let _ = PeerConnection::close(&pc).await;
         return Err(format!(
             "offer did not return a session: {}",
             brief(&answer)
         ));
     }
+    report_stage(
+        &opts,
+        &format!(
+            "offer answered (session_len={}, sdp_len={}, encoder={}, hardware={})",
+            session_id.len(),
+            sdp.len(),
+            answer.get("encoder").and_then(|v| v.as_str()).unwrap_or(""),
+            answer.get("hardware").and_then(|v| v.as_bool()).unwrap_or(false)
+        ),
+    );
     let info = LiveInfo {
         session_id: session_id.clone(),
         codec: answer
@@ -482,6 +578,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let info = Arc::new(Mutex::new(info));
     let transport = Arc::new(Mutex::new(None));
 
+    report_stage(&opts, "applying remote answer, ICE in progress");
     let remote = RTCSessionDescription::answer(sdp).map_err(|err| err.to_string())?;
     PeerConnection::set_remote_description(&pc, remote)
         .await
@@ -555,11 +652,13 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         }
     });
 
+    report_stage(&opts, "requesting keyframe");
     let _ = roundtrip(
         &signal,
         json!({"action": "keyframe", "session_id": session_id}),
     )
     .await;
+    report_stage(&opts, "signaling complete, waiting for ICE pair / video");
 
     Ok(Built {
         cmd: cmd_tx,
@@ -590,7 +689,7 @@ async fn drive(
     stop: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     close_notify: Arc<tokio::sync::Notify>,
-    _failed: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
     gather_done: Arc<AtomicBool>,
     disconnected_at_ms: Arc<AtomicI64>,
     info: Arc<Mutex<LiveInfo>>,
@@ -599,6 +698,7 @@ async fn drive(
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.tick().await;
     let mut last_ice_restart = Instant::now() - Duration::from_secs(30);
+    let mut ice_restart_fails = 0u32;
     loop {
         if stop.load(Ordering::Relaxed) {
             stop.store(true, Ordering::Relaxed);
@@ -652,6 +752,9 @@ async fn drive(
                 }
                 refresh_transport(&peer, &info, &transport).await;
                 // ICE/DTLS left Connected: restart within 1s (throttle 5s).
+                // A gone node session must be treated as a hard ICE/session
+                // loss so the Controller can resume JPEG — do not retry
+                // ice_restart in a tight loop.
                 let disc = disconnected_at_ms.load(Ordering::Relaxed);
                 if disc > 0 {
                     let now_ms = SystemTime::now()
@@ -661,19 +764,46 @@ async fn drive(
                     if now_ms.saturating_sub(disc) >= 1000
                         && last_ice_restart.elapsed() >= Duration::from_secs(5)
                     {
-                        if ice_restart(&peer, &signal, &session_id, &gather_done)
-                            .await
-                            .is_ok()
+                        last_ice_restart = Instant::now();
+                        match ice_restart(&peer, &signal, &session_id, &gather_done).await
                         {
-                            last_ice_restart = Instant::now();
-                            disconnected_at_ms.store(0, Ordering::Relaxed);
-                            ask_keyframe(&signal, &session_id, &input, &input_open).await;
+                            Ok(()) => {
+                                disconnected_at_ms.store(0, Ordering::Relaxed);
+                                ask_keyframe(&signal, &session_id, &input, &input_open)
+                                    .await;
+                            }
+                            Err(err) if signaling_session_gone(&err) => {
+                                eprintln!(
+                                    "agentlink live-webrtc: session gone ({err}); ending live video"
+                                );
+                                failed.store(true, Ordering::Relaxed);
+                            }
+                            Err(err) => {
+                                ice_restart_fails += 1;
+                                eprintln!(
+                                    "agentlink live-webrtc: ice_restart error ({ice_restart_fails}): {err}"
+                                );
+                                if ice_restart_fails >= 3 {
+                                    failed.store(true, Ordering::Relaxed);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+
+fn signaling_session_gone(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("unknown stream session")
+        || lower.contains("unknown session")
+        || lower.contains("no such session")
+        || lower.contains("session not found")
+        || lower.contains("session closed")
+        || lower.contains("already closed")
 }
 
 async fn ice_restart(
@@ -1032,7 +1162,20 @@ async fn refresh_transport(
         sdp_inventory: inventory,
         note: note.clone(),
     };
-    if std::env::var_os("AGENTLINK_LIVE_PATH_LOG").is_some() {
+    let changed = transport
+        .lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref().map(|prev| {
+                prev.path != snap.path
+                    || prev.local_addr != snap.local_addr
+                    || prev.remote_addr != snap.remote_addr
+                    || prev.local_typ != snap.local_typ
+                    || prev.remote_typ != snap.remote_typ
+            })
+        })
+        .unwrap_or(true);
+    if changed {
         eprintln!(
             "agentlink live-path: path={} local={} {} remote={} {} proto={} inventory={} note={}",
             snap.path,
@@ -1064,17 +1207,22 @@ fn strip_port(addr: &str) -> &str {
 }
 
 fn selected_pair_note(path: &str, local_ip: &str, remote_ip: &str) -> String {
+    let hint = media_path_hint("h264", path);
+    if let Some(reason) = detect_tailscale_reason(local_ip, remote_ip) {
+        return format!("{hint} ({reason})");
+    }
     let scopes = [addr_scope(local_ip), addr_scope(remote_ip)];
     let extra = if scopes.contains(&AddrScope::Loopback) {
-        "loopback (same host); not cross-machine or public NAT"
-    } else if scopes.contains(&AddrScope::CgnatTailscale) {
-        "address in 100.64.0.0/10 or fd7a:115c:a1e0::/48 (Tailscale KB 1015); overlay, not public NAT"
-    } else if scopes.contains(&AddrScope::PrivateLan) {
-        "private/LAN typ host; not public NAT traversal"
+        "loopback addresses; same host only"
+    } else if scopes.contains(&AddrScope::Cgnat) {
+        "100.64.0.0/10 is RFC 6598 CGNAT, not a Tailscale confirmation"
+    } else if scopes.contains(&AddrScope::Private) {
+        "private addresses may be LAN, VPN, or routed"
+    } else if scopes.contains(&AddrScope::Public) {
+        "public typ host is not a public-NAT-success claim"
     } else {
         ""
     };
-    let hint = media_path_hint("h264", path);
     if extra.is_empty() {
         hint.to_string()
     } else {

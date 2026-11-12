@@ -208,11 +208,18 @@ pub fn has_saved_session(refresh_token: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// `host` beats `stun`, which beats `turn`. Empty input is the relay socket.
+/// Map a raw path token to the HUD label. Tokens are exact selected-pair
+/// facts; `cgnat` is never folded into `tailscale`.
 pub fn connection_label(raw: &str) -> &'static str {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("tailscale") || lower.contains("cgnat") {
+    if lower.contains("tailscale") {
         "tailscale"
+    } else if lower.contains("cgnat") {
+        "cgnat"
+    } else if lower.contains("loopback") {
+        "loopback"
+    } else if lower.contains("private") {
+        "private"
     } else if lower.contains("quic") {
         "quic"
     } else if lower.contains("connecting") {
@@ -247,10 +254,10 @@ pub fn webrtc_connect_is_hard_reject(err: &str) -> bool {
         || lower.contains("offline")
 }
 
-/// After offer, a lost ICE/DTLS session should not tear down JPEG stills
-/// that have not been replaced by H.264.
-pub fn webrtc_loss_keeps_jpeg(saw_h264_frame: bool) -> bool {
-    !saw_h264_frame
+/// A lost ICE/DTLS session should keep (or resume) JPEG stills over the
+/// relay, including after H.264 had already taken over.
+pub fn webrtc_loss_keeps_jpeg(_saw_h264_frame: bool) -> bool {
+    true
 }
 
 pub fn asks_for_totp(message: &str) -> bool {
@@ -664,6 +671,10 @@ mod tests {
         assert_eq!(connection_label("TURN udp"), "turn");
         assert_eq!(connection_label("quic"), "quic");
         assert_eq!(connection_label("tailscale"), "tailscale");
+        assert_eq!(connection_label("cgnat"), "cgnat");
+        assert_eq!(connection_label("loopback"), "loopback");
+        assert_eq!(connection_label("private"), "private");
+        assert_ne!(connection_label("cgnat"), "tailscale");
         assert_eq!(connection_label("connecting"), "connecting");
         assert_eq!(
             connection_path_hint("jpeg", "relay"),
@@ -673,7 +684,7 @@ mod tests {
         assert!(webrtc_connect_is_hard_reject("node offline"));
         assert!(!webrtc_connect_is_hard_reject("ICE failed to gather"));
         assert!(webrtc_loss_keeps_jpeg(false));
-        assert!(!webrtc_loss_keeps_jpeg(true));
+        assert!(webrtc_loss_keeps_jpeg(true));
     }
 
     #[test]

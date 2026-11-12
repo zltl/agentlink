@@ -43,20 +43,43 @@ pub fn classify_media_path(sdp: &str) -> &'static str {
     }
 }
 
-/// Path token for a *selected* ICE candidate pair (`host`, `stun`, `turn`,
-/// `tailscale`, or `unknown`).
+/// Path token for a *selected* ICE candidate pair.
 ///
-/// TURN (`typ relay`) always wins: media then goes through a TURN server,
-/// not a direct peer path. STUN (`typ srflx`/`prflx`) is NAT-assisted
-/// WebRTC, not a Tailscale tunnel. `typ host` addresses in 100.64.0.0/10
-/// or `fd7a:115c:a1e0::/48` are labeled `tailscale` (Tailscale's CGNAT /
-/// ULA ranges; see Tailscale KB 1015). That is an overlay, not public NAT
-/// traversal, and is not unique to Tailscale for IPv4 CGNAT.
+/// Tokens describe observable pair facts only:
+/// `turn`, `stun`, `loopback`, `private`, `cgnat`, `tailscale`, `host`,
+/// or `unknown`. `host` means typ host on a public or unparsed address.
+/// It is not a claim of public NAT traversal success. `stun` is typ
+/// srflx/prflx and is likewise not a NAT-success claim. `private` is typ
+/// host on RFC1918/ULA/link-local and is not a claim of same-LAN (the
+/// path may be a VPN or routed overlay). `cgnat` is typ host in
+/// 100.64.0.0/10 (RFC 6598); that range is generic CGNAT and is not
+/// itself a Tailscale confirmation. `tailscale` is used only when
+/// [`detect_tailscale_reason`] finds a documented Tailscale identifier
+/// (the `fd7a:115c:a1e0::/48` prefix, KB 1015) or a `tailscale*`
+/// interface/route — never from 100.64/10 alone, and never by logging in.
 pub fn classify_selected_path(
     local_typ: &str,
     remote_typ: &str,
     local_ip: &str,
     remote_ip: &str,
+) -> &'static str {
+    classify_selected_path_with(
+        local_typ,
+        remote_typ,
+        local_ip,
+        remote_ip,
+        detect_tailscale_reason(local_ip, remote_ip).is_some(),
+    )
+}
+
+/// Like [`classify_selected_path`], but the Tailscale confirmation is
+/// supplied by the caller so tests do not depend on this host's routes.
+pub fn classify_selected_path_with(
+    local_typ: &str,
+    remote_typ: &str,
+    local_ip: &str,
+    remote_ip: &str,
+    tailscale_confirmed: bool,
 ) -> &'static str {
     let local_typ = typ_token(local_typ);
     let remote_typ = typ_token(remote_typ);
@@ -67,8 +90,21 @@ pub fn classify_selected_path(
         return "stun";
     }
     if local_typ == "host" || remote_typ == "host" {
-        if is_tailscale_range(local_ip) || is_tailscale_range(remote_ip) {
+        if tailscale_confirmed {
             return "tailscale";
+        }
+        let scopes = [addr_scope(local_ip), addr_scope(remote_ip)];
+        if scopes.contains(&AddrScope::Cgnat) {
+            return "cgnat";
+        }
+        if scopes.contains(&AddrScope::Loopback) {
+            return "loopback";
+        }
+        if scopes.contains(&AddrScope::Public) {
+            return "host";
+        }
+        if scopes.contains(&AddrScope::Private) {
+            return "private";
         }
         return "host";
     }
@@ -94,9 +130,12 @@ fn typ_token(raw: &str) -> &str {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddrScope {
     Loopback,
-    PrivateLan,
-    /// 100.64.0.0/10 (RFC 6598) or Tailscale IPv6 ULA fd7a:115c:a1e0::/48.
-    CgnatTailscale,
+    /// RFC1918, unique-local (except the Tailscale ULA), or link-local.
+    Private,
+    /// 100.64.0.0/10 (RFC 6598 shared space). Not a Tailscale identifier.
+    Cgnat,
+    /// Documented Tailscale IPv6 prefix fd7a:115c:a1e0::/48 (KB 1015).
+    TailscaleUla,
     Public,
     Other,
 }
@@ -112,9 +151,9 @@ pub fn addr_scope(ip: &str) -> AddrScope {
             if v4.is_loopback() {
                 AddrScope::Loopback
             } else if is_cgnat(v4) {
-                AddrScope::CgnatTailscale
+                AddrScope::Cgnat
             } else if v4.is_private() || v4.is_link_local() {
-                AddrScope::PrivateLan
+                AddrScope::Private
             } else if v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() {
                 AddrScope::Other
             } else {
@@ -125,9 +164,9 @@ pub fn addr_scope(ip: &str) -> AddrScope {
             if v6.is_loopback() {
                 AddrScope::Loopback
             } else if is_tailscale_ula(v6) {
-                AddrScope::CgnatTailscale
+                AddrScope::TailscaleUla
             } else if v6.is_unique_local() || v6.is_unicast_link_local() {
-                AddrScope::PrivateLan
+                AddrScope::Private
             } else if v6.is_unspecified() || v6.is_multicast() {
                 AddrScope::Other
             } else {
@@ -137,8 +176,83 @@ pub fn addr_scope(ip: &str) -> AddrScope {
     }
 }
 
-pub fn is_tailscale_range(ip: &str) -> bool {
-    addr_scope(ip) == AddrScope::CgnatTailscale
+/// True when this address is in Tailscale's documented IPv6 prefix.
+/// 100.64.0.0/10 is not included: that is generic RFC 6598 CGNAT.
+pub fn is_tailscale_ula_prefix(ip: &str) -> bool {
+    addr_scope(ip) == AddrScope::TailscaleUla
+}
+
+/// If this selected-pair address can be confirmed as Tailscale without a
+/// Tailscale login, return a short reason. Confirmation is either the
+/// documented IPv6 ULA prefix or a local `tailscale*` interface/route.
+pub fn detect_tailscale_reason(local_ip: &str, remote_ip: &str) -> Option<String> {
+    if is_tailscale_ula_prefix(local_ip) || is_tailscale_ula_prefix(remote_ip) {
+        return Some(
+            "address in fd7a:115c:a1e0::/48 (Tailscale documented IPv6 prefix, KB 1015)"
+                .into(),
+        );
+    }
+    for ip in [local_ip, remote_ip] {
+        if let Some(dev) = linux_route_device(ip) {
+            if is_tailscale_iface(&dev) {
+                return Some(format!(
+                    "route to {ip} is via interface {dev} (name starts with tailscale)"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn is_tailscale_iface(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("tailscale")
+}
+
+/// Best-effort Linux route lookup (`/proc/net/route`). Other OS: none.
+fn linux_route_device(ip: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_route_device_v4(strip_host(ip));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ip;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_device_v4(ip: &str) -> Option<String> {
+    let addr: std::net::Ipv4Addr = ip.parse().ok()?;
+    let bits = u32::from(addr);
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    let mut best: Option<(u32, String)> = None;
+    for (i, line) in text.lines().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let iface = cols.next()?;
+        let dest = cols.next()?;
+        let _gateway = cols.next()?;
+        let _flags = cols.next()?;
+        let _refcnt = cols.next()?;
+        let _use = cols.next()?;
+        let _metric = cols.next()?;
+        let mask = cols.next()?;
+        let dest_u = u32::from_str_radix(dest, 16).ok()?;
+        let mask_u = u32::from_str_radix(mask, 16).ok()?;
+        // /proc/net/route writes little-endian hex.
+        let dest_ip = u32::from_le(dest_u);
+        let mask_ip = u32::from_le(mask_u);
+        if bits & mask_ip == dest_ip & mask_ip {
+            let ones = mask_ip.count_ones();
+            if best.as_ref().map(|(o, _)| ones > *o).unwrap_or(true) {
+                best = Some((ones, iface.to_string()));
+            }
+        }
+    }
+    best.map(|(_, dev)| dev)
 }
 
 fn strip_host(raw: &str) -> &str {
@@ -146,7 +260,6 @@ fn strip_host(raw: &str) -> &str {
     if let Some(rest) = raw.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(rest);
     }
-    // IPv4 host:port (not IPv6)
     if raw.chars().filter(|c| *c == ':').count() == 1 {
         return raw.rsplit_once(':').map(|(h, _)| h).unwrap_or(raw);
     }
@@ -154,19 +267,18 @@ fn strip_host(raw: &str) -> &str {
 }
 
 fn is_cgnat(addr: std::net::Ipv4Addr) -> bool {
-    // RFC 6598 shared address space, also used by Tailscale (KB 1015).
+    // RFC 6598 shared address space. Also used by Tailscale, but not unique.
     let o = addr.octets();
     o[0] == 100 && (o[1] & 0xc0) == 64
 }
 
 fn is_tailscale_ula(addr: std::net::Ipv6Addr) -> bool {
-    // Tailscale IPv6 unique-local prefix fd7a:115c:a1e0::/48 (KB 1015 / 1033).
+    // Tailscale IPv6 unique-local prefix fd7a:115c:a1e0::/48 (KB 1015).
     let s = addr.segments();
     s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
 }
 
-/// Short explanation for the HUD. Distinguishes WebSocket JPEG, TURN, STUN,
-/// LAN host, and a Tailscale/CGNAT host overlay.
+/// Short explanation for the HUD. Claims only what the selected pair shows.
 pub fn media_path_hint(kind: &str, path: &str) -> &'static str {
     let kind = kind.trim().to_ascii_lowercase();
     let path = path.trim().to_ascii_lowercase();
@@ -174,13 +286,24 @@ pub fn media_path_hint(kind: &str, path: &str) -> &'static str {
         return "JPEG stills over the WebSocket relay — not WebRTC P2P";
     }
     match path.as_str() {
-        "host" => {
-            "WebRTC ICE typ host on a loopback or private address — same machine or LAN, not public NAT traversal"
+        "loopback" => {
+            "Selected ICE typ host on a loopback address (same host). Not cross-machine and not a public NAT traversal result"
         }
-        "stun" => "WebRTC ICE typ srflx/prflx — STUN-assisted path, not a Tailscale tunnel",
+        "private" => {
+            "Selected ICE typ host on a private address (RFC1918/ULA/link-local). May be LAN, VPN, or routed — not a same-LAN or public NAT claim"
+        }
+        "cgnat" => {
+            "Selected ICE typ host in 100.64.0.0/10 (RFC 6598 CGNAT). That prefix alone does not identify Tailscale, and this is not a public NAT traversal result"
+        }
+        "host" => {
+            "Selected ICE typ host on a public or unclassified address. This names the pair type only — it is not a public NAT traversal result"
+        }
+        "stun" => {
+            "Selected ICE typ srflx/prflx (STUN-assisted). This is not a public NAT traversal result, and is not a Tailscale tunnel"
+        }
         "turn" => "WebRTC media through a TURN relay — not a direct P2P path",
         "tailscale" => {
-            "WebRTC typ host in 100.64.0.0/10 or fd7a:115c:a1e0::/48 (Tailscale/CGNAT range) — overlay, not public NAT traversal"
+            "Selected typ host confirmed as Tailscale (documented IPv6 prefix or a tailscale* interface/route). Overlay, not public NAT traversal"
         }
         "relay" => "WebSocket relay — not WebRTC P2P",
         "quic" => "Direct QUIC used for file/exec, not the desktop video path",
@@ -471,47 +594,73 @@ mod tests {
         let sdp = "a=candidate:1 1 UDP 1 10.0.0.2 9 typ host\r\na=candidate:2 1 UDP 1 198.51.100.8 9 typ relay";
         assert_eq!(classify_media_path(sdp), "host");
         assert_eq!(
-            classify_selected_path("host", "relay", "10.0.0.2", "198.51.100.8"),
+            classify_selected_path_with("host", "relay", "10.0.0.2", "198.51.100.8", false),
             "turn"
         );
         assert_eq!(
-            classify_selected_path("typ host", "typ srflx", "10.0.0.2", "203.0.113.5"),
+            classify_selected_path_with("typ host", "typ srflx", "10.0.0.2", "203.0.113.5", false),
             "stun"
         );
         assert_eq!(
-            classify_selected_path("host", "host", "127.0.0.1", "127.0.0.1"),
+            classify_selected_path_with("host", "host", "127.0.0.1", "127.0.0.1", false),
+            "loopback"
+        );
+        assert_eq!(
+            classify_selected_path_with("host", "host", "192.168.1.12", "10.0.0.2", false),
+            "private"
+        );
+        // 100.64/10 alone is RFC 6598 CGNAT, not Tailscale.
+        assert_eq!(
+            classify_selected_path_with("host", "host", "100.64.1.2", "100.64.1.3", false),
+            "cgnat"
+        );
+        assert_eq!(
+            classify_selected_path_with("host", "host", "192.168.1.12", "100.65.0.4", false),
+            "cgnat"
+        );
+        // Public typ host is possible and must not be called private or NAT success.
+        assert_eq!(
+            classify_selected_path_with("host", "host", "203.0.113.5", "198.51.100.8", false),
             "host"
         );
+        // Mixed private + public typ host: do not invent "same LAN".
         assert_eq!(
-            classify_selected_path("host", "host", "100.64.1.2", "100.64.1.3"),
+            classify_selected_path_with("host", "host", "192.168.1.12", "203.0.113.5", false),
+            "host"
+        );
+        // Tailscale only with extra confirmation, or the documented IPv6 prefix.
+        assert_eq!(
+            classify_selected_path_with("host", "host", "100.64.1.2", "100.64.1.3", true),
             "tailscale"
         );
         assert_eq!(
-            classify_selected_path("host", "host", "192.168.1.12", "100.65.0.4"),
+            classify_selected_path_with(
+                "host",
+                "host",
+                "fd7a:115c:a1e0::1",
+                "fd7a:115c:a1e0::2",
+                detect_tailscale_reason("fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2").is_some()
+            ),
             "tailscale"
         );
-        assert_eq!(
-            classify_selected_path("host", "host", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2"),
-            "tailscale"
-        );
+        assert!(detect_tailscale_reason("fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2").is_some());
+        assert!(detect_tailscale_reason("100.64.1.2", "100.64.1.3").is_none());
         assert_eq!(addr_scope("127.0.0.1:9"), AddrScope::Loopback);
-        assert_eq!(addr_scope("192.168.1.12"), AddrScope::PrivateLan);
-        assert_eq!(addr_scope("10.0.0.2"), AddrScope::PrivateLan);
-        assert_eq!(addr_scope("100.64.0.1"), AddrScope::CgnatTailscale);
+        assert_eq!(addr_scope("192.168.1.12"), AddrScope::Private);
+        assert_eq!(addr_scope("10.0.0.2"), AddrScope::Private);
+        assert_eq!(addr_scope("100.64.0.1"), AddrScope::Cgnat);
         assert_eq!(addr_scope("203.0.113.5"), AddrScope::Public);
-        assert_eq!(
-            media_path_hint("jpeg", "relay"),
-            "JPEG stills over the WebSocket relay — not WebRTC P2P"
-        );
-        assert!(
-            !media_path_hint("h264", "host").contains("P2P")
-                || media_path_hint("h264", "host").contains("LAN")
-        );
+        assert_eq!(addr_scope("fd7a:115c:a1e0::1"), AddrScope::TailscaleUla);
+        assert!(media_path_hint("jpeg", "relay").contains("not WebRTC P2P"));
+        assert!(!media_path_hint("h264", "private").to_ascii_lowercase().contains("same lan"));
+        assert!(!media_path_hint("h264", "host").to_ascii_lowercase().contains("success"));
+        assert!(media_path_hint("h264", "cgnat").contains("RFC 6598"));
+        assert!(!media_path_hint("h264", "cgnat").contains("confirmed as Tailscale"));
+        assert!(media_path_hint("h264", "stun").contains("not a public NAT"));
         assert!(media_path_hint("h264", "turn").contains("not a direct P2P"));
     }
 
-    #[test]
-    fn screenshot_fallback_matches_the_phone_node() {
+        fn screenshot_fallback_matches_the_phone_node() {
         let body = serde_json::json!({
             "status": "unavailable",
             "fallback": "screenshot"
