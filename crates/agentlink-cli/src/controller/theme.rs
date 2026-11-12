@@ -345,7 +345,7 @@ fn styled(base: &Style) -> Style {
 
     visuals.widgets.inactive.bg_fill = BG_SURFACE;
     visuals.widgets.inactive.weak_bg_fill = BG_SURFACE;
-    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.bg_stroke = stroke_border_subtle();
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_BODY);
     visuals.widgets.inactive.corner_radius = r;
 
@@ -355,10 +355,12 @@ fn styled(base: &Style) -> Style {
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.hovered.corner_radius = r;
 
-    visuals.widgets.active.bg_fill = ACCENT_BG;
-    visuals.widgets.active.weak_bg_fill = ACCENT_BG;
+    visuals.widgets.active.bg_fill = BG_HOVER;
+    visuals.widgets.active.weak_bg_fill = BG_HOVER;
     visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, ACCENT);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_ON_ACCENT);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
+    visuals.widgets.active.expansion = 0.0;
+    visuals.widgets.hovered.expansion = 0.0;
     visuals.widgets.active.corner_radius = r;
 
     visuals.widgets.open.bg_fill = BG_HOVER;
@@ -447,13 +449,13 @@ fn install_fonts(ctx: &egui::Context) {
 
 /// Secondary toolbar / card action button (28px).
 pub fn secondary_button(label: &str) -> egui::Button<'static> {
+    // Do not pin fill/stroke: egui uses widgets.active (2px accent ring)
+    // when the button has keyboard focus.
     egui::Button::new(
         egui::RichText::new(label.to_owned())
             .size(SECONDARY_SIZE)
             .color(TEXT_BODY),
     )
-    .fill(BG_SURFACE)
-    .stroke(stroke_border_subtle())
     .corner_radius(CornerRadius::same(RADIUS_CONTROL))
     .min_size(egui::vec2(0.0, BTN_TOOLBAR_H))
 }
@@ -466,7 +468,6 @@ pub fn primary_button(label: &str) -> egui::Button<'static> {
             .color(TEXT_ON_ACCENT),
     )
     .fill(ACCENT_BG)
-    .stroke(Stroke::NONE)
     .corner_radius(CornerRadius::same(RADIUS_CONTROL))
     .min_size(egui::vec2(0.0, BTN_PRIMARY_H))
 }

@@ -4,25 +4,25 @@
 //! [`super::worker`] on the same client the phone uses. Visual tokens live in
 //! [`super::theme`].
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentlink_core::{NodeInfo, NodePolicy};
 use eframe::egui;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::chrome::{
-    BAR_HEIGHT, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
     classify_connect_error, connection_bar_visible, encoder_label, estimate_right_width_with,
     link_is_connecting, pick_bar_density, session_chrome_top_height, session_phase, stats_chip,
-    stats_line, text_advance,
+    stats_line, text_advance, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
+    BAR_HEIGHT,
 };
 use super::model::{
-    self, Action, CardButtonKind, access_summary, card_buttons, connection_label, display_note,
-    has_saved_session, node_presence_label,
+    self, access_summary, card_buttons, connection_label, display_note, has_saved_session,
+    node_presence_label, Action, CardButtonKind,
 };
 use super::term::Emulator;
 use super::theme;
@@ -48,6 +48,8 @@ pub struct DebugLayout {
     /// crushed `ui.horizontal()` row cannot report a large raw rect that is
     /// mostly invisible (parent saw black after wide→narrow resize).
     pub page_rect: [f32; 4],
+    /// Visible clip of the machines/session body (not the scrolled content bounds).
+    pub visible_clip: [f32; 4],
     pub texts: Vec<String>,
 }
 
@@ -61,6 +63,7 @@ impl DebugLayout {
         self.rail_rect = [0.0; 4];
         self.main_rect = [0.0; 4];
         self.page_rect = [0.0; 4];
+        self.visible_clip = [0.0; 4];
         self.texts.clear();
     }
 
@@ -82,6 +85,17 @@ impl DebugLayout {
     fn set_page_visible(&mut self, rect: egui::Rect, clip: egui::Rect) {
         self.page_rect = rect_xywh(visible_rect(rect, clip));
     }
+
+    fn set_visible_clip(&mut self, clip: egui::Rect) {
+        self.visible_clip = rect_xywh(clip);
+    }
+
+    fn note_focus(&mut self, id: &str, response: &egui::Response, clip: egui::Rect) {
+        if response.has_focus() {
+            self.note_item(&format!("focus:{id}"), response.rect);
+            self.note_visible(&format!("focus_ring:{id}"), response.rect, clip);
+        }
+    }
 }
 
 fn rect_xywh(rect: egui::Rect) -> [f32; 4] {
@@ -90,6 +104,18 @@ fn rect_xywh(rect: egui::Rect) -> [f32; 4] {
 
 fn visible_rect(rect: egui::Rect, clip: egui::Rect) -> egui::Rect {
     rect.intersect(clip)
+}
+
+fn innermost_avail(ui: &egui::Ui) -> f32 {
+    let avail = ui.available_rect_before_wrap();
+    let visible = avail.intersect(ui.clip_rect());
+    let scroll = ui.spacing().scroll;
+    model::innermost_content_width(
+        avail.width(),
+        visible.width(),
+        scroll.bar_width,
+        scroll.floating,
+    )
 }
 
 /// One debug-bus request delivered from the Unix socket thread.
@@ -1388,9 +1414,11 @@ impl ControllerApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_XS);
                 let quit = ui
-                    .add(theme::secondary_button("Quit"))
+                    .push_id("header-quit", |ui| ui.add(theme::secondary_button("Quit")))
+                    .inner
                     .on_hover_text("Exit the controller. The window close button also exits unless this was started with --background and a status icon is running.");
                 self.debug_layout.note_visible("header_quit", quit.rect, clip);
+                self.debug_layout.note_focus("header_quit", &quit, clip);
                 if quit.clicked() {
                     self.flags.quit.store(true, Ordering::Relaxed);
                     self.send(Cmd::PtyClose);
@@ -1404,6 +1432,7 @@ impl ControllerApp {
                         let logout = ui.add(theme::secondary_button("Log out"));
                         self.debug_layout
                             .note_visible("header_logout", logout.rect, clip);
+                        self.debug_layout.note_focus("header_logout", &logout, clip);
                         if logout.clicked() {
                             self.back_to_machines();
                             self.send(Cmd::Logout);
@@ -1411,6 +1440,7 @@ impl ControllerApp {
                         let refresh = ui.add(theme::secondary_button("Refresh"));
                         self.debug_layout
                             .note_visible("header_refresh", refresh.rect, clip);
+                        self.debug_layout.note_focus("header_refresh", &refresh, clip);
                         if refresh.clicked() {
                             self.send(Cmd::Refresh);
                         }
@@ -1419,13 +1449,18 @@ impl ControllerApp {
                         status_pill(ui, user, theme::TEXT_MUTED, None);
                     }
                 }
-                let settings = ui.add(theme::secondary_button(if self.settings_open {
-                    "Close settings"
-                } else {
-                    "Settings"
-                }));
+                let settings = ui
+                    .push_id("header-settings", |ui| {
+                        ui.add(theme::secondary_button(if self.settings_open {
+                            "Close settings"
+                        } else {
+                            "Settings"
+                        }))
+                    })
+                    .inner;
                 self.debug_layout
                     .note_visible("header_settings", settings.rect, clip);
+                self.debug_layout.note_focus("header_settings", &settings, clip);
                 if settings.clicked() {
                     self.settings_open = !self.settings_open;
                 }
@@ -1544,11 +1579,13 @@ impl ControllerApp {
 
     fn machines(&mut self, ui: &mut egui::Ui) {
         self.ensure_selection();
+        self.debug_layout.set_visible_clip(ui.clip_rect());
         egui::ScrollArea::vertical()
             .id_salt("machines-page")
-            .auto_shrink([false, false])
+            .drag_to_scroll(false)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
-                ui.set_width(ui.available_width());
+                ui.set_width(innermost_avail(ui));
                 self.machines_inner(ui);
             });
     }
@@ -1589,13 +1626,10 @@ impl ControllerApp {
                 ui.add_space(theme::SPACE_SM);
             }
             if let Some(node) = self.selected_node() {
-                let detail = egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.machine_detail(ui, &node);
-                    });
-                self.debug_layout.set_page_visible(detail.inner_rect, clip);
+                let start = ui.min_rect().min;
+                self.machine_detail(ui, &node);
+                let rect = egui::Rect::from_min_max(start, ui.min_rect().max);
+                self.debug_layout.set_page_visible(rect, clip);
             } else {
                 let hint = ui.label(theme::muted_text("Select a machine."));
                 self.debug_layout.set_page_visible(hint.rect, clip);
@@ -1628,6 +1662,8 @@ impl ControllerApp {
         };
         self.debug_layout
             .note_visible("pair_toggle", resp.rect, ui.clip_rect());
+        self.debug_layout
+            .note_focus("pair_toggle", &resp, ui.clip_rect());
         if self.preview_ui {
             self.debug_layout
                 .note_visible("pair_toggle_disabled", resp.rect, ui.clip_rect());
@@ -1670,11 +1706,22 @@ impl ControllerApp {
 
     fn machine_list(&mut self, ui: &mut egui::Ui, compact: bool) {
         let nodes = self.nodes.clone();
-        let max_h = if compact {
-            (ui.available_height() * 0.38).clamp(96.0, 220.0)
-        } else {
-            ui.available_height()
-        };
+        let clip = ui.clip_rect();
+        // When the list is stacked in the page ScrollArea, paint every fixture
+        // in-flow so one vertical scroll reaches the last row and Details.
+        // The sidebar rail keeps its own list scroll (see machine_rail).
+        if compact {
+            let start = ui.min_rect().min;
+            ui.set_width(ui.available_width());
+            for node in &nodes {
+                self.machine_row(ui, node);
+                ui.add_space(theme::SPACE_XS);
+            }
+            let rect = egui::Rect::from_min_max(start, ui.min_rect().max);
+            self.debug_layout.note_visible("machine_list", rect, clip);
+            return;
+        }
+        let max_h = ui.available_height();
         let list = egui::ScrollArea::vertical()
             .id_salt("machine-list")
             .auto_shrink([false, true])
@@ -1688,7 +1735,7 @@ impl ControllerApp {
                 }
             });
         self.debug_layout
-            .note_visible("machine_list", list.inner_rect, ui.clip_rect());
+            .note_visible("machine_list", list.inner_rect, clip);
     }
 
     fn machine_row(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
@@ -1709,48 +1756,53 @@ impl ControllerApp {
             theme::BG_SURFACE
         };
         let inner_w = ui.available_width();
-        let response = egui::Frame::new()
-            .fill(fill)
-            .stroke(if selected {
-                theme::stroke_border()
-            } else {
-                theme::stroke_border_subtle()
+        let response = ui
+            .push_id(("machine-row", node.id.as_str()), |ui| {
+                let frame_resp = egui::Frame::new()
+                    .fill(fill)
+                    .stroke(if selected {
+                        theme::stroke_border()
+                    } else {
+                        theme::stroke_border_subtle()
+                    })
+                    .inner_margin(egui::Margin::symmetric(
+                        theme::SPACE_SM as i8,
+                        theme::SPACE_XS as i8,
+                    ))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
+                    .show(ui, |ui| {
+                        ui.set_width(inner_w);
+                        ui.set_max_width(inner_w);
+                        let (name_rect, badge_rect) = machine_name_and_status(
+                            ui,
+                            &node.name,
+                            node.online,
+                            theme::TEXT_PRIMARY,
+                            false,
+                        );
+                        self.debug_layout.note_visible(
+                            &format!("nav_name:{}", node.id),
+                            name_rect,
+                            ui.clip_rect(),
+                        );
+                        self.debug_layout.note_visible(
+                            &format!("nav_badge:{}", node.id),
+                            badge_rect,
+                            ui.clip_rect(),
+                        );
+                        ui.label(theme::muted_text(node_presence_label(
+                            node.online,
+                            node.has_display,
+                        )));
+                        if session {
+                            ui.label(theme::muted_text("This session"));
+                        }
+                    })
+                    .response;
+                let id = ui.id().with("machine-row-focus").with(node.id.as_str());
+                ui.interact(frame_resp.rect, id, egui::Sense::click())
             })
-            .inner_margin(egui::Margin::symmetric(
-                theme::SPACE_SM as i8,
-                theme::SPACE_XS as i8,
-            ))
-            .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
-            .show(ui, |ui| {
-                ui.set_width(inner_w);
-                ui.set_max_width(inner_w);
-                let (name_rect, badge_rect) = machine_name_and_status(
-                    ui,
-                    &node.name,
-                    node.online,
-                    theme::TEXT_PRIMARY,
-                    false,
-                );
-                self.debug_layout.note_visible(
-                    &format!("nav_name:{}", node.id),
-                    name_rect,
-                    ui.clip_rect(),
-                );
-                self.debug_layout.note_visible(
-                    &format!("nav_badge:{}", node.id),
-                    badge_rect,
-                    ui.clip_rect(),
-                );
-                ui.label(theme::muted_text(node_presence_label(
-                    node.online,
-                    node.has_display,
-                )));
-                if session {
-                    ui.label(theme::muted_text("This session"));
-                }
-            })
-            .response
-            .interact(egui::Sense::click());
+            .inner;
         let response = if response.has_focus() {
             let focused = response.clone();
             ui.painter().rect_stroke(
@@ -1765,6 +1817,8 @@ impl ControllerApp {
         };
         self.debug_layout
             .note_item(&format!("nav_row:{}", node.id), response.rect);
+        self.debug_layout
+            .note_focus(&format!("nav_row:{}", node.id), &response, ui.clip_rect());
         ui.data_mut(|d| d.insert_temp(hover_id, response.hovered()));
         if response.clicked() {
             self.selected_id = Some(node.id.clone());
@@ -1773,7 +1827,7 @@ impl ControllerApp {
 
     fn machine_detail(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
         let clip = ui.clip_rect();
-        let content_w = ui.available_width().min(640.0);
+        let content_w = innermost_avail(ui).min(model::connect_detail_max_width());
         ui.vertical(|ui| {
             ui.set_width(content_w);
             ui.set_max_width(content_w);
@@ -1820,7 +1874,7 @@ impl ControllerApp {
             ui.add_space(theme::SPACE_SM);
             self.session_actions(ui, node, false);
             ui.add_space(theme::SPACE_LG);
-            egui::CollapsingHeader::new("Details")
+            let details = egui::CollapsingHeader::new("Details")
                 .default_open(false)
                 .show(ui, |ui| {
                     if !node.id.is_empty() {
@@ -1835,6 +1889,12 @@ impl ControllerApp {
                         ui.label(theme::muted_text(format!("Owner: {}", node.owner)));
                     }
                 });
+            self.debug_layout
+                .note_item("details", details.header_response.rect);
+            self.debug_layout
+                .note_visible("details", details.header_response.rect, clip);
+            self.debug_layout
+                .note_focus("details", &details.header_response, clip);
         });
     }
 
@@ -1870,18 +1930,10 @@ impl ControllerApp {
                 }
             });
         } else {
-            let gap = theme::SPACE_MD;
-            let avail = ui.available_width();
-            let min_card = 200.0;
-            let max_card = 260.0;
+            let gap = model::CONNECT_CARD_GAP;
+            let avail = innermost_avail(ui);
             let buttons = card_buttons(node.online, node.has_display, node.effective);
-            let cols = ((avail + gap) / (min_card + gap))
-                .floor()
-                .max(1.0)
-                .min(buttons.len().max(1) as f32) as usize;
-            let card_w = ((avail - gap * (cols.saturating_sub(1) as f32)) / cols as f32)
-                .clamp(min_card, max_card)
-                .min(avail);
+            let (cols, card_w) = model::connect_card_layout(avail, buttons.len());
             // Rows of horizontal groups shrink to content. A Grid inside a
             // tall ScrollArea stretches the last row through the leftover page.
             for row in buttons.chunks(cols) {
@@ -1893,7 +1945,14 @@ impl ControllerApp {
                             reason: button.reason,
                         };
                         let blurb = action_card_blurb(button.kind);
-                        let response = action_card(ui, card_w, button.label, blurb, &action);
+                        let response = action_card(
+                            ui,
+                            ("connect-card", node.id.as_str(), button.label),
+                            card_w,
+                            button.label,
+                            blurb,
+                            &action,
+                        );
                         self.debug_layout.note_button_raw_vis(
                             &format!("action_btn:{}:{}", node.id, button.label),
                             response.rect,
@@ -1902,6 +1961,11 @@ impl ControllerApp {
                         self.debug_layout.note_visible(
                             &format!("action_card:{}:{}", node.id, button.label),
                             response.rect,
+                            clip,
+                        );
+                        self.debug_layout.note_focus(
+                            &format!("action_card:{}:{}", node.id, button.label),
+                            &response,
                             clip,
                         );
                         if !action.enabled {
@@ -1944,6 +2008,8 @@ impl ControllerApp {
                 let resp = ui.add(theme::secondary_button(label));
                 self.debug_layout
                     .note_visible("settings_autostart", resp.rect, clip);
+                self.debug_layout
+                    .note_focus("settings_autostart", &resp, clip);
                 if resp.clicked() {
                     self.toggle_autostart();
                 }
@@ -2047,6 +2113,8 @@ impl ControllerApp {
             let back = ui.add(theme::secondary_button("Back to machines"));
             self.debug_layout
                 .note_visible("rail_back", back.rect, ui.clip_rect());
+            self.debug_layout
+                .note_focus("rail_back", &back, ui.clip_rect());
             if back.clicked() {
                 self.back_to_machines();
                 return;
@@ -2064,6 +2132,7 @@ impl ControllerApp {
         let nodes = self.nodes.clone();
         egui::ScrollArea::vertical()
             .id_salt("machine-rail-list")
+            .drag_to_scroll(false)
             .max_width(rail_inner_w)
             .max_height(list_h)
             .auto_shrink([false, false])
@@ -4358,62 +4427,34 @@ fn action_card_blurb(kind: CardButtonKind) -> &'static str {
 
 fn action_card(
     ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
     width: f32,
     label: &str,
     blurb: &str,
     action: &Action,
 ) -> egui::Response {
-    let (fill, title_color, body_color) = if action.enabled {
-        (theme::BG_SURFACE, theme::TEXT_PRIMARY, theme::TEXT_BODY)
+    // Native egui Button so Tab/Enter use built-in focus (widgets.active 2px ring).
+    // Do not pin fill/stroke — that would hide the focused stroke.
+    let color = if action.enabled {
+        theme::TEXT_BODY
     } else {
-        (theme::BG_PANEL, theme::TEXT_MUTED, theme::TEXT_FAINT)
+        theme::TEXT_FAINT
     };
-    let status = action.reason;
-    let max_h = 140.0;
-    let max_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, max_h));
-    let inner = ui.allocate_new_ui(
-        egui::UiBuilder::new()
-            .max_rect(max_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-        |ui| {
-            theme::card_frame().fill(fill).show(ui, |ui| {
-                ui.set_max_width(width);
-                ui.set_min_width(width);
-                ui.label(
-                    egui::RichText::new(label)
-                        .size(theme::SECTION_SIZE)
-                        .color(title_color)
-                        .strong(),
-                );
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(blurb)
-                            .size(theme::BODY_SIZE)
-                            .color(body_color),
-                    )
-                    .wrap(),
-                );
-                ui.add(egui::Label::new(theme::muted_text(status)).wrap());
-            })
-        },
-    );
-    let mut response = inner
-        .inner
-        .response
-        .interact(if action.enabled {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        })
-        .on_hover_text(action.reason);
-    if response.has_focus() {
-        ui.painter().rect_stroke(
-            response.rect.expand(1.0),
-            egui::CornerRadius::same(theme::RADIUS_CARD),
-            theme::focus_stroke(),
-            egui::StrokeKind::Outside,
-        );
-    }
+    let text = format!("{label}\n{blurb}\n{}", action.reason);
+    let btn = egui::Button::new(
+        egui::RichText::new(text)
+            .size(theme::BODY_SIZE)
+            .color(color),
+    )
+    .wrap_mode(egui::TextWrapMode::Wrap)
+    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
+    .min_size(egui::vec2(width, 88.0));
+    let inner = ui.push_id(id, |ui| {
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        ui.add_enabled(action.enabled, btn)
+    });
+    let mut response = inner.inner.on_hover_text(action.reason);
     if !action.enabled {
         response = response.on_disabled_hover_text(action.reason);
     }
@@ -4539,7 +4580,11 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
     }
     let n = delta / 120;
     if n == 0 {
-        if delta > 0 { 1 } else { -1 }
+        if delta > 0 {
+            1
+        } else {
+            -1
+        }
     } else {
         n
     }
@@ -4548,8 +4593,8 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -4770,6 +4815,62 @@ mod geometry_tests {
                 path: "readme.txt".into(),
                 text: "hello from geometry test\n".into(),
             });
+        }
+
+        fn press_key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
+            self.pending_events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            self.pass();
+            self.pending_events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers,
+            });
+            self.pass();
+        }
+
+        fn press_tab(&mut self, shift: bool) {
+            let mut modifiers = egui::Modifiers::default();
+            modifiers.shift = shift;
+            self.press_key(egui::Key::Tab, modifiers);
+        }
+
+        fn press_enter(&mut self) {
+            self.press_key(egui::Key::Enter, egui::Modifiers::default());
+        }
+
+        fn scroll_content(&mut self, dy: f32) {
+            let clip = self.app.debug_layout.visible_clip;
+            let pos = if clip[2] > 1.0 && clip[3] > 1.0 {
+                egui::pos2(clip[0] + clip[2] * 0.5, clip[1] + clip[3] * 0.5)
+            } else {
+                let (w, h) = self.app.debug_window_size();
+                egui::pos2(w * 0.5, h * 0.5)
+            };
+            self.pending_events.push(egui::Event::PointerMoved(pos));
+            self.pending_events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                modifiers: egui::Modifiers::default(),
+            });
+            self.pass();
+        }
+
+        fn focused_ids(&self) -> Vec<String> {
+            self.app
+                .debug_layout
+                .toolbar_items
+                .iter()
+                .filter(|(id, _)| id.starts_with("focus:"))
+                .map(|(id, _)| id.clone())
+                .collect()
         }
 
         fn open_quant_terminal(&mut self) {
@@ -5312,6 +5413,7 @@ mod geometry_tests {
                 || id == "machine_list"
                 || id == "detail_node_id"
                 || id == "pair_toggle"
+                || id == "details"
                 || id.starts_with("action_reason:")
             {
                 continue;
@@ -5391,6 +5493,7 @@ mod geometry_tests {
         ] {
             let mut harn = Harness::new(w, h);
             harn.app.screen = Screen::Machines;
+            harn.app.selected_id = Some("sufa".into());
             harn.pass();
             harn.pass();
             assert_eq!(model::machine_rail_visible(w), expect_rail);
@@ -5493,14 +5596,13 @@ mod geometry_tests {
         assert!(harn.app.preview_ui && harn.app.mock);
         assert!(!harn.app.hide_on_close);
         assert!(!harn.app.autostart);
-        assert!(
-            harn.app
-                .nodes
-                .iter()
-                .all(|n| n.id.starts_with("preview-fixture-")
-                    && n.name.contains("Fixture")
-                    && n.name.contains("sample"))
-        );
+        assert!(harn
+            .app
+            .nodes
+            .iter()
+            .all(|n| n.id.starts_with("preview-fixture-")
+                && n.name.contains("Fixture")
+                && n.name.contains("sample")));
         let layout = &harn.app.debug_layout;
         assert!(
             item_rect(layout, "preview_banner").is_some(),
@@ -5535,12 +5637,11 @@ mod geometry_tests {
         );
         assert_eq!(harn.app.node_line, super::super::PREVIEW_NODE_LINE);
         assert!(!harn.app.autostart);
-        assert!(
-            harn.app
-                .nodes
-                .iter()
-                .all(|n| n.id.starts_with("preview-fixture-"))
-        );
+        assert!(harn
+            .app
+            .nodes
+            .iter()
+            .all(|n| n.id.starts_with("preview-fixture-")));
         harn.app.last_node = Instant::now() - Duration::from_secs(3);
         harn.pass();
         harn.pass();
@@ -5550,12 +5651,11 @@ mod geometry_tests {
             "pump past 2s must not call live resolver/autostart/load in preview"
         );
         assert_eq!(harn.app.node_line, super::super::PREVIEW_NODE_LINE);
-        assert!(
-            harn.app
-                .nodes
-                .iter()
-                .all(|n| n.id.starts_with("preview-fixture-"))
-        );
+        assert!(harn
+            .app
+            .nodes
+            .iter()
+            .all(|n| n.id.starts_with("preview-fixture-")));
         assert!(!harn.app.hide_on_close);
         assert!(item_rect(&harn.app.debug_layout, "preview_banner").is_some());
     }
@@ -5591,6 +5691,7 @@ mod geometry_tests {
         ] {
             let mut harn = Harness::new(w, h);
             harn.app.screen = Screen::Machines;
+            harn.app.selected_id = Some("sufa".into());
             harn.pass();
             harn.pass();
             assert!(item_rect(&harn.app.debug_layout, "header_settings").is_some());
@@ -5720,6 +5821,283 @@ mod geometry_tests {
                 "{label} card too small (still a tiny toolbar?): {card:?}"
             );
             assert_action_fully_visible(layout, &format!("action_btn:{selected}:{label}"), 1024.0);
+        }
+    }
+
+    fn card_items(layout: &DebugLayout) -> Vec<(String, [f32; 4])> {
+        layout
+            .toolbar_items
+            .iter()
+            .filter(|(id, _)| id.starts_with("action_card:"))
+            .cloned()
+            .collect()
+    }
+
+    fn rect_max_x(rect: [f32; 4]) -> f32 {
+        rect[0] + rect[2]
+    }
+
+    fn rect_max_y(rect: [f32; 4]) -> f32 {
+        rect[1] + rect[3]
+    }
+
+    fn assert_cards_inside_visible_clip(layout: &DebugLayout) {
+        let clip = layout.visible_clip;
+        assert!(
+            clip[2] > 1.0 && clip[3] > 1.0,
+            "visible_clip was not recorded: {clip:?}"
+        );
+        let clip_max_x = rect_max_x(clip);
+        let cards = card_items(layout);
+        assert!(!cards.is_empty(), "no connect cards recorded");
+        for (id, rect) in &cards {
+            assert!(
+                rect_max_x(*rect) <= clip_max_x + 0.5,
+                "{id} raw max.x {} exceeds visible clip max.x {} (rect={rect:?} clip={clip:?})",
+                rect_max_x(*rect),
+                clip_max_x
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_721_page_keeps_connect_cards_inside_visible_clip() {
+        // Real 721x759 client, including header, page margins, and scrollbar.
+        let mut harn = Harness::new(721.0, 759.0);
+        harn.app.screen = Screen::Machines;
+        harn.app.selected_id = Some("sufa".into());
+        harn.pass();
+        harn.pass();
+        assert!(
+            !model::machine_rail_visible(721.0),
+            "721 must fold the rail"
+        );
+        let selected = harn.app.selected_id.clone().expect("selection");
+        let cards = card_items(&harn.app.debug_layout);
+        let ours: Vec<_> = cards
+            .iter()
+            .filter(|(id, _)| id.starts_with(&format!("action_card:{selected}:")))
+            .cloned()
+            .collect();
+        assert!(
+            ours.len() >= 3,
+            "expected Terminal/Files/View cards at 721, got {ours:?}"
+        );
+        let xs: Vec<i32> = {
+            let mut v: Vec<i32> = ours.iter().map(|(_, r)| r[0].round() as i32).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert!(
+            xs.len() <= 2,
+            "721 must use one or two columns, not three: xs={xs:?} cards={ours:?}"
+        );
+        assert_cards_inside_visible_clip(&harn.app.debug_layout);
+
+        let last = harn
+            .app
+            .debug_layout
+            .toolbar_items
+            .iter()
+            .filter(|(id, _)| {
+                id.starts_with("action_card:") || id == "details" || id.starts_with("nav_row:")
+            })
+            .max_by(|a, b| rect_max_y(a.1).partial_cmp(&rect_max_y(b.1)).unwrap())
+            .cloned()
+            .expect("last card or details");
+        let mut reached = false;
+        for _ in 0..40 {
+            let clip = harn.app.debug_layout.visible_clip;
+            let rect = item_rect(&harn.app.debug_layout, &last.0).unwrap_or(last.1);
+            if rect[1] >= clip[1] - 1.0 && rect_max_y(rect) <= rect_max_y(clip) + 1.0 {
+                reached = true;
+                break;
+            }
+            // Reveal content below: move the scrolled content up.
+            harn.scroll_content(-120.0);
+        }
+        assert!(
+            reached,
+            "could not scroll to last item {} at {:?}; clip={:?} items={:?}",
+            last.0,
+            item_rect(&harn.app.debug_layout, &last.0),
+            harn.app.debug_layout.visible_clip,
+            harn.app
+                .debug_layout
+                .toolbar_items
+                .iter()
+                .map(|(k, r)| (k, r))
+                .collect::<Vec<_>>()
+        );
+        assert_cards_inside_visible_clip(&harn.app.debug_layout);
+    }
+
+    #[test]
+    fn wide_connect_cards_use_two_by_two_not_three_plus_one() {
+        for (w, h) in [(1026.0, 759.0), (1080.0, 760.0), (1920.0, 1135.0)] {
+            let mut harn = Harness::new(w, h);
+            harn.app.screen = Screen::Machines;
+            harn.app.selected_id = Some("sufa".into());
+            harn.pass();
+            harn.pass();
+            let selected = harn.app.selected_id.clone().expect("selection");
+            let ours: Vec<_> = card_items(&harn.app.debug_layout)
+                .into_iter()
+                .filter(|(id, _)| id.starts_with(&format!("action_card:{selected}:")))
+                .collect();
+            assert_eq!(
+                ours.len(),
+                4,
+                "desktop node should show four cards at {w}x{h}"
+            );
+            let mut ys: Vec<i32> = ours.iter().map(|(_, r)| r[1].round() as i32).collect();
+            ys.sort();
+            ys.dedup();
+            assert_eq!(
+                ys.len(),
+                2,
+                "four cards should be a 2x2, not 3+1, at {w}: ys={ys:?} cards={ours:?}"
+            );
+            assert_cards_inside_visible_clip(&harn.app.debug_layout);
+        }
+    }
+
+    #[test]
+    fn tab_shift_tab_and_enter_use_native_focus_on_machines_page() {
+        let mut harn = Harness::preview(1080.0, 760.0, super::super::LiveHooks::production());
+        harn.app.screen = Screen::Machines;
+        harn.pass();
+        harn.pass();
+        assert!(
+            harn.ctx.style().visuals.widgets.active.bg_stroke.width >= 2.0,
+            "theme must give focused widgets a 2px high-contrast ring"
+        );
+        assert!(
+            harn.focused_ids().is_empty(),
+            "no widget should start focused: {:?}",
+            harn.focused_ids()
+        );
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut found_header = false;
+        let mut found_card = false;
+        let mut found_row = false;
+        for _ in 0..24 {
+            harn.press_tab(false);
+            let ids = harn.focused_ids();
+            if ids.is_empty() {
+                continue;
+            }
+            // A recorded focus_ring means the widget was painted as focused
+            // (native Button uses widgets.active; rows paint theme::focus_stroke).
+            let rings: Vec<_> = harn
+                .app
+                .debug_layout
+                .toolbar_items
+                .iter()
+                .filter(|(id, _)| id.starts_with("focus_ring:"))
+                .map(|(id, _)| id.clone())
+                .collect();
+            assert_eq!(
+                rings.len(),
+                ids.len(),
+                "every focused widget must record a visible focus ring: focus={ids:?} rings={rings:?}"
+            );
+            for id in &ids {
+                if !seen.contains(id) {
+                    seen.push(id.clone());
+                }
+                if id.contains("header_settings") || id.contains("header_quit") {
+                    found_header = true;
+                }
+                if id.contains("action_card:") {
+                    found_card = true;
+                }
+                if id.contains("nav_row:") {
+                    found_row = true;
+                }
+            }
+        }
+        assert!(
+            seen.len() >= 2,
+            "Tab should visit more than one widget: {seen:?}"
+        );
+        assert!(
+            found_header,
+            "Settings/Quit should take Tab focus: {seen:?}"
+        );
+        assert!(
+            found_card || found_row,
+            "machine list or connect cards should take Tab focus: {seen:?}"
+        );
+
+        let after_tabs = harn.focused_ids();
+        harn.press_tab(true);
+        let after_shift = harn.focused_ids();
+        assert!(!after_shift.is_empty(), "Shift+Tab lost focus entirely");
+        assert_ne!(
+            after_shift, after_tabs,
+            "Shift+Tab should move focus backward: {after_tabs:?} -> {after_shift:?}"
+        );
+
+        // Walk Tab until the enabled Terminal card is focused, then Enter.
+        let selected = harn.app.selected_id.clone().expect("selection");
+        let terminal_id = format!("focus:action_card:{selected}:Terminal");
+        let mut on_terminal = harn.focused_ids().contains(&terminal_id);
+        for _ in 0..32 {
+            if on_terminal {
+                break;
+            }
+            harn.press_tab(false);
+            on_terminal = harn.focused_ids().contains(&terminal_id);
+        }
+        assert!(
+            on_terminal,
+            "never focused the Terminal card with Tab events: {:?}",
+            harn.focused_ids()
+        );
+        harn.press_enter();
+        assert!(
+            matches!(harn.app.screen, Screen::Terminal { .. }),
+            "Enter on an enabled Terminal card should start the (preview) mock session"
+        );
+
+        // Disabled actions must not activate. Select the offline fixture and
+        // try Enter on its Terminal card (machine is offline).
+        harn.app.back_to_machines();
+        harn.app.selected_id = Some("preview-fixture-offline".into());
+        harn.pass();
+        harn.pass();
+        let offline_terminal = "focus:action_card:preview-fixture-offline:Terminal";
+        let mut focused_disabled = false;
+        for _ in 0..32 {
+            harn.press_tab(false);
+            if harn.focused_ids().iter().any(|id| id == offline_terminal) {
+                focused_disabled = true;
+                break;
+            }
+        }
+        if focused_disabled {
+            harn.press_enter();
+            assert!(
+                matches!(harn.app.screen, Screen::Machines),
+                "Enter on a disabled card must not start a session"
+            );
+        } else {
+            // Disabled buttons may be skipped by Tab; a click must still not activate.
+            if item_rect(
+                &harn.app.debug_layout,
+                "action_card:preview-fixture-offline:Terminal",
+            )
+            .is_some()
+            {
+                harn.click_item("action_card:preview-fixture-offline:Terminal");
+            }
+            assert!(
+                matches!(harn.app.screen, Screen::Machines),
+                "disabled Terminal card activated"
+            );
         }
     }
 }

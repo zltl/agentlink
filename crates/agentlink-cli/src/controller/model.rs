@@ -490,6 +490,84 @@ pub const MACHINE_RAIL_WIDTH: f32 = 220.0;
 /// labels. The compact nav no longer needs that leftover main width.
 pub const MACHINE_RAIL_SHOW_AT: f32 = 800.0;
 
+/// Horizontal gap between connect cards. Matches `theme::SPACE_MD`.
+pub const CONNECT_CARD_GAP: f32 = 12.0;
+
+/// Frame chrome (inner margin + stroke) on each side of a card-style
+/// widget. Connect cards are now native buttons, so this is only used
+/// when measuring a framed card; the layout function treats `outer`
+/// as the full widget width.
+pub const CONNECT_CARD_FRAME_CHROME: f32 = 2.0 * 12.0 + 2.0 * 1.0;
+
+/// Minimum / maximum outer width of one connect card, including padding.
+pub const CONNECT_CARD_MIN_OUTER: f32 = 200.0;
+pub const CONNECT_CARD_MAX_OUTER: f32 = 320.0;
+
+/// Widest detail column: two max-width cards and one gap (a 2x2 grid).
+pub fn connect_detail_max_width() -> f32 {
+    CONNECT_CARD_MAX_OUTER * 2.0 + CONNECT_CARD_GAP
+}
+
+/// Columns and outer card width that fit in the innermost visible width.
+///
+/// `inner_avail` must already be the content width after page margins,
+/// a reserved vertical scrollbar, and clip. Widths are floored so
+/// rounding cannot push the last card past the clip.
+///
+/// Four actions use two columns (2x2) whenever two columns fit, so a
+/// wide window does not leave a lone Control card in a 3+1 row. One
+/// column is used when two minimum-width cards would not fit.
+pub fn connect_card_layout(inner_avail: f32, n_buttons: usize) -> (usize, f32) {
+    let n = n_buttons.max(1);
+    let gap = CONNECT_CARD_GAP;
+    let min_outer = CONNECT_CARD_MIN_OUTER;
+    let max_outer = CONNECT_CARD_MAX_OUTER;
+    let avail = inner_avail.max(1.0);
+    let fit = ((avail + gap) / (min_outer + gap)).floor().max(1.0) as usize;
+    let mut cols = fit.min(n);
+    if n == 4 && cols >= 2 {
+        cols = 2;
+    }
+    let outer = if cols == 1 {
+        avail.min(max_outer)
+    } else {
+        ((avail - gap * (cols - 1) as f32) / cols as f32)
+            .floor()
+            .clamp(1.0, max_outer)
+    };
+    while cols > 1 && cols as f32 * outer + (cols - 1) as f32 * gap > avail + 0.01 {
+        cols -= 1;
+    }
+    let outer = if cols == 1 {
+        avail.min(max_outer)
+    } else {
+        ((avail - gap * (cols - 1) as f32) / cols as f32)
+            .floor()
+            .clamp(1.0, max_outer)
+    };
+    debug_assert!(cols as f32 * outer + (cols.saturating_sub(1) as f32) * gap <= avail + 0.5);
+    (cols, outer)
+}
+
+/// Reserve a floating vertical scrollbar so cards are not drawn under it.
+pub fn reserved_scrollbar_width(bar_width: f32, floating: bool) -> f32 {
+    if floating {
+        bar_width.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+pub fn innermost_content_width(
+    available: f32,
+    clip_width: f32,
+    bar_width: f32,
+    floating: bool,
+) -> f32 {
+    let visible = available.min(clip_width).max(1.0);
+    (visible - reserved_scrollbar_width(bar_width, floating)).max(1.0)
+}
+
 /// The Machines list is a single compact column.
 ///
 /// 0133 used a two-column `Grid` once the list was ≥ 860 px. In the
@@ -717,11 +795,9 @@ mod tests {
         let buttons = card_buttons(true, Some(false), full);
         let labels: Vec<_> = buttons.iter().map(|b| b.label).collect();
         assert_eq!(labels, ["Terminal", "Files"]);
-        assert!(
-            !labels
-                .iter()
-                .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop"))
-        );
+        assert!(!labels
+            .iter()
+            .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop")));
     }
 
     #[test]
@@ -917,11 +993,9 @@ mod tests {
             .find(|n| n.id.ends_with("headless"))
             .unwrap();
         let buttons = card_buttons(headless.online, headless.has_display, headless.effective);
-        assert!(
-            buttons
-                .iter()
-                .all(|b| b.label != "View desktop" && b.label != "Control desktop")
-        );
+        assert!(buttons
+            .iter()
+            .all(|b| b.label != "View desktop" && b.label != "Control desktop"));
         let view_only = fixtures
             .iter()
             .find(|n| n.id.ends_with("view-only"))
@@ -943,5 +1017,41 @@ mod tests {
         assert!(!hides_window_on_close(true, false, false));
         assert!(hides_window_on_close(true, true, false));
         assert!(!hides_window_on_close(true, true, true));
+    }
+
+    fn assert_cards_fit(avail: f32, n: usize) {
+        let (cols, outer) = connect_card_layout(avail, n);
+        let used = cols as f32 * outer + (cols.saturating_sub(1) as f32) * CONNECT_CARD_GAP;
+        assert!(
+            used <= avail + 0.01,
+            "cards overflow avail={avail}: cols={cols} outer={outer} used={used}"
+        );
+        assert!(cols >= 1 && cols <= n.max(1));
+        if n == 4 && avail + CONNECT_CARD_GAP >= 2.0 * (CONNECT_CARD_MIN_OUTER + CONNECT_CARD_GAP) {
+            assert_eq!(
+                cols, 2,
+                "four actions should use 2x2 when two columns fit (avail={avail})"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_cards_fit_innermost_width_and_prefer_two_by_two() {
+        // 721 client minus 12px page margins and a 10px floating scrollbar.
+        let narrow = innermost_content_width(721.0 - 24.0, 721.0 - 24.0, 10.0, true);
+        assert!((narrow - (721.0 - 24.0 - 10.0)).abs() < 0.01);
+        assert_cards_fit(narrow, 4);
+        let (cols, _) = connect_card_layout(narrow, 4);
+        assert!(
+            cols <= 2,
+            "721 visible content must not squeeze three columns"
+        );
+        assert_cards_fit(1026.0 - 24.0, 4);
+        assert_cards_fit(1080.0 - 24.0 - MACHINE_RAIL_WIDTH, 4);
+        assert_cards_fit(1920.0 - 24.0 - MACHINE_RAIL_WIDTH, 4);
+        assert_cards_fit(250.0, 4);
+        let (one, outer) = connect_card_layout(250.0, 4);
+        assert_eq!(one, 1);
+        assert!(outer <= 250.0);
     }
 }
