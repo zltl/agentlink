@@ -96,6 +96,22 @@ impl DebugLayout {
             self.note_visible(&format!("focus_ring:{id}"), response.rect, clip);
         }
     }
+
+    fn note_painted_focus_ring(
+        &mut self,
+        id: &str,
+        widget: egui::Rect,
+        ring: egui::Rect,
+        outer: egui::Rect,
+        clip: egui::Rect,
+    ) {
+        self.note_item(&format!("focus:{id}"), widget);
+        // Raw painted ring and its stroke outer bounds — not the
+        // already-intersected widget vis rect.
+        self.note_item(&format!("focus_ring:{id}"), ring);
+        self.note_item(&format!("focus_outer:{id}"), outer);
+        self.note_item(&format!("focus_clip:{id}"), clip);
+    }
 }
 
 fn rect_xywh(rect: egui::Rect) -> [f32; 4] {
@@ -116,6 +132,64 @@ fn innermost_avail(ui: &egui::Ui) -> f32 {
         scroll.bar_width,
         scroll.floating,
     )
+}
+
+/// Keep the 2px focus stroke fully inside the visible clip (sidebar or
+/// scrolling list). Half the stroke width plus a small inset.
+const FOCUS_RING_INSET: f32 = 1.0;
+
+fn inset_focus_ring_rect(widget: egui::Rect, clip: egui::Rect) -> Option<egui::Rect> {
+    let pad = theme::focus_stroke().width * 0.5 + FOCUS_RING_INSET;
+    let ring = widget.intersect(clip).shrink(pad);
+    if ring.width() > 2.0 && ring.height() > 2.0 {
+        Some(ring)
+    } else {
+        None
+    }
+}
+
+fn stroke_outer_rect(rect: egui::Rect, width: f32, kind: egui::StrokeKind) -> egui::Rect {
+    match kind {
+        egui::StrokeKind::Inside => rect,
+        egui::StrokeKind::Middle => rect.expand(width * 0.5),
+        egui::StrokeKind::Outside => rect.expand(width),
+    }
+}
+
+/// Paint a 2px high-contrast ring whose stroke stays inside `clip`.
+/// Returns (stroke rect, outer bounds of the stroke).
+fn paint_focus_ring(
+    ui: &egui::Ui,
+    widget: egui::Rect,
+    clip: egui::Rect,
+) -> Option<(egui::Rect, egui::Rect)> {
+    let ring = inset_focus_ring_rect(widget, clip)?;
+    let stroke = theme::focus_stroke();
+    let kind = egui::StrokeKind::Inside;
+    ui.painter().rect_stroke(
+        ring,
+        egui::CornerRadius::same(theme::RADIUS_CONTROL),
+        stroke,
+        kind,
+    );
+    Some((ring, stroke_outer_rect(ring, stroke.width, kind)))
+}
+
+fn paint_and_note_focus_ring(
+    layout: &mut DebugLayout,
+    ui: &egui::Ui,
+    id: &str,
+    response: &egui::Response,
+    clip: egui::Rect,
+) {
+    if !response.has_focus() {
+        return;
+    }
+    if let Some((ring, outer)) = paint_focus_ring(ui, response.rect, clip) {
+        layout.note_painted_focus_ring(id, response.rect, ring, outer, clip);
+    } else {
+        layout.note_focus(id, response, clip);
+    }
 }
 
 /// One debug-bus request delivered from the Unix socket thread.
@@ -1534,7 +1608,7 @@ impl ControllerApp {
                 self.submit_login();
             }
             ui.add_space(theme::SPACE_MD);
-            egui::CollapsingHeader::new(theme::muted_text("Advanced"))
+            let advanced = egui::CollapsingHeader::new(theme::muted_text("Advanced"))
                 .default_open(self.advanced)
                 .show(ui, |ui| {
                     ui.label(theme::muted_text(
@@ -1552,6 +1626,13 @@ impl ControllerApp {
                         "Leave the pin empty only when this relay uses public roots (system or webpki). Otherwise pin sha256:, spki:sha256:, or intermediate:sha256:.",
                     ));
                 });
+            paint_and_note_focus_ring(
+                &mut self.debug_layout,
+                ui,
+                "advanced",
+                &advanced.header_response,
+                ui.clip_rect(),
+            );
         });
     }
 
@@ -1803,22 +1884,15 @@ impl ControllerApp {
                 ui.interact(frame_resp.rect, id, egui::Sense::click())
             })
             .inner;
-        let response = if response.has_focus() {
-            let focused = response.clone();
-            ui.painter().rect_stroke(
-                focused.rect.expand(1.0),
-                egui::CornerRadius::same(theme::RADIUS_CONTROL),
-                theme::focus_stroke(),
-                egui::StrokeKind::Outside,
-            );
-            focused
-        } else {
-            response
-        };
         self.debug_layout
             .note_item(&format!("nav_row:{}", node.id), response.rect);
-        self.debug_layout
-            .note_focus(&format!("nav_row:{}", node.id), &response, ui.clip_rect());
+        paint_and_note_focus_ring(
+            &mut self.debug_layout,
+            ui,
+            &format!("nav_row:{}", node.id),
+            &response,
+            ui.clip_rect(),
+        );
         ui.data_mut(|d| d.insert_temp(hover_id, response.hovered()));
         if response.clicked() {
             self.selected_id = Some(node.id.clone());
@@ -1893,8 +1967,13 @@ impl ControllerApp {
                 .note_item("details", details.header_response.rect);
             self.debug_layout
                 .note_visible("details", details.header_response.rect, clip);
-            self.debug_layout
-                .note_focus("details", &details.header_response, clip);
+            paint_and_note_focus_ring(
+                &mut self.debug_layout,
+                ui,
+                "details",
+                &details.header_response,
+                ui.clip_rect(),
+            );
         });
     }
 
@@ -6254,6 +6333,163 @@ mod geometry_tests {
                 matches!(harn.app.screen, Screen::Machines),
                 "disabled Terminal card activated"
             );
+        }
+    }
+
+    fn tab_until_focus(harn: &mut Harness, id: &str, max_tabs: usize) -> bool {
+        if harn.focused_ids().iter().any(|got| got == id) {
+            return true;
+        }
+        for _ in 0..max_tabs {
+            harn.press_tab(false);
+            if harn.focused_ids().iter().any(|got| got == id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn assert_painted_focus_outer_inside_clip(layout: &DebugLayout, id: &str) {
+        let outer = item_rect(layout, &format!("focus_outer:{id}")).unwrap_or_else(|| {
+            panic!(
+                "missing painted focus_outer:{id} (need the stroke outer bounds, not an intersected vis rect); have {:?}",
+                layout
+                    .toolbar_items
+                    .iter()
+                    .map(|(k, _)| k)
+                    .collect::<Vec<_>>()
+            )
+        });
+        let clip = item_rect(layout, &format!("focus_clip:{id}")).unwrap_or_else(|| {
+            panic!(
+                "missing focus_clip:{id}; have {:?}",
+                layout
+                    .toolbar_items
+                    .iter()
+                    .map(|(k, _)| k)
+                    .collect::<Vec<_>>()
+            )
+        });
+        let ring = item_rect(layout, &format!("focus_ring:{id}")).expect("focus_ring");
+        assert!(
+            outer[2] > 2.0 && outer[3] > 2.0,
+            "painted focus ring is degenerate: outer={outer:?} ring={ring:?} clip={clip:?}"
+        );
+        assert!(
+            outer[0] >= clip[0] - 0.01,
+            "{id} focus ring left edge clipped: outer={outer:?} clip={clip:?}"
+        );
+        assert!(
+            outer[1] >= clip[1] - 0.01,
+            "{id} focus ring top edge clipped: outer={outer:?} clip={clip:?}"
+        );
+        assert!(
+            outer[0] + outer[2] <= clip[0] + clip[2] + 0.01,
+            "{id} focus ring right edge clipped: outer={outer:?} clip={clip:?}"
+        );
+        assert!(
+            outer[1] + outer[3] <= clip[1] + clip[3] + 0.01,
+            "{id} focus ring bottom edge clipped: outer={outer:?} clip={clip:?}"
+        );
+    }
+
+    fn scroll_item_fully_into_view(harn: &mut Harness, key: &str) -> bool {
+        for _ in 0..60 {
+            let raw = match item_rect(&harn.app.debug_layout, key) {
+                Some(raw) => raw,
+                None => return false,
+            };
+            let clip = harn.app.debug_layout.visible_clip;
+            if raw[1] >= clip[1] - 1.0 && rect_max_y(raw) <= rect_max_y(clip) + 1.0 {
+                return true;
+            }
+            let dy = if raw[1] < clip[1] { 120.0 } else { -120.0 };
+            harn.scroll_content(dy);
+        }
+        false
+    }
+
+    #[test]
+    fn tab_from_control_card_to_details_paints_ring_and_enter_expands() {
+        for (w, h) in [(1080.0_f32, 760.0_f32), (721.0, 759.0)] {
+            let mut harn = Harness::preview(w, h, super::super::LiveHooks::production());
+            harn.app.screen = Screen::Machines;
+            harn.app.selected_id = Some("preview-fixture-desktop".into());
+            harn.pass();
+            harn.pass();
+            let control = "focus:action_card:preview-fixture-desktop:Control desktop";
+            let details = "focus:details";
+            assert!(
+                tab_until_focus(&mut harn, control, 40),
+                "never focused Control desktop at {w}x{h}: {:?}",
+                harn.focused_ids()
+            );
+            harn.press_tab(false);
+            // Details may sit below the fold at 721; scroll it into view
+            // without using request_focus, then confirm the ring is painted.
+            let _ = scroll_item_fully_into_view(&mut harn, "details");
+            assert!(
+                harn.focused_ids().iter().any(|id| id == details),
+                "Tab after Control should focus Details at {w}x{h}, got {:?}",
+                harn.focused_ids()
+            );
+            assert_painted_focus_outer_inside_clip(&harn.app.debug_layout, "details");
+            assert!(
+                item_rect(&harn.app.debug_layout, "detail_node_id").is_none(),
+                "Details should start collapsed at {w}x{h}"
+            );
+            harn.press_enter();
+            assert!(
+                item_rect(&harn.app.debug_layout, "detail_node_id").is_some(),
+                "Enter on focused Details should expand the section at {w}x{h}"
+            );
+            // Focus should still show a painted ring after expand.
+            if harn.focused_ids().iter().any(|id| id == details) {
+                assert_painted_focus_outer_inside_clip(&harn.app.debug_layout, "details");
+            }
+        }
+    }
+
+    #[test]
+    fn machine_row_focus_ring_stays_inside_clip_on_rail_and_narrow_list() {
+        // Wide / mid windows keep the 220 pt sidebar; 721 folds to a scrolling list.
+        for (w, h) in [(1080.0_f32, 760.0_f32), (1026.0, 759.0), (721.0, 759.0)] {
+            let mut harn = Harness::new(w, h);
+            harn.app.screen = Screen::Machines;
+            harn.app.selected_id = Some("sufa".into());
+            harn.pass();
+            harn.pass();
+            if w >= model::MACHINE_RAIL_SHOW_AT {
+                assert!(
+                    model::machine_rail_visible(w),
+                    "expected a {0} pt rail at {w}",
+                    model::MACHINE_RAIL_WIDTH
+                );
+            } else {
+                assert!(!model::machine_rail_visible(w), "721 must fold the rail");
+            }
+            let mut row_id = None;
+            for _ in 0..32 {
+                harn.press_tab(false);
+                if let Some(id) = harn
+                    .focused_ids()
+                    .into_iter()
+                    .find(|id| id.starts_with("focus:nav_row:"))
+                {
+                    row_id = Some(id.trim_start_matches("focus:").to_string());
+                    break;
+                }
+            }
+            let row_id = row_id.unwrap_or_else(|| {
+                panic!(
+                    "never focused a machine row at {w}x{h}: {:?}",
+                    harn.focused_ids()
+                )
+            });
+            // If the focused row is below the fold, bring it on screen and
+            // re-paint the ring, still via the live Tab focus (no set_focus).
+            let _ = scroll_item_fully_into_view(&mut harn, &row_id);
+            assert_painted_focus_outer_inside_clip(&harn.app.debug_layout, &row_id);
         }
     }
 }
