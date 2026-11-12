@@ -29,6 +29,9 @@ pub struct StreamAudit {
 
 pub type StreamAuditHook = Arc<dyn Fn(&StreamAudit) + Send + Sync>;
 
+/// Returns true when this grant jti is still active for `peer`.
+pub type GrantActiveHook = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 pub struct StreamSettings {
     pub policy: NodePolicy,
     pub audit_path: PathBuf,
@@ -36,6 +39,10 @@ pub struct StreamSettings {
     /// When set, stream start, stop, and remote-control input go through this
     /// hook instead of the desktop JSONL writer.
     pub on_audit: Option<StreamAuditHook>,
+    /// When set, live sessions re-check this hook (revoked jti) on later
+    /// signaling and input. Missing hook means "no deny-list check"; expiry
+    /// is still enforced when `_grant_exp` was stamped.
+    pub grant_active: Option<GrantActiveHook>,
 }
 
 pub(crate) struct StreamShared {
@@ -43,6 +50,7 @@ pub(crate) struct StreamShared {
     pub audit_path: RwLock<PathBuf>,
     pub consent: RwLock<ConsentMode>,
     pub on_audit: RwLock<Option<StreamAuditHook>>,
+    pub grant_active: RwLock<Option<GrantActiveHook>>,
 }
 
 pub struct StreamHandler {
@@ -80,6 +88,7 @@ impl StreamHandler {
                 audit_path: RwLock::new(PathBuf::new()),
                 consent: RwLock::new(ConsentMode::Deny),
                 on_audit: RwLock::new(None),
+                grant_active: RwLock::new(None),
             }),
             engine: Mutex::new(None),
         }
@@ -98,6 +107,40 @@ impl StreamHandler {
         if let Ok(mut hook) = self.shared.on_audit.write() {
             *hook = settings.on_audit;
         }
+        if let Ok(mut hook) = self.shared.grant_active.write() {
+            *hook = settings.grant_active;
+        }
+    }
+
+    pub fn set_grant_active(&self, hook: Option<GrantActiveHook>) {
+        if let Ok(mut slot) = self.shared.grant_active.write() {
+            *slot = hook;
+        }
+    }
+
+    pub fn close_sessions_for_jti(&self, jti: &str) -> usize {
+        let Ok(sessions) = self.sessions() else {
+            return 0;
+        };
+        let Ok(handle) = self.runtime_handle() else {
+            return 0;
+        };
+        let jti = jti.to_string();
+        std::thread::spawn(move || handle.block_on(sessions.close_sessions_for_jti(&jti)))
+            .join()
+            .unwrap_or(0)
+    }
+
+    pub fn close_expired_sessions(&self) -> usize {
+        let Ok(sessions) = self.sessions() else {
+            return 0;
+        };
+        let Ok(handle) = self.runtime_handle() else {
+            return 0;
+        };
+        std::thread::spawn(move || handle.block_on(sessions.close_expired_sessions()))
+            .join()
+            .unwrap_or(0)
     }
 
     pub fn set_policy(&self, policy: NodePolicy) {
@@ -194,6 +237,18 @@ pub fn update_stream_policy(extensions: &[Arc<dyn NodeExtension>], policy: NodeP
     if let Some(handler) = find(extensions) {
         handler.set_policy(policy);
     }
+}
+
+pub fn close_streams_for_jti(extensions: &[Arc<dyn NodeExtension>], jti: &str) -> usize {
+    find(extensions)
+        .map(|handler| handler.close_sessions_for_jti(jti))
+        .unwrap_or(0)
+}
+
+pub fn close_expired_streams(extensions: &[Arc<dyn NodeExtension>]) -> usize {
+    find(extensions)
+        .map(|handler| handler.close_expired_sessions())
+        .unwrap_or(0)
 }
 
 fn find(extensions: &[Arc<dyn NodeExtension>]) -> Option<&StreamHandler> {

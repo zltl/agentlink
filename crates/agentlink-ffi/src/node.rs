@@ -1210,14 +1210,20 @@ async fn perform(
         }
         Op::Extension { name, payload } => {
             let mut payload = payload.clone();
-            // Keep a relay-stamped session grant. Only default from the ceiling
-            // when the flag is absent (agent sessions without stamp_stream_flags).
+            // Overwrite flags from the verified policy. Drop any client
+            // `_grant_*` — this FFI path does not attach a node-verified jti.
             if name == PHASE3_WEBRTC_SIGNAL {
                 if let Some(obj) = payload.as_object_mut() {
-                    obj.entry("_allow_view".to_string())
-                        .or_insert_with(|| json!(policy.allows_remote_view()));
-                    obj.entry("_allow_control".to_string())
-                        .or_insert_with(|| json!(policy.allows_remote_control()));
+                    obj.insert(
+                        "_allow_view".to_string(),
+                        json!(policy.allows_remote_view()),
+                    );
+                    obj.insert(
+                        "_allow_control".to_string(),
+                        json!(policy.allows_remote_control()),
+                    );
+                    obj.remove("_grant_jti");
+                    obj.remove("_grant_exp");
                 }
             }
             let body =
@@ -1322,14 +1328,13 @@ async fn run_pty(
     rows: u16,
     cols: u16,
 ) -> Result<()> {
-    let session_id = resp.request_id.clone();
     let rows = rows.max(1);
     let cols = cols.max(1);
     let dir = match cwd {
         Some(path) if !path.is_empty() => paths::real_target(&paths.roots, path, false)?,
         _ => paths.roots.files.clone(),
     };
-    shells.open(&session_id, command, rows, cols, &dir)?;
+    let session_id = shells.open(command, rows, cols, &dir)?;
     if let Err(err) = resp
         .ack(json!({
             "session_id": session_id,

@@ -49,8 +49,9 @@ pub use input::{HidBackend as InputInjector, InputAction, MouseButton};
 pub use mock::MockDesktop;
 pub use session::{display_from_signals, has_display, DisplaySignals};
 pub use stream::{
-    configure_stream, register_frame_tap, unregister_frame_tap, update_stream_policy, ConsentMode,
-    StreamAudit, StreamHandler, StreamSettings, StreamTapEvent, TapId,
+    close_expired_streams, close_streams_for_jti, configure_stream, register_frame_tap, unregister_frame_tap,
+    update_stream_policy, ConsentMode, GrantActiveHook, StreamAudit, StreamHandler,
+    StreamSettings, StreamTapEvent, TapId,
 };
 
 /// Capture, input, and accessibility bound to one backend.

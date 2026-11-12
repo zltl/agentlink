@@ -98,11 +98,18 @@ pub fn load(args: NodeArgs) -> Result<NodeConfig> {
             .and_then(|v| v["root"].as_str())
             .map(PathBuf::from)
     });
+    // First-run (no saved node.json, or a pre-max_policy file with the key
+    // absent) keeps the historical default of `full` so a fresh node can be
+    // configured. A present but unreadable `max_policy` is fail-closed: do
+    // not start as `full`. Fix or remove the key, then restart.
     let max_policy = if let Some(access) = args.max_access {
         parse_access(&access)?
     } else if let Some(policy) = saved.as_ref().and_then(|v| v.get("max_policy")) {
-        serde_json::from_value(policy.clone())
-            .unwrap_or_else(|_| agentlink_core::NodePolicy::full())
+        serde_json::from_value(policy.clone()).map_err(|err| {
+            anyhow!(
+                "node.json max_policy is invalid ({err}); refusing to start.                  Repair or delete that key and restart. A missing key (first run                  or a pre-max_policy config) still defaults to full."
+            )
+        })?
     } else {
         agentlink_core::NodePolicy::full()
     };
@@ -126,6 +133,17 @@ pub fn load(args: NodeArgs) -> Result<NodeConfig> {
             audit_path: data_dir.join("audit.log"),
             consent,
             on_audit: Some(Arc::new(submit_stream_audit)),
+            grant_active: Some({
+                let dir = data_dir.clone();
+                Arc::new(move |jti: &str, _peer: &str| {
+                    match agentlink_core::grant::load_revoked_jtis(&dir) {
+                        Ok(revoked) => !revoked
+                            .iter()
+                            .any(|item| item.trim().eq_ignore_ascii_case(jti.trim())),
+                        Err(_) => false,
+                    }
+                })
+            }),
         },
     );
     let hooked = extensions.clone();

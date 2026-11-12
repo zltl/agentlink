@@ -32,12 +32,12 @@ pub struct PhonePty {
 impl PhonePty {
     pub fn open(
         &self,
-        session_id: &str,
         command: Option<&str>,
         rows: u16,
         cols: u16,
         cwd: &Path,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let session_id = uuid::Uuid::new_v4().to_string();
         #[cfg(unix)]
         {
             let live = unix::spawn(command, rows.max(1), cols.max(1), cwd)?;
@@ -45,14 +45,15 @@ impl PhonePty {
                 .sessions
                 .lock()
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
-            if let Some(previous) = sessions.insert(session_id.to_string(), live) {
+            if let Some(previous) = sessions.insert(session_id.clone(), live) {
                 unix::kill_live(previous);
             }
-            Ok(())
+            Ok(session_id)
         }
         #[cfg(not(unix))]
         {
-            let _ = (session_id, command, rows, cols, cwd);
+            let _ = (command, rows, cols, cwd);
+            let _ = session_id;
             Err(Error::Message("pty is only built for unix".into()))
         }
     }
@@ -411,12 +412,14 @@ mod tests {
     fn echo_and_winsize_use_a_real_pty() {
         let dir = tempfile::tempdir().unwrap();
         let pty = PhonePty::default();
-        pty.open("s", Some("echo hello-pty; stty size"), 30, 90, dir.path())
+        let sid = pty
+            .open(Some("echo hello-pty; stty size"), 30, 90, dir.path())
             .unwrap();
+        assert!(uuid::Uuid::parse_str(&sid).is_ok(), "{sid}");
         let mut out = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         let code = loop {
-            match pty.poll("s") {
+            match pty.poll(&sid) {
                 PtyPoll::Chunk(bytes) => out.extend(bytes),
                 PtyPoll::Exit(code) => break code,
                 PtyPoll::Pending => {
@@ -433,6 +436,6 @@ mod tests {
         assert_eq!(code, 0, "{text}");
         assert!(text.contains("hello-pty"), "{text}");
         assert!(text.contains("30 90"), "winsize was not applied: {text}");
-        pty.close("s").unwrap();
+        pty.close(&sid).unwrap();
     }
 }

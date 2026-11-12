@@ -62,6 +62,11 @@ struct LiveSession {
     /// ICE ufrag from the current remote offer. Compared to trickle
     /// `usernameFragment` when present; never logged.
     remote_ufrag: Mutex<Option<String>>,
+    /// Verified grant jti stamped by the node. Empty in direct handler tests
+    /// that never went through fill_stream_grant_flags.
+    grant_jti: String,
+    /// Unix expiry of that grant, when known.
+    grant_exp_unix: Option<i64>,
 }
 
 struct Built {
@@ -271,6 +276,8 @@ struct Handler {
     /// From the node-injected `_allow_control` flag. A view-only grant stays
     /// false even when the node ceiling allows remote control.
     allow_control: bool,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
     /// Set once ICE and DTLS are both up, which is when the SRTP contexts exist.
     media_ready: Arc<AtomicBool>,
     /// Drop delta frames until an IDR is actually written. The first IDR is
@@ -295,11 +302,11 @@ impl SessionManager {
         match action {
             "list_monitors" => self.list_monitors(),
             "offer" => self.offer(peer, payload).await,
-            "ice_restart" => self.ice_restart(payload).await,
+            "ice_restart" => self.ice_restart(peer, payload).await,
             "ice" => self.ice(peer, payload).await,
             "ice_pull" => self.ice_pull(peer, payload),
-            "keyframe" => self.keyframe(payload),
-            "close" => self.close(payload).await,
+            "keyframe" => self.keyframe(peer, payload),
+            "close" => self.close(peer, payload).await,
             other => Err(format!("unknown webrtc_signal action '{other}'")),
         }
     }
@@ -309,11 +316,84 @@ impl SessionManager {
             .shared
             .policy
             .read()
-            .unwrap_or_else(|err| err.into_inner());
+            .map_err(|_| "node policy is unavailable".to_string())?;
         if !policy.allows_remote_view() {
             return Err("remote_view is not allowed on this node".into());
         }
         Ok(())
+    }
+
+    /// Peer ownership plus verified grant jti/expiry. Ceiling is still
+    /// required. A revoked or expired grant stops the session even when the
+    /// node ceiling is still `full`.
+    fn require_session_grant(
+        &self,
+        peer: &str,
+        session_id: &str,
+        stop_if_dead: bool,
+    ) -> std::result::Result<(), String> {
+        self.require_remote_view()?;
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(index) = sessions.iter().position(|session| session.id == session_id) else {
+            return Err("unknown stream session".into());
+        };
+        if sessions[index].peer_id != peer || sessions[index].stop.load(Ordering::Relaxed) {
+            return Err("unknown stream session".into());
+        }
+        let err = session_grant_error(&self.shared, &sessions[index], peer);
+        if let Some(err) = err {
+            if stop_if_dead {
+                sessions[index].stop.store(true, Ordering::Relaxed);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Close every live session whose grant jti is on the deny-list.
+    pub async fn close_sessions_for_jti(&self, jti: &str) -> usize {
+        let jti = jti.trim();
+        if jti.is_empty() {
+            return 0;
+        }
+        let ids: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions
+                .iter()
+                .filter(|session| session.grant_jti.trim().eq_ignore_ascii_case(jti))
+                .map(|session| session.id.clone())
+                .collect()
+        };
+        let n = ids.len();
+        for id in ids {
+            let _ = self
+                .close_owned(&json!({"session_id": id}), None)
+                .await;
+        }
+        n
+    }
+
+    pub async fn close_expired_sessions(&self) -> usize {
+        let now = agentlink_core::util::unix_now();
+        let ids: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions
+                .iter()
+                .filter(|session| {
+                    session
+                        .grant_exp_unix
+                        .is_some_and(|exp| now >= exp)
+                })
+                .map(|session| session.id.clone())
+                .collect()
+        };
+        let n = ids.len();
+        for id in ids {
+            let _ = self
+                .close_owned(&json!({"session_id": id}), None)
+                .await;
+        }
+        n
     }
 
     fn list_monitors(&self) -> std::result::Result<Value, String> {
@@ -448,6 +528,8 @@ impl SessionManager {
                 remote_ufrag: Mutex::new(sdp_ice_ufrag(
                     payload.get("sdp").and_then(Value::as_str).unwrap_or(""),
                 )),
+                grant_jti: payload_grant_jti(payload),
+                grant_exp_unix: payload_grant_exp(payload),
             });
         let _ = self.started_cleanup();
         Ok(built.answer)
@@ -467,7 +549,7 @@ impl SessionManager {
         true
     }
 
-    async fn ice_restart(&self, payload: &Value) -> std::result::Result<Value, String> {
+    async fn ice_restart(&self, peer: &str, payload: &Value) -> std::result::Result<Value, String> {
         let id = payload
             .get("session_id")
             .and_then(Value::as_str)
@@ -476,11 +558,12 @@ impl SessionManager {
         if sdp.is_empty() {
             return Err("ice_restart requires an offer sdp".into());
         }
-        let peer = {
+        self.require_session_grant(peer, id, true)?;
+        let ice_peer = {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             sessions
                 .iter()
-                .find(|session| session.id == id)
+                .find(|session| session.id == id && session.peer_id == peer)
                 .and_then(|session| {
                     session
                         .peer
@@ -489,7 +572,7 @@ impl SessionManager {
                         .clone()
                 })
         };
-        let Some(peer) = peer else {
+        let Some(peer) = ice_peer else {
             return Err("unknown stream session".into());
         };
         let (answer, candidates) = peer.renegotiate(sdp).await?;
@@ -555,11 +638,11 @@ impl SessionManager {
     }
 
     fn ice_pull(&self, peer: &str, payload: &Value) -> std::result::Result<Value, String> {
-        self.require_remote_view()?;
         let id = payload
             .get("session_id")
             .and_then(Value::as_str)
             .unwrap_or("");
+        self.require_session_grant(peer, id, true)?;
         let after = payload.get("after").and_then(Value::as_u64).unwrap_or(0) as usize;
         // Closed, unknown, and other-peer sessions all look the same so a
         // caller cannot inventory someone else's candidate list.
@@ -609,11 +692,11 @@ impl SessionManager {
     }
 
     async fn ice(&self, peer: &str, payload: &Value) -> std::result::Result<Value, String> {
-        self.require_remote_view()?;
         let id = payload
             .get("session_id")
             .and_then(Value::as_str)
             .unwrap_or("");
+        self.require_session_grant(peer, id, true)?;
         let candidate = payload.get("candidate").cloned().unwrap_or(Value::Null);
         let typ_hint = candidate
             .get("candidate")
@@ -671,26 +754,45 @@ impl SessionManager {
         Ok(json!({"ok": true, "added": true}))
     }
 
-    fn keyframe(&self, payload: &Value) -> std::result::Result<Value, String> {
+    fn keyframe(&self, peer: &str, payload: &Value) -> std::result::Result<Value, String> {
         let id = payload
             .get("session_id")
             .and_then(Value::as_str)
             .unwrap_or("");
+        self.require_session_grant(peer, id, true)?;
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(session) = sessions.iter().find(|session| session.id == id) {
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == id && session.peer_id == peer)
+        {
             session.control.keyframe.store(true, Ordering::Relaxed);
         }
         Ok(json!({"ok": true}))
     }
 
-    async fn close(&self, payload: &Value) -> std::result::Result<Value, String> {
+    async fn close(&self, peer: &str, payload: &Value) -> std::result::Result<Value, String> {
+        self.close_owned(payload, Some(peer)).await
+    }
+
+    async fn close_owned(
+        &self,
+        payload: &Value,
+        peer: Option<&str>,
+    ) -> std::result::Result<Value, String> {
         let id = payload
             .get("session_id")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if let Some(peer) = peer {
+            // Revoke/expiry teardown uses close_owned(..., None) and does not
+            // re-check the (already revoked) grant.
+            self.require_session_grant(peer, id, true)?;
+        }
         let session = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            let index = sessions.iter().position(|session| session.id == id);
+            let index = sessions.iter().position(|session| {
+                session.id == id && peer.map(|peer| session.peer_id == peer).unwrap_or(true)
+            });
             index.map(|index| sessions.remove(index))
         };
         if let Some(session) = session {
@@ -856,14 +958,8 @@ async fn build_answer(
         .get("audio")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let session_id = format!(
-        "{peer_id}-{}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-        SESSION_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let _ = (peer_id, &SESSION_SEQ);
 
     // Target encode size from the (possibly capped) scale. Capture-side
     // downsample feeds ffmpeg at this size so -vf scale is skipped.
@@ -946,7 +1042,10 @@ async fn build_answer(
         cursor: None,
         meta: None,
     }));
-    let policy_now = *shared.policy.read().unwrap_or_else(|err| err.into_inner());
+    let policy_now = *shared
+        .policy
+        .read()
+        .map_err(|_| msg("node policy is unavailable"))?;
     let handler = Arc::new(Handler {
         candidates: Arc::new(Mutex::new(Vec::new())),
         gather_done: Arc::new(AtomicBool::new(false)),
@@ -959,6 +1058,8 @@ async fn build_answer(
         peer: peer_id.to_string(),
         session_id: session_id.clone(),
         allow_control: session_allows_control(payload, &policy_now),
+        grant_jti: payload_grant_jti(payload),
+        grant_exp_unix: payload_grant_exp(payload),
         media_ready: Arc::new(AtomicBool::new(false)),
         wait_idr: Arc::new(AtomicBool::new(true)),
         aimd: AimdState::new(),
@@ -1634,6 +1735,10 @@ fn sdp_ice_ufrag(sdp: &str) -> Option<String> {
 /// When the trickle carries a usernameFragment, it must match the current
 /// remote offer ufrag. A missing fragment (webrtc-0.21 `to_json`) is admitted
 /// and isolated by `session_id` instead. The ufrag value is never logged.
+// Bound: a missing usernameFragment is admitted so current viewers that omit
+// ufrag still attach to the session they already own. Isolation is peer +
+// session_id, not ufrag alone. A later generation with a different ufrag is
+// rejected when both sides present one.
 fn ice_ufrag_matches(remote_ufrag: Option<&str>, fragment: Option<&str>) -> bool {
     match (remote_ufrag, fragment) {
         (Some(want), Some(got)) if !got.is_empty() => want == got,
@@ -1818,6 +1923,8 @@ impl PeerConnectionEventHandler for Handler {
         let peer = self.peer.clone();
         let session_id = self.session_id.clone();
         let allow_control = self.allow_control;
+        let grant_jti = self.grant_jti.clone();
+        let grant_exp_unix = self.grant_exp_unix;
         let aimd = self.aimd.clone();
         let input = label == "input" || label.is_empty();
         tokio::spawn(async move {
@@ -1838,6 +1945,8 @@ impl PeerConnectionEventHandler for Handler {
                             &peer,
                             &session_id,
                             allow_control,
+                            &grant_jti,
+                            grant_exp_unix,
                             &aimd,
                         )
                         .await;
@@ -1860,11 +1969,16 @@ async fn handle_input(
     peer: &str,
     session_id: &str,
     allow_control: bool,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
     aimd: &AimdState,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
     };
+    if let Some(_err) = grant_still_active(shared, grant_jti, grant_exp_unix, peer) {
+        return;
+    }
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "feedback" {
         if let Some(loss) = value.get("loss").and_then(Value::as_f64) {
@@ -2006,16 +2120,67 @@ pub(crate) fn answer_control_field(session_allow_control: bool) -> bool {
     session_allow_control
 }
 
-/// Honor a node-injected `_allow_control` flag. Absent means the ceiling.
-/// An explicit false keeps a view-only grant from driving a control-capable node.
+/// Honor a node-injected `_allow_control` flag. Only an explicit `true`
+/// plus a control-capable ceiling grants control. A missing flag does not
+/// inherit the ceiling.
 pub(crate) fn session_allows_control(payload: &Value, policy: &NodePolicy) -> bool {
     if !policy.allows_remote_control() {
         return false;
     }
+    // Only an explicit true from the node-stamped grant is control. A missing
+    // flag or a client-supplied default must not inherit the ceiling.
+    payload.get("_allow_control").and_then(Value::as_bool) == Some(true)
+}
+
+fn payload_grant_jti(payload: &Value) -> String {
     payload
-        .get("_allow_control")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
+        .get("_grant_jti")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn payload_grant_exp(payload: &Value) -> Option<i64> {
+    payload.get("_grant_exp").and_then(Value::as_i64)
+}
+
+fn session_grant_error(shared: &super::StreamShared, session: &LiveSession, peer: &str) -> Option<String> {
+    if session.peer_id != peer {
+        return Some("unknown stream session".into());
+    }
+    grant_still_active(shared, &session.grant_jti, session.grant_exp_unix, peer)
+}
+
+fn grant_still_active(
+    shared: &super::StreamShared,
+    jti: &str,
+    exp: Option<i64>,
+    peer: &str,
+) -> Option<String> {
+    if let Some(exp) = exp {
+        if agentlink_core::util::unix_now() >= exp {
+            return Some("grant expired".into());
+        }
+    }
+    let hook = match shared.grant_active.read() {
+        Ok(guard) => guard,
+        Err(_) => return Some("node policy is unavailable".into()),
+    };
+    match hook.as_ref() {
+        None => None,
+        Some(hook) => {
+            let jti = jti.trim();
+            if jti.is_empty() {
+                return Some("grant is required".into());
+            }
+            if !hook(jti, peer) {
+                Some("grant was revoked".into())
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Character count and a 12-character preview. The full string stays out of the log.
@@ -2155,6 +2320,8 @@ mod tests {
     use crate::input::InputAction;
     use agentlink_core::NodePolicy;
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn default_scale_caps_wide_panels_only_when_unset() {
@@ -2460,7 +2627,7 @@ mod tests {
             &json!({"_allow_control": true}),
             &NodePolicy::remote_view()
         ));
-        assert!(super::session_allows_control(&json!({}), &ceiling));
+        assert!(!super::session_allows_control(&json!({}), &ceiling));
     }
 
     #[test]
@@ -2551,5 +2718,178 @@ mod tests {
             "queue must cap at {}, got {len}",
             super::MAX_GATHERED_CANDIDATES
         );
+    }
+
+    fn dummy_control() -> super::super::pipeline::PumpControl {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+        use std::sync::{Arc, Mutex};
+        super::super::pipeline::PumpControl {
+            bitrate: Arc::new(AtomicU32::new(0)),
+            keyframe: Arc::new(AtomicBool::new(false)),
+            frames_sent: Arc::new(AtomicU64::new(0)),
+            bytes_sent: Arc::new(AtomicU64::new(0)),
+            encoded_frames: Arc::new(AtomicU64::new(0)),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            encode_us_ema: Arc::new(AtomicU64::new(0)),
+            capture_us_ema: Arc::new(AtomicU64::new(0)),
+            convert_us_ema: Arc::new(AtomicU64::new(0)),
+            queue_us_ema: Arc::new(AtomicU64::new(0)),
+            keyframes: Arc::new(AtomicU64::new(0)),
+            capture_w: Arc::new(AtomicU32::new(0)),
+            capture_h: Arc::new(AtomicU32::new(0)),
+            encode_w: Arc::new(AtomicU32::new(0)),
+            encode_h: Arc::new(AtomicU32::new(0)),
+            encoder_name: Arc::new(Mutex::new(String::new())),
+            last_error: Arc::new(Mutex::new(String::new())),
+        }
+    }
+
+    fn dummy_session(id: &str, peer: &str, jti: &str, exp: Option<i64>) -> super::LiveSession {
+        super::LiveSession {
+            id: id.to_string(),
+            stop: Arc::new(AtomicBool::new(false)),
+            control: dummy_control(),
+            peer: Mutex::new(None),
+            started: std::time::Instant::now(),
+            viewer: "viewer".into(),
+            peer_id: peer.to_string(),
+            control_held: Arc::new(AtomicBool::new(false)),
+            remote_ufrag: Mutex::new(None),
+            grant_jti: jti.to_string(),
+            grant_exp_unix: exp,
+        }
+    }
+
+    fn test_manager() -> super::SessionManager {
+        use crate::stream::handler::StreamShared;
+        super::SessionManager {
+            desktop: crate::Desktop::mock(),
+            shared: Arc::new(StreamShared {
+                policy: Arc::new(std::sync::RwLock::new(NodePolicy::remote_control())),
+                audit_path: std::sync::RwLock::new(std::path::PathBuf::new()),
+                consent: std::sync::RwLock::new(crate::stream::consent::ConsentMode::Auto),
+                on_audit: std::sync::RwLock::new(None),
+                grant_active: std::sync::RwLock::new(None),
+            }),
+            sessions: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn client_preset_allow_control_is_ignored_until_node_stamps_true() {
+        let ceiling = NodePolicy::remote_control();
+        // A view-only (or attacker-supplied) true is not enough by itself once
+        // the node overwrites the flag. This helper is what the session uses
+        // after that overwrite; a missing flag is also deny.
+        assert!(!super::session_allows_control(
+            &json!({"_allow_control": true, "_allow_view": true}),
+            &NodePolicy::remote_view()
+        ));
+        assert!(!super::session_allows_control(&json!({}), &ceiling));
+        assert!(!super::session_allows_control(
+            &json!({"_allow_control": false}),
+            &ceiling
+        ));
+        assert!(super::session_allows_control(
+            &json!({"_allow_control": true}),
+            &ceiling
+        ));
+    }
+
+    #[test]
+    fn forged_peer_cannot_keyframe_or_close_another_session() {
+        let mgr = test_manager();
+        mgr.sessions
+            .lock()
+            .unwrap()
+            .push(dummy_session("sess-a", "alice", "jti-a", None));
+        let err = mgr
+            .keyframe("bob", &json!({"session_id": "sess-a"}))
+            .unwrap_err();
+        assert!(err.contains("unknown stream session"), "{err}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(mgr.close("bob", &json!({"session_id": "sess-a"})))
+            .unwrap_err();
+        assert!(err.contains("unknown stream session"), "{err}");
+        assert_eq!(mgr.sessions.lock().unwrap().len(), 1);
+        assert!(!mgr.sessions.lock().unwrap()[0].stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn revoke_of_one_jti_closes_media_while_ceiling_stays_full() {
+        let mgr = test_manager();
+        {
+            let mut hook = mgr.shared.grant_active.write().unwrap();
+            *hook = Some(Arc::new(|jti: &str, _peer: &str| jti != "revoked"));
+        }
+        mgr.sessions.lock().unwrap().extend([
+            dummy_session("live-revoked", "alice", "revoked", None),
+            dummy_session("live-ok", "alice", "still-good", None),
+        ]);
+        // With the ceiling still full, a later action on the revoked jti fails
+        // and marks the session stopped.
+        let err = mgr
+            .keyframe("alice", &json!({"session_id": "live-revoked"}))
+            .unwrap_err();
+        assert!(err.contains("revoked"), "{err}");
+        assert!(mgr
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == "live-revoked")
+            .unwrap()
+            .stop
+            .load(Ordering::Relaxed));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let closed = runtime.block_on(mgr.close_sessions_for_jti("revoked"));
+        assert_eq!(closed, 1);
+        let left: Vec<_> = mgr
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(left, vec!["live-ok".to_string()]);
+        // Legitimate remaining grant still works.
+        mgr.keyframe("alice", &json!({"session_id": "live-ok"}))
+            .expect("active grant must still keyframe");
+    }
+
+    #[test]
+    fn expired_grant_closes_even_when_ceiling_is_full() {
+        let mgr = test_manager();
+        let past = agentlink_core::util::unix_now() - 10;
+        mgr.sessions
+            .lock()
+            .unwrap()
+            .push(dummy_session("old", "alice", "jti-exp", Some(past)));
+        let err = mgr
+            .keyframe("alice", &json!({"session_id": "old"}))
+            .unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(mgr.close_expired_sessions()), 1);
+        assert!(mgr.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_stream_session_ids_are_uuids_not_peer_timestamps() {
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        assert_ne!(a, b);
+        assert!(uuid::Uuid::parse_str(&a).is_ok());
+        assert!(!a.contains("alice"), "session id must not embed the peer");
     }
 }

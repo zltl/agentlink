@@ -154,6 +154,7 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
         pty: PtyManager::default(),
         cancels: Arc::new(Mutex::new(HashMap::new())),
         grant_sessions: Mutex::new(HashMap::new()),
+        extensions: config.extensions.clone(),
     });
     pipeline::spawn_recorder(service.clone(), config.capture.clone());
 
@@ -292,6 +293,7 @@ struct Live {
     cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// jti -> in-flight request ids. A local revoke closes these.
     grant_sessions: Mutex<HashMap<String, Vec<(String, CancellationToken)>>>,
+    extensions: Vec<Arc<dyn NodeExtension>>,
 }
 
 impl Live {
@@ -940,7 +942,17 @@ async fn handle_env(
             // client_id the relay wrote on the outer envelope.
             let grantee = seal_ref.peer.clone();
             let _relay_says = (&client_id, relay_admin, relay_grant);
-            let ceiling = policy.read().map(|g| *g).unwrap_or(NodePolicy::full());
+            let ceiling = policy.read().ok().map(|g| *g);
+            let Some(ceiling) = ceiling else {
+                let deny = Envelope::result_err(
+                    request_id.clone(),
+                    "node policy is unavailable",
+                );
+                if let Ok(out) = ws::encode(&deny) {
+                    let _ = tx.send(out).await;
+                }
+                return;
+            };
             let owner_keys = live.current_owner_keys();
             let revoked_jtis = live.current_revoked_jtis();
             let policy_now = match agentlink_core::grant::resolve_e2e_policy(
@@ -990,6 +1002,9 @@ async fn handle_env(
             let node_name = live.node_name.clone();
             let node_id = live.node_id.clone();
             let audit = live.service.clone();
+            let peer_id = grantee.clone();
+            let grant_jti = authz.as_ref().map(|g| g.jti.clone());
+            let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
             let confirm_wait = confirm_category.map(|category| {
                 let approval_id = Uuid::new_v4().to_string();
                 let (wait_tx, wait_rx) = oneshot::channel();
@@ -1061,6 +1076,9 @@ async fn handle_env(
                         audit: audit.clone(),
                         user: user.clone(),
                         device_id: device_id.clone(),
+                        peer_id: &peer_id,
+                        grant_jti: grant_jti.as_deref(),
+                        grant_exp_unix,
                     },
                 )
                 .await;
@@ -1103,7 +1121,10 @@ async fn handle_env(
             let _relay_says = (&client_id, relay_admin, relay_grant);
             let owner_keys = live.current_owner_keys();
             let policy_now = {
-                let ceiling = policy.read().map(|g| *g).unwrap_or(NodePolicy::full());
+                let Some(ceiling) = policy.read().ok().map(|g| *g) else {
+                    tracing::error!("node policy lock poisoned; denying transfer");
+                    return;
+                };
                 let revoked_jtis = live.current_revoked_jtis();
                 match agentlink_core::grant::resolve_e2e_policy(
                     &owner_keys,
@@ -1154,22 +1175,24 @@ async fn handle_env(
 
 fn sweep_revoked_sessions(live: &Live) {
     let revoked = live.current_revoked_jtis();
-    let Some(mut sessions) = live.grant_sessions.lock().ok() else {
-        return;
-    };
-    sessions.retain(|jti, inflight| {
-        let dead = revoked
-            .iter()
-            .any(|item| item.trim().eq_ignore_ascii_case(jti.trim()));
-        if !dead {
-            return true;
-        }
-        for (request_id, token) in inflight.drain(..) {
-            token.cancel();
-            live.pty.close(&request_id).ok();
-        }
-        false
-    });
+    if let Ok(mut sessions) = live.grant_sessions.lock() {
+        sessions.retain(|jti, inflight| {
+            let dead = revoked
+                .iter()
+                .any(|item| item.trim().eq_ignore_ascii_case(jti.trim()));
+            if !dead {
+                return true;
+            }
+            for (_request_id, token) in inflight.drain(..) {
+                token.cancel();
+            }
+            live.pty.close_for_jti(jti);
+            let _ = agentlink_desktop::close_streams_for_jti(&live.extensions, jti);
+            false
+        });
+    }
+    live.pty.close_expired();
+    let _ = agentlink_desktop::close_expired_streams(&live.extensions);
 }
 
 async fn replay_log(

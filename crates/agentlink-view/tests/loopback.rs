@@ -37,6 +37,7 @@ fn mock_desktop_delivers_an_idr_and_a_mouse() {
                 .unwrap_or_else(|err| err.into_inner())
                 .push(event.action.clone());
         })),
+        grant_active: None,
     });
 
     let viewer = Viewer::connect(
@@ -242,7 +243,9 @@ fn view_handler() -> Arc<StreamHandler> {
         audit_path: std::env::temp_dir().join("agentlink-view-loopback-ice.log"),
         consent: ConsentMode::Auto,
         on_audit: None,
-    });
+    
+            grant_active: None,
+        });
     handler
 }
 
@@ -1038,7 +1041,9 @@ fn offer_and_ice_pull_without_a_handler_grant_are_rejected() {
         audit_path: std::env::temp_dir().join("agentlink-view-loopback-nogrant.log"),
         consent: ConsentMode::Auto,
         on_audit: None,
-    });
+    
+            grant_active: None,
+        });
     let offer = handler.handle_peer(
         &serde_json::json!({
             "action": "offer",

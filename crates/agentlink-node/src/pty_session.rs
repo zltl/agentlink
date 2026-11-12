@@ -24,6 +24,9 @@ struct LivePty {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
 }
 
 #[derive(Clone, Default)]
@@ -35,7 +38,6 @@ impl PtyManager {
     #[allow(clippy::too_many_arguments)]
     pub async fn open(
         &self,
-        session_id: &str,
         command: Option<String>,
         cwd: Option<PathBuf>,
         rows: u16,
@@ -44,7 +46,13 @@ impl PtyManager {
         origin: Origin,
         agent: Option<String>,
         service: Arc<AuditService>,
-    ) -> Result<()> {
+        owner_peer: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
+    ) -> Result<String> {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let owner_peer = owner_peer.to_string();
+        let grant_jti = grant_jti.trim().to_string();
         let (rows, cols) = normalize_pty_size(rows, cols);
         let started = Instant::now();
         let command_line = command.clone().unwrap_or_else(default_shell);
@@ -67,9 +75,7 @@ impl PtyManager {
                 {
                     // portable-pty has no raw_arg; argv quoting would mangle user
                     // quotes. Run the line from a temp .cmd instead.
-                    let bat = std::env::temp_dir().join(format!(
-                        "agentlink-pty-{session_id}.cmd"
-                    ));
+                    let bat = windows_pty_script_path(&session_id);
                     std::fs::write(&bat, format!("{line}\r\n")).map_err(|e| {
                         Error::Message(format!("pty script: {e}"))
                     })?;
@@ -126,6 +132,9 @@ impl PtyManager {
                     master,
                     writer: Arc::new(Mutex::new(writer)),
                     killer,
+                    owner_peer: owner_peer.clone(),
+                    grant_jti: grant_jti.clone(),
+                    grant_exp_unix,
                 },
             );
         }
@@ -140,7 +149,7 @@ impl PtyManager {
             }))
             .await
         {
-            self.close(session_id).ok();
+            self.close(&session_id, None).ok();
             tokio::task::spawn_blocking(move || {
                 let _ = child.wait();
             });
@@ -223,19 +232,20 @@ impl PtyManager {
             service.submit(event);
             let _ = resp.end(code, error).await;
         });
-        Ok(())
+        Ok(session_id)
     }
 
-    pub fn write(&self, session_id: &str, data: &[u8]) -> Result<()> {
+    pub fn write(&self, session_id: &str, data: &[u8], peer: &str) -> Result<()> {
         let writer = {
             let sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
-            sessions
+            let live = sessions
                 .get(session_id)
-                .map(|live| live.writer.clone())
-                .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?
+                .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
+            require_pty_access(live, Some(peer))?;
+            live.writer.clone()
         };
         let mut guard = writer
             .lock()
@@ -245,16 +255,17 @@ impl PtyManager {
         Ok(())
     }
 
-    pub fn resize(&self, session_id: &str, rows: u16, cols: u16) -> Result<()> {
+    pub fn resize(&self, session_id: &str, rows: u16, cols: u16, peer: &str) -> Result<()> {
         let master = {
             let sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
-            sessions
+            let live = sessions
                 .get(session_id)
-                .map(|live| live.master.clone())
-                .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?
+                .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
+            require_pty_access(live, Some(peer))?;
+            live.master.clone()
         };
         let guard = master
             .lock()
@@ -270,18 +281,70 @@ impl PtyManager {
         Ok(())
     }
 
-    pub fn close(&self, session_id: &str) -> Result<()> {
+    pub fn close(&self, session_id: &str, peer: Option<&str>) -> Result<()> {
         let mut live = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
+            if let Some(existing) = sessions.get(session_id) {
+                require_pty_access(existing, peer)?;
+            }
             sessions.remove(session_id)
         };
         if let Some(live) = live.as_mut() {
             live.killer.kill().ok();
         }
         Ok(())
+    }
+
+    pub fn close_for_jti(&self, jti: &str) -> usize {
+        let jti = jti.trim();
+        if jti.is_empty() {
+            return 0;
+        }
+        let victims = {
+            let mut sessions = match self.sessions.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let ids: Vec<String> = sessions
+                .iter()
+                .filter(|(_, live)| live.grant_jti.trim().eq_ignore_ascii_case(jti))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| sessions.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let n = victims.len();
+        for mut live in victims {
+            live.killer.kill().ok();
+        }
+        n
+    }
+
+    pub fn close_expired(&self) -> usize {
+        let now = agentlink_core::util::unix_now();
+        let victims = {
+            let mut sessions = match self.sessions.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let ids: Vec<String> = sessions
+                .iter()
+                .filter(|(_, live)| live.grant_exp_unix.is_some_and(|exp| now >= exp))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| sessions.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let n = victims.len();
+        for mut live in victims {
+            live.killer.kill().ok();
+        }
+        n
     }
 
     pub fn close_all(&self) {
@@ -293,6 +356,41 @@ impl PtyManager {
             live.killer.kill().ok();
         }
     }
+}
+
+fn require_pty_access(live: &LivePty, peer: Option<&str>) -> Result<()> {
+    pty_access_error(&live.owner_peer, live.grant_exp_unix, peer)
+}
+
+fn pty_access_error(owner_peer: &str, grant_exp_unix: Option<i64>, peer: Option<&str>) -> Result<()> {
+    if let Some(peer) = peer {
+        if owner_peer != peer {
+            return Err(Error::NotFound(
+                "pty session not found for this peer".into(),
+            ));
+        }
+    }
+    if let Some(exp) = grant_exp_unix {
+        if agentlink_core::util::unix_now() >= exp {
+            return Err(Error::Auth("grant expired".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Windows temp script name uses only a UUID stem. Client request ids, path
+/// separators, and `..` never reach `temp_dir().join`.
+fn windows_pty_script_path(session_id: &str) -> PathBuf {
+    let stem = safe_pty_script_stem(session_id);
+    std::env::temp_dir().join(format!("agentlink-pty-{stem}.cmd"))
+}
+
+fn safe_pty_script_stem(session_id: &str) -> String {
+    let trimmed = session_id.trim();
+    if uuid::Uuid::parse_str(trimmed).is_ok() {
+        return trimmed.to_ascii_lowercase();
+    }
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn default_shell() -> String {
@@ -374,5 +472,44 @@ mod tests {
         assert_eq!(normalize_pty_size(0, 120), (24, 120));
         assert_eq!(normalize_pty_size(40, 1), (40, 80));
         assert_eq!(normalize_pty_size(30, 100), (30, 100));
+    }
+
+    #[test]
+    fn windows_pty_script_path_rejects_traversal_and_uses_uuid() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = windows_pty_script_path(&id);
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("agentlink-pty-"));
+        assert!(path.extension().and_then(|e| e.to_str()) == Some("cmd"));
+        let bad = windows_pty_script_path("..\\..\\evil");
+        assert_eq!(bad.parent(), Some(std::env::temp_dir().as_path()));
+        let name = bad.file_name().unwrap().to_string_lossy();
+        assert!(!name.contains("evil"), "{name}");
+        assert!(!name.contains(".."), "{name}");
+        assert!(uuid::Uuid::parse_str(
+            name
+                .trim_start_matches("agentlink-pty-")
+                .trim_end_matches(".cmd")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn alice_cannot_access_bobs_pty_record() {
+        let err = pty_access_error("bob", None, Some("alice")).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        pty_access_error("bob", None, Some("bob")).unwrap();
+        pty_access_error("bob", None, None).unwrap();
+        let err = pty_access_error(
+            "bob",
+            Some(agentlink_core::util::unix_now() - 5),
+            Some("bob"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
     }
 }

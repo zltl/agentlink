@@ -26,7 +26,8 @@ mod videotoolbox;
 
 pub use consent::ConsentMode;
 pub use handler::{
-    configure_stream, update_stream_policy, StreamAudit, StreamHandler, StreamSettings,
+    close_expired_streams, close_streams_for_jti, configure_stream, update_stream_policy, GrantActiveHook, StreamAudit,
+    StreamHandler, StreamSettings,
 };
 pub use tap::{register_frame_tap, unregister_frame_tap, StreamTapEvent, TapId};
 

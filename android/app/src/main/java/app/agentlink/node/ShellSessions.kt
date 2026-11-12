@@ -15,7 +15,9 @@ class ShellSessions {
     private val sessions = ConcurrentHashMap<String, Running>()
 
     fun open(kind: String, payload: JSONObject, allowShizuku: Boolean, allowRoot: Boolean): String {
-        val id = payload.optString("session_id").ifBlank { java.util.UUID.randomUUID().toString() }
+        // Always a server-generated UUID. Client session_id is ignored so it
+        // cannot be used as a map key or a file name.
+        val id = java.util.UUID.randomUUID().toString()
         val cwd = payload.optString("cwd").ifBlank { null }
         val env = envPairs(payload.optJSONArray("env"))
         val plan = when (kind) {

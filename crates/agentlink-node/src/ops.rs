@@ -141,6 +141,10 @@ pub struct OpContext<'a> {
     pub audit: Arc<AuditService>,
     pub user: Option<String>,
     pub device_id: Option<String>,
+    /// End-to-end peer (grantee), not the relay's outer client_id.
+    pub peer_id: &'a str,
+    pub grant_jti: Option<&'a str>,
+    pub grant_exp_unix: Option<i64>,
 }
 
 struct Finished {
@@ -267,17 +271,17 @@ pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: O
         Op::PtyInput {
             session_id,
             data_b64,
-        } => pty_input(&resp, ctx.pty, &session_id, &data_b64)
+        } => pty_input(&resp, ctx.pty, ctx.peer_id, &session_id, &data_b64)
             .await
             .map(|()| already(Outcome::ok(Value::Null))),
         Op::PtyResize {
             session_id,
             rows,
             cols,
-        } => pty_resize(&resp, ctx.pty, &session_id, rows, cols)
+        } => pty_resize(&resp, ctx.pty, ctx.peer_id, &session_id, rows, cols)
             .await
             .map(|()| already(Outcome::ok(Value::Null))),
-        Op::PtyClose { session_id } => pty_close(&resp, ctx.pty, &session_id)
+        Op::PtyClose { session_id } => pty_close(&resp, ctx.pty, ctx.peer_id, &session_id)
             .await
             .map(|()| already(Outcome::ok(Value::Null))),
         Op::Search {
@@ -405,7 +409,12 @@ pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: O
         )),
         Op::Extension { name, mut payload } => {
             if name == agentlink_core::PHASE3_WEBRTC_SIGNAL {
-                fill_stream_grant_flags(&mut payload, ctx.policy);
+                fill_stream_grant_flags(
+                    &mut payload,
+                    ctx.policy,
+                    ctx.grant_jti,
+                    ctx.grant_exp_unix,
+                );
             }
             extension_op(&resp, ctx.extensions, &name, &payload, ctx.client_id)
                 .await
@@ -1321,14 +1330,13 @@ async fn pty_open(
     rows: u16,
     cols: u16,
 ) -> Result<Finished> {
-    let session_id = resp.request_id.clone();
     let command_line = command.clone().unwrap_or_else(|| default_shell_name());
     let (program, args) = shell_parts(&command_line);
     allow_command(ctx.commands, &program, &args, command.is_some())?;
     let (cwd_path, cwd_display) = confine_cwd(ctx.root, cwd.as_deref())?;
-    ctx.pty
+    let session_id = ctx
+        .pty
         .open(
-            &session_id,
             command,
             cwd_path,
             rows,
@@ -1337,6 +1345,9 @@ async fn pty_open(
             origin_of(ctx),
             Some(ctx.client_id.to_string()),
             ctx.audit.clone(),
+            ctx.peer_id,
+            ctx.grant_jti.unwrap_or(""),
+            ctx.grant_exp_unix,
         )
         .await?;
     Ok(already(
@@ -1360,11 +1371,12 @@ fn default_shell_name() -> String {
 async fn pty_input(
     resp: &Responder,
     pty: &PtyManager,
+    peer: &str,
     session_id: &str,
     data_b64: &str,
 ) -> Result<()> {
     let data = util::b64_decode(data_b64)?;
-    pty.write(session_id, &data)?;
+    pty.write(session_id, &data, peer)?;
     resp.ok(serde_json::json!({"bytes": data.len()})).await?;
     Ok(())
 }
@@ -1372,18 +1384,19 @@ async fn pty_input(
 async fn pty_resize(
     resp: &Responder,
     pty: &PtyManager,
+    peer: &str,
     session_id: &str,
     rows: u16,
     cols: u16,
 ) -> Result<()> {
-    pty.resize(session_id, rows, cols)?;
+    pty.resize(session_id, rows, cols, peer)?;
     resp.ok(serde_json::json!({"rows": rows, "cols": cols}))
         .await?;
     Ok(())
 }
 
-async fn pty_close(resp: &Responder, pty: &PtyManager, session_id: &str) -> Result<()> {
-    pty.close(session_id)?;
+async fn pty_close(resp: &Responder, pty: &PtyManager, peer: &str, session_id: &str) -> Result<()> {
+    pty.close(session_id, Some(peer))?;
     resp.ok(serde_json::json!({"closed": session_id})).await?;
     Ok(())
 }
@@ -1461,16 +1474,33 @@ fn full_display(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-/// Keep a relay-stamped session grant. Only default from the node ceiling when
-/// the flag is absent (agent sessions without `stamp_stream_flags`).
-pub(crate) fn fill_stream_grant_flags(payload: &mut Value, policy: NodePolicy) {
+/// Overwrite view/control flags from the verified grant (clipped by the node
+/// ceiling). Client-supplied `_allow_*` and `_grant_*` fields are discarded.
+pub(crate) fn fill_stream_grant_flags(
+    payload: &mut Value,
+    policy: NodePolicy,
+    grant_jti: Option<&str>,
+    grant_exp_unix: Option<i64>,
+) {
     let Some(obj) = payload.as_object_mut() else {
         return;
     };
-    obj.entry("_allow_view".to_string())
-        .or_insert_with(|| serde_json::json!(policy.allows_remote_view()));
-    obj.entry("_allow_control".to_string())
-        .or_insert_with(|| serde_json::json!(policy.allows_remote_control()));
+    obj.insert(
+        "_allow_view".to_string(),
+        serde_json::json!(policy.allows_remote_view()),
+    );
+    obj.insert(
+        "_allow_control".to_string(),
+        serde_json::json!(policy.allows_remote_control()),
+    );
+    obj.remove("_grant_jti");
+    obj.remove("_grant_exp");
+    if let Some(jti) = grant_jti.map(str::trim).filter(|s| !s.is_empty()) {
+        obj.insert("_grant_jti".to_string(), serde_json::json!(jti));
+    }
+    if let Some(exp) = grant_exp_unix {
+        obj.insert("_grant_exp".to_string(), serde_json::json!(exp));
+    }
 }
 
 #[cfg(test)]
@@ -1734,16 +1764,40 @@ mod tests {
 
 
     #[test]
-    fn stream_grant_flags_preserve_relay_stamp_over_ceiling() {
+    fn stream_grant_flags_overwrite_client_fields_from_verified_grant() {
         let ceiling = NodePolicy::full();
-        let mut stamped = json!({"_allow_view": true, "_allow_control": false});
-        fill_stream_grant_flags(&mut stamped, ceiling);
+        // Attacker / view-only client pre-sets control true: the node overwrites
+        // from the verified grant (here a view-only policy).
+        let mut stamped = json!({
+            "_allow_view": true,
+            "_allow_control": true,
+            "_grant_jti": "forged",
+            "_grant_exp": 9999999999i64
+        });
+        fill_stream_grant_flags(&mut stamped, NodePolicy::remote_view(), Some("real-jti"), Some(42));
         assert_eq!(stamped["_allow_control"], json!(false));
         assert_eq!(stamped["_allow_view"], json!(true));
+        assert_eq!(stamped["_grant_jti"], json!("real-jti"));
+        assert_eq!(stamped["_grant_exp"], json!(42));
 
-        let mut bare = json!({"action": "offer"});
-        fill_stream_grant_flags(&mut bare, ceiling);
+        let mut bare = json!({"action": "offer", "_grant_jti": "forged"});
+        fill_stream_grant_flags(&mut bare, ceiling, Some("ok"), None);
         assert_eq!(bare["_allow_control"], json!(true));
+        assert_eq!(bare["_allow_view"], json!(true));
+        assert_eq!(bare["_grant_jti"], json!("ok"));
+        assert!(bare.get("_grant_exp").is_none());
+
+        let mut no_grant = json!({"_allow_control": true, "_grant_jti": "forged"});
+        fill_stream_grant_flags(&mut no_grant, ceiling, None, None);
+        assert_eq!(no_grant["_allow_control"], json!(true));
+        assert!(no_grant.get("_grant_jti").is_none());
+    }
+
+    #[test]
+    fn stream_grant_flags_missing_client_flags_do_not_stay_true_on_view_only() {
+        let mut bare = json!({"action": "offer"});
+        fill_stream_grant_flags(&mut bare, NodePolicy::remote_view(), Some("j"), None);
+        assert_eq!(bare["_allow_control"], json!(false));
         assert_eq!(bare["_allow_view"], json!(true));
     }
 

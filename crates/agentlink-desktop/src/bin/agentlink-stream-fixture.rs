@@ -24,7 +24,9 @@ fn main() {
         audit_path: std::env::temp_dir().join("agentlink-stream-fixture-audit.log"),
         consent: ConsentMode::Auto,
         on_audit: None,
-    });
+    
+            grant_active: None,
+        });
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
