@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::audit::{self, Origin};
-use crate::ops::Responder;
 #[cfg(not(windows))]
 use crate::ops::shell_parts;
+use crate::ops::Responder;
 use crate::pipeline::AuditService;
 use crate::proc::push_capped;
 use agentlink_core::util;
@@ -45,7 +45,10 @@ impl PtyManager {
     }
 
     fn grant_hook(&self) -> Option<PtyGrantHook> {
-        self.grant_active.read().ok().and_then(|guard| guard.clone())
+        self.grant_active
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -89,9 +92,8 @@ impl PtyManager {
                     // portable-pty has no raw_arg; argv quoting would mangle user
                     // quotes. Run the line from a temp .cmd instead.
                     let bat = windows_pty_script_path(&session_id);
-                    std::fs::write(&bat, format!("{line}\r\n")).map_err(|e| {
-                        Error::Message(format!("pty script: {e}"))
-                    })?;
+                    std::fs::write(&bat, format!("{line}\r\n"))
+                        .map_err(|e| Error::Message(format!("pty script: {e}")))?;
                     windows_pty_script = Some(bat.clone());
                     let mut cmd = CommandBuilder::new("cmd.exe");
                     cmd.arg("/D");
@@ -623,8 +625,7 @@ mod tests {
         assert!(!name.contains("evil"), "{name}");
         assert!(!name.contains(".."), "{name}");
         assert!(uuid::Uuid::parse_str(
-            name
-                .trim_start_matches("agentlink-pty-")
+            name.trim_start_matches("agentlink-pty-")
                 .trim_end_matches(".cmd")
         )
         .is_ok());
@@ -729,7 +730,10 @@ mod tests {
         revoked_set.insert("jti-bob".into());
         assert_eq!(mgr.close_inactive(&revoked_set), 1);
         let err = mgr.write(&bob, b"x", "bob").unwrap_err();
-        assert!(err.to_string().contains("not found") || err.to_string().contains("pty session"), "{err}");
+        assert!(
+            err.to_string().contains("not found") || err.to_string().contains("pty session"),
+            "{err}"
+        );
     }
 
     fn pty_transcript(resp: &crate::ops::Responder) -> String {
@@ -743,10 +747,14 @@ mod tests {
             .ok()
             .and_then(|extra| extra.exit_code)
             .or_else(|| {
-                resp.log.snapshot().into_iter().rev().find_map(|env| match env {
-                    agentlink_core::Envelope::End { exit_code, .. } => exit_code,
-                    _ => None,
-                })
+                resp.log
+                    .snapshot()
+                    .into_iter()
+                    .rev()
+                    .find_map(|env| match env {
+                        agentlink_core::Envelope::End { exit_code, .. } => exit_code,
+                        _ => None,
+                    })
             })
     }
 
@@ -817,6 +825,221 @@ mod tests {
         );
     }
 
+    /// Drop CSI / ESC sequences so a wait or parse cannot treat a host-side
+    /// `ESC[8;30;100t` resize advertisement as the child's reported size.
+    fn strip_csi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for d in chars.by_ref() {
+                    if d.is_ascii_alphabetic() || d == '@' {
+                        break;
+                    }
+                }
+            } else if c != '\u{1b}' {
+                out.push(c);
+            } else if chars.peek() == Some(&']') {
+                chars.next();
+                while let Some(d) = chars.next() {
+                    if d == '\u{7}' {
+                        break;
+                    }
+                    if d == '\\' {
+                        continue;
+                    }
+                    if d == '\u{1b}' {
+                        let _ = chars.next();
+                        break;
+                    }
+                }
+            } else {
+                let _ = chars.next();
+            }
+        }
+        out
+    }
+
+    fn transcript_lines_from(raw: &str) -> Vec<String> {
+        strip_csi(raw)
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    fn has_sentinel_line(lines: &[String], sentinel: &str) -> bool {
+        lines
+            .iter()
+            .any(|line| line == sentinel || line.starts_with(&format!("{sentinel} ")))
+    }
+
+    async fn wait_transcript_sentinel(
+        resp: &crate::ops::Responder,
+        sentinel: &str,
+        timeout: std::time::Duration,
+    ) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let raw = pty_transcript(resp);
+            if has_sentinel_line(&transcript_lines_from(&raw), sentinel) {
+                return raw;
+            }
+            if std::time::Instant::now() >= deadline {
+                return raw;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ChildSize {
+        buf_cols: Option<i32>,
+        buf_rows: Option<i32>,
+        win_cols: i32,
+        win_rows: i32,
+    }
+
+    fn parse_tagged_i32(line: &str, key: &str) -> Option<i32> {
+        let token = format!("{key}=");
+        let start = line.find(&token)?;
+        let rest = &line[start + token.len()..];
+        let value = rest.split_whitespace().next().unwrap_or(rest);
+        value.parse().ok()
+    }
+
+    fn parse_size_report(raw: &str, tag: &str) -> Option<ChildSize> {
+        let line = transcript_lines_from(raw)
+            .into_iter()
+            .find(|line| line.starts_with(tag))?;
+        let win_cols = parse_tagged_i32(&line, "srWindow.cols")
+            .or_else(|| parse_tagged_i32(&line, "winsize.cols"))?;
+        let win_rows = parse_tagged_i32(&line, "srWindow.rows")
+            .or_else(|| parse_tagged_i32(&line, "winsize.rows"))?;
+        Some(ChildSize {
+            buf_cols: parse_tagged_i32(&line, "dwSize.X"),
+            buf_rows: parse_tagged_i32(&line, "dwSize.Y"),
+            win_cols,
+            win_rows,
+        })
+    }
+
+    /// Windows child: a tiny rustc program that calls GetConsoleScreenBufferInfo
+    /// and prints dwSize / srWindow separately. Avoids `mode con` localization
+    /// and cmd.exe script echo/redraw loops.
+    const WINDOWS_SIZE_REPORTER_SRC: &str = r#"
+use std::io::{Read, Write};
+
+#[repr(C)]
+struct Coord { x: i16, y: i16 }
+#[repr(C)]
+struct SmallRect { left: i16, top: i16, right: i16, bottom: i16 }
+#[repr(C)]
+struct ConsoleScreenBufferInfo {
+    dw_size: Coord,
+    dw_cursor_position: Coord,
+    w_attributes: u16,
+    sr_window: SmallRect,
+    dw_maximum_window_size: Coord,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetStdHandle(nstdhandle: i32) -> *mut core::ffi::c_void;
+    fn GetConsoleScreenBufferInfo(
+        hconsoleoutput: *mut core::ffi::c_void,
+        lpconsolescreenbufferinfo: *mut ConsoleScreenBufferInfo,
+    ) -> i32;
+}
+
+const STD_OUTPUT_HANDLE: i32 = -11;
+
+fn invalid_handle(h: *mut core::ffi::c_void) -> bool {
+    h.is_null() || h as isize == -1
+}
+
+fn report(tag: &str) {
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut info = std::mem::zeroed();
+        if invalid_handle(h) || GetConsoleScreenBufferInfo(h, &mut info) == 0 {
+            let _ = writeln!(std::io::stdout(), "{tag} ERR GetConsoleScreenBufferInfo");
+            let _ = std::io::stdout().flush();
+            return;
+        }
+        let win_cols = i32::from(info.sr_window.right - info.sr_window.left + 1);
+        let win_rows = i32::from(info.sr_window.bottom - info.sr_window.top + 1);
+        let _ = writeln!(
+            std::io::stdout(),
+            "{tag} dwSize.X={} dwSize.Y={} srWindow.cols={} srWindow.rows={}",
+            info.dw_size.x,
+            info.dw_size.y,
+            win_cols,
+            win_rows
+        );
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn main() {
+    report("AL_SIZE_BEFORE");
+    let _ = writeln!(std::io::stdout(), "AL_READY");
+    let _ = std::io::stdout().flush();
+    let mut buf = [0u8; 64];
+    let _ = std::io::stdin().read(&mut buf);
+    report("AL_SIZE_AFTER");
+    let _ = writeln!(std::io::stdout(), "AL_DONE");
+    let _ = std::io::stdout().flush();
+}
+"#;
+
+    fn compile_windows_size_reporter(dir: &std::path::Path) -> String {
+        let src = dir.join("report_con_size.rs");
+        let exe = dir.join("report_con_size.exe");
+        std::fs::write(&src, WINDOWS_SIZE_REPORTER_SRC).expect("write size reporter source");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc"));
+        let out = std::process::Command::new(&rustc)
+            .args(["--edition", "2021", "-O", "-o"])
+            .arg(&exe)
+            .arg(&src)
+            .output()
+            .unwrap_or_else(|err| panic!("spawn rustc ({rustc:?}) for size reporter: {err}"));
+        assert!(
+            out.status.success(),
+            "rustc size reporter failed: status={:?} stdout={} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        format!("\"{}\"", exe.display())
+    }
+
+    fn unix_size_reporter(dir: &std::path::Path) -> String {
+        let path = dir.join("report-size.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+set -e\n\
+report() {\n\
+  tag=$1\n\
+  # stty size prints \"rows cols\". There is no separate dwSize; report the\n\
+  # same TIOCGWINSZ as winsize.* (the Unix equivalent of srWindow).\n\
+  size=$(stty size)\n\
+  rows=${size% *}\n\
+  cols=${size#* }\n\
+  printf '%s winsize.cols=%s winsize.rows=%s\\n' \"$tag\" \"$cols\" \"$rows\"\n\
+}\n\
+report AL_SIZE_BEFORE\n\
+printf 'AL_READY\\n'\n\
+IFS= read -r _\n\
+report AL_SIZE_AFTER\n\
+printf 'AL_DONE\\n'\n",
+        )
+        .expect("write unix size reporter");
+        format!("sh '{}'", path.display())
+    }
+
     #[tokio::test]
     async fn real_pty_resize_changes_child_winsize() {
         let mgr = PtyManager::default();
@@ -827,15 +1050,13 @@ mod tests {
             node: "box".into(),
             node_id: "node".into(),
         };
+        // Do not use `mode con` (localized) or wait for a bare "30", which is
+        // satisfied by ConPTY's host-side CSI `ESC[8;30;100t` and is not a
+        // child GetConsoleScreenBufferInfo / TIOCGWINSZ reading.
         let script = if cfg!(windows) {
-            let path = dir.path().join("report-size.cmd");
-            std::fs::write(&path, "@echo off\r\necho READY\r\nset /p x=\r\nmode con\r\n").unwrap();
-            format!("\"{}\"", path.display())
+            compile_windows_size_reporter(dir.path())
         } else {
-            let path = dir.path().join("report-size.sh");
-            std::fs::write(&path, "#!/bin/sh\nprintf 'READY\\n'\nIFS= read -r _\nstty size\n")
-                .unwrap();
-            format!("sh '{}'", path.display())
+            unix_size_reporter(dir.path())
         };
         let sid = mgr
             .open(
@@ -853,28 +1074,43 @@ mod tests {
             )
             .await
             .expect("open size pty");
-        let ready = wait_transcript_contains(&resp, "READY", std::time::Duration::from_secs(3)).await;
-        assert!(ready.contains("READY"), "child did not start, got {ready:?}");
+        let ready =
+            wait_transcript_sentinel(&resp, "AL_READY", std::time::Duration::from_secs(8)).await;
+        assert!(
+            has_sentinel_line(&transcript_lines_from(&ready), "AL_READY"),
+            "child did not print the AL_READY sentinel, got {ready:?}"
+        );
+        let before = parse_size_report(&ready, "AL_SIZE_BEFORE").unwrap_or_else(|| {
+            panic!("child must report structured size before resize, got {ready:?}")
+        });
+        assert_eq!(
+            (before.win_cols, before.win_rows),
+            (80, 24),
+            "srWindow/winsize before resize, dwSize={:?}x{:?}, got {ready:?}",
+            before.buf_cols,
+            before.buf_rows
+        );
         mgr.resize(&sid, 30, 100, "alice").expect("resize");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        mgr.write(&sid, b"\n", "alice").expect("signal after resize");
-        let text = wait_transcript_contains(&resp, "30", std::time::Duration::from_secs(3)).await;
+        mgr.write(&sid, b"\n", "alice")
+            .expect("signal after resize");
+        let text =
+            wait_transcript_sentinel(&resp, "AL_DONE", std::time::Duration::from_secs(8)).await;
         let _ = mgr.close(&sid, Some("alice"));
-        if cfg!(windows) {
-            assert!(
-                text.contains("30") && text.contains("100")
-                    && (text.to_ascii_lowercase().contains("lines")
-                        || text.to_ascii_lowercase().contains("columns")
-                        || text.contains("30 100")
-                        || text.contains("100 30")),
-                "child must observe the resized ConPTY, got {text:?}"
-            );
-        } else {
-            assert!(
-                text.contains("30 100") || text.contains("30\t100"),
-                "child stty size must report the resized winsize, got {text:?}"
-            );
-        }
+        assert!(
+            has_sentinel_line(&transcript_lines_from(&text), "AL_DONE"),
+            "child did not finish the size handshake, got {text:?}"
+        );
+        let after = parse_size_report(&text, "AL_SIZE_AFTER").unwrap_or_else(|| {
+            panic!("child must report structured size after resize, got {text:?}")
+        });
+        assert_eq!(
+            (after.win_cols, after.win_rows),
+            (100, 30),
+            "srWindow/winsize after resize must be the new size (not a host CSI), dwSize={:?}x{:?}, got {text:?}",
+            after.buf_cols,
+            after.buf_rows
+        );
     }
 
     #[tokio::test]

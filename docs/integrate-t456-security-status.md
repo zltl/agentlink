@@ -150,3 +150,23 @@ Typecheck / unit status (Asia/Shanghai, 2026-11-12):
 - No known inevitable Kotlin compile error remains between the generated trait and hand-written implementors/tests.
 
 No Windows sources changed; the 8143 Windows retest does not need a full re-run for this commit. Controller/UI was not touched. SQLite `RUSTSEC-2026-0459` remains accurately documented; cargo-audit is still expected exit 1 (bundled `libsqlite3-sys`, lockfile `rsa`, 12 unmaintained warnings). This executor does not push `main`.
+
+## Post-8df ConPTY resize test (this commit, not a rewrite of `8df767a` or `8143d2ee`)
+
+Windows verification of `8143d2ee` (logs at `C:\Users\liaot\src\agentlink-8143d2e-verify-logs\verify.log`) went green on the four earlier lib failures, Unicode ConPTY, exit code 9, desktop 76, ffi 26, node 89/1 fail, security 1, functional 5 (1 skip true-desktop), controller 75, and nodecfg 4. The remaining main-gate failure is `real_pty_resize_changes_child_winsize` (not skipped).
+
+Source diagnosis from the reported transcript, before any production change: after `READY`, the host transcript contained `ESC[8;30;100t` (ConPTY/xterm window-resize advertisement on the **host** pipe). `wait_transcript_contains(..., "30")` can return on that CSI alone. `mode con` on Chinese Windows does not print English `Lines`/`Columns`, and cmd prompt redraws (script path, a second `READY`, many `ESC[K`) are not a child size reading. Production `PtyManager::resize` already calls `portable-pty` `MasterPty::resize` → `ResizePseudoConsole` (`portable-pty` 0.8.1). This commit does **not** change that production path; Linux passing is not Windows evidence that the child window actually changed.
+
+The test now:
+
+- Waits for complete sentinels `AL_READY` / `AL_DONE` as whole lines after stripping CSI (never a bare `"30"`).
+- Snapshots a structured **before** size at `AL_READY`, then resizes, then waits for `AL_DONE` and parses **after**.
+- On Windows, compiles a tiny `GetConsoleScreenBufferInfo` helper (`rustc` of an in-test source) and prints `dwSize.X/Y` and `srWindow.cols/rows` separately. No `mode con`, no cmd `set /p` script loop.
+- On Unix, `stty size` (TIOCGWINSZ) is printed as `winsize.cols/rows` (no separate buffer).
+- Asserts window/winsize is `80x24` before and `100x30` after. Host CSI is not accepted as proof.
+
+Linux (this box, rustc 1.99.1, Asia/Shanghai, 2026-11-12, reused target, `--offline`): `cargo test -p agentlink-node --lib --offline real_pty_` → 4 passed (resize, unicode, exit 9, owner/revoke entry), 0 failed, 102 filtered. Windows must re-run this freeze on the existing Windows target; if it fails, the assertion text should include the `AL_SIZE_BEFORE` / `AL_SIZE_AFTER` lines (and any `ERR GetConsoleScreenBufferInfo`).
+
+`8df767a` generated Kotlin is unchanged. Controller/UI and production `abf86f1` were not touched. The review finding that `poll_until_end` does not `close_quiet` on a normal `"exit"` (registry / Android `ShellSessions` map can remain) is still open: it is FFI host-session lifecycle, not this ConPTY test, and was left out of this small delta.
+
+SQLite `RUSTSEC-2026-0459` remains accurately documented; cargo-audit is still expected exit 1. This executor does not push `main`.

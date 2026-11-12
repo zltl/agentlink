@@ -100,3 +100,7 @@ The continuation worktree `/workspace/agentlink-integrate-t456-cont` on `integra
 ## Post-8143 UniFFI Kotlin regenerate (local, not pushed)
 
 A second incremental commit on the same branch regenerates `android/app/src/main/java/uniffi/agentlink_ffi/agentlink_ffi.kt` with official `uniffi-bindgen` against the verified 8143 `libagentlink_ffi.so`. `8143d2ee` and `cd30c9e` are not rewritten. No Windows/Rust behavior change; the Windows 8143 retest boundary stays valid. Still not pushed; wait for the isolated UI worker and the parent’s final gate.
+
+## Post-8df ConPTY resize test (local, not pushed)
+
+A third incremental commit on the same branch fixes `real_pty_resize_changes_child_winsize` (structured GetConsoleScreenBufferInfo / `stty size` handshake; no production resize-path change). `8df767a`, `8143d2ee`, and `cd30c9e` are not rewritten. Generated Kotlin from `8df767a` is kept. Windows worker should re-run this freeze only for this test (plus any chosen regression slice); not pushed.
