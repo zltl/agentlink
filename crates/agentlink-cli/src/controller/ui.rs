@@ -5014,6 +5014,61 @@ mod geometry_tests {
         );
     }
 
+    /// Raw vs clip-visible *x* bounds. A card may be only partly inside the
+    /// vertical scroll viewport, so height is allowed to differ until the
+    /// card is scrolled fully into view.
+    fn assert_action_x_fully_visible(layout: &DebugLayout, key: &str, window_w: f32) {
+        let raw = item_rect(layout, &format!("{key}:raw")).unwrap_or_else(|| {
+            panic!(
+                "missing raw rect for {key}; have {:?}",
+                layout
+                    .toolbar_items
+                    .iter()
+                    .map(|(k, _)| k)
+                    .collect::<Vec<_>>()
+            )
+        });
+        let vis = item_rect(layout, &format!("{key}:vis")).expect("vis rect");
+        let min_w = if key.ends_with("View desktop") || key.ends_with("Control desktop") {
+            90.0
+        } else {
+            48.0
+        };
+        assert!(
+            raw[2] >= min_w,
+            "{key} raw width too small (label incomplete?): {raw:?}"
+        );
+        assert!(
+            (vis[0] - raw[0]).abs() <= 1.0,
+            "{key} left edge clipped: raw={raw:?} vis={vis:?}"
+        );
+        assert!(
+            (vis[2] - raw[2]).abs() <= 1.0,
+            "{key} right edge clipped (raw width vs visible width): raw={raw:?} vis={vis:?}"
+        );
+        assert!(
+            vis[0] >= 0.0 && vis[0] + vis[2] <= window_w + 1.0,
+            "{key} vis outside window: {vis:?} w={window_w}"
+        );
+        assert!(
+            raw[0] >= 0.0 && raw[0] + raw[2] <= window_w + 1.0,
+            "{key} raw outside window: {raw:?} w={window_w}"
+        );
+        let clip = layout.visible_clip;
+        if clip[2] > 1.0 {
+            assert!(
+                raw[0] + raw[2] <= clip[0] + clip[2] + 0.5,
+                "{key} raw max.x {} exceeds visible clip max.x {} (raw={raw:?} clip={clip:?})",
+                raw[0] + raw[2],
+                clip[0] + clip[2]
+            );
+        }
+    }
+
+    fn action_vis_is_on_screen(vis: [f32; 4]) -> bool {
+        vis[2] > 0.5 && vis[3] > 0.5
+    }
+
     fn assert_view_desktop_fully_in_clip(layout: &DebugLayout) {
         // Actions live in the detail / session toolbar, not the compact nav.
         let w = if layout.main_rect[2] > 0.0 {
@@ -5863,74 +5918,175 @@ mod geometry_tests {
     #[test]
     fn narrow_721_page_keeps_connect_cards_inside_visible_clip() {
         // Real 721x759 client, including header, page margins, and scrollbar.
-        let mut harn = Harness::new(721.0, 759.0);
+        const WIN_W: f32 = 721.0;
+        const WIN_H: f32 = 759.0;
+        let mut harn = Harness::new(WIN_W, WIN_H);
         harn.app.screen = Screen::Machines;
         harn.app.selected_id = Some("sufa".into());
         harn.pass();
         harn.pass();
         assert!(
-            !model::machine_rail_visible(721.0),
+            !model::machine_rail_visible(WIN_W),
             "721 must fold the rail"
         );
         let selected = harn.app.selected_id.clone().expect("selection");
+        let labels = ["Terminal", "Files", "View desktop", "Control desktop"];
+        let keys: Vec<String> = labels
+            .iter()
+            .map(|label| format!("action_btn:{selected}:{label}"))
+            .collect();
+        for key in &keys {
+            assert!(
+                item_rect(&harn.app.debug_layout, &format!("{key}:raw")).is_some(),
+                "missing {key}:raw after 721 paint; have {:?}",
+                harn.app
+                    .debug_layout
+                    .toolbar_items
+                    .iter()
+                    .map(|(k, _)| k)
+                    .collect::<Vec<_>>()
+            );
+        }
         let cards = card_items(&harn.app.debug_layout);
         let ours: Vec<_> = cards
             .iter()
             .filter(|(id, _)| id.starts_with(&format!("action_card:{selected}:")))
             .cloned()
             .collect();
-        assert!(
-            ours.len() >= 3,
-            "expected Terminal/Files/View cards at 721, got {ours:?}"
+        assert_eq!(
+            ours.len(),
+            4,
+            "desktop node should show four cards at 721, got {ours:?}"
         );
         let xs: Vec<i32> = {
-            let mut v: Vec<i32> = ours.iter().map(|(_, r)| r[0].round() as i32).collect();
+            let mut v: Vec<i32> = keys
+                .iter()
+                .filter_map(|key| {
+                    item_rect(&harn.app.debug_layout, &format!("{key}:raw"))
+                        .map(|r| r[0].round() as i32)
+                })
+                .collect();
             v.sort();
             v.dedup();
             v
         };
         assert!(
             xs.len() <= 2,
-            "721 must use one or two columns, not three: xs={xs:?} cards={ours:?}"
+            "721 must use one or two columns, not three: xs={xs:?}"
         );
-        assert_cards_inside_visible_clip(&harn.app.debug_layout);
 
-        let last = harn
-            .app
-            .debug_layout
-            .toolbar_items
-            .iter()
-            .filter(|(id, _)| {
-                id.starts_with("action_card:") || id == "details" || id.starts_with("nav_row:")
-            })
-            .max_by(|a, b| rect_max_y(a.1).partial_cmp(&rect_max_y(b.1)).unwrap())
-            .cloned()
-            .expect("last card or details");
-        let mut reached = false;
-        for _ in 0..40 {
-            let clip = harn.app.debug_layout.visible_clip;
-            let rect = item_rect(&harn.app.debug_layout, &last.0).unwrap_or(last.1);
-            if rect[1] >= clip[1] - 1.0 && rect_max_y(rect) <= rect_max_y(clip) + 1.0 {
-                reached = true;
-                break;
+        // Partially visible cards may have a shorter vis height; x must
+        // still match the raw rect (this is what the View-card clip failed).
+        for key in &keys {
+            let vis = item_rect(&harn.app.debug_layout, &format!("{key}:vis")).expect("vis");
+            if action_vis_is_on_screen(vis) {
+                assert_action_x_fully_visible(&harn.app.debug_layout, key, WIN_W);
             }
-            // Reveal content below: move the scrolled content up.
-            harn.scroll_content(-120.0);
         }
+
+        // Scroll each of the four cards fully into the viewport, then
+        // assert the complete raw vs vis rect (x and y).
+        for key in &keys {
+            assert!(
+                scroll_action_fully_into_view(&mut harn, key),
+                "could not scroll {key} fully into the 721x759 viewport; raw={:?} vis={:?} clip={:?}",
+                item_rect(&harn.app.debug_layout, &format!("{key}:raw")),
+                item_rect(&harn.app.debug_layout, &format!("{key}:vis")),
+                harn.app.debug_layout.visible_clip
+            );
+            assert_action_fully_visible(&harn.app.debug_layout, key, WIN_W);
+            assert_action_x_fully_visible(&harn.app.debug_layout, key, WIN_W);
+        }
+    }
+
+    fn action_raw_matches_vis(raw: [f32; 4], vis: [f32; 4]) -> bool {
+        (vis[0] - raw[0]).abs() <= 1.0
+            && (vis[2] - raw[2]).abs() <= 1.0
+            && (vis[1] - raw[1]).abs() <= 1.0
+            && (vis[3] - raw[3]).abs() <= 1.0
+    }
+
+    fn scroll_action_fully_into_view(harn: &mut Harness, key: &str) -> bool {
+        for _ in 0..60 {
+            let raw = match item_rect(&harn.app.debug_layout, &format!("{key}:raw")) {
+                Some(raw) => raw,
+                None => return false,
+            };
+            let vis = match item_rect(&harn.app.debug_layout, &format!("{key}:vis")) {
+                Some(vis) => vis,
+                None => return false,
+            };
+            if action_raw_matches_vis(raw, vis) {
+                return true;
+            }
+            // Use the raw-vs-vis shortfall so a tight widget clip (narrower
+            // than visible_clip) still gets the last few pixels on screen.
+            let overflow_top = (vis[1] - raw[1]).max(0.0);
+            let overflow_bottom = if action_vis_is_on_screen(vis) {
+                (rect_max_y(raw) - rect_max_y(vis)).max(0.0)
+            } else {
+                0.0
+            };
+            let dy = if !action_vis_is_on_screen(vis) {
+                let clip = harn.app.debug_layout.visible_clip;
+                if raw[1] < clip[1] {
+                    120.0
+                } else {
+                    -120.0
+                }
+            } else if overflow_top > 1.0 {
+                overflow_top.min(120.0)
+            } else if overflow_bottom > 1.0 {
+                -overflow_bottom.min(120.0)
+            } else {
+                return true;
+            };
+            harn.scroll_content(dy);
+        }
+        false
+    }
+
+    #[test]
+    fn narrow_721_long_offline_name_keeps_badge_in_page_width() {
+        const WIN_W: f32 = 721.0;
+        let mut harn = Harness::new(WIN_W, 759.0);
+        let mut node = harn.app.nodes[0].clone();
+        node.id = "long-offline".into();
+        node.name = "Fixture · offline workstation with a long display name (sample)".into();
+        node.online = false;
+        harn.app.nodes.insert(0, node);
+        harn.app.selected_id = Some("long-offline".into());
+        harn.app.screen = Screen::Machines;
+        harn.pass();
+        harn.pass();
+        let layout = &harn.app.debug_layout;
+        let name = item_rect(layout, "nav_name:long-offline").expect("nav name");
+        let badge = item_rect(layout, "nav_badge:long-offline").expect("nav badge");
         assert!(
-            reached,
-            "could not scroll to last item {} at {:?}; clip={:?} items={:?}",
-            last.0,
-            item_rect(&harn.app.debug_layout, &last.0),
-            harn.app.debug_layout.visible_clip,
-            harn.app
-                .debug_layout
-                .toolbar_items
-                .iter()
-                .map(|(k, r)| (k, r))
-                .collect::<Vec<_>>()
+            badge[1] + 0.5 >= name[1] + name[3] - 1.0,
+            "badge must sit on the next row, not beside the name: name={name:?} badge={badge:?}"
         );
-        assert_cards_inside_visible_clip(&harn.app.debug_layout);
+        assert!(
+            badge[2] >= 64.0 && badge[3] >= 16.0,
+            "offline badge clipped at 721: {badge:?}"
+        );
+        assert!(
+            name[0] + name[2] <= WIN_W + 1.0,
+            "long offline name exceeds 721 page width: {name:?}"
+        );
+        assert!(
+            badge[0] + badge[2] <= WIN_W + 1.0,
+            "offline badge exceeds 721 page width: {badge:?}"
+        );
+        let detail_badge = item_rect(layout, "detail_badge").expect("detail badge");
+        assert!(
+            detail_badge[2] >= 64.0,
+            "detail offline badge clipped at 721: {detail_badge:?}"
+        );
+        assert!(
+            detail_badge[0] + detail_badge[2] <= WIN_W + 1.0,
+            "detail offline badge exceeds 721 page width: {detail_badge:?}"
+        );
     }
 
     #[test]
