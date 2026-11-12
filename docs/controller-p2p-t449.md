@@ -960,3 +960,127 @@ reviewed deploy of this ice-ack honesty change to a
 non-production node. Do not treat TURN or Tailscale overlay as
 native public P2P. Do not change firewalls or routes to force
 a pair.
+
+## t452 — bidirectional late ICE, generation isolation, honest checks
+
+Authorized by the user (`那你先补吧`) after the t451 research
+note. Built on `feat/controller-p2p-observe-t449` at
+`a87dca2526154d7ac0da3ae92112c93a97245067`. Frozen 1212
+(`d970df9`, bin `f5a4ed3d…`) is unchanged. No push, merge,
+deploy, CI, phone probe, firewall/route change, production
+node edit, or new grant/identity rotation.
+
+### What landed
+
+1. **Bounded `ice_pull` on existing `webrtc_signal`** (request/
+   response, not a new server-push channel). A new node answer
+   and ice-restart reply advertise `"ice_pull": true`. The
+   Viewer pulls only when that flag is present, starting
+   `after` at the number of candidates already in the answer.
+   Budget: 10 pulls, 4s, 200ms spacing; stop on
+   `gather_done` twice empty, on `IceFault`, on Viewer close,
+   after two non-unknown errors, or immediately on
+   `unknown webrtc_signal action`. Candidate typ is logged;
+   ufrag/password is not. Pulled inits whose fragment does
+   not match the answer ufrag are dropped. A test-only
+   `inject_gathered_candidate` hook exists for fixtures.
+
+2. **Session / negotiation generation isolation.** Node
+   `session_id` is `{peer}-{millis}-{seq}` (unique per offer).
+   The live session stores the remote offer ufrag and rejects
+   trickle whose `usernameFragment` is a different generation
+   (`stale ice generation`). Empty / omitted fragment is still
+   admitted because `RTCIceCandidate::to_json` often leaves it
+   blank. After close, ice on the old `session_id` is
+   `unknown stream session`. A later Viewer offer creates a
+   new session and must not inherit the old remote list.
+   Login/identity is still not a stream grant.
+
+3. **Safer ICE observability.** Node `ice` logs distinguish
+   recv / parse-reject / stale-reject / added. Viewer
+   `ice_check_counts_label` prints
+   `checks=unavailable-selected-stats-only` when webrtc-0.21
+   `get_stats()` has no pair (it mostly reports the selected
+   pair). A selected-only `req_sent=0` is therefore not
+   written as “checks were never sent”. No third-party crate
+   was patched and no credential capture was added.
+
+4. **Recovery / JPEG / grant / close (no regression).**
+   Existing bounded JPEG retry, hard-reject on missing grant,
+   and Viewer close deadlines are unchanged. New coverage:
+   stale-generation reject + new session recovers H.264;
+   worker tests still show JPEG kept across a soft miss and
+   H.264 only after a later success; withdrawn/missing grant
+   still spends no retry budget. `ice_pull` honors the Viewer
+   stop flag.
+
+### Backward compatibility
+
+- New node → new Viewer: answer includes `ice_pull: true`;
+  Viewer may pull late host/srflx that missed the answer.
+- Old node → new Viewer: answer has no `ice_pull` flag;
+  Viewer never calls the action (one-shot skip). Batched
+  answer candidates still form a pair on the local fixture.
+- New node → old Viewer: unknown JSON field is ignored;
+  old Viewer uses answer + its own trickle only.
+- Advertised but unsupported `ice_pull` (mixed node): Viewer
+  logs `late ice pull not supported by node` once and stops;
+  it does not retry-storm. Answer candidates still work.
+- `ice` success is still `{ok: true, added: true}`. Errors
+  stay errors (the t450 honesty fix). `session_id` remains an
+  opaque string the Viewer echoes back.
+
+### Tests that actually ran (not compile-only)
+
+Real `StreamHandler` → `SessionManager` → `Viewer`, plus a
+local cross-process fixture (`agentlink-stream-fixture`,
+`Desktop::mock()`, auto consent, isolated temp audit path,
+no production identity/grant). Same host is not a public
+NAT result. Test frames, not a live desktop portal.
+
+- `ice_pull_delivers_candidates_omitted_from_the_answer` —
+  answer SDP/candidates stripped, `ice_pull` returned 6
+  host+srflx, all `added=true`, selected typ host,
+  H.264 IDR, path=`private`.
+- `ice_pull_skipped_on_old_node_still_selects_a_pair` —
+  answer hid `ice_pull`; no pull attempts; typ host + IDR.
+- `advertised_but_unsupported_ice_pull_degrades_without_a_retry_storm`
+  — flag present, action returns unknown once, log
+  `late ice pull not supported by node`, typ host + IDR.
+- `stale_session_ice_is_rejected_and_a_new_generation_recovers_h264`
+  — wrong ufrag while live: `ice rejected stale generation typ=host`;
+  after close, old session_id is `unknown stream session`;
+  a new Viewer/session selected typ host and delivered an IDR.
+- `delayed_trickle_still_selects_a_pair_and_delivers_h264` and
+  the malformed / short-gather / no-grant loopback tests still pass.
+- `cross_process_fixture_selects_a_pair_and_delivers_h264` —
+  parent Viewer, child real handler: IDR, selected typ host
+  `172.17.0.1:47205` ↔ `172.30.0.2:33092`,
+  `req_sent=3 req_recv=6 resp_sent=6 resp_recv=5`, then ice
+  on the closed session is rejected. Finished in 0.52s.
+- Unit: `sdp_ice_ufrag_*`, `ice_ufrag_matches_*`,
+  `ice_check_counts_label_does_not_claim_zero_means_unsent`.
+- JPEG / grant regression (`agentlink` bin tests):
+  `jpeg_stays_visible_when_ice_cannot_connect`,
+  `jpeg_resumes_after_h264_endpoint_disconnect`,
+  `jpeg_retries_then_recovers_h264_without_claiming_p2p_early`,
+  `exhausted_retries_keep_jpeg_release_viewer_and_stop`,
+  `jpeg_stills_rate_is_measured_from_a_real_sequence`,
+  `negotiation_hud_stays_jpeg_through_offer_answer_wait_timeout_and_close`,
+  `missing_grant_is_rejected_and_does_not_show_p2p`,
+  `missing_grant_does_not_spend_retry_budget`,
+  `live_retry_backoff_is_bounded_and_does_not_run_forever`.
+
+### Still unverified on the public internet
+
+This batch did **not** re-run box↔sufa or any other
+cross-network pair. Local selected typ host + H.264 is not a
+public P2P claim. The earlier box↔sufa no-pair miss (after
+DNS rewrite produced public typ srflx on both sides) is still
+unexplained at the check-send/receive layer on that path:
+webrtc-0.21 often only exposes selected-pair stats, and no
+remote node was instrumented or redeployed. TURN and
+Tailscale overlay are still not native public P2P. No
+firewall, route, or production-node change was made to force
+a pair. A reviewed non-production node deploy is still a
+parent/user step.

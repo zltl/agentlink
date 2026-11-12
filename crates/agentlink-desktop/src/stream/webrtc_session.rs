@@ -59,6 +59,9 @@ struct LiveSession {
     peer_id: String,
     /// Set while this session still holds a control-indicator ref.
     control_held: Arc<AtomicBool>,
+    /// ICE ufrag from the current remote offer. Compared to trickle
+    /// `usernameFragment` when present; never logged.
+    remote_ufrag: Mutex<Option<String>>,
 }
 
 struct Built {
@@ -84,6 +87,8 @@ trait IcePeer: Send + Sync {
         offer_sdp: &str,
     ) -> std::result::Result<(String, Vec<Value>), String>;
     fn gathered_candidates(&self) -> Vec<Value>;
+    fn gather_done(&self) -> bool;
+    fn push_gathered_candidate(&self, candidate: Value);
     async fn close(&self);
 }
 
@@ -160,6 +165,16 @@ where
             .lock()
             .map(|candidates| candidates.clone())
             .unwrap_or_default()
+    }
+
+    fn gather_done(&self) -> bool {
+        self.gather_done.load(Ordering::Relaxed)
+    }
+
+    fn push_gathered_candidate(&self, candidate: Value) {
+        if let Ok(mut candidates) = self.candidates.lock() {
+            candidates.push(candidate);
+        }
     }
 
     async fn close(&self) {
@@ -266,6 +281,8 @@ struct Handler {
     aimd: AimdState,
 }
 
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
+
 pub fn manager(desktop: Arc<Desktop>, shared: Arc<StreamShared>) -> SessionManager {
     SessionManager {
         desktop,
@@ -282,6 +299,7 @@ impl SessionManager {
             "offer" => self.offer(peer, payload).await,
             "ice_restart" => self.ice_restart(payload).await,
             "ice" => self.ice(payload).await,
+            "ice_pull" => self.ice_pull(payload),
             "keyframe" => self.keyframe(payload),
             "close" => self.close(payload).await,
             other => Err(format!("unknown webrtc_signal action '{other}'")),
@@ -417,6 +435,9 @@ impl SessionManager {
                 viewer,
                 peer_id: peer.to_string(),
                 control_held,
+                remote_ufrag: Mutex::new(sdp_ice_ufrag(
+                    payload.get("sdp").and_then(Value::as_str).unwrap_or(""),
+                )),
             });
         let _ = self.started_cleanup();
         Ok(built.answer)
@@ -462,10 +483,20 @@ impl SessionManager {
             return Err("unknown stream session".into());
         };
         let (answer, candidates) = peer.renegotiate(sdp).await?;
+        {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(session) = sessions.iter().find(|session| session.id == id) {
+                *session
+                    .remote_ufrag
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = sdp_ice_ufrag(sdp);
+            }
+        }
         Ok(json!({
             "session_id": id,
             "sdp": answer,
             "candidates": candidates,
+            "ice_pull": true,
         }))
     }
 
@@ -486,17 +517,18 @@ impl SessionManager {
             })
     }
 
-    async fn ice(&self, payload: &Value) -> std::result::Result<Value, String> {
-        let id = payload
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let candidate = payload.get("candidate").cloned().unwrap_or(Value::Null);
+    /// Append a candidate that arrived after the answer was serialized.
+    /// Fixture / tests only; production signaling never calls this.
+    pub fn inject_gathered_candidate(
+        &self,
+        session_id: &str,
+        candidate: Value,
+    ) -> std::result::Result<(), String> {
         let peer = {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             sessions
                 .iter()
-                .find(|session| session.id == id)
+                .find(|session| session.id == session_id && !session.stop.load(Ordering::Relaxed))
                 .and_then(|session| {
                     session
                         .peer
@@ -508,10 +540,104 @@ impl SessionManager {
         let Some(peer) = peer else {
             return Err("unknown stream session".into());
         };
-        // A parse miss used to fall through to `{ok: true}` and look like a
-        // successful `add_ice_candidate` in the webrtc_signal audit. Do not
-        // ack a candidate that was never added.
-        let init = parse_trickle_candidate(&candidate)?;
+        peer.push_gathered_candidate(candidate);
+        Ok(())
+    }
+
+    fn ice_pull(&self, payload: &Value) -> std::result::Result<Value, String> {
+        let id = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let after = payload.get("after").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let (candidates, gather_done, closed) = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match sessions.iter().find(|session| session.id == id) {
+                Some(session) if session.stop.load(Ordering::Relaxed) => (Vec::new(), true, true),
+                Some(session) => session
+                    .peer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|peer| (peer.gathered_candidates(), peer.gather_done(), false))
+                    .unwrap_or((Vec::new(), true, true)),
+                None => return Err("unknown stream session".into()),
+            }
+        };
+        if closed {
+            return Err("unknown stream session".into());
+        }
+        let tail = if after >= candidates.len() {
+            Vec::new()
+        } else {
+            candidates[after..].to_vec()
+        };
+        let typ_list: Vec<&str> = tail
+            .iter()
+            .map(|value| {
+                candidate_typ_hint(value.get("candidate").and_then(Value::as_str).unwrap_or(""))
+            })
+            .collect();
+        eprintln!(
+            "agentlink live-webrtc: ice_pull after={after} new={} gather_done={gather_done} typ={}",
+            tail.len(),
+            typ_list.join(",")
+        );
+        Ok(json!({
+            "ok": true,
+            "ice_pull": true,
+            "gather_done": gather_done,
+            "after": candidates.len(),
+            "candidates": tail,
+        }))
+    }
+
+    async fn ice(&self, payload: &Value) -> std::result::Result<Value, String> {
+        let id = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let candidate = payload.get("candidate").cloned().unwrap_or(Value::Null);
+        let typ_hint = candidate
+            .get("candidate")
+            .and_then(Value::as_str)
+            .map(candidate_typ_hint)
+            .unwrap_or("unknown");
+        eprintln!("agentlink live-webrtc: ice recv typ={typ_hint}");
+        let (peer, remote_ufrag, closed) = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match sessions.iter().find(|session| session.id == id) {
+                Some(session) if session.stop.load(Ordering::Relaxed) => (None, None, true),
+                Some(session) => (
+                    session
+                        .peer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
+                    session
+                        .remote_ufrag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
+                    false,
+                ),
+                None => return Err("unknown stream session".into()),
+            }
+        };
+        if closed {
+            return Err("unknown stream session".into());
+        }
+        let Some(peer) = peer else {
+            return Err("unknown stream session".into());
+        };
+        let init = parse_trickle_candidate(&candidate).map_err(|err| {
+            eprintln!("agentlink live-webrtc: ice parse rejected typ={typ_hint}");
+            err
+        })?;
+        if !ice_ufrag_matches(remote_ufrag.as_deref(), init.username_fragment.as_deref()) {
+            eprintln!("agentlink live-webrtc: ice rejected stale generation typ={typ_hint}");
+            return Err("stale ice generation".into());
+        }
         let typ = candidate_typ_hint(&init.candidate);
         let mid_empty = init.sdp_mid.as_deref().unwrap_or("").is_empty();
         let mline = init.sdp_mline_index;
@@ -711,11 +837,12 @@ async fn build_answer(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let session_id = format!(
-        "{peer_id}-{}",
+        "{peer_id}-{}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        SESSION_SEQ.fetch_add(1, Ordering::Relaxed)
     );
 
     // Target encode size from the (possibly capped) scale. Capture-side
@@ -1133,6 +1260,9 @@ async fn build_answer(
             "audio": audio,
             // Session grant (`_allow_control` ∩ ceiling), not the node ceiling.
             "control": answer_control_field(handler.allow_control),
+            // Viewer may bounded-pull candidates gathered after this answer.
+            // Absent on older nodes; a new viewer must not retry-storm then.
+            "ice_pull": true,
         }),
         peer: Arc::new(OwnedPeer {
             inner: pc,
@@ -1466,6 +1596,31 @@ fn parse_trickle_candidate(
 
 /// typ only, for logs and tests. The candidate attribute does not carry a
 /// ufrag; still do not print the address line.
+/// ICE ufrag from an SDP. Compared to trickle `usernameFragment`; never logged.
+fn sdp_ice_ufrag(sdp: &str) -> Option<String> {
+    for line in sdp.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("a=ice-ufrag:") {
+            let value = trimmed[trimmed.len() - rest.len()..].trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// When the trickle carries a usernameFragment, it must match the current
+/// remote offer ufrag. A missing fragment (webrtc-0.21 `to_json`) is admitted
+/// and isolated by `session_id` instead. The ufrag value is never logged.
+fn ice_ufrag_matches(remote_ufrag: Option<&str>, fragment: Option<&str>) -> bool {
+    match (remote_ufrag, fragment) {
+        (Some(want), Some(got)) if !got.is_empty() => want == got,
+        _ => true,
+    }
+}
+
 fn candidate_typ_hint(line: &str) -> &'static str {
     let lower = line.to_ascii_lowercase();
     if lower.contains("typ srflx") {
@@ -2311,5 +2466,17 @@ mod tests {
             err.contains("RTCIceCandidateInit"),
             "unexpected parse error: {err}"
         );
+    }
+
+    #[test]
+    fn sdp_ice_ufrag_reads_the_attribute_and_ice_ufrag_matches_isolates_generations() {
+        let sdp = "v=0\r\na=ice-ufrag:genA\r\na=ice-pwd:secret-must-not-matter\r\n";
+        let ufrag = super::sdp_ice_ufrag(sdp).expect("ufrag");
+        assert_eq!(ufrag, "genA");
+        assert!(super::ice_ufrag_matches(Some("genA"), None));
+        assert!(super::ice_ufrag_matches(Some("genA"), Some("")));
+        assert!(super::ice_ufrag_matches(Some("genA"), Some("genA")));
+        assert!(!super::ice_ufrag_matches(Some("genA"), Some("genB")));
+        assert!(super::ice_ufrag_matches(None, Some("genB")));
     }
 }

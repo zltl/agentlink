@@ -161,6 +161,7 @@ name = "agentlink-desktop"
 version = "0.1.0"
 dependencies = [
  "agentlink-core",
+ "agentlink-view",
  "async-trait",
  "base64 0.22.1",
  "bytes",

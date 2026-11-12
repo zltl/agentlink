@@ -114,6 +114,16 @@ impl StreamHandler {
             .and_then(|sessions| sessions.gathered_candidates(session_id))
     }
 
+    /// Fixture / tests only: append a candidate gathered after the answer.
+    pub fn inject_gathered_candidate(
+        &self,
+        session_id: &str,
+        candidate: Value,
+    ) -> std::result::Result<(), String> {
+        self.sessions()?
+            .inject_gathered_candidate(session_id, candidate)
+    }
+
     fn sessions(&self) -> std::result::Result<Arc<SessionManager>, String> {
         let mut guard = self.engine.lock().unwrap_or_else(|err| err.into_inner());
         if guard.is_none() {

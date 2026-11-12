@@ -660,6 +660,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let ice_checks = Arc::new(Mutex::new(String::new()));
 
     report_stage(&opts, "applying remote answer, ICE in progress");
+    let pull_ufrag_early = sdp_ice_ufrag(&sdp);
     let remote = RTCSessionDescription::answer(sdp).map_err(|err| err.to_string())?;
     PeerConnection::set_remote_description(&pc, remote)
         .await
@@ -753,6 +754,34 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
                 ),
             }
         }
+    });
+
+    let pull_advertised = answer
+        .get("ice_pull")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let pull_after = answer
+        .get("candidates")
+        .and_then(|value| value.as_array())
+        .map(|arr| arr.len() as u64)
+        .unwrap_or(0);
+    let pull_ufrag = pull_ufrag_early;
+    let pull_signal = signal.clone();
+    let pull_session = session_id.clone();
+    let pull_stop = stop.clone();
+    let pull_peer = peer.clone();
+    tokio::spawn(async move {
+        pull_late_ice(
+            pull_signal,
+            pull_session,
+            pull_peer,
+            pull_stop,
+            pull_advertised,
+            no_pair_after_signaling,
+            pull_after,
+            pull_ufrag,
+        )
+        .await;
     });
 
     report_stage(&opts, "requesting keyframe");
@@ -1278,6 +1307,171 @@ async fn publish_ice_checks(
     true
 }
 
+/// When the library only exposes selected-pair stats, a zero request count
+/// is not evidence that checks were never sent.
+fn ice_check_counts_label(
+    pair_count: usize,
+    req_sent: u64,
+    req_recv: u64,
+    resp_sent: u64,
+    resp_recv: u64,
+) -> String {
+    if pair_count == 0 {
+        "checks=unavailable-selected-stats-only".into()
+    } else {
+        format!(
+            "req_sent={req_sent} req_recv={req_recv} resp_sent={resp_sent} resp_recv={resp_recv}"
+        )
+    }
+}
+
+fn sdp_ice_ufrag(sdp: &str) -> Option<String> {
+    for line in sdp.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("a=ice-ufrag:") {
+            let value = trimmed[trimmed.len() - rest.len()..].trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn ice_ufrag_matches(remote_ufrag: Option<&str>, fragment: Option<&str>) -> bool {
+    match (remote_ufrag, fragment) {
+        (Some(want), Some(got)) if !got.is_empty() => want == got,
+        _ => true,
+    }
+}
+
+/// Bounded request/response pull of candidates gathered after the answer.
+/// Old nodes that omit `ice_pull` are skipped once. A single "unknown
+/// action" error also stops the loop so a missing handler cannot storm.
+async fn pull_late_ice(
+    signal: Arc<dyn Signal>,
+    session_id: String,
+    peer: Arc<dyn LivePeer>,
+    stop: Arc<AtomicBool>,
+    advertised: bool,
+    suppress: bool,
+    mut after: u64,
+    remote_ufrag: Option<String>,
+) {
+    if suppress {
+        return;
+    }
+    if !advertised {
+        eprintln!("agentlink live-webrtc: late ice pull skipped (node did not advertise ice_pull)");
+        return;
+    }
+    const PULL_MAX: u32 = 10;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut fails = 0u32;
+    let mut empty_after_done = 0u32;
+    for n in 0..PULL_MAX {
+        if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            break;
+        }
+        if n > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let result = roundtrip(
+            &signal,
+            json!({
+                "action": "ice_pull",
+                "session_id": session_id,
+                "after": after,
+            }),
+        )
+        .await;
+        match result {
+            Ok(value) => {
+                let candidates = value
+                    .get("candidates")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(next) = value.get("after").and_then(|v| v.as_u64()) {
+                    after = next;
+                } else {
+                    after += candidates.len() as u64;
+                }
+                let mut added = 0u32;
+                for candidate in &candidates {
+                    let typ = candidate
+                        .get("candidate")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let typ_hint = describe_ice_candidates(typ);
+                    match serde_json::from_value::<RTCIceCandidateInit>(candidate.clone()) {
+                        Ok(init) => {
+                            if !ice_ufrag_matches(
+                                remote_ufrag.as_deref(),
+                                init.username_fragment.as_deref(),
+                            ) {
+                                eprintln!(
+                                    "agentlink live-webrtc: late ice rejected stale generation ({typ_hint})"
+                                );
+                                continue;
+                            }
+                            match peer.add_ice_candidate(init).await {
+                                Ok(()) => {
+                                    added += 1;
+                                    eprintln!("agentlink live-webrtc: late ice added ({typ_hint})");
+                                }
+                                Err(err) => eprintln!(
+                                    "agentlink live-webrtc: late ice add error ({err}) ({typ_hint})"
+                                ),
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "agentlink live-webrtc: late ice parse rejected ({typ_hint})"
+                            );
+                        }
+                    }
+                }
+                let gather_done = value
+                    .get("gather_done")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                eprintln!(
+                    "agentlink live-webrtc: late ice pull ok new={} added={added} gather_done={gather_done}", candidates.len()
+                );
+                if candidates.is_empty() && gather_done {
+                    empty_after_done += 1;
+                    if empty_after_done >= 2 {
+                        break;
+                    }
+                } else {
+                    empty_after_done = 0;
+                }
+            }
+            Err(err) => {
+                let lower = err.to_ascii_lowercase();
+                if lower.contains("unknown webrtc_signal action")
+                    || lower.contains("unknown action")
+                {
+                    eprintln!(
+                        "agentlink live-webrtc: late ice pull not supported by node; using answer candidates only"
+                    );
+                    return;
+                }
+                fails += 1;
+                eprintln!("agentlink live-webrtc: late ice pull error ({fails}): {err}");
+                if fails >= 2 {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Format ICE stats without credentials, username fragments, certificates,
 /// or packet payloads. Records typ / raddr / proto / check state / counts.
 fn format_ice_checks(report: &RTCStatsReport) -> String {
@@ -1376,8 +1570,9 @@ fn format_ice_checks(report: &RTCStatsReport) -> String {
     }
 
     let mut out = format!(
-        "role={role} ice_state={ice_state} selected={selected} pair_changes={pair_changes} pairs={} succeeded={succeeded} failed={failed} in_progress={in_progress} waiting={waiting} frozen={frozen} nominated={nominated} req_sent={req_sent} req_recv={req_recv} resp_sent={resp_sent} resp_recv={resp_recv}",
-        pairs.len()
+        "role={role} ice_state={ice_state} selected={selected} pair_changes={pair_changes} pairs={} succeeded={succeeded} failed={failed} in_progress={in_progress} waiting={waiting} frozen={frozen} nominated={nominated} {}",
+        pairs.len(),
+        ice_check_counts_label(pairs.len(), req_sent, req_recv, resp_sent, resp_recv)
     );
     for (dir, typ, addr, port, proto, raddr, url, _id) in &cands {
         out.push_str(&format!(
@@ -1831,5 +2026,28 @@ mod tests {
         assert!(!out.to_ascii_lowercase().contains("a=candidate"), "{out}");
         assert!(out.contains("a=ice-ufrag:abc"), "{out}");
         assert!(out.contains("m=video"), "{out}");
+    }
+
+    #[test]
+    fn ice_check_counts_label_does_not_claim_zero_means_unsent() {
+        assert_eq!(
+            super::ice_check_counts_label(0, 0, 0, 0, 0),
+            "checks=unavailable-selected-stats-only"
+        );
+        assert_eq!(
+            super::ice_check_counts_label(1, 4, 8, 8, 6),
+            "req_sent=4 req_recv=8 resp_sent=8 resp_recv=6"
+        );
+        assert_ne!(
+            super::ice_check_counts_label(0, 0, 0, 0, 0),
+            "req_sent=0 req_recv=0 resp_sent=0 resp_recv=0"
+        );
+    }
+
+    #[test]
+    fn ice_ufrag_matches_admits_empty_fragment_and_rejects_stale() {
+        assert!(super::ice_ufrag_matches(Some("genA"), None));
+        assert!(super::ice_ufrag_matches(Some("genA"), Some("genA")));
+        assert!(!super::ice_ufrag_matches(Some("genA"), Some("genB")));
     }
 }

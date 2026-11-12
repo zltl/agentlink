@@ -259,6 +259,11 @@ struct ProtocolSignal {
     /// arrive only as delayed `ice` trickle — the sequence that matters
     /// after `pingAllCandidates` has already run with an empty list.
     strip_offer_candidates: bool,
+    omit_answer_candidates: bool,
+    pretend_old_node: bool,
+    /// Answer still advertises ice_pull, but the action itself is unknown
+    /// (mixed / half-upgraded node). Viewer must log once and stop.
+    reject_ice_pull: bool,
     answer_at: Mutex<Option<Instant>>,
     answer_candidates: Mutex<usize>,
     session_id: Mutex<String>,
@@ -270,6 +275,8 @@ impl ProtocolSignal {
         ice_delay: Duration,
         rewrite_gather_ms: Option<u64>,
         strip_offer_candidates: bool,
+        omit_answer_candidates: bool,
+        pretend_old_node: bool,
     ) -> Self {
         Self {
             handler,
@@ -277,6 +284,9 @@ impl ProtocolSignal {
             ice_delay,
             rewrite_gather_ms,
             strip_offer_candidates,
+            omit_answer_candidates,
+            pretend_old_node,
+            reject_ice_pull: false,
             answer_at: Mutex::new(None),
             answer_candidates: Mutex::new(0),
             session_id: Mutex::new(String::new()),
@@ -376,7 +386,33 @@ impl Signal for ProtocolSignal {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        let result = self.handler.handle_peer(&body, "protocol-test");
+        if action == "ice_pull" && (self.pretend_old_node || self.reject_ice_pull) {
+            self.push("ice_pull rejected as unsupported".into());
+            return Err("unknown webrtc_signal action 'ice_pull'".into());
+        }
+        let mut result = self.handler.handle_peer(&body, "protocol-test");
+        if action == "offer" {
+            if let Ok(answer) = result.as_mut() {
+                if self.omit_answer_candidates {
+                    if let Some(sdp) = answer.get("sdp").and_then(Value::as_str) {
+                        let (stripped, dropped) = strip_sdp_ice_candidates(sdp);
+                        if let Some(obj) = answer.as_object_mut() {
+                            obj.insert("sdp".into(), Value::String(stripped));
+                            obj.insert("candidates".into(), serde_json::json!([]));
+                        }
+                        self.push(format!(
+                            "answer omitted {dropped} SDP candidates for ice_pull"
+                        ));
+                    }
+                }
+                if self.pretend_old_node {
+                    if let Some(obj) = answer.as_object_mut() {
+                        obj.remove("ice_pull");
+                    }
+                    self.push("answer hid ice_pull (old node)".into());
+                }
+            }
+        }
         match (action, &result) {
             ("offer", Ok(answer)) => {
                 let session = answer
@@ -418,6 +454,21 @@ impl Signal for ProtocolSignal {
             }
             ("ice", Err(err)) => {
                 self.push(format!("ice err {err}"));
+            }
+            ("ice_pull", Ok(value)) => {
+                let n = value
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .map(|arr| arr.len())
+                    .unwrap_or(0);
+                let done = value
+                    .get("gather_done")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.push(format!("ice_pull ok new={n} gather_done={done}"));
+            }
+            ("ice_pull", Err(err)) => {
+                self.push(format!("ice_pull err {err}"));
             }
             (other, Err(err)) => {
                 self.push(format!("{other} err {err}"));
@@ -485,6 +536,8 @@ fn delayed_trickle_still_selects_a_pair_and_delivers_h264() {
         Duration::from_millis(400),
         None,
         true,
+        false,
+        false,
     ));
     let viewer = Viewer::connect(
         signal.clone(),
@@ -578,6 +631,8 @@ fn malformed_trickle_after_answer_is_not_acked_ok() {
         Duration::ZERO,
         None,
         false,
+        false,
+        false,
     ));
     let viewer = Viewer::connect(
         signal.clone(),
@@ -620,6 +675,8 @@ fn short_gather_late_node_candidates_are_observed_without_claiming_nat() {
         Duration::ZERO,
         Some(20),
         false,
+        false,
+        false,
     ));
     let viewer = Viewer::connect(
         signal.clone(),
@@ -654,5 +711,265 @@ fn short_gather_late_node_candidates_are_observed_without_claiming_nat() {
         idr && snap.is_some(),
         "same-host host candidates in the answer should still be enough without ice_pull"
     );
+    viewer.close();
+}
+
+#[test]
+fn ice_pull_delivers_candidates_omitted_from_the_answer() {
+    let handler = view_handler();
+    let signal = Arc::new(ProtocolSignal::new(
+        handler.clone(),
+        Duration::ZERO,
+        None,
+        false,
+        true,
+        false,
+    ));
+    let viewer = Viewer::connect(
+        signal.clone(),
+        LiveOptions {
+            viewer: "protocol-test".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("offer");
+    let idr = wait_for_idr(&viewer);
+    let snap = wait_for_selected_pair(&viewer);
+    let events = signal.events();
+    let pulled = events
+        .iter()
+        .any(|event| event.starts_with("ice_pull ok") && !event.contains("new=0"));
+    eprintln!(
+        "agentlink live-protocol: ice_pull omitted-answer pulled={pulled} idr={idr} path={:?} events={events:?}",
+        snap.as_ref().map(|s| s.path.clone())
+    );
+    assert!(
+        events.iter().any(|event| event.contains("answer omitted")),
+        "answer must omit candidates so pull is required: {events:?}"
+    );
+    assert!(
+        pulled,
+        "ice_pull must return the omitted candidates: {events:?}"
+    );
+    assert!(idr, "H.264 must arrive via pulled candidates: {events:?}");
+    assert!(
+        snap.is_some(),
+        "selected pair required after ice_pull: {events:?}"
+    );
+    viewer.close();
+}
+
+#[test]
+fn ice_pull_skipped_on_old_node_still_selects_a_pair() {
+    let handler = view_handler();
+    let signal = Arc::new(ProtocolSignal::new(
+        handler.clone(),
+        Duration::ZERO,
+        None,
+        false,
+        false,
+        true,
+    ));
+    let viewer = Viewer::connect(
+        signal.clone(),
+        LiveOptions {
+            viewer: "protocol-test".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("offer");
+    let idr = wait_for_idr(&viewer);
+    let snap = wait_for_selected_pair(&viewer);
+    let events = signal.events();
+    eprintln!(
+        "agentlink live-protocol: old-node ice_pull idr={idr} path={:?} events={events:?}",
+        snap.as_ref().map(|s| s.path.clone())
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("answer hid ice_pull")),
+        "old node must hide ice_pull: {events:?}"
+    );
+    let pull_attempts = events
+        .iter()
+        .filter(|event| event.contains("ice_pull"))
+        .count();
+    assert!(
+        pull_attempts <= 1,
+        "unsupported ice_pull must not retry-storm, events={events:?}"
+    );
+    assert!(
+        idr && snap.is_some(),
+        "answer candidates must still work: {events:?}"
+    );
+    viewer.close();
+}
+
+#[test]
+fn advertised_but_unsupported_ice_pull_degrades_without_a_retry_storm() {
+    let handler = view_handler();
+    let signal = ProtocolSignal::new(handler.clone(), Duration::ZERO, None, false, false, false);
+    // Keep ice_pull:true in the answer, but reject the action itself.
+    let mut signal = signal;
+    signal.reject_ice_pull = true;
+    let signal = Arc::new(signal);
+    let viewer = Viewer::connect(
+        signal.clone(),
+        LiveOptions {
+            viewer: "protocol-test".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("offer");
+    let idr = wait_for_idr(&viewer);
+    let snap = wait_for_selected_pair(&viewer);
+    let events = signal.events();
+    eprintln!(
+        "agentlink live-protocol: unsupported ice_pull advertised idr={idr} path={:?} events={events:?}",
+        snap.as_ref().map(|s| s.path.clone())
+    );
+    let unsupported = events
+        .iter()
+        .filter(|event| {
+            event.contains("ice_pull rejected as unsupported")
+                || event.contains("ice_pull err unknown")
+        })
+        .count();
+    assert!(
+        unsupported >= 1,
+        "unknown ice_pull must be observed, events={events:?}"
+    );
+    let pull_attempts = events
+        .iter()
+        .filter(|event| event.contains("ice_pull"))
+        .count();
+    assert!(
+        pull_attempts <= 2,
+        "unsupported ice_pull must not retry-storm, events={events:?}"
+    );
+    assert!(
+        idr && snap.is_some(),
+        "batched answer candidates must still form a pair: {events:?}"
+    );
+    viewer.close();
+}
+
+#[test]
+fn stale_session_ice_is_rejected_and_a_new_generation_recovers_h264() {
+    let handler = view_handler();
+    let first = Arc::new(ProtocolSignal::new(
+        handler.clone(),
+        Duration::ZERO,
+        None,
+        false,
+        false,
+        false,
+    ));
+    let viewer = Viewer::connect(
+        first.clone(),
+        LiveOptions {
+            viewer: "protocol-test".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("offer");
+    assert!(wait_for_idr(&viewer), "first generation must get H.264");
+    let old_session = viewer.info().session_id.clone();
+    let stale = handler
+        .handle_peer(
+            &serde_json::json!({
+                "action": "ice",
+                "session_id": old_session,
+                "candidate": {
+                    "candidate": "candidate:1 1 udp 2130706431 192.0.2.1 9 typ host",
+                    "sdpMid": "",
+                    "sdpMLineIndex": 0,
+                    "usernameFragment": "stale-generation"
+                }
+            }),
+            "protocol-test",
+        )
+        .unwrap_err();
+    assert!(
+        stale.contains("stale ice generation"),
+        "foreign ufrag must be rejected, got {stale}"
+    );
+    viewer.close();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let err = handler.handle_peer(
+            &serde_json::json!({
+                "action": "ice",
+                "session_id": old_session,
+                "candidate": {
+                    "candidate": "candidate:1 1 udp 2130706431 192.0.2.1 9 typ host",
+                    "sdpMid": "",
+                    "sdpMLineIndex": 0,
+                    "usernameFragment": null
+                }
+            }),
+            "protocol-test",
+        );
+        if err
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("unknown stream session"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let closed = handler
+        .handle_peer(
+            &serde_json::json!({
+                "action": "ice",
+                "session_id": old_session,
+                "candidate": {
+                    "candidate": "candidate:1 1 udp 2130706431 192.0.2.1 9 typ host",
+                    "sdpMid": "",
+                    "sdpMLineIndex": 0,
+                    "usernameFragment": null
+                }
+            }),
+            "protocol-test",
+        )
+        .unwrap_err();
+    assert!(
+        closed.contains("unknown stream session"),
+        "closed session must not accept ice, got {closed}"
+    );
+
+    let second = Arc::new(ProtocolSignal::new(
+        handler.clone(),
+        Duration::ZERO,
+        None,
+        false,
+        false,
+        false,
+    ));
+    let viewer = Viewer::connect(
+        second.clone(),
+        LiveOptions {
+            viewer: "protocol-test".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("second offer");
+    let new_session = viewer.info().session_id.clone();
+    assert_ne!(
+        old_session, new_session,
+        "recovery must use a new session id"
+    );
+    assert!(
+        wait_for_idr(&viewer),
+        "new generation must deliver H.264 after the previous session closed"
+    );
+    assert!(wait_for_selected_pair(&viewer).is_some());
     viewer.close();
 }

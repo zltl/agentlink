@@ -68,3 +68,9 @@ screencapturekit = "11"
 
 [dev-dependencies]
 tempfile.workspace = true
+agentlink-view = { workspace = true }
+
+
+[[bin]]
+name = "agentlink-stream-fixture"
+path = "src/bin/agentlink-stream-fixture.rs"
