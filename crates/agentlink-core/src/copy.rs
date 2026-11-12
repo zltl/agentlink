@@ -67,7 +67,10 @@ impl Client {
             };
             match result {
                 Ok(stats) => return Ok(stats),
-                Err(err) if err.is_retryable() && std::time::Instant::now() < deadline => {
+                Err(err)
+                    if is_copy_resume_retryable(&err, self.is_alive())
+                        && std::time::Instant::now() < deadline =>
+                {
                     tokio::time::sleep(backoff.next_delay()).await;
                 }
                 Err(err) => return Err(err),
@@ -98,12 +101,13 @@ impl Client {
                             "{remote} is not a regular file (refusing fifo/socket/device)"
                         )));
                     }
-                    let mtime = stat
-                        .modified_unix_ms
-                        .map(|ms| (ms / 1000) as u64);
+                    let mtime = stat.modified_unix_ms.map(|ms| (ms / 1000) as u64);
                     (stat.is_dir, stat.mode, mtime)
                 }
-                Err(err) if err.is_retryable() && std::time::Instant::now() < deadline => {
+                Err(err)
+                    if is_copy_resume_retryable(&err, self.is_alive())
+                        && std::time::Instant::now() < deadline =>
+                {
                     tokio::time::sleep(backoff.next_delay()).await;
                     continue;
                 }
@@ -142,7 +146,10 @@ impl Client {
                     }
                     return Ok(stats);
                 }
-                Err(err) if err.is_retryable() && std::time::Instant::now() < deadline => {
+                Err(err)
+                    if is_copy_resume_retryable(&err, self.is_alive())
+                        && std::time::Instant::now() < deadline =>
+                {
                     tokio::time::sleep(backoff.next_delay()).await;
                 }
                 Err(err) => return Err(err),
@@ -462,6 +469,28 @@ fn register(
     Ok(())
 }
 
+/// A mid-copy failure that may be retried as a **new** grant-checked
+/// `open_data_link`, not by resurrecting the cancelled request.
+///
+/// The node fail-closes in-flight RPCs, shells, and media immediately when
+/// the relay drops (`cancelled`). `Error::is_retryable` stays false for that
+/// result so exec/PTY do not silently rerun. Journaled copy may open a fresh
+/// session while this client is still alive. Auth and permission failures
+/// are not retried.
+fn is_copy_resume_retryable(err: &Error, client_alive: bool) -> bool {
+    if !client_alive {
+        return false;
+    }
+    if err.is_retryable() {
+        return true;
+    }
+    match err {
+        Error::Cancelled => true,
+        Error::Message(message) => message.eq_ignore_ascii_case("cancelled"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod bridge_progress_tests {
     use std::sync::Mutex;
@@ -483,5 +512,54 @@ mod bridge_progress_tests {
             *seen.lock().expect("seen"),
             vec![(50, 200), (150, 200), (200, 200)]
         );
+    }
+
+    #[test]
+    fn cancelled_copy_is_retryable_only_while_the_client_is_alive() {
+        let cancelled = Error::Message("cancelled".into());
+        assert!(
+            !cancelled.is_retryable(),
+            "exec/PTY must not treat cancelled as a generic retry"
+        );
+        assert!(is_copy_resume_retryable(&cancelled, true));
+        assert!(is_copy_resume_retryable(&Error::Cancelled, true));
+        assert!(!is_copy_resume_retryable(&cancelled, false));
+        assert!(!is_copy_resume_retryable(&Error::Cancelled, false));
+    }
+
+    #[test]
+    fn copy_resume_still_retries_transient_link_errors() {
+        assert!(is_copy_resume_retryable(
+            &Error::Message("relay going away".into()),
+            true
+        ));
+        assert!(is_copy_resume_retryable(
+            &Error::Message("transfer closed".into()),
+            true
+        ));
+        assert!(is_copy_resume_retryable(
+            &Error::Offline("box".into()),
+            true
+        ));
+        assert!(!is_copy_resume_retryable(
+            &Error::Message("relay going away".into()),
+            false
+        ));
+    }
+
+    #[test]
+    fn copy_resume_does_not_retry_auth_or_permission_failures() {
+        assert!(!is_copy_resume_retryable(
+            &Error::Auth("bad token".into()),
+            true
+        ));
+        assert!(!is_copy_resume_retryable(
+            &Error::PermissionDenied("no grant".into()),
+            true
+        ));
+        assert!(!is_copy_resume_retryable(
+            &Error::Message("grant revoked".into()),
+            true
+        ));
     }
 }
