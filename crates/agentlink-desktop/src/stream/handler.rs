@@ -106,6 +106,14 @@ impl StreamHandler {
         }
     }
 
+    /// Candidates gathered for a live session, including any that arrived
+    /// after the answer was returned. typ/proto JSON only; no ufrag.
+    pub fn gathered_candidates(&self, session_id: &str) -> Option<Vec<Value>> {
+        self.sessions()
+            .ok()
+            .and_then(|sessions| sessions.gathered_candidates(session_id))
+    }
+
     fn sessions(&self) -> std::result::Result<Arc<SessionManager>, String> {
         let mut guard = self.engine.lock().unwrap_or_else(|err| err.into_inner());
         if guard.is_none() {

@@ -856,3 +856,107 @@ Do not mix binaries. Read-only View of sufa. Expect JPEG to
 remain through a no-pair miss, then up to two further offers
 (3s / 6s backoff) rather than a single 12s-and-done live
 attempt. Do not expect a selected public P2P pair.
+
+# t450 — offer/gather/trickle lifecycle (local protocol, not a new 1212)
+
+1212 remains frozen. This batch did not probe sufa, change log
+levels, deploy, capture packets, or alter third-party crates.
+
+## Does `live_pipeline` / loopback match the production path?
+
+Yes, for the `webrtc_signal` contract. Both the Controller
+`live_pipeline` harness and `crates/agentlink-view/tests/loopback.rs`
+call `StreamHandler::handle_peer`, which is the same
+`SessionManager` production uses via `dispatch_extension_as` →
+`handle_peer` (node `ops.rs` only additionally stamps
+`_allow_view` / `_allow_control`). They are not a two-peer
+loopback that bypasses offer/answer/ice JSON.
+
+They are **not** the production network: `Desktop::mock()`,
+auto consent, isolated fixtures (no production identity or new
+grant), in-process signaling rather than the relay, and both
+peers on the same box. A selected `path=private` typ host pair
+here is not public NAT P2P.
+
+The deployed sufa node is still `0.1.0` / `bc97ba1`. These
+tests run against the worktree node handler, which is the same
+offer/ice/session contract plus the ice-ack honesty fix below.
+
+## What the library actually does (read-only)
+
+- `webrtc-0.21.1` `add_ice_candidate` → `rtc` `add_remote_candidate`
+  requires a remote description, then parses only the candidate
+  attribute. **`sdpMid`, `sdpMLineIndex`, and `usernameFragment`
+  are ignored.** `RTCIceCandidate::to_json` sets `sdpMid` to `""`
+  and m-line `0`. That shape still adds.
+- `Agent::add_remote_candidate` pairs a new remote with every
+  compatible local (`can_pair_with`: same IP family, matching
+  TCP types) and requests a connectivity check. Late remotes
+  after `start_connectivity_checks` are not dropped; they form
+  new pairs. An early `pingAllCandidates called with no
+  candidate pairs` warning is therefore not a terminal root
+  cause if trickle or SDP candidates arrive afterwards.
+- Host and srflx are gathered from the same bound
+  `local_addrs`. The STUN gatherer does not close those
+  transport sockets when a binding times out. No evidence in
+  this library that a temporary gather socket is released and
+  then leaves host candidates unusable.
+- `get_stats()` still only reports selected / known candidates,
+  not a full failed-check checklist.
+
+## Proven gap and minimal fix
+
+`SessionManager::ice` used to do `if let Ok(init) = serde_json::from_value(...) { add } ; Ok({ok:true})`.
+A bare string, null, or foreign JSON was **acked `ok` without
+`add_ice_candidate`**. The webrtc_signal audit could then show
+ice ok for a candidate that was never added.
+
+Fix: parse with `parse_trickle_candidate`, return an error on
+a bad shape or unknown `session_id`, and only then
+`add_ice_candidate`. Success is `{ok: true, added: true}`
+(backward compatible). Logs record typ / `sdpMid` emptiness /
+m-line only — no ufrag, password, or token.
+
+The live Viewer trickle shape (`camelCase` Init, empty
+`sdpMid`) **does parse**. Production's 18 ice-ok rows are
+therefore not explained by this swallow, unless some payloads
+were a different shape (not observed on this path). The fix is
+still required so a future miss cannot hide behind `ok`.
+
+## Protocol tests (real handler + Viewer)
+
+- `trickle_ice_init_parses_the_viewer_to_json_shape`,
+  `trickle_ice_bare_string_or_null_is_a_parse_error`
+- `ice_before_session_is_rejected_and_is_not_ok` — ice before
+  offer is `unknown stream session`, not `ok`
+- `delayed_trickle_still_selects_a_pair_and_delivers_h264` —
+  12 offer SDP candidates stripped, ICE already started, then
+  delayed 400ms trickle: **6 `added=true`, 0 errors, selected
+  typ host pair, H.264 IDR**. Late `add_ice_candidate` works
+  on this path. Empty `sdpMid` does not prevent the add.
+- `malformed_trickle_after_answer_is_not_acked_ok` — a bare
+  candidate string after a real session is rejected; valid
+  candidates still deliver H.264
+- `short_gather_late_node_candidates_are_observed_without_claiming_nat`
+  — `gather_ms=20`, answer already had 6 candidates
+  (host+srflx), **0 additional candidates 2s later**. Same-host
+  pair and H.264 still succeeded from the answer. **No
+  `ice_pull` added**: it was not shown to be useful here.
+
+## Still not a cross-machine P2P result
+
+A complete-gather Viewer offer already embeds host+srflx in the
+SDP, so trickle is often a duplicate of what `set_remote` has
+already applied. The box↔sufa no-pair miss, after the DNS
+rewrite gave both sides public typ srflx, is **not** explained
+by mid/ufrag JSON mismatch, ice-before-session, or silent
+parse-drop of the Viewer shape. It is also not a NAT-type
+conclusion: this batch did not observe check send/receive on
+the wire to sufa.
+
+What still needs a user-authorized remote step (not done here):
+safe node-side check inventories during a live View, or a
+reviewed deploy of this ice-ack honesty change to a
+non-production node. Do not treat TURN or Tailscale overlay as
+native public P2P. Do not change firewalls or routes to force
+a pair.

@@ -31,9 +31,9 @@ use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::default_runtime;
 
 use crate::capture::{CaptureRequest, CaptureTarget};
+use crate::control_indicator;
 use crate::error::{msg, Result};
 use crate::input::{InputAction, MouseButton};
-use crate::control_indicator;
 use crate::Desktop;
 
 use super::audio::{ulaw, AudioCapture};
@@ -83,6 +83,7 @@ trait IcePeer: Send + Sync {
         &self,
         offer_sdp: &str,
     ) -> std::result::Result<(String, Vec<Value>), String>;
+    fn gathered_candidates(&self) -> Vec<Value>;
     async fn close(&self);
 }
 
@@ -152,6 +153,13 @@ where
             .map(|candidates| candidates.clone())
             .unwrap_or_default();
         Ok((local.sdp, candidates))
+    }
+
+    fn gathered_candidates(&self) -> Vec<Value> {
+        self.candidates
+            .lock()
+            .map(|candidates| candidates.clone())
+            .unwrap_or_default()
     }
 
     async fn close(&self) {
@@ -367,7 +375,11 @@ impl SessionManager {
             codec: built.answer["codec"].as_str().unwrap_or("h264").to_string(),
             encoder: built.answer["encoder"].as_str().unwrap_or("").to_string(),
         });
-        spawn_cursor(self.desktop.clone(), built.channels.clone(), built.stop.clone());
+        spawn_cursor(
+            self.desktop.clone(),
+            built.channels.clone(),
+            built.stop.clone(),
+        );
         spawn_capturable(
             self.desktop.clone(),
             built.channels,
@@ -457,6 +469,23 @@ impl SessionManager {
         }))
     }
 
+    /// Safe typ inventory of candidates gathered for a live session, including
+    /// any that arrived after the answer was returned. No ufrag or password.
+    pub fn gathered_candidates(&self, session_id: &str) -> Option<Vec<Value>> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| {
+                session
+                    .peer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|peer| peer.gathered_candidates())
+            })
+    }
+
     async fn ice(&self, payload: &Value) -> std::result::Result<Value, String> {
         let id = payload
             .get("session_id")
@@ -479,12 +508,21 @@ impl SessionManager {
         let Some(peer) = peer else {
             return Err("unknown stream session".into());
         };
-        if let Ok(init) = serde_json::from_value(candidate.clone()) {
-            peer.add_ice_candidate(init)
-                .await
-                .map_err(|err| err.to_string())?;
-        }
-        Ok(json!({"ok": true}))
+        // A parse miss used to fall through to `{ok: true}` and look like a
+        // successful `add_ice_candidate` in the webrtc_signal audit. Do not
+        // ack a candidate that was never added.
+        let init = parse_trickle_candidate(&candidate)?;
+        let typ = candidate_typ_hint(&init.candidate);
+        let mid_empty = init.sdp_mid.as_deref().unwrap_or("").is_empty();
+        let mline = init.sdp_mline_index;
+        peer.add_ice_candidate(init)
+            .await
+            .map_err(|err| err.to_string())?;
+        // typ / mid emptiness / m-line only — never ufrag, password, or token.
+        eprintln!(
+            "agentlink live-webrtc: ice added typ={typ} sdpMid_empty={mid_empty} sdpMLineIndex={mline:?}"
+        );
+        Ok(json!({"ok": true, "added": true}))
     }
 
     fn keyframe(&self, payload: &Value) -> std::result::Result<Value, String> {
@@ -714,12 +752,8 @@ async fn build_answer(
     } else if want_encode_w > 0 {
         (want_encode_w, want_encode_h.max(2), capture_w, capture_h)
     } else {
-        let ew = super::encode::align_mb(
-            ((capture_w as f32) * scale).round().max(1.0) as u32,
-        );
-        let eh = super::encode::align_mb(
-            ((capture_h as f32) * scale).round().max(1.0) as u32,
-        );
+        let ew = super::encode::align_mb(((capture_w as f32) * scale).round().max(1.0) as u32);
+        let eh = super::encode::align_mb(((capture_h as f32) * scale).round().max(1.0) as u32);
         (ew, eh, capture_w, capture_h)
     };
     tracing::info!(
@@ -1420,6 +1454,33 @@ fn candidates_have_typ(candidates: &Mutex<Vec<Value>>, typ: &str) -> bool {
         })
 }
 
+/// Parse the trickle `candidate` object the viewer sends. A bare SDP string,
+/// null, or a foreign JSON shape is an error so the audit cannot report
+/// `ok` for a candidate that was never added.
+fn parse_trickle_candidate(
+    candidate: &Value,
+) -> std::result::Result<rtc::peer_connection::transport::RTCIceCandidateInit, String> {
+    serde_json::from_value(candidate.clone())
+        .map_err(|err| format!("ice candidate is not a valid RTCIceCandidateInit ({err})"))
+}
+
+/// typ only, for logs and tests. The candidate attribute does not carry a
+/// ufrag; still do not print the address line.
+fn candidate_typ_hint(line: &str) -> &'static str {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("typ srflx") {
+        "srflx"
+    } else if lower.contains("typ relay") {
+        "relay"
+    } else if lower.contains("typ prflx") {
+        "prflx"
+    } else if lower.contains("typ host") {
+        "host"
+    } else {
+        "unknown"
+    }
+}
+
 fn rand_ssrc() -> u32 {
     let tick = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1764,10 +1825,7 @@ pub(crate) fn input_audit(kind: &str, value: &Value) -> (String, Value) {
         "type" | "clipboard" => {
             let text = value.get("text").and_then(Value::as_str);
             let Some(text) = text else {
-                return (
-                    format!("{kind} get"),
-                    json!({"kind": kind, "op": "get"}),
-                );
+                return (format!("{kind} get"), json!({"kind": kind, "op": "get"}));
             };
             let count = text.chars().count();
             let mut preview: String = text.chars().take(12).collect();
@@ -1897,7 +1955,7 @@ mod tests {
     use super::input_allowed;
     use crate::input::InputAction;
     use agentlink_core::NodePolicy;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn default_scale_caps_wide_panels_only_when_unset() {
@@ -2218,5 +2276,40 @@ mod tests {
         assert!(!clip.contains("clipboard-secret-value"));
         assert!(clip_args.get("text").is_none());
         assert!(!format!("{clip_args}").contains("sdp"));
+    }
+
+    #[test]
+    fn trickle_ice_init_parses_the_viewer_to_json_shape() {
+        // webrtc-0.21 `RTCIceCandidate::to_json` uses camelCase, empty
+        // `sdpMid`, m-line 0, and no usernameFragment. That is the live
+        // viewer trickle shape. The library's add_remote_candidate ignores
+        // mid/ufrag and only parses the candidate attribute.
+        let value = json!({
+            "candidate": "candidate:1 1 udp 2130706431 192.0.2.1 9 typ host",
+            "sdpMid": "",
+            "sdpMLineIndex": 0,
+            "usernameFragment": null
+        });
+        let init = super::parse_trickle_candidate(&value).expect("viewer shape");
+        assert_eq!(init.sdp_mid.as_deref(), Some(""));
+        assert_eq!(init.sdp_mline_index, Some(0));
+        assert!(init.username_fragment.is_none());
+        assert_eq!(super::candidate_typ_hint(&init.candidate), "host");
+    }
+
+    #[test]
+    fn trickle_ice_bare_string_or_null_is_a_parse_error() {
+        // The previous ice() handler swallowed this and returned `{ok: true}`.
+        let bare = json!("candidate:1 1 udp 2130706431 192.0.2.1 9 typ host");
+        let err = super::parse_trickle_candidate(&bare).unwrap_err();
+        assert!(
+            err.contains("RTCIceCandidateInit"),
+            "unexpected parse error: {err}"
+        );
+        let err = super::parse_trickle_candidate(&Value::Null).unwrap_err();
+        assert!(
+            err.contains("RTCIceCandidateInit"),
+            "unexpected parse error: {err}"
+        );
     }
 }
