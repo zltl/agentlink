@@ -32,6 +32,7 @@ async fn flow() -> anyhow::Result<()> {
         db_schema: None,
         trust_proxy: Vec::new(),
         print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
     })
     .await?;
     let relay_url = format!("wss://{}/v1/connect", relay.local_addr);

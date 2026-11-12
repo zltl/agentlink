@@ -1,6 +1,6 @@
 # Accounts, sessions, and sharing
 
-The relay keeps local accounts. A node is owned by the user who enrolled it. That user sees the node, and so does anyone they share it with. An admin sees every node. A legacy admin token still works and is treated as the `admin` user, so existing automation keeps its access. Prefer an account and TOTP for people. Rotate `admin.token` after any exposure. `AGENTLINK_LEGACY_ADMIN=0` disables the file token, and `AGENTLINK_LEGACY_ADMIN_TTL_SECS` expires it. Every accept and reject is written to the hash-chained audit log.
+The relay keeps local accounts. A node is owned by the user who enrolled it. That user sees the node, and so does anyone they share it with. An admin sees every node. The legacy admin file token is disabled by default and is treated as the `admin` user only when `AGENTLINK_LEGACY_ADMIN=1` and `AGENTLINK_LEGACY_ADMIN_TTL_SECS` are both set. Existing token files are left in place and are not rewritten. Prefer an account and TOTP for people. Every accept and reject is written to the hash-chained audit log.
 
 Sealed agent sessions and owner-signed grants (relay untrusted for authz) are covered in [e2e-auth.md](e2e-auth.md).
 

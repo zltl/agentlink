@@ -25,6 +25,7 @@ async fn web_socket_requires_the_dashboard_session_and_only_file_or_pty_ops() {
         db_schema: None,
         trust_proxy: Vec::new(),
         print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
     })
     .await
     .unwrap();
@@ -267,6 +268,7 @@ async fn public_ice_hides_turn_secrets_and_minting_requires_a_session_or_ticket(
         db_schema: None,
         trust_proxy: Vec::new(),
         print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
     })
     .await
     .unwrap();

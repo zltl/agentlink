@@ -399,6 +399,7 @@ async fn spawn(dir: &std::path::Path) -> RelayHandle {
         db_schema: None,
         trust_proxy: Vec::new(),
         print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
     })
     .await
     .unwrap()

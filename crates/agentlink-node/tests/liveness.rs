@@ -95,6 +95,7 @@ async fn flow() -> anyhow::Result<()> {
         db_schema: None,
         trust_proxy: Vec::new(),
         print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
     })
     .await?;
     let proxy = spawn_proxy(relay.local_addr).await?;

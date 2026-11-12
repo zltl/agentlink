@@ -84,6 +84,9 @@ pub struct RelayConfig {
     pub trust_proxy: Vec<String>,
     /// Print the admin token even when it was created by an earlier start.
     pub print_admin_token: bool,
+    /// When set, overrides `AGENTLINK_LEGACY_ADMIN` / `_TTL_SECS` for this
+    /// instance only (tests). Production leaves this `None`.
+    pub legacy_admin_override: Option<(bool, Option<i64>)>,
 }
 
 pub struct RelayHandle {
@@ -129,6 +132,9 @@ impl RelayHandle {
 
         let shutdown = CancellationToken::new();
         let kick = Arc::new(Mutex::new(Vec::new()));
+        let (legacy_enabled, legacy_ttl) = config
+            .legacy_admin_override
+            .unwrap_or_else(|| (legacy_admin_enabled(), legacy_admin_ttl()));
         let hub = Arc::new(Hub {
             db: opened.db,
             online: Mutex::new(HashMap::new()),
@@ -143,6 +149,8 @@ impl RelayHandle {
             data_dir: config.data_dir.clone(),
             admin_token: admin_token.clone(),
             admin_token_created_unix,
+            legacy_admin_enabled: legacy_enabled,
+            legacy_admin_ttl: legacy_ttl,
             view_tickets: Mutex::new(HashMap::new()),
             allow_signup: config.allow_signup,
             login_windows: Mutex::new(HashMap::new()),
@@ -361,6 +369,8 @@ pub(crate) struct Hub {
     data_dir: PathBuf,
     admin_token: String,
     admin_token_created_unix: i64,
+    legacy_admin_enabled: bool,
+    legacy_admin_ttl: Option<i64>,
     view_tickets: Mutex<HashMap<String, ViewTicketRecord>>,
     allow_signup: bool,
     login_windows: Mutex<HashMap<String, (i64, u32)>>,
@@ -481,6 +491,8 @@ struct Router {
     audit_path: PathBuf,
     admin_token: String,
     admin_token_created_unix: i64,
+    legacy_admin_enabled: bool,
+    legacy_admin_ttl: Option<i64>,
 }
 
 impl Callback for Router {
@@ -542,7 +554,7 @@ impl Router {
         if presented.is_empty() || !util::ct_eq(presented, &self.admin_token) {
             return false;
         }
-        match legacy_admin_gate(self.admin_token_created_unix) {
+        match legacy_gate_at(self.legacy_admin_enabled, self.legacy_admin_ttl, self.admin_token_created_unix, unix_now()) {
             Ok(()) => {
                 note_legacy_use(&self.audit_path, true, "");
                 true
@@ -584,7 +596,7 @@ fn print_banner(handle: &RelayHandle, force_token: bool) {
     if force_token || handle.admin_token_created {
         let _ = writeln!(
             out,
-            "  prefer an account and TOTP. admin.token is for automation: rotate it, then set AGENTLINK_LEGACY_ADMIN=0."
+            "  prefer an account and TOTP. admin.token is disabled by default. To enable automation access, set AGENTLINK_LEGACY_ADMIN=1 and AGENTLINK_LEGACY_ADMIN_TTL_SECS."
         );
     }
     let _ = writeln!(
@@ -928,7 +940,7 @@ fn presented_legacy(hub: &Hub, presented: &str) -> bool {
     if presented.is_empty() || !util::ct_eq(presented, &hub.admin_token) {
         return false;
     }
-    match legacy_admin_gate(hub.admin_token_created_unix) {
+    match legacy_gate_at(hub.legacy_admin_enabled, hub.legacy_admin_ttl, hub.admin_token_created_unix, unix_now()) {
         Ok(()) => {
             note_legacy_use(&hub.audit_path, true, "");
             true
@@ -1054,6 +1066,8 @@ async fn handle_connection(
                 audit_path: hub.audit_path.clone(),
                 admin_token: hub.admin_token.clone(),
                 admin_token_created_unix: hub.admin_token_created_unix,
+                legacy_admin_enabled: hub.legacy_admin_enabled,
+                legacy_admin_ttl: hub.legacy_admin_ttl,
             },
             Some(ws::ws_config()),
         ),
@@ -1411,6 +1425,8 @@ async fn serve_web_socket(
                 audit_path: hub.audit_path.clone(),
                 admin_token: hub.admin_token.clone(),
                 admin_token_created_unix: hub.admin_token_created_unix,
+                legacy_admin_enabled: hub.legacy_admin_enabled,
+                legacy_admin_ttl: hub.legacy_admin_ttl,
             },
             Some(ws::ws_config()),
         ),
@@ -1489,7 +1505,7 @@ async fn client_principal(
     if !presented.is_empty() {
         let admin = hub.db.admin_token().to_string();
         if util::ct_eq(&presented, &admin) {
-            return match legacy_admin_gate(hub.admin_token_created_unix) {
+            return match legacy_gate_at(hub.legacy_admin_enabled, hub.legacy_admin_ttl, hub.admin_token_created_unix, unix_now()) {
                 Ok(()) => {
                     note_legacy_use(&hub.audit_path, true, "");
                     Ok(legacy_admin(
@@ -3971,12 +3987,9 @@ fn legacy_admin_enabled() -> bool {
     match std::env::var("AGENTLINK_LEGACY_ADMIN") {
         Ok(value) => {
             let value = value.trim().to_ascii_lowercase();
-            !matches!(
-                value.as_str(),
-                "0" | "false" | "off" | "no" | "disable" | "disabled"
-            )
+            matches!(value.as_str(), "1" | "true" | "on" | "yes" | "enable" | "enabled")
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -3984,15 +3997,6 @@ fn legacy_admin_ttl() -> Option<i64> {
     std::env::var("AGENTLINK_LEGACY_ADMIN_TTL_SECS")
         .ok()
         .and_then(|value| value.trim().parse().ok())
-}
-
-fn legacy_admin_gate(created_unix: i64) -> std::result::Result<(), &'static str> {
-    legacy_gate_at(
-        legacy_admin_enabled(),
-        legacy_admin_ttl(),
-        created_unix,
-        unix_now(),
-    )
 }
 
 fn legacy_gate_at(
@@ -4004,10 +4008,11 @@ fn legacy_gate_at(
     if !enabled {
         return Err("legacy admin token is disabled");
     }
-    if let Some(ttl) = ttl {
-        if ttl <= 0 || now > created_unix.saturating_add(ttl) {
-            return Err("legacy admin token expired");
-        }
+    let Some(ttl) = ttl else {
+        return Err("legacy admin token requires AGENTLINK_LEGACY_ADMIN_TTL_SECS");
+    };
+    if ttl <= 0 || now > created_unix.saturating_add(ttl) {
+        return Err("legacy admin token expired");
     }
     Ok(())
 }
@@ -5126,7 +5131,10 @@ mod view_ticket_tests {
 
     #[test]
     fn legacy_token_can_be_disabled_or_expired() {
-        assert!(legacy_gate_at(true, None, 10, 100).is_ok());
+        assert_eq!(
+            legacy_gate_at(true, None, 10, 100).unwrap_err(),
+            "legacy admin token requires AGENTLINK_LEGACY_ADMIN_TTL_SECS"
+        );
         assert_eq!(
             legacy_gate_at(false, None, 10, 100).unwrap_err(),
             "legacy admin token is disabled"
@@ -5319,6 +5327,7 @@ mod route_rebind_tests {
             db_schema: None,
             trust_proxy: Vec::new(),
             print_admin_token: false,
+            legacy_admin_override: Some((true, Some(86_400))),
         })
         .await
         .unwrap();

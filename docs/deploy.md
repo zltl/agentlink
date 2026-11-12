@@ -285,7 +285,7 @@ A desktop link minted from the dashboard or `agentlink view` is view-only unless
 
 ## Legacy admin token
 
-`admin.token` stays for automation. Prefer an account plus TOTP for people. Rotate the file after any exposure (`agentlink relay` prints the path, not the secret, after the first start). `AGENTLINK_LEGACY_ADMIN=0` (also `false`, `off`, `no`, `disable`) rejects the token. `AGENTLINK_LEGACY_ADMIN_TTL_SECS` rejects it after that many seconds from the start that created it. Each use, including a rejection, is appended to `audit.jsonl` as `legacy.admin` on the hash chain.
+`admin.token` is disabled by default. Prefer an account plus TOTP for people. The file is not rotated or rewritten automatically. To enable it for automation, set `AGENTLINK_LEGACY_ADMIN=1` (also `true`, `on`, `yes`, `enable`, `enabled`) and a positive `AGENTLINK_LEGACY_ADMIN_TTL_SECS` measured from the start that created the token. Enabling without a TTL is rejected. Each use, including a rejection, is appended to `audit.jsonl` as `legacy.admin` on the hash chain. `agentlink relay` prints the path, not the secret, after the first start.
 
 ## Node name pins
 

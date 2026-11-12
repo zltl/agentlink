@@ -1364,6 +1364,7 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                 db_schema: None,
                 trust_proxy: trust_proxy.clone(),
                 print_admin_token: *print_admin_token,
+                legacy_admin_override: None,
             })
             .await?;
             Ok(0)
