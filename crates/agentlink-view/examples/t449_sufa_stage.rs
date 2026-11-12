@@ -1,7 +1,7 @@
 //! Read-only diagnostic: send webrtc list_monitors / offer to an existing
 //! node (default: sufa) with the already-authorized client identity.
 //! Does not create an identity or grant, does not print tokens, and closes
-//! the session immediately after connect or timeout.
+//! the session after a short wait for a selected ICE pair or first frame.
 
 use std::env;
 use std::sync::Arc;
@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 
 use agentlink_core::client::maintain_session;
 use agentlink_core::config::{self, ClientSettings};
-use agentlink_core::{
-    apply_relay_defaults, Client, Identity, Op, PHASE3_WEBRTC_SIGNAL,
-};
+use agentlink_core::{apply_relay_defaults, Client, Identity, Op, PHASE3_WEBRTC_SIGNAL};
 use agentlink_view::{is_screenshot_fallback, LiveOptions, Signal, Viewer};
 use serde_json::{json, Value};
 
@@ -50,18 +48,9 @@ impl Signal for ClientSignal {
 }
 
 fn summarize(value: &Value) -> String {
-    let status = value
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let fallback = value
-        .get("fallback")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let encoder = value
-        .get("encoder")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
+    let status = value.get("status").and_then(Value::as_str).unwrap_or("-");
+    let fallback = value.get("fallback").and_then(Value::as_str).unwrap_or("-");
+    let encoder = value.get("encoder").and_then(Value::as_str).unwrap_or("-");
     let hardware = value.get("hardware").and_then(Value::as_bool);
     let sdp_len = value
         .get("sdp")
@@ -78,10 +67,7 @@ fn summarize(value: &Value) -> String {
         .and_then(Value::as_array)
         .map(|items| items.len())
         .unwrap_or(0);
-    let err = value
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
+    let err = value.get("error").and_then(Value::as_str).unwrap_or("-");
     format!(
         "status={status} fallback={fallback} encoder={encoder} hardware={hardware:?} sdp_len={sdp_len} session_len={session_len} monitors={monitors} error={err} screenshot_fallback={}",
         is_screenshot_fallback(value)
@@ -90,9 +76,7 @@ fn summarize(value: &Value) -> String {
 
 #[tokio::main]
 async fn main() {
-    let node = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "sufa".to_string());
+    let node = env::args().nth(1).unwrap_or_else(|| "sufa".to_string());
     let config_dir = env::var("AGENTLINK_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| config::default_config_dir().expect("config dir"));
@@ -158,13 +142,22 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let target = nodes.iter().find(|n| n.name == node || n.id.starts_with(&node));
+    let target = nodes
+        .iter()
+        .find(|n| n.name == node || n.id.starts_with(&node));
     let Some(target) = target else {
         eprintln!(
             "t449-probe: node '{node}' not in list (names: {})",
             nodes
                 .iter()
-                .map(|n| format!("{}:{}:{}", n.name, if n.online { "up" } else { "down" }, n.has_display.map(|d| if d { "desktop" } else { "headless" }).unwrap_or("unknown")))
+                .map(|n| format!(
+                    "{}:{}:{}",
+                    n.name,
+                    if n.online { "up" } else { "down" },
+                    n.has_display
+                        .map(|d| if d { "desktop" } else { "headless" })
+                        .unwrap_or("unknown")
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -254,12 +247,30 @@ async fn main() {
                 info.height,
                 info.codec
             );
-            let deadline = Instant::now() + Duration::from_secs(8);
+            // 15s covers the Controller's 12s no-pair / no-first-frame
+            // deadline plus a little slack for logging the pair.
+            let deadline = Instant::now() + Duration::from_secs(15);
             let mut frames = 0u32;
+            let mut logged_pair = false;
             while Instant::now() < deadline {
                 if viewer.failed() {
                     eprintln!("t449-probe: viewer.failed() before first frame");
                     break;
+                }
+                if !logged_pair {
+                    if let Some(snap) = viewer.transport() {
+                        logged_pair = true;
+                        eprintln!(
+                            "t449-probe: selected pair path={} local={} {} remote={} {} proto={} inventory={}",
+                            snap.path,
+                            snap.local_typ,
+                            snap.local_addr,
+                            snap.remote_typ,
+                            snap.remote_addr,
+                            snap.protocol,
+                            snap.sdp_inventory
+                        );
+                    }
                 }
                 if let Some(frame) = viewer.poll_frame(Duration::from_millis(200)) {
                     frames += 1;
@@ -276,9 +287,14 @@ async fn main() {
                     }
                 }
             }
-            if frames == 0 {
+            if !logged_pair {
                 eprintln!(
-                    "t449-probe: no H.264 frame in 8s after connect (failed={})",
+                    "t449-probe: no selected ICE pair within 15s after connect (failed={})",
+                    viewer.failed()
+                );
+            } else if frames == 0 {
+                eprintln!(
+                    "t449-probe: no H.264 frame within 15s after a selected ICE pair (failed={})",
                     viewer.failed()
                 );
             }

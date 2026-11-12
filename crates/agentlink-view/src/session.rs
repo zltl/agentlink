@@ -12,21 +12,21 @@ use rtc::peer_connection::configuration::RTCOfferOptions;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
-    MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer, RTCPeerConnectionIceEvent,
-    RTCPeerConnectionState, RTCSessionDescription, Registry, register_default_interceptors,
+    register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
+    PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
+    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, Registry,
 };
 use webrtc::runtime::default_runtime;
 
 use crate::h264::{
-    AccessUnit, AddrScope, H264Depacketizer, LossWindow, addr_scope, classify_media_path,
-    classify_selected_path, detect_tailscale_reason, feedback_ratio, is_screenshot_fallback,
-    media_path_hint,
+    addr_scope, classify_media_path, classify_selected_path, describe_ice_candidates,
+    detect_tailscale_reason, feedback_ratio, is_screenshot_fallback, media_path_hint, AccessUnit,
+    AddrScope, H264Depacketizer, LossWindow,
 };
 use crate::queue::{FrameBus, Queued};
 
@@ -475,12 +475,22 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         .ok_or_else(|| "local description was not set".to_string())?;
     let stun_n = ice_servers
         .iter()
-        .flat_map(|e| e.get("urls").and_then(|v| v.as_array()).cloned().unwrap_or_default())
+        .flat_map(|e| {
+            e.get("urls")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        })
         .filter(|u| u.as_str().unwrap_or("").starts_with("stun:"))
         .count();
     let turn_n = ice_servers
         .iter()
-        .flat_map(|e| e.get("urls").and_then(|v| v.as_array()).cloned().unwrap_or_default())
+        .flat_map(|e| {
+            e.get("urls")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        })
         .filter(|u| {
             let s = u.as_str().unwrap_or("");
             s.starts_with("turn:") || s.starts_with("turns:")
@@ -489,11 +499,12 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     report_stage(
         &opts,
         &format!(
-            "local offer ready (sdp_len={}, gather_complete={}, stun={}, turn={})",
+            "local offer ready (sdp_len={}, gather_complete={}, stun={}, turn={}, candidates={})",
             local.sdp.len(),
             gather_done.load(Ordering::Relaxed),
             stun_n,
-            turn_n
+            turn_n,
+            describe_ice_candidates(&local.sdp)
         ),
     );
     report_stage(&opts, "sending webrtc offer");
@@ -510,6 +521,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             "scale": opts.scale.clamp(0.05, 1.0),
             "audio": false,
             "ice_servers": ice_servers,
+            "gather_ms": 4000,
             "_allow_control": opts.control,
         }),
     )
@@ -540,14 +552,30 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             brief(&answer)
         ));
     }
+    let extra_candidates = answer
+        .get("candidates")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("candidate").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                )
+        })
+        .unwrap_or_default();
     report_stage(
         &opts,
         &format!(
-            "offer answered (session_len={}, sdp_len={}, encoder={}, hardware={})",
+            "offer answered (session_len={}, sdp_len={}, encoder={}, hardware={}, sdp_candidates={}, extra_candidates={})",
             session_id.len(),
             sdp.len(),
             answer.get("encoder").and_then(|v| v.as_str()).unwrap_or(""),
-            answer.get("hardware").and_then(|v| v.as_bool()).unwrap_or(false)
+            answer.get("hardware").and_then(|v| v.as_bool()).unwrap_or(false),
+            describe_ice_candidates(&sdp),
+            describe_ice_candidates(&extra_candidates)
         ),
     );
     let info = LiveInfo {
@@ -640,7 +668,11 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             if stop_ice.load(Ordering::Relaxed) {
                 break;
             }
-            let _ = roundtrip(
+            let typ_addr = candidate
+                .get("candidate")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let result = roundtrip(
                 &signal_ice,
                 json!({
                     "action": "ice",
@@ -649,6 +681,16 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
                 }),
             )
             .await;
+            match result {
+                Ok(_) => eprintln!(
+                    "agentlink live-webrtc: trickle ice sent ok ({})",
+                    describe_ice_candidates(typ_addr)
+                ),
+                Err(err) => eprintln!(
+                    "agentlink live-webrtc: trickle ice error ({err}) ({})",
+                    describe_ice_candidates(typ_addr)
+                ),
+            }
         }
     });
 
@@ -794,7 +836,6 @@ async fn drive(
         }
     }
 }
-
 
 fn signaling_session_gone(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
@@ -982,6 +1023,7 @@ impl PeerConnectionEventHandler for ViewHandler {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        eprintln!("agentlink live-webrtc: peer connection state={state:?}");
         if self.stop.load(Ordering::Relaxed) {
             return;
         }
@@ -1251,7 +1293,7 @@ fn offer_servers(servers: &[Value]) -> Vec<Value> {
     if !servers.is_empty() {
         return servers.to_vec();
     }
-    let urls = agentlink_core::stun_urls_from_env();
+    let urls = agentlink_core::stun_urls_ready_for_ice();
     if urls.is_empty() {
         Vec::new()
     } else {
@@ -1362,7 +1404,7 @@ mod tests {
     #[test]
     fn empty_offer_uses_the_process_stun_list() {
         let servers = super::offer_servers(&[]);
-        let expected = agentlink_core::stun_urls_from_env();
+        let expected = agentlink_core::stun_urls_ready_for_ice();
         if expected.is_empty() {
             assert!(servers.is_empty());
         } else {

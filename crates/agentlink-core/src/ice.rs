@@ -9,6 +9,9 @@
 //! `AGENTLINK_TURN_USERNAME` and `AGENTLINK_TURN_PASSWORD` are obsolete;
 //! treat any password that was published in `/view/config.json` as compromised.
 
+use std::net::{IpAddr, ToSocketAddrs};
+use std::time::Duration;
+
 /// Public STUN servers used when `AGENTLINK_STUN_URLS` is unset.
 /// These reveal a reflexive address. They do not relay media through symmetric NAT.
 pub const DEFAULT_STUN_URLS: &[&str] = &[
@@ -264,6 +267,216 @@ fn is_benchmarking_v4(host: &str) -> bool {
     octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)
 }
 
+/// Rewrite ICE URLs so the WebRTC stack does not target RFC 2544
+/// `198.18.0.0/15` addresses. Some resolvers return that range for public
+/// STUN hostnames; a STUN transaction to them never completes, so typ srflx
+/// never appears. When system DNS only yields that range, [`resolve`] may
+/// return usable addresses from another lookup (DoH). Hostnames that cannot
+/// be rewritten are omitted rather than left to resolve to 198.18/15.
+pub fn rewrite_ice_urls<F>(urls: &[String], mut resolve: F) -> Vec<String>
+where
+    F: FnMut(&str) -> Vec<IpAddr>,
+{
+    let mut out = Vec::new();
+    for url in urls {
+        let Some((scheme, host, suffix)) = split_ice_url_parts(url) else {
+            out.push(url.clone());
+            continue;
+        };
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_benchmarking_ip(ip) {
+                eprintln!(
+                    "agentlink live-webrtc: skipping ICE URL in RFC 2544 198.18.0.0/15 ({url})"
+                );
+                continue;
+            }
+            out.push(url.clone());
+            continue;
+        }
+        let usable: Vec<IpAddr> = resolve(&host)
+            .into_iter()
+            .filter(|ip| !is_benchmarking_ip(*ip))
+            .collect();
+        if usable.is_empty() {
+            eprintln!(
+                "agentlink live-webrtc: no usable address for ICE host {host} (system DNS may have returned 198.18.0.0/15); skipping"
+            );
+            continue;
+        }
+        for ip in usable {
+            let rewritten = format_ice_url(scheme, ip, suffix);
+            if rewritten != *url {
+                eprintln!(
+                    "agentlink live-webrtc: ICE URL {url} rewritten to {rewritten} so the peer connection does not re-resolve via poisoned DNS"
+                );
+            }
+            out.push(rewritten);
+        }
+    }
+    out
+}
+
+/// Default or env STUN URLs, with RFC 2544 destinations removed and
+/// hostnames rewritten to usable addresses when needed.
+pub fn stun_urls_ready_for_ice() -> Vec<String> {
+    // reqwest::blocking (used by DoH) creates and drops its own runtime.
+    // Viewer::connect calls this from an async context, so the lookup
+    // must run on a regular thread.
+    let urls = stun_urls_from_env();
+    match std::thread::Builder::new()
+        .name("agentlink-ice-resolve".into())
+        .spawn(move || rewrite_ice_urls(&urls, resolve_stun_host))
+    {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            eprintln!(
+                "agentlink live-webrtc: ICE URL resolve thread panicked; STUN hostnames left unresolved"
+            );
+            Vec::new()
+        }),
+        Err(err) => {
+            eprintln!("agentlink live-webrtc: cannot spawn ICE URL resolve thread: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn resolve_stun_host(host: &str) -> Vec<IpAddr> {
+    let sys = lookup_host_system(host);
+    let usable: Vec<IpAddr> = sys
+        .iter()
+        .copied()
+        .filter(|ip| !is_benchmarking_ip(*ip))
+        .collect();
+    if !usable.is_empty() {
+        return usable;
+    }
+    if sys.iter().any(|ip| is_benchmarking_ip(*ip)) {
+        eprintln!(
+            "agentlink live-webrtc: {host} resolved to RFC 2544 198.18.0.0/15 via system DNS; trying DoH"
+        );
+    }
+    doh_lookup_a(host)
+}
+
+fn lookup_host_system(host: &str) -> Vec<IpAddr> {
+    let query = if host.contains(':') && !host.contains('.') {
+        format!("[{host}]:0")
+    } else {
+        format!("{host}:0")
+    };
+    query
+        .to_socket_addrs()
+        .map(|iter| {
+            let mut ips = Vec::new();
+            for addr in iter {
+                if !ips.contains(&addr.ip()) {
+                    ips.push(addr.ip());
+                }
+            }
+            ips
+        })
+        .unwrap_or_default()
+}
+
+fn doh_lookup_a(host: &str) -> Vec<IpAddr> {
+    let endpoints = [
+        format!("https://cloudflare-dns.com/dns-query?name={host}&type=A"),
+        format!("https://dns.google/resolve?name={host}&type=A"),
+    ];
+    for url in endpoints {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => continue,
+        };
+        let Ok(resp) = client
+            .get(&url)
+            .header("accept", "application/dns-json")
+            .send()
+        else {
+            continue;
+        };
+        let Ok(text) = resp.text() else {
+            continue;
+        };
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let mut ips = Vec::new();
+        if let Some(answers) = body.get("Answer").and_then(|value| value.as_array()) {
+            for item in answers {
+                if item.get("type").and_then(|value| value.as_u64()) != Some(1) {
+                    continue;
+                }
+                if let Some(data) = item.get("data").and_then(|value| value.as_str()) {
+                    if let Ok(ip) = data.trim().parse::<IpAddr>() {
+                        if !is_benchmarking_ip(ip) && !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+        if !ips.is_empty() {
+            return ips;
+        }
+    }
+    Vec::new()
+}
+
+fn split_ice_url_parts(url: &str) -> Option<(&str, String, &str)> {
+    let (scheme, rest) = url.split_once(':')?;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let suffix_start = scheme.len() + 1 + rest.len();
+    let suffix = if suffix_start < url.len() {
+        &url[suffix_start..]
+    } else {
+        ""
+    };
+    let (host, port_suffix) = if let Some(rest) = rest.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        (host.to_string(), after)
+    } else {
+        match rest.rsplit_once(':') {
+            Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                (host.to_string(), &url[scheme.len() + 1 + host.len()..])
+            }
+            _ => (rest.to_string(), suffix),
+        }
+    };
+    // port_suffix for bracket form:
+    let port_suffix = if url.contains('[') {
+        let after = url.split_once(']')?.1;
+        after
+    } else {
+        port_suffix
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some((scheme, host, port_suffix))
+    }
+}
+
+fn format_ice_url(scheme: &str, ip: IpAddr, suffix: &str) -> String {
+    match ip {
+        IpAddr::V6(v6) => format!("{scheme}:[{v6}]{suffix}"),
+        IpAddr::V4(v4) => format!("{scheme}:{v4}{suffix}"),
+    }
+}
+
+fn is_benchmarking_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 198 && (o[1] == 18 || o[1] == 19)
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +550,40 @@ mod tests {
         let json = attempts[2].to_json();
         assert_eq!(json["ice_transport_policy"], "relay");
         assert_eq!(json["ice_servers"][0]["credential"], "replace-me");
+    }
+
+    #[test]
+    fn rewrite_skips_rfc2544_literals_and_rewrites_poisoned_hosts() {
+        use std::net::IpAddr;
+        let urls = vec![
+            "stun:198.18.0.1:19302".into(),
+            "stun:stun.l.google.com:19302".into(),
+            "stun:stun.cloudflare.com:3478".into(),
+        ];
+        let rewritten = rewrite_ice_urls(&urls, |host| match host {
+            "stun.l.google.com" => vec![
+                "198.18.0.1".parse().unwrap(),
+                "74.125.250.129".parse().unwrap(),
+            ],
+            "stun.cloudflare.com" => vec!["162.159.207.0".parse().unwrap()],
+            _ => Vec::new(),
+        });
+        assert!(!rewritten.iter().any(|u| u.contains("198.18")));
+        assert_eq!(
+            rewritten,
+            vec![
+                "stun:74.125.250.129:19302".to_string(),
+                "stun:162.159.207.0:3478".to_string(),
+            ]
+        );
+        // A host that only resolves to 198.18/15 and whose resolver returns
+        // nothing usable is dropped, not left as a hostname.
+        let dropped = rewrite_ice_urls(&["stun:poison.example:19302".into()], |_| {
+            vec!["198.18.0.1".parse::<IpAddr>().unwrap()]
+        });
+        assert!(dropped.is_empty());
+        // Already-good literals are kept.
+        let kept = rewrite_ice_urls(&["stun:74.125.250.129:19302".into()], |_| Vec::new());
+        assert_eq!(kept, vec!["stun:74.125.250.129:19302".to_string()]);
     }
 }

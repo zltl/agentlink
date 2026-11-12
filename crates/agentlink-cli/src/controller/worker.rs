@@ -9,16 +9,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::client::{login_user, maintain_session};
 use agentlink_core::{
-    Client, ClientSettings, DirEntry, Identity, NodeInfo, Op, PHASE2_INJECT_INPUT,
-    PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL, PtyEvent, PtySession, RelayTrust,
-    apply_relay_defaults, parse_access,
+    apply_relay_defaults, parse_access, Client, ClientSettings, DirEntry, Identity, NodeInfo, Op,
+    PtyEvent, PtySession, RelayTrust, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
 };
 use agentlink_view::{is_screenshot_fallback, IceFault, LiveOptions, Signal, Viewer};
 use base64::Engine;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use super::decode::{H264Decoder, decode_image};
+use super::decode::{decode_image, H264Decoder};
 use super::model::enroll_command;
 
 #[derive(Clone, Debug)]
@@ -247,6 +246,9 @@ pub struct Shared {
     events: Mutex<Vec<UiEvent>>,
     picture: Mutex<Option<Picture>>,
     seq: AtomicU64,
+    /// Once a terminal handshake is published, progress/cleanup stages
+    /// must not overwrite it until the next live attempt.
+    terminal_handshake: AtomicBool,
     pub perf: ClientPerf,
 }
 
@@ -256,6 +258,7 @@ impl Shared {
             events: Mutex::new(Vec::new()),
             picture: Mutex::new(None),
             seq: AtomicU64::new(0),
+            terminal_handshake: AtomicBool::new(false),
             perf: ClientPerf::default(),
         }
     }
@@ -298,11 +301,41 @@ impl Shared {
         self.push(UiEvent::Hud(hud));
     }
 
+    /// Start a new live attempt: later progress stages may update the HUD again.
+    pub fn begin_handshake(&self) {
+        self.terminal_handshake.store(false, Ordering::Relaxed);
+    }
+
+    /// Progress stage. Ignored after a terminal reason has been recorded.
     pub fn set_handshake(&self, stage: impl Into<String>) {
+        let stage = stage.into();
+        if handshake_is_cleanup(&stage) {
+            return;
+        }
+        if self.terminal_handshake.load(Ordering::Relaxed) {
+            return;
+        }
+        self.push(UiEvent::Handshake(stage));
+    }
+
+    /// Terminal negotiation result. Survives cleanup/close until the next attempt.
+    pub fn set_handshake_terminal(&self, stage: impl Into<String>) {
+        self.terminal_handshake.store(true, Ordering::Relaxed);
         self.push(UiEvent::Handshake(stage.into()));
     }
 }
 
+/// Close/cleanup and routine trickle/keyframe acks belong in the log, not
+/// the stats handshake line. Matches the 0910 GUI sequence where
+/// `signal close ok 1098ms` overwrote the negotiation failure.
+pub fn handshake_is_cleanup(msg: &str) -> bool {
+    let lower = msg.trim().to_ascii_lowercase();
+    if lower.contains("signal close") {
+        return true;
+    }
+    let routine = lower.starts_with("signal ice") || lower.starts_with("signal keyframe");
+    routine && !lower.contains("error") && !lower.contains("fallback")
+}
 
 struct TracingSignal {
     inner: Arc<dyn Signal>,
@@ -840,6 +873,7 @@ fn start_live_from(
                 on_stage: Some(on_stage),
                 ..LiveOptions::default()
             };
+            thread_shared.begin_handshake();
             thread_shared.set_handshake("webrtc: starting");
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let connect_traced = Arc::clone(&traced);
@@ -870,7 +904,7 @@ fn start_live_from(
             let viewer = match connected {
                 Ok(viewer) => Arc::new(viewer),
                 Err(err) => {
-                    thread_shared.set_handshake(format!("webrtc: failed ({err})"));
+                    thread_shared.set_handshake_terminal(format!("webrtc: failed ({err})"));
                     // Keep JPEG bootstrap for soft failures, but surface hard rejects.
                     if super::model::webrtc_connect_is_hard_reject(&err) {
                         thread_stop.store(true, Ordering::Relaxed);
@@ -910,8 +944,10 @@ fn start_live_from(
                 info.encoder.clone()
             };
             thread_shared.set_handshake(
-                "webrtc: signaling complete, waiting for video".to_string(),
+                "webrtc: signaling complete, waiting for ICE pair / video".to_string(),
             );
+            const ICE_WAIT: Duration = Duration::from_secs(12);
+            let ice_deadline = Instant::now() + ICE_WAIT;
             let mut decoder = H264Decoder::new();
             if !decoder.available() {
                 thread_shared.push(UiEvent::Notice(
@@ -932,8 +968,8 @@ fn start_live_from(
                         // H.264 frame). Resume JPEG stills over the relay.
                         if super::model::webrtc_loss_keeps_jpeg(saw_frame) {
                             thread_h264.store(false, Ordering::Relaxed);
-                            thread_shared.set_handshake(
-                                "webrtc: connection lost; jpeg resumed".to_string(),
+                            thread_shared.set_handshake_terminal(
+                                "webrtc: connection lost; JPEG stills remain".to_string(),
                             );
                             thread_shared.push(UiEvent::Notice(
                                 "WebRTC live video is not up. Showing JPEG over the relay."
@@ -953,11 +989,37 @@ fn start_live_from(
                         thread_shared.push(UiEvent::Failed("WebRTC connection failed".into()));
                         break;
                     }
+                    if !saw_frame && Instant::now() >= ice_deadline {
+                        let has_pair = viewer
+                            .transport()
+                            .is_some();
+                        let reason = if has_pair {
+                            "webrtc: no H.264 frame within 12s after a selected ICE pair; JPEG stills remain"
+                        } else {
+                            "webrtc: no selected ICE pair within 12s; JPEG stills remain"
+                        };
+                        thread_h264.store(false, Ordering::Relaxed);
+                        thread_shared.set_handshake_terminal(reason);
+                        thread_shared.push(UiEvent::Notice(
+                            "WebRTC live video is not up. Showing JPEG over the relay."
+                                .into(),
+                        ));
+                        thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                        thread_shared.set_hud(LiveHud {
+                            path: "relay".into(),
+                            kind: "jpeg".into(),
+                            encoder: "jpeg".into(),
+                            path_note: super::model::connection_path_hint("jpeg", "relay")
+                                .into(),
+                            ..LiveHud::default()
+                        });
+                        break;
+                    }
                     if saw_frame && last_decoded_at.elapsed() > Duration::from_secs(8) {
                         if super::model::webrtc_loss_keeps_jpeg(saw_frame) {
                             thread_h264.store(false, Ordering::Relaxed);
-                            thread_shared.set_handshake(
-                                "webrtc: no video for 8s; jpeg resumed".to_string(),
+                            thread_shared.set_handshake_terminal(
+                                "webrtc: no H.264 frame for 8s after takeover; JPEG stills remain".to_string(),
                             );
                             thread_shared.push(UiEvent::Notice(
                                 "WebRTC live video is not up. Showing JPEG over the relay."
@@ -1011,6 +1073,9 @@ fn start_live_from(
                     last_frame_at = Instant::now();
                     last_decoded_at = last_frame_at;
                     thread_h264.store(true, Ordering::Relaxed);
+                    if first_h264 {
+                        thread_shared.set_handshake_terminal("webrtc: receiving video");
+                    }
                     // Approximate input RTT: move timestamp → frame with meta latency.
                     let move_ms = thread_shared
                         .perf
@@ -1095,8 +1160,7 @@ fn start_live_from(
                             width: width as u32,
                             height: height as u32,
                             encoder: "jpeg".into(),
-                            path_note: super::model::connection_path_hint("jpeg", "relay")
-                                .into(),
+                            path_note: super::model::connection_path_hint("jpeg", "relay").into(),
                             ..LiveHud::default()
                         });
                     }
@@ -1116,7 +1180,6 @@ fn start_live_from(
         shots,
     }
 }
-
 
 async fn client_jpeg(
     client: &Client,
@@ -1411,7 +1474,11 @@ async fn sign_in(
     let parsed = RelayTrust::parse(pin, trust.as_deref()).map_err(|err| err.to_string())?;
     let totp = {
         let code = totp.trim();
-        if code.is_empty() { None } else { Some(code) }
+        if code.is_empty() {
+            None
+        } else {
+            Some(code)
+        }
     };
     let session = login_user(
         &relay,
@@ -1464,7 +1531,6 @@ fn settings_of(file: &agentlink_core::config::FileConfig) -> Option<ClientSettin
     })
 }
 
-
 #[cfg(test)]
 mod live_pipeline_tests {
     use super::*;
@@ -1507,7 +1573,10 @@ mod live_pipeline_tests {
         out
     }
 
-    fn jpeg_source() -> (Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>, Arc<AtomicU32>) {
+    fn jpeg_source() -> (
+        Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>,
+        Arc<AtomicU32>,
+    ) {
         let seq = Arc::new(AtomicU32::new(0));
         let tick = Arc::clone(&seq);
         let grab = Arc::new(move || {
@@ -1589,7 +1658,8 @@ mod live_pipeline_tests {
                 match ev {
                     UiEvent::Hud(hud) => {
                         self.hud_history.push((hud.kind.clone(), hud.path.clone()));
-                        self.last_hud = Some((hud.kind.clone(), hud.path.clone(), hud.path_note.clone()));
+                        self.last_hud =
+                            Some((hud.kind.clone(), hud.path.clone(), hud.path_note.clone()));
                     }
                     UiEvent::Handshake(text) => self.handshakes.push(text),
                     UiEvent::Notice(text) => self.notices.push(text),
@@ -1689,7 +1759,9 @@ mod live_pipeline_tests {
         assert_eq!(first.height, 16);
         assert!(first.rgba.len() == 16 * 16 * 4);
         let first_seq = first.seq;
-        let deadline = Instant::now() + Duration::from_secs(12);
+        // Connect can take several seconds, then the 12s no-pair deadline
+        // has to fire before the explicit terminal reason is published.
+        let deadline = Instant::now() + Duration::from_secs(25);
         let mut later = first.clone();
         let mut saw_webrtc_fail = false;
         while Instant::now() < deadline {
@@ -1697,7 +1769,9 @@ mod live_pipeline_tests {
             if let Some(pic) = h.last.clone() {
                 later = pic;
             }
-            if h.notices.iter().any(|n| n.contains("JPEG over the relay") || n.contains("Live video is not up"))
+            if h.notices
+                .iter()
+                .any(|n| n.contains("JPEG over the relay") || n.contains("Live video is not up"))
                 || h.links.iter().any(|l| l == "jpeg · relay")
             {
                 saw_webrtc_fail = true;
@@ -1707,7 +1781,11 @@ mod live_pipeline_tests {
             }
             thread::sleep(Duration::from_millis(40));
         }
-        assert_eq!(later.kind, "jpeg", "fallback picture must stay jpeg, got {:?}", later);
+        assert_eq!(
+            later.kind, "jpeg",
+            "fallback picture must stay jpeg, got {:?}",
+            later
+        );
         assert_eq!(later.path, "relay");
         assert!(
             later.seq > first_seq,
@@ -1724,10 +1802,16 @@ mod live_pipeline_tests {
             assert_eq!(path, "relay");
             assert!(note.contains("not WebRTC P2P"), "{note}");
         }
-        assert!(h.failed.is_empty(), "soft ICE failure must not hard-fail: {:?}", h.failed);
+        assert!(
+            h.failed.is_empty(),
+            "soft ICE failure must not hard-fail: {:?}",
+            h.failed
+        );
         assert!(seq.load(AtomicOrdering::Relaxed) >= 2);
         assert!(
-            !h.hud_history.iter().any(|(k, p)| k == "h264" || p == "connecting"),
+            !h.hud_history
+                .iter()
+                .any(|(k, p)| k == "h264" || p == "connecting"),
             "handshake must not pollute the painted media path: {:?}",
             h.hud_history
         );
@@ -1739,6 +1823,20 @@ mod live_pipeline_tests {
         assert!(
             !h.handshakes.is_empty(),
             "expected visible webrtc handshake stages, got none"
+        );
+        let last_hs = h.handshakes.last().cloned().unwrap_or_default();
+        assert!(
+            last_hs.contains("no selected ICE pair")
+                || last_hs.contains("no H.264 frame")
+                || last_hs.contains("connection lost")
+                || last_hs.contains("webrtc: failed"),
+            "terminal handshake must state the failure, not a cleanup ack: {last_hs:?} all={:?}",
+            h.handshakes
+        );
+        assert!(
+            h.handshakes.iter().all(|hs| !hs.contains("signal close")),
+            "cleanup must not occupy handshake: {:?}",
+            h.handshakes
         );
         // Same-host ICE fail is not public NAT evidence.
         eprintln!(
@@ -1762,7 +1860,9 @@ mod live_pipeline_tests {
         assert_eq!(jpeg1.path, "relay");
         h.pump();
         assert!(
-            !h.hud_history.iter().any(|(k, p)| k == "h264" || p == "connecting"),
+            !h.hud_history
+                .iter()
+                .any(|(k, p)| k == "h264" || p == "connecting"),
             "must not publish h264 · connecting over a rendered JPEG path: {:?} handshakes={:?}",
             h.hud_history,
             h.handshakes
@@ -1787,13 +1887,19 @@ mod live_pipeline_tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            matches!(video.path.as_str(), "loopback" | "private" | "host" | "stun"),
+            matches!(
+                video.path.as_str(),
+                "loopback" | "private" | "host" | "stun"
+            ),
             "unexpected h264 path {} (hud={:?} handshakes={:?})",
             video.path,
             h.last_hud,
             h.handshakes
         );
-        assert_ne!(video.path, "relay", "h264 must not be labeled as websocket relay");
+        assert_ne!(
+            video.path, "relay",
+            "h264 must not be labeled as websocket relay"
+        );
         assert_ne!(video.path, "tailscale");
         h.wait_hud("h264", &video.path, Duration::from_secs(3));
         let before_drop = video.seq;
@@ -1821,8 +1927,15 @@ mod live_pipeline_tests {
         if let Some((_, _, note)) = &h.last_hud {
             assert!(note.contains("not WebRTC P2P"), "{note}");
         }
-        assert!(h.notices.iter().any(|n| n.contains("JPEG over the relay") || n.contains("Live video is not up")));
-        assert!(h.failed.is_empty(), "disconnect fallback must not hard-fail: {:?}", h.failed);
+        assert!(h
+            .notices
+            .iter()
+            .any(|n| n.contains("JPEG over the relay") || n.contains("Live video is not up")));
+        assert!(
+            h.failed.is_empty(),
+            "disconnect fallback must not hard-fail: {:?}",
+            h.failed
+        );
         eprintln!(
             "t449 harness h264-then-jpeg: h264 {} · {} #{}, resumed jpeg #{}",
             video.kind, video.path, video.seq, resumed.seq
@@ -1839,7 +1952,9 @@ mod live_pipeline_tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            h.failed.iter().any(|e| e.to_ascii_lowercase().contains("not allowed")),
+            h.failed
+                .iter()
+                .any(|e| e.to_ascii_lowercase().contains("not allowed")),
             "missing grant must fail, got {:?}",
             h.failed
         );
@@ -1852,5 +1967,94 @@ mod live_pipeline_tests {
             assert_ne!(kind, "h264");
         }
         eprintln!("t449 harness no-grant: failed={:?}", h.failed);
+    }
+}
+
+#[cfg(test)]
+mod handshake_retention_tests {
+    use super::{handshake_is_cleanup, Shared, UiEvent};
+
+    #[test]
+    fn cleanup_and_keyframe_acks_do_not_count_as_handshake_progress() {
+        assert!(handshake_is_cleanup("signal close sent"));
+        assert!(handshake_is_cleanup("signal close ok 1098ms"));
+        assert!(handshake_is_cleanup("signal keyframe ok 474ms"));
+        assert!(handshake_is_cleanup("signal ice sent"));
+        assert!(handshake_is_cleanup("signal ice ok 631ms"));
+        assert!(!handshake_is_cleanup(
+            "signaling complete, waiting for ICE pair / video"
+        ));
+        assert!(!handshake_is_cleanup("signal offer ok 2241ms sdp_len=2308"));
+        assert!(!handshake_is_cleanup(
+            "signal offer error 25000ms: webrtc_signal timed out"
+        ));
+        assert!(!handshake_is_cleanup(
+            "webrtc: no selected ICE pair within 12s; JPEG stills remain"
+        ));
+    }
+
+    #[test]
+    fn close_ok_does_not_overwrite_terminal_negotiation_failure() {
+        // Real 0910 GUI sequence: offer/answer, wait for pair/video,
+        // keyframes, fallback notice, then signal close ok 1098ms which
+        // previously replaced the stats handshake.
+        let shared = Shared::new();
+        shared.begin_handshake();
+        shared.set_handshake("webrtc: starting");
+        shared.set_handshake("list_monitors ok");
+        shared.set_handshake("sending webrtc offer");
+        shared.set_handshake("signal offer ok 2241ms sdp_len=2308 session_len=78");
+        shared.set_handshake("signaling complete, waiting for ICE pair / video");
+        shared.set_handshake("signal keyframe sent");
+        shared.set_handshake("signal keyframe ok 1267ms");
+        let reason = "webrtc: no selected ICE pair within 12s; JPEG stills remain";
+        shared.set_handshake_terminal(reason);
+        shared.set_handshake("signal close sent");
+        shared.set_handshake("signal close ok 1098ms");
+        let stages: Vec<String> = shared
+            .drain()
+            .into_iter()
+            .filter_map(|ev| match ev {
+                UiEvent::Handshake(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stages.iter().any(|s| s == reason),
+            "terminal reason missing: {stages:?}"
+        );
+        assert_eq!(
+            stages.last().map(String::as_str),
+            Some(reason),
+            "close must not overwrite the terminal reason, got {stages:?}"
+        );
+        assert!(
+            stages.iter().all(|s| !s.contains("signal close")),
+            "cleanup stages must not appear in the handshake HUD: {stages:?}"
+        );
+        assert!(
+            stages
+                .iter()
+                .all(|s| !s.starts_with("signal keyframe") && !s.starts_with("signal ice ")),
+            "routine ice/keyframe acks must not occupy handshake: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn next_attempt_can_replace_a_previous_terminal_reason() {
+        let shared = Shared::new();
+        shared
+            .set_handshake_terminal("webrtc: no selected ICE pair within 12s; JPEG stills remain");
+        shared.begin_handshake();
+        shared.set_handshake("webrtc: starting");
+        let stages: Vec<String> = shared
+            .drain()
+            .into_iter()
+            .filter_map(|ev| match ev {
+                UiEvent::Handshake(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stages.last().map(String::as_str), Some("webrtc: starting"));
     }
 }

@@ -43,6 +43,67 @@ pub fn classify_media_path(sdp: &str) -> &'static str {
     }
 }
 
+/// Count and label ICE candidates in an SDP (or loose candidate lines).
+/// Used for diagnostics; this is not the selected-pair media path.
+pub fn describe_ice_candidates(input: &str) -> String {
+    let mut host = 0u32;
+    let mut srflx = 0u32;
+    let mut prflx = 0u32;
+    let mut relay = 0u32;
+    let mut other = 0u32;
+    let mut items = Vec::new();
+    for raw in input.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        let typ = if let Some(rest) = lower.split(" typ ").nth(1) {
+            rest.split_whitespace().next().unwrap_or("unknown")
+        } else if lower.contains("candidate:") {
+            "unknown"
+        } else {
+            continue;
+        };
+        match typ {
+            "host" => host += 1,
+            "srflx" => srflx += 1,
+            "prflx" => prflx += 1,
+            "relay" => relay += 1,
+            _ => other += 1,
+        }
+        let addr = candidate_addr(line).unwrap_or_else(|| "-".into());
+        let scope = format!("{:?}", addr_scope(&addr)).to_ascii_lowercase();
+        items.push(format!("{typ}:{scope}:{addr}"));
+    }
+    format!(
+        "n={} host={} srflx={} prflx={} relay={} other={} [{}]",
+        host + srflx + prflx + relay + other,
+        host,
+        srflx,
+        prflx,
+        relay,
+        other,
+        items.join(", ")
+    )
+}
+
+fn candidate_addr(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let start = lower
+        .find("candidate:")
+        .map(|i| i + "candidate:".len())
+        .unwrap_or(0);
+    let tokens: Vec<&str> = line[start..].split_whitespace().collect();
+    // foundation component transport priority address port typ ...
+    if let Some(typ_at) = tokens.iter().position(|t| t.eq_ignore_ascii_case("typ")) {
+        if typ_at >= 2 {
+            return Some(tokens[typ_at - 2].to_string());
+        }
+    }
+    tokens.get(4).map(|s| (*s).to_string())
+}
+
 /// Path token for a *selected* ICE candidate pair.
 ///
 /// Tokens describe observable pair facts only:
@@ -188,8 +249,7 @@ pub fn is_tailscale_ula_prefix(ip: &str) -> bool {
 pub fn detect_tailscale_reason(local_ip: &str, remote_ip: &str) -> Option<String> {
     if is_tailscale_ula_prefix(local_ip) || is_tailscale_ula_prefix(remote_ip) {
         return Some(
-            "address in fd7a:115c:a1e0::/48 (Tailscale documented IPv6 prefix, KB 1015)"
-                .into(),
+            "address in fd7a:115c:a1e0::/48 (Tailscale documented IPv6 prefix, KB 1015)".into(),
         );
     }
     for ip in [local_ip, remote_ip] {
@@ -344,7 +404,11 @@ impl H264Depacketizer {
                 self.nals.push(payload.to_vec());
             }
         }
-        if marker { self.finish() } else { None }
+        if marker {
+            self.finish()
+        } else {
+            None
+        }
     }
 
     fn stap_a(&mut self, payload: &[u8]) {
@@ -652,15 +716,26 @@ mod tests {
         assert_eq!(addr_scope("203.0.113.5"), AddrScope::Public);
         assert_eq!(addr_scope("fd7a:115c:a1e0::1"), AddrScope::TailscaleUla);
         assert!(media_path_hint("jpeg", "relay").contains("not WebRTC P2P"));
-        assert!(!media_path_hint("h264", "private").to_ascii_lowercase().contains("same lan"));
-        assert!(!media_path_hint("h264", "host").to_ascii_lowercase().contains("success"));
+        assert!(!media_path_hint("h264", "private")
+            .to_ascii_lowercase()
+            .contains("same lan"));
+        assert!(!media_path_hint("h264", "host")
+            .to_ascii_lowercase()
+            .contains("success"));
         assert!(media_path_hint("h264", "cgnat").contains("RFC 6598"));
         assert!(!media_path_hint("h264", "cgnat").contains("confirmed as Tailscale"));
         assert!(media_path_hint("h264", "stun").contains("not a public NAT"));
         assert!(media_path_hint("h264", "turn").contains("not a direct P2P"));
+        let inv = describe_ice_candidates(
+            "a=candidate:1 1 UDP 2130706431 172.30.0.2 9 typ host\na=candidate:2 1 UDP 1694498815 203.0.113.5 9 typ srflx raddr 172.30.0.2 rport 9\n",
+        );
+        assert!(inv.contains("host=1"), "{inv}");
+        assert!(inv.contains("srflx=1"), "{inv}");
+        assert!(inv.contains("host:private:172.30.0.2"), "{inv}");
+        assert!(inv.contains("srflx:public:203.0.113.5"), "{inv}");
     }
 
-        fn screenshot_fallback_matches_the_phone_node() {
+    fn screenshot_fallback_matches_the_phone_node() {
         let body = serde_json::json!({
             "status": "unavailable",
             "fallback": "screenshot"

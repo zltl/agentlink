@@ -12,9 +12,9 @@ mod queue;
 mod session;
 
 pub use h264::{
-    AddrScope, access_unit_is_idr, addr_scope, clamp_offer, classify_media_path,
-    classify_selected_path, classify_selected_path_with, detect_tailscale_reason,
-    feedback_ratio, is_screenshot_fallback, is_tailscale_ula_prefix, media_path_hint,
+    access_unit_is_idr, addr_scope, clamp_offer, classify_media_path, classify_selected_path,
+    classify_selected_path_with, describe_ice_candidates, detect_tailscale_reason, feedback_ratio,
+    is_screenshot_fallback, is_tailscale_ula_prefix, media_path_hint, AddrScope,
 };
 pub use session::{
     IceFault, LiveCursor, LiveFrame, LiveInfo, LiveOptions, LiveStats, Signal, TransportSnapshot,
