@@ -1006,7 +1006,7 @@ fn main() {
         let exe = dir.join("report_con_size.exe");
         std::fs::write(&src, WINDOWS_SIZE_REPORTER_SRC).expect("write size reporter source");
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc"));
-        let out = std::process::Command::new(&rustc)
+        let out = std::process::Command::new(&rustc) // no-window-reviewed: cfg(test) rustc for size reporter, not pty spawn
             .args(["--edition", "2021", "-O", "-o"])
             .arg(&exe)
             .arg(&src)

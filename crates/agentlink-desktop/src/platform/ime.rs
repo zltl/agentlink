@@ -7,8 +7,6 @@
 //! previous engine afterward. Prefer AT-SPI `InsertText` when available; this
 //! is the recoverable fallback when keysyms must be used.
 
-use std::process::Command;
-
 use agentlink_core::process::hidden;
 
 /// Holds the previous IME engine and restores it on drop.
@@ -105,7 +103,7 @@ fn set_ibus(engine: &str) -> Result<(), ()> {
 }
 
 fn ibus_latin_candidate() -> Option<String> {
-    let output = Command::new("ibus")
+    let output = hidden("ibus")
         .args(["list-engine"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

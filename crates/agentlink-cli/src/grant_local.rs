@@ -106,11 +106,23 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Visible local grant dialog process (zenity / kdialog).
+///
+/// A plain `Command` is kept here to express "this is a visible UI prompt"
+/// and to make that intent easy to maintain. It is not a required functional
+/// fix: on Linux, `process::hidden` is already a plain `Command`, and on
+/// Windows `CREATE_NO_WINDOW` only suppresses a console window — it does not
+/// prevent a normal GUI from showing. These tools are Unix GUI prompts,
+/// invoked only when a display and the binary exist.
+fn grant_ui_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    std::process::Command::new(program) // no-window-reviewed: visible Unix grant UI; do not hide
+}
+
 /// Graphical (or tty) paste box for a controller identity card.
 pub fn paste_card_dialog() -> Result<String> {
     let hint = "请粘贴控制端身份码（agentlink-offer:v1:…）或完整 64 位公钥。\n\n公开身份不是凭证，身份码不是 grant，relay 不能据此授权。";
     if display_ok() && command_exists("zenity") {
-        let out = std::process::Command::new("zenity")
+        let out = grant_ui_command("zenity")
             .args([
                 "--entry",
                 "--title",
@@ -127,7 +139,7 @@ pub fn paste_card_dialog() -> Result<String> {
         return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
     if display_ok() && command_exists("kdialog") {
-        let out = std::process::Command::new("kdialog")
+        let out = grant_ui_command("kdialog")
             .args(["--title", "粘贴控制端身份码", "--inputbox", hint])
             .output()?;
         if !out.status.success() {
@@ -153,7 +165,7 @@ pub fn paste_card_dialog() -> Result<String> {
 /// Local Allow/Deny UI. Never talks to the relay.
 pub fn decision_prompt(body: &str) -> Result<bool> {
     if display_ok() && command_exists("zenity") {
-        let status = std::process::Command::new("zenity")
+        let status = grant_ui_command("zenity")
             .args([
                 "--question",
                 "--title",
@@ -172,7 +184,7 @@ pub fn decision_prompt(body: &str) -> Result<bool> {
         return Ok(status.success());
     }
     if display_ok() && command_exists("kdialog") {
-        let status = std::process::Command::new("kdialog")
+        let status = grant_ui_command("kdialog")
             .args([
                 "--yesno",
                 body,
@@ -244,7 +256,7 @@ pub fn shrink_grant_prompt(
         let Some(policy) = kdialog_policy_radiolist(&hint, &allowed, &default_policy)? else {
             return Ok(None);
         };
-        let ttl_out = std::process::Command::new("kdialog")
+        let ttl_out = grant_ui_command("kdialog")
             .args([
                 "--title",
                 "缩短有效期后批准",
@@ -483,7 +495,7 @@ fn zenity_policy_buttons(
         args.push("--extra-button".into());
         args.push(label.clone());
     }
-    let out = std::process::Command::new("zenity").args(&args).output()?;
+    let out = grant_ui_command("zenity").args(&args).output()?;
     if out.status.success() {
         return Ok(Some(default_policy.to_string()));
     }
@@ -501,7 +513,7 @@ fn zenity_policy_buttons(
 }
 
 fn zenity_ttl_entry(default_ttl: &str) -> Result<Option<String>> {
-    let out = std::process::Command::new("zenity")
+    let out = grant_ui_command("zenity")
         .args([
             "--entry",
             "--title",
@@ -531,7 +543,7 @@ fn zenity_ttl_entry(default_ttl: &str) -> Result<Option<String>> {
 fn confirm_issue(policy: &str, ttl_secs: u64) -> Result<bool> {
     let body = issue_confirm_body(policy, ttl_secs);
     if display_ok() && command_exists("zenity") {
-        let status = std::process::Command::new("zenity")
+        let status = grant_ui_command("zenity")
             .args([
                 "--question",
                 "--title",
@@ -550,7 +562,7 @@ fn confirm_issue(policy: &str, ttl_secs: u64) -> Result<bool> {
         return Ok(status.success());
     }
     if display_ok() && command_exists("kdialog") {
-        let status = std::process::Command::new("kdialog")
+        let status = grant_ui_command("kdialog")
             .args([
                 "--yesno",
                 &body,
@@ -587,7 +599,7 @@ fn kdialog_policy_radiolist(
             "off".into()
         });
     }
-    let out = std::process::Command::new("kdialog").args(&args).output()?;
+    let out = grant_ui_command("kdialog").args(&args).output()?;
     if !out.status.success() {
         return Ok(None);
     }
