@@ -136,7 +136,7 @@ fn launch_paste_ui() {
             return;
         }
     };
-    match std::process::Command::new(exe)
+    match std::process::Command::new(exe) // no-window-reviewed: Linux-only grant paste-ui; must stay visible
         .args(["grant", "paste-ui"])
         .spawn()
     {

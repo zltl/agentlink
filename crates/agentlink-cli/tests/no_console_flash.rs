@@ -2,6 +2,11 @@
 //!
 //! Every runtime subprocess must go through `agentlink_core::process::hidden`
 //! (or `detached`). Interactive PTY stays on portable-pty and is out of scope.
+//! A same-line `// no-window-reviewed` mark is only for an evidenced exception:
+//! Unix-only code, a deliberately visible local UI prompt, or a `#[cfg(test)]`
+//! helper. Do not use the token to paper over a Windows console helper, and do
+//! not route a window the user must see (for example a local grant dialog)
+//! through `hidden()`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
