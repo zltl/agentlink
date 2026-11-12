@@ -3,6 +3,12 @@
 //! JSON lines on stdin, JSON lines on stdout. Uses `Desktop::mock()`,
 //! auto consent, and a throwaway audit file. It does not load production
 //! identity, sign grants, or listen on a network port.
+//!
+//! This binary is a test helper, not the production node or Controller
+//! entrypoint. `ConsentMode::Auto` is set only here (and in in-process
+//! test harnesses). The production node default in `node_cfg` is
+//! `notify`. `StreamHandler::new` starts at `Deny`. `fixture_inject_late`
+//! is implemented in this bin only; it is not a `webrtc_signal` action.
 
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;

@@ -172,9 +172,7 @@ where
     }
 
     fn push_gathered_candidate(&self, candidate: Value) {
-        if let Ok(mut candidates) = self.candidates.lock() {
-            candidates.push(candidate);
-        }
+        record_gathered_candidate(self.candidates.as_ref(), candidate);
     }
 
     async fn close(&self) {
@@ -298,12 +296,24 @@ impl SessionManager {
             "list_monitors" => self.list_monitors(),
             "offer" => self.offer(peer, payload).await,
             "ice_restart" => self.ice_restart(payload).await,
-            "ice" => self.ice(payload).await,
-            "ice_pull" => self.ice_pull(payload),
+            "ice" => self.ice(peer, payload).await,
+            "ice_pull" => self.ice_pull(peer, payload),
             "keyframe" => self.keyframe(payload),
             "close" => self.close(payload).await,
             other => Err(format!("unknown webrtc_signal action '{other}'")),
         }
+    }
+
+    fn require_remote_view(&self) -> std::result::Result<(), String> {
+        let policy = *self
+            .shared
+            .policy
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        if !policy.allows_remote_view() {
+            return Err("remote_view is not allowed on this node".into());
+        }
+        Ok(())
     }
 
     fn list_monitors(&self) -> std::result::Result<Value, String> {
@@ -544,22 +554,28 @@ impl SessionManager {
         Ok(())
     }
 
-    fn ice_pull(&self, payload: &Value) -> std::result::Result<Value, String> {
+    fn ice_pull(&self, peer: &str, payload: &Value) -> std::result::Result<Value, String> {
+        self.require_remote_view()?;
         let id = payload
             .get("session_id")
             .and_then(Value::as_str)
             .unwrap_or("");
         let after = payload.get("after").and_then(Value::as_u64).unwrap_or(0) as usize;
+        // Closed, unknown, and other-peer sessions all look the same so a
+        // caller cannot inventory someone else's candidate list.
         let (candidates, gather_done, closed) = {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             match sessions.iter().find(|session| session.id == id) {
                 Some(session) if session.stop.load(Ordering::Relaxed) => (Vec::new(), true, true),
+                Some(session) if session.peer_id != peer => {
+                    return Err("unknown stream session".into());
+                }
                 Some(session) => session
                     .peer
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
-                    .map(|peer| (peer.gathered_candidates(), peer.gather_done(), false))
+                    .map(|ice| (ice.gathered_candidates(), ice.gather_done(), false))
                     .unwrap_or((Vec::new(), true, true)),
                 None => return Err("unknown stream session".into()),
             }
@@ -592,7 +608,8 @@ impl SessionManager {
         }))
     }
 
-    async fn ice(&self, payload: &Value) -> std::result::Result<Value, String> {
+    async fn ice(&self, peer: &str, payload: &Value) -> std::result::Result<Value, String> {
+        self.require_remote_view()?;
         let id = payload
             .get("session_id")
             .and_then(Value::as_str)
@@ -604,10 +621,13 @@ impl SessionManager {
             .map(candidate_typ_hint)
             .unwrap_or("unknown");
         eprintln!("agentlink live-webrtc: ice recv typ={typ_hint}");
-        let (peer, remote_ufrag, closed) = {
+        let (ice, remote_ufrag, closed) = {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             match sessions.iter().find(|session| session.id == id) {
                 Some(session) if session.stop.load(Ordering::Relaxed) => (None, None, true),
+                Some(session) if session.peer_id != peer => {
+                    return Err("unknown stream session".into());
+                }
                 Some(session) => (
                     session
                         .peer
@@ -627,7 +647,7 @@ impl SessionManager {
         if closed {
             return Err("unknown stream session".into());
         }
-        let Some(peer) = peer else {
+        let Some(ice) = ice else {
             return Err("unknown stream session".into());
         };
         let init = parse_trickle_candidate(&candidate).map_err(|err| {
@@ -641,7 +661,7 @@ impl SessionManager {
         let typ = candidate_typ_hint(&init.candidate);
         let mid_empty = init.sdp_mid.as_deref().unwrap_or("").is_empty();
         let mline = init.sdp_mline_index;
-        peer.add_ice_candidate(init)
+        ice.add_ice_candidate(init)
             .await
             .map_err(|err| err.to_string())?;
         // typ / mid emptiness / m-line only — never ufrag, password, or token.
@@ -1621,6 +1641,33 @@ fn ice_ufrag_matches(remote_ufrag: Option<&str>, fragment: Option<&str>) -> bool
     }
 }
 
+/// Upper bound on remembered local candidates for one session.
+/// Typical gathers here are around a dozen host+srflx lines; this caps
+/// inject/retry growth. It is not a network or NAT claim.
+pub(crate) const MAX_GATHERED_CANDIDATES: usize = 32;
+
+fn record_gathered_candidate(candidates: &std::sync::Mutex<Vec<Value>>, value: Value) {
+    let line = value
+        .get("candidate")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let typ = candidate_typ_hint(&line);
+    let mut queue = candidates.lock().unwrap_or_else(|err| err.into_inner());
+    if !line.is_empty()
+        && queue.iter().any(|existing| {
+            existing.get("candidate").and_then(Value::as_str) == Some(line.as_str())
+        })
+    {
+        return;
+    }
+    if queue.len() >= MAX_GATHERED_CANDIDATES {
+        eprintln!("agentlink live-webrtc: gathered candidate queue full typ={typ}");
+        return;
+    }
+    queue.push(value);
+}
+
 fn candidate_typ_hint(line: &str) -> &'static str {
     let lower = line.to_ascii_lowercase();
     if lower.contains("typ srflx") {
@@ -1713,10 +1760,7 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
         if let Ok(init) = event.candidate.to_json() {
             if let Ok(value) = serde_json::to_value(&init) {
-                self.candidates
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .push(value);
+                record_gathered_candidate(self.candidates.as_ref(), value);
             }
         }
     }
@@ -2478,5 +2522,34 @@ mod tests {
         assert!(super::ice_ufrag_matches(Some("genA"), Some("genA")));
         assert!(!super::ice_ufrag_matches(Some("genA"), Some("genB")));
         assert!(super::ice_ufrag_matches(None, Some("genB")));
+    }
+
+    #[test]
+    fn gathered_candidate_queue_dedups_and_stays_bounded() {
+        let queue = std::sync::Mutex::new(Vec::new());
+        let make = |n: u16| {
+            json!({
+                "candidate": format!("candidate:{n} 1 udp 2130706431 192.0.2.1 {n} typ host"),
+                "sdpMid": "",
+                "sdpMLineIndex": 0
+            })
+        };
+        super::record_gathered_candidate(&queue, make(1));
+        super::record_gathered_candidate(&queue, make(1));
+        assert_eq!(
+            queue.lock().unwrap().len(),
+            1,
+            "duplicate candidate line must be dropped"
+        );
+        for n in 2..=40 {
+            super::record_gathered_candidate(&queue, make(n));
+        }
+        let len = queue.lock().unwrap().len();
+        assert_eq!(
+            len,
+            super::MAX_GATHERED_CANDIDATES,
+            "queue must cap at {}, got {len}",
+            super::MAX_GATHERED_CANDIDATES
+        );
     }
 }

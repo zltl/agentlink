@@ -1084,3 +1084,136 @@ Tailscale overlay are still not native public P2P. No
 firewall, route, or production-node change was made to force
 a pair. A reviewed non-production node deploy is still a
 parent/user step.
+
+## t452 review — grant/peer isolation, bounded queue, full related tests
+
+1332 (`b4a4cc0`, bin `8d5bc974…`) stays frozen for the parent GUI /
+old-sufa compatibility run. Do not overwrite it, and do not attribute
+that GUI result to later commits.
+
+### Related test totals on frozen 1332 / `b4a4cc0` (no double-count)
+
+Run 2026-11-12 13:36–13:37 CST (Asia/Shanghai), `--offline`, same HEAD
+as 1332. Each line is a distinct cargo target/filter; totals do not
+overlap.
+
+| Set | Filter | Passed | Failed |
+| --- | --- | ---: | ---: |
+| core DNS/STUN | `agentlink-core --lib ice::` | 7 | 0 |
+| desktop lib (complete) | `agentlink-desktop --lib` | 100 | 0 |
+| desktop cross-process | `--test crossproc_ice` | 1 | 0 |
+| desktop X11 roundtrip | `--test x11_roundtrip` (DISPLAY=:2, real) | 1 | 0 |
+| view lib | `agentlink-view --lib` | 16 | 0 |
+| view loopback integration | `--test loopback` | 11 | 0 |
+| controller (full, includes live_pipeline / debug HUD / JPEG retry / grant) | `agentlink-cli --bin agentlink controller::` | 75 | 0 |
+| **Unique total** | | **211** | **0** |
+
+`controller::` already contains `live_pipeline_tests` (JPEG retry,
+disconnect recovery, missing-grant hard reject, handshake HUD) and
+chrome stills/debug labeling; those were not re-run as a second
+filter. 778 other `agentlink` bin tests were filtered out and are
+not in the 211.
+
+### ice_pull boundary review (on 1332) and what was missing
+
+Already covered on 1332, with evidence:
+
+- **10-pull / 4s / 200ms budget, stop on `gather_done` twice empty, stop
+  flag, two non-unknown errors, unknown action returns immediately.**
+  Implemented in `pull_late_ice`. Old-node skip and advertised-but-
+  unsupported one-shot degrade were tested
+  (`ice_pull_skipped_on_old_node_still_selects_a_pair`,
+  `advertised_but_unsupported_ice_pull_degrades_without_a_retry_storm`).
+  This host usually finishes gather before the 10/4s ceiling, so those
+  caps are enforced in code and were not exhausted by a 10-pull soak
+  here.
+- **Unknown session / stale ufrag / empty fragment admitted on the
+  owning session.** `stale_session_ice_is_rejected_and_a_new_generation_recovers_h264`
+  plus unit `ice_ufrag_matches_*`. Empty fragment is compatible because
+  `to_json` often omits it; isolation was by `session_id` only.
+- **Close sets the Viewer stop flag; pull checks it before/after the
+  200ms sleep.** Runtime shutdown then drops the task. No join handle.
+- **Production grant at the node layer:** `NodePolicy::allows(Op::Extension
+  { webrtc_signal })` requires `allows_remote_view()` before dispatch.
+  Loopback `webrtc_offer_without_a_grant_is_rejected` was only a
+  Viewer-side `DenySignal` mock, not the handler policy.
+- **Fixture `ConsentMode::Auto`:** only in `agentlink-stream-fixture`
+  (test helper bin), `tests/loopback.rs`, and the controller
+  `live_pipeline` test harness `mock_handler`. `StreamHandler::new`
+  defaults to `Deny`. Production `node_cfg` default is `notify`.
+  `fixture_inject_late` is implemented in the fixture bin only; it is
+  not a `webrtc_signal` action. Auto consent is not on the production
+  node/Controller run path.
+
+Gaps found (handler-direct path, which is also what loopback uses):
+
+- `ice_pull` / `ice` did **not** re-check `allows_remote_view()`, so a
+  withdrawn handler policy could still return or accept candidates.
+- Lookup was by `session_id` only: a second granted peer who learned
+  the id could pull the first session's candidate list. Empty-ufrag
+  trickle could also be applied to another session with that id.
+- The gathered-candidate `Vec` was unbounded and not de-duplicated
+  (`on_ice_candidate` / inject).
+
+### Fixes in a new commit (not 1332)
+
+- `ice_pull` and `ice` call the same `require_remote_view()` as
+  `offer`. Missing or withdrawn grant returns
+  `remote_view is not allowed on this node` and does not create a
+  stream or return a candidate body.
+- Both actions require `session.peer_id ==` the `handle_peer` caller.
+  Closed, unknown, and other-peer sessions all return
+  `unknown stream session` (no candidate list leak).
+- Gathered queue is de-duplicated by the candidate line and capped at
+  `MAX_GATHERED_CANDIDATES` (32). typ only is logged when full.
+
+New real-handler tests (not mock Signal denies):
+
+- `offer_and_ice_pull_without_a_handler_grant_are_rejected`
+- `withdrawn_grant_rejects_ice_pull_on_the_live_handler` (also showed
+  later trickle `remote_view is not allowed`; before a pair, ICE
+  stats logged `checks=unavailable-selected-stats-only`)
+- `ice_pull_and_empty_ufrag_ice_are_isolated_across_peers` — alice
+  and bob on one `StreamHandler`; alice inject marker `192.0.2.77`;
+  bob `ice_pull` of alice's id is `unknown stream session`; bob's
+  own pull does not contain the marker; alice empty-ufrag ice on
+  bob's session is rejected; alice empty-ufrag on her own session
+  is still admitted. Both sessions had IDR + selected typ host.
+- `close_stops_ice_pull_and_rejects_the_old_session` — after
+  `Viewer::close`, ice_pull event count grows by at most one
+  in-flight pull over 800ms; owner pull of the old id is unknown.
+- `ice_pull_queue_on_the_handler_dedups_and_stays_bounded` plus
+  unit `gathered_candidate_queue_dedups_and_stays_bounded`.
+
+### Related test totals after the fix (still no double-count)
+
+Run 2026-11-12 13:39–13:40 CST (Asia/Shanghai):
+
+| Set | Passed | Failed |
+| --- | ---: | ---: |
+| core `ice::` | 7 | 0 |
+| desktop lib | 101 | 0 |
+| desktop crossproc | 1 | 0 |
+| desktop X11 | 1 | 0 |
+| view lib | 16 | 0 |
+| view loopback | 16 | 0 |
+| controller:: | 75 | 0 |
+| **Unique total** | **217** | **0** |
+
+### Semantics that must not be over-claimed
+
+- A passing local or **same-host cross-process** fixture (selected typ
+  host + H.264 IDR) is **not** a cross-network or public NAT P2P
+  result. 1332 and this follow-up still did not re-run box↔sufa.
+- `checks=unavailable-selected-stats-only` means webrtc-0.21
+  `get_stats()` did not expose a selected pair, so send/recv check
+  counters are **unavailable**, not that zero checks were sent or
+  that the agent proved “no STUN was ever sent.” Once a pair is
+  selected, the same library may report real `req_sent` / `req_recv`
+  / `resp_sent` / `resp_recv` on that pair (seen in loopback and
+  cross-process runs). Absence of those counters on a failed remote
+  path remains unexplained at the wire layer.
+
+Parent GUI of 1332 must be recorded against `b4a4cc0` / 1332 only.
+If the isolation/grant fixes should be in the GUI build, re-run GUI
+on the new freeze, not on 1332.

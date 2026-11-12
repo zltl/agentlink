@@ -973,3 +973,367 @@ fn stale_session_ice_is_rejected_and_a_new_generation_recovers_h264() {
     assert!(wait_for_selected_pair(&viewer).is_some());
     viewer.close();
 }
+
+struct NamedPeerSignal {
+    handler: Arc<StreamHandler>,
+    peer: String,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl NamedPeerSignal {
+    fn new(handler: Arc<StreamHandler>, peer: &str) -> Self {
+        Self {
+            handler,
+            peer: peer.to_string(),
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+}
+
+impl Signal for NamedPeerSignal {
+    fn signal(&self, payload: &Value) -> Result<Value, String> {
+        let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
+        let result = self.handler.handle_peer(payload, &self.peer);
+        let mut events = self.events.lock().unwrap_or_else(|err| err.into_inner());
+        match (action, &result) {
+            ("ice_pull", Ok(_)) => events.push("ice_pull ok".into()),
+            ("ice_pull", Err(err)) => events.push(format!("ice_pull err {err}")),
+            _ => {}
+        }
+        result
+    }
+}
+
+fn host_candidate(n: u16) -> Value {
+    serde_json::json!({
+        "candidate": format!("candidate:{n} 1 udp 2130706431 192.0.2.{n} 9 typ host"),
+        "sdpMid": "",
+        "sdpMLineIndex": 0,
+        "usernameFragment": Value::Null
+    })
+}
+
+fn ice_pull_payload(session: &str, after: u64) -> Value {
+    serde_json::json!({
+        "action": "ice_pull",
+        "session_id": session,
+        "after": after
+    })
+}
+
+/// Real StreamHandler, no Viewer-side DenySignal mock: a missing view grant
+/// must reject offer and ice_pull before any session is created.
+#[test]
+fn offer_and_ice_pull_without_a_handler_grant_are_rejected() {
+    let handler = Arc::new(StreamHandler::new(Desktop::mock()));
+    handler.configure(StreamSettings {
+        policy: NodePolicy::none(),
+        audit_path: std::env::temp_dir().join("agentlink-view-loopback-nogrant.log"),
+        consent: ConsentMode::Auto,
+        on_audit: None,
+    });
+    let offer = handler.handle_peer(
+        &serde_json::json!({
+            "action": "offer",
+            "sdp": "v=0\r\n",
+            "viewer": "alice"
+        }),
+        "alice",
+    );
+    assert!(
+        offer
+            .as_ref()
+            .err()
+            .is_some_and(|err| err.contains("remote_view is not allowed")),
+        "offer without grant must fail at the handler, got {offer:?}"
+    );
+    let pull = handler.handle_peer(&ice_pull_payload("alice-0-1", 0), "alice");
+    assert!(
+        pull.as_ref()
+            .err()
+            .is_some_and(|err| err.contains("remote_view is not allowed")),
+        "ice_pull without grant must not invent a session, got {pull:?}"
+    );
+    if let Ok(value) = &pull {
+        panic!("ice_pull must not return candidates without a grant: {value}");
+    }
+}
+
+/// Withdraw the handler policy after a real session exists. ice_pull must
+/// hard-reject and must not return the live candidate list.
+#[test]
+fn withdrawn_grant_rejects_ice_pull_on_the_live_handler() {
+    let handler = view_handler();
+    let signal = Arc::new(NamedPeerSignal::new(handler.clone(), "alice"));
+    let viewer = Viewer::connect(
+        signal.clone(),
+        LiveOptions {
+            viewer: "alice".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("offer");
+    let session = viewer.info().session_id.clone();
+    let before = handler
+        .handle_peer(&ice_pull_payload(&session, 0), "alice")
+        .expect("owner ice_pull while granted");
+    assert!(
+        before.get("candidates").and_then(Value::as_array).is_some(),
+        "granted owner should see a candidate array: {before}"
+    );
+    handler.set_policy(NodePolicy::none());
+    let denied = handler.handle_peer(&ice_pull_payload(&session, 0), "alice");
+    assert!(
+        denied
+            .as_ref()
+            .err()
+            .is_some_and(|err| err.contains("remote_view is not allowed")),
+        "withdrawn grant must hard-reject ice_pull, got {denied:?}"
+    );
+    viewer.close();
+}
+
+/// Two real sessions on one handler. A second peer cannot pull or trickle
+/// the first session, including with an empty usernameFragment.
+#[test]
+fn ice_pull_and_empty_ufrag_ice_are_isolated_across_peers() {
+    let handler = view_handler();
+    let alice_signal = Arc::new(NamedPeerSignal::new(handler.clone(), "alice"));
+    let bob_signal = Arc::new(NamedPeerSignal::new(handler.clone(), "bob"));
+    let alice = Viewer::connect(
+        alice_signal,
+        LiveOptions {
+            viewer: "alice".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("alice offer");
+    let bob = Viewer::connect(
+        bob_signal,
+        LiveOptions {
+            viewer: "bob".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("bob offer");
+    assert!(
+        wait_for_idr(&alice) && wait_for_idr(&bob),
+        "both sessions need an IDR"
+    );
+    assert!(
+        wait_for_selected_pair(&alice).is_some() && wait_for_selected_pair(&bob).is_some(),
+        "both sessions need a selected pair"
+    );
+    let alice_sid = alice.info().session_id.clone();
+    let bob_sid = bob.info().session_id.clone();
+    assert_ne!(alice_sid, bob_sid);
+
+    let marker = host_candidate(77);
+    handler
+        .inject_gathered_candidate(&alice_sid, marker.clone())
+        .expect("inject into alice");
+    let alice_pull = handler
+        .handle_peer(&ice_pull_payload(&alice_sid, 0), "alice")
+        .expect("alice owner pull");
+    let alice_lines: Vec<String> = alice_pull
+        .get("candidates")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("candidate")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        alice_lines.iter().any(|line| line.contains("192.0.2.77")),
+        "alice must see her injected candidate: {alice_pull}"
+    );
+
+    let leaked = handler.handle_peer(&ice_pull_payload(&alice_sid, 0), "bob");
+    assert!(
+        leaked
+            .as_ref()
+            .err()
+            .is_some_and(|err| err.contains("unknown stream session")),
+        "bob must not pull alice candidates, got {leaked:?}"
+    );
+    if let Ok(value) = &leaked {
+        panic!("cross-peer ice_pull must not return a body: {value}");
+    }
+
+    let bob_pull = handler
+        .handle_peer(&ice_pull_payload(&bob_sid, 0), "bob")
+        .expect("bob owner pull");
+    let bob_lines: Vec<String> = bob_pull
+        .get("candidates")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("candidate")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        bob_lines.iter().all(|line| !line.contains("192.0.2.77")),
+        "bob must not see alice's injected candidate: {bob_pull}"
+    );
+
+    let cross_ice = handler.handle_peer(
+        &serde_json::json!({
+            "action": "ice",
+            "session_id": bob_sid,
+            "candidate": {
+                "candidate": "candidate:99 1 udp 2130706431 192.0.2.99 9 typ host",
+                "sdpMid": "",
+                "sdpMLineIndex": 0,
+                "usernameFragment": Value::Null
+            }
+        }),
+        "alice",
+    );
+    assert!(
+        cross_ice
+            .as_ref()
+            .err()
+            .is_some_and(|err| err.contains("unknown stream session")),
+        "empty-ufrag ice must not enter another peer's session, got {cross_ice:?}"
+    );
+    let own_empty = handler.handle_peer(
+        &serde_json::json!({
+            "action": "ice",
+            "session_id": alice_sid,
+            "candidate": {
+                "candidate": "candidate:88 1 udp 2130706431 192.0.2.88 9 typ host",
+                "sdpMid": "",
+                "sdpMLineIndex": 0,
+                "usernameFragment": Value::Null
+            }
+        }),
+        "alice",
+    );
+    assert!(
+        own_empty.is_ok(),
+        "empty fragment on the owning session must still be admitted, got {own_empty:?}"
+    );
+
+    eprintln!(
+        "agentlink live-protocol: cross-peer isolation alice={alice_sid} bob={bob_sid} alice_has_marker=true bob_leak=false"
+    );
+    alice.close();
+    bob.close();
+}
+
+/// After Viewer close, the owner cannot keep pulling, and the Viewer must
+/// not keep issuing ice_pull in the background.
+#[test]
+fn close_stops_ice_pull_and_rejects_the_old_session() {
+    let handler = view_handler();
+    let signal = Arc::new(NamedPeerSignal::new(handler.clone(), "alice"));
+    let viewer = Viewer::connect(
+        signal.clone(),
+        LiveOptions {
+            viewer: "alice".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("offer");
+    let session = viewer.info().session_id.clone();
+    let _ = wait_for_idr(&viewer);
+    let _ = wait_for_selected_pair(&viewer);
+    let before = signal
+        .events()
+        .iter()
+        .filter(|event| event.starts_with("ice_pull"))
+        .count();
+    viewer.close();
+    std::thread::sleep(Duration::from_millis(800));
+    let after = signal
+        .events()
+        .iter()
+        .filter(|event| event.starts_with("ice_pull"))
+        .count();
+    assert!(
+        after <= before + 1,
+        "close must stop further ice_pull, before={before} after={after} events={:?}",
+        signal.events()
+    );
+    let stale = handler.handle_peer(&ice_pull_payload(&session, 0), "alice");
+    assert!(
+        stale
+            .as_ref()
+            .err()
+            .is_some_and(|err| err.contains("unknown stream session")),
+        "closed session ice_pull must be unknown, got {stale:?}"
+    );
+}
+
+/// inject / pull on a live handler must honor the bounded, de-duplicated queue.
+#[test]
+fn ice_pull_queue_on_the_handler_dedups_and_stays_bounded() {
+    let handler = view_handler();
+    let signal = Arc::new(NamedPeerSignal::new(handler.clone(), "alice"));
+    let viewer = Viewer::connect(
+        signal,
+        LiveOptions {
+            viewer: "alice".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    )
+    .expect("offer");
+    let session = viewer.info().session_id.clone();
+    let baseline = handler
+        .handle_peer(&ice_pull_payload(&session, 0), "alice")
+        .expect("baseline pull");
+    let baseline_n = baseline
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let marker = host_candidate(3);
+    handler
+        .inject_gathered_candidate(&session, marker.clone())
+        .expect("inject");
+    handler
+        .inject_gathered_candidate(&session, marker)
+        .expect("duplicate inject");
+    for n in 4..50 {
+        handler
+            .inject_gathered_candidate(&session, host_candidate(n))
+            .expect("inject unique");
+    }
+    let pulled = handler
+        .handle_peer(&ice_pull_payload(&session, 0), "alice")
+        .expect("capped pull");
+    let n = pulled
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    assert!(
+        n <= 32,
+        "handler queue must stay at or under 32, baseline={baseline_n} pulled={n} body={pulled}"
+    );
+    assert!(
+        n >= baseline_n,
+        "queue should not shrink, baseline={baseline_n} pulled={n}"
+    );
+    viewer.close();
+}
