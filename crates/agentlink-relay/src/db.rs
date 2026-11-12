@@ -15,7 +15,7 @@ use agentlink_core::protocol::ApprovalInfo;
 use agentlink_core::util::{self, unix_now};
 use agentlink_core::{Error, NodePolicy, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{PgPool, Row, SqlitePool};
+use sqlx::{AssertSqlSafe, PgPool, Row, SqlitePool};
 
 use crate::models::{
     AccessSession, Caller, ClientRecord, Device, EnrolledNode, IssuedSession, IssuedToken,
@@ -176,7 +176,7 @@ macro_rules! exec {
         match &$db.backend {
             Backend::Sqlite(pool) => {
                 let adapted = adapt(sql, false);
-                bind_query!(sqlx::query(&adapted), $($b),*)
+                bind_query!(sqlx::query(AssertSqlSafe(adapted)), $($b),*)
                     .execute(pool)
                     .await
                     .map(|done| done.rows_affected())
@@ -184,7 +184,7 @@ macro_rules! exec {
             }
             Backend::Postgres(pool) => {
                 let adapted = adapt(sql, true);
-                bind_query!(sqlx::query(&adapted), $($b),*)
+                bind_query!(sqlx::query(AssertSqlSafe(adapted)), $($b),*)
                     .execute(pool)
                     .await
                     .map(|done| done.rows_affected())
@@ -200,14 +200,14 @@ macro_rules! fetch_all {
         match &$db.backend {
             Backend::Sqlite(pool) => {
                 let adapted = adapt(sql, false);
-                bind_query!(sqlx::query_as(&adapted), $($b),*)
+                bind_query!(sqlx::query_as(AssertSqlSafe(adapted)), $($b),*)
                     .fetch_all(pool)
                     .await
                     .map_err(db_err)
             }
             Backend::Postgres(pool) => {
                 let adapted = adapt(sql, true);
-                bind_query!(sqlx::query_as(&adapted), $($b),*)
+                bind_query!(sqlx::query_as(AssertSqlSafe(adapted)), $($b),*)
                     .fetch_all(pool)
                     .await
                     .map_err(db_err)
@@ -237,10 +237,10 @@ impl Database {
                     let schema_for_conn = schema_for_conn.clone();
                     Box::pin(async move {
                         if let Some(schema) = schema_for_conn {
-                            sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                            sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA IF NOT EXISTS {schema}")))
                                 .execute(&mut *conn)
                                 .await?;
-                            sqlx::query(&format!("SET search_path TO {schema}"))
+                            sqlx::query(AssertSqlSafe(format!("SET search_path TO {schema}")))
                                 .execute(&mut *conn)
                                 .await?;
                         }
@@ -321,7 +321,7 @@ impl Database {
         };
         validate_schema(schema)?;
         if let Backend::Postgres(pool) = &self.backend {
-            sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            sqlx::query(AssertSqlSafe(format!("DROP SCHEMA IF EXISTS {schema} CASCADE")))
                 .execute(pool)
                 .await
                 .map_err(db_err)?;
@@ -2327,6 +2327,10 @@ fn db_err(err: sqlx::Error) -> Error {
     Error::Message(format!("database: {err}"))
 }
 
+/// Rewrites only `?N` placeholders to `$N` for Postgres. Values stay bound
+/// separately. sqlx 0.9 requires that the resulting `String` be passed through
+/// `AssertSqlSafe` after this audit; this function must not interpolate identifiers
+/// or user data into the SQL text.
 fn adapt(sql: &str, postgres: bool) -> String {
     let mut out = String::with_capacity(sql.len());
     let chars: Vec<char> = sql.chars().collect();
@@ -2362,7 +2366,7 @@ async fn fetch_optional_text(db: &Database, sql: &str, a: &str, b: &str) -> Resu
     match &db.backend {
         Backend::Sqlite(pool) => {
             let adapted = adapt(sql, false);
-            let row = sqlx::query(&adapted)
+            let row = sqlx::query(AssertSqlSafe(adapted))
                 .bind(a)
                 .bind(b)
                 .fetch_optional(pool)
@@ -2375,7 +2379,7 @@ async fn fetch_optional_text(db: &Database, sql: &str, a: &str, b: &str) -> Resu
         }
         Backend::Postgres(pool) => {
             let adapted = adapt(sql, true);
-            let row = sqlx::query(&adapted)
+            let row = sqlx::query(AssertSqlSafe(adapted))
                 .bind(a)
                 .bind(b)
                 .fetch_optional(pool)
@@ -2393,7 +2397,7 @@ async fn fetch_optional_text_one(db: &Database, sql: &str, a: &str) -> Result<Op
     match &db.backend {
         Backend::Sqlite(pool) => {
             let adapted = adapt(sql, false);
-            let row = sqlx::query(&adapted)
+            let row = sqlx::query(AssertSqlSafe(adapted))
                 .bind(a)
                 .fetch_optional(pool)
                 .await
@@ -2405,7 +2409,7 @@ async fn fetch_optional_text_one(db: &Database, sql: &str, a: &str) -> Result<Op
         }
         Backend::Postgres(pool) => {
             let adapted = adapt(sql, true);
-            let row = sqlx::query(&adapted)
+            let row = sqlx::query(AssertSqlSafe(adapted))
                 .bind(a)
                 .fetch_optional(pool)
                 .await
@@ -2426,7 +2430,7 @@ async fn fetch_optional_web(
     match &db.backend {
         Backend::Sqlite(pool) => {
             let adapted = adapt(sql, false);
-            let row = sqlx::query(&adapted)
+            let row = sqlx::query(AssertSqlSafe(adapted))
                 .bind(hash)
                 .fetch_optional(pool)
                 .await
@@ -2444,7 +2448,7 @@ async fn fetch_optional_web(
         }
         Backend::Postgres(pool) => {
             let adapted = adapt(sql, true);
-            let row = sqlx::query(&adapted)
+            let row = sqlx::query(AssertSqlSafe(adapted))
                 .bind(hash)
                 .fetch_optional(pool)
                 .await
@@ -2528,5 +2532,232 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn sqlite_pool(db: &Database) -> &SqlitePool {
+        match &db.backend {
+            Backend::Sqlite(pool) => pool,
+            Backend::Postgres(_) => panic!("expected sqlite backend"),
+        }
+    }
+
+    async fn open_sqlite(dir: &std::path::Path) -> Database {
+        Database::open(OpenOptions {
+            data_dir: dir,
+            database_url: None,
+            schema: None,
+            bootstrap_admin: false,
+            mint_legacy_admin: false,
+        })
+        .await
+        .expect("sqlite open")
+        .db
+    }
+
+    /// Official e5bf1198 fix in sqlite3WalReadFrame: when the WAL page size is
+    /// smaller than the caller buffer, zero the tail instead of leaving
+    /// uninitialized page-cache bytes.
+    const SQLITE_E5BF_FIX: &str = "memset(pOut+sz, 0, nOut-sz)";
+
+    fn official_libsqlite3_sys_0391_amalgamation() -> std::path::PathBuf {
+        let home = std::env::var("CARGO_HOME").unwrap_or_else(|_| {
+            format!(
+                "{}/.cargo",
+                std::env::var("HOME").expect("HOME")
+            )
+        });
+        let root = std::path::Path::new(&home).join("registry/src");
+        let mut found = Vec::new();
+        if let Ok(idx_dirs) = std::fs::read_dir(&root) {
+            for idx in idx_dirs.flatten() {
+                let cand = idx
+                    .path()
+                    .join("libsqlite3-sys-0.39.1/sqlite3/sqlite3.c");
+                if cand.is_file() {
+                    found.push(cand);
+                }
+            }
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "expected one official libsqlite3-sys 0.39.1 amalgamation under {root:?}, found {found:?}"
+        );
+        found.pop().unwrap()
+    }
+
+    #[tokio::test]
+    async fn sqlite_runtime_is_3_54_1_and_amalgamation_has_official_e5bf_fix() {
+        let amalgamation = official_libsqlite3_sys_0391_amalgamation();
+        let src = std::fs::read_to_string(&amalgamation).expect("read sqlite3.c");
+        assert!(
+            src.contains("#define SQLITE_VERSION        \"3.54.1\""),
+            "amalgamation {} is not SQLite 3.54.1",
+            amalgamation.display()
+        );
+        assert!(
+            src.contains("sqlite3WalReadFrame"),
+            "missing sqlite3WalReadFrame in {}",
+            amalgamation.display()
+        );
+        assert!(
+            src.contains(SQLITE_E5BF_FIX),
+            "official e5bf1198 zeroing fix not found in {}",
+            amalgamation.display()
+        );
+
+        let dir = tempdir().unwrap();
+        let db = open_sqlite(dir.path()).await;
+        let pool = sqlite_pool(&db);
+        let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(pool)
+            .await
+            .expect("sqlite_version");
+        assert_eq!(version, "3.54.1", "linked runtime SQLite is {version}, not 3.54.1");
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(pool)
+            .await
+            .expect("journal_mode");
+        assert_eq!(journal.to_lowercase(), "wal");
+        drop(db);
+    }
+
+    #[tokio::test]
+    async fn sqlite_wal_transaction_restart_and_old_schema_migrate() {
+        // Fresh schema: write, transaction rollback, WAL, restart.
+        let fresh = tempdir().unwrap();
+        let db = open_sqlite(fresh.path()).await;
+        let pool = sqlite_pool(&db);
+        sqlx::query("INSERT INTO meta(name, value) VALUES ('probe', 'alive')")
+            .execute(pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE meta SET value = 'rolled' WHERE name = 'probe'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM meta WHERE name = 'probe'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "alive", "rollback must not persist");
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        drop(db);
+
+        let db = open_sqlite(fresh.path()).await;
+        let value: String = sqlx::query_scalar("SELECT value FROM meta WHERE name = 'probe'")
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+        assert_eq!(value, "alive", "value must survive restart");
+        drop(db);
+
+        // Old schema: only 0001 applied. Then product open must apply 0002/0003.
+        let complete = tempdir().unwrap();
+        let complete_db = open_sqlite(complete.path()).await;
+        let create_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_one(sqlite_pool(&complete_db))
+        .await
+        .unwrap();
+        let (version, description, installed_on, success, checksum, execution_time): (
+            i64,
+            String,
+            String,
+            bool,
+            Vec<u8>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT version, description, installed_on, success, checksum, execution_time              FROM _sqlx_migrations WHERE version = 1",
+        )
+        .fetch_one(sqlite_pool(&complete_db))
+        .await
+        .expect("version 1 checksum from a complete migrate");
+        drop(complete_db);
+
+        let old = tempdir().unwrap();
+        let old_path = old.path().join("relay.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&old_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal);
+        let old_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/sqlite/0001_init.sql"))
+            .execute(&old_pool)
+            .await
+            .expect("apply 0001 only");
+        assert!(
+            create_sql.starts_with("CREATE TABLE"),
+            "unexpected migrations table sql: {create_sql}"
+        );
+        sqlx::query(AssertSqlSafe(create_sql))
+            .execute(&old_pool)
+            .await
+            .expect("create _sqlx_migrations");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations              (version, description, installed_on, success, checksum, execution_time)              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(version)
+        .bind(&description)
+        .bind(&installed_on)
+        .bind(success)
+        .bind(&checksum)
+        .bind(execution_time)
+        .execute(&old_pool)
+        .await
+        .unwrap();
+
+        let refresh_cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('refresh_tokens')")
+            .fetch_all(&old_pool)
+            .await
+            .unwrap();
+        let node_cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('nodes')")
+            .fetch_all(&old_pool)
+            .await
+            .unwrap();
+        assert!(!refresh_cols.iter().any(|c| c == "replaced_by"), "0002 must not be present yet");
+        assert!(!node_cols.iter().any(|c| c == "has_display"), "0003 must not be present yet");
+        old_pool.close().await;
+
+        let migrated = open_sqlite(old.path()).await;
+        let pool = sqlite_pool(&migrated);
+        let refresh_cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('refresh_tokens')")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let node_cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('nodes')")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        assert!(refresh_cols.iter().any(|c| c == "replaced_by"));
+        assert!(refresh_cols.iter().any(|c| c == "acknowledged"));
+        assert!(node_cols.iter().any(|c| c == "has_display"));
+        sqlx::query("INSERT INTO meta(name, value) VALUES ('after-migrate', 'ok')")
+            .execute(pool)
+            .await
+            .unwrap();
+        let got: String = sqlx::query_scalar("SELECT value FROM meta WHERE name = 'after-migrate'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(got, "ok");
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        drop(migrated);
     }
 }

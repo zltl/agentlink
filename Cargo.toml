@@ -77,8 +77,12 @@ hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 argon2 = "0.5"
 sha1 = "0.10"
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "migrate", "macros", "derive"] }
-libsqlite3-sys = { version = "0.30.1", features = ["bundled"] }
+# Isolated candidate only — not adopted on main.
+# Official launchbadge/sqlx merge commit of #4502 (full SHA, not floating main).
+# Allows libsqlite3-sys 0.39.x; does not allow 0.40.0.
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "migrate", "macros", "derive"] }
+# Official crates.io 0.39.1 bundles SQLite 3.54.1 (RUSTSEC-2026-0459). Not 0.40.0. No SQLCipher.
+libsqlite3-sys = { version = "=0.39.1", features = ["bundled"] }
 qrcode = "0.14"
 
 [profile.release]
