@@ -683,3 +683,176 @@ not only after timeout. Handshake should keep the no-pair (or
 no-first-frame) terminal reason after close. Path stays
 `jpeg · relay` unless a real H.264 frame arrives (do not expect a
 selected public P2P pair).
+
+
+## t450 — learn Tailscale, keep JPEG, retry with a bound
+
+User t450 asked whether P2P was already fixed and how Tailscale
+does it. It was **not** fixed after 0951. This section is the
+official-source study and the first implementation batch: keep
+JPEG up and renegotiate with a backoff budget. Public NAT P2P
+on box↔sufa is still not claimed.
+
+### Official sources (fetched 2026-11-12, not cloned)
+
+- [How NAT traversal works](https://tailscale.com/blog/how-nat-traversal-works)
+  (David Anderson, 2020-08-21). The closing checklist: enumerate
+  local and STUN `ip:port`s, exchange them on a side channel, *begin
+  on a fallback relay*, probe all peer endpoints, transparently
+  upgrade to a better path, downgrade if the active path dies.
+- [NAT traversal, and how we're improving it (pt. 1)](https://tailscale.com/blog/nat-traversal-improvements-pt-1)
+  (2025-10-15). “Every connection technically begins via DERP, then
+  upgrades to a direct link if possible.” If traversal never
+  succeeds, “traffic continues flowing over DERP for as long as
+  needed.” Symmetric / “hard” NAT (mapping differs per destination)
+  is called out as the usual direct-path failure. `tailscale netcheck`
+  reports whether the mapping varies by destination.
+- [DERP servers](https://tailscale.com/docs/reference/derp-servers)
+  (docs last validated 2026-01-21). DERP is a rendezvous *and* a
+  last-resort relay for already-encrypted WireGuard packets, not a
+  WebRTC/TURN server.
+- [What is STUN?](https://tailscale.com/docs/reference/stun-protocol)
+  (docs last validated 2025-08-06). Clients STUN to *all* DERP
+  relays so they can compare mapped `ip:port`s.
+- [How Tailscale works](https://tailscale.com/blog/how-tailscale-works).
+  DERP is described as filling the *role* of TURN, over HTTPS, using
+  WireGuard keys. That is an analogy, not protocol equivalence.
+- Upstream source (raw, no clone), `main` as of this fetch:
+  - [`disco/disco.go`](https://raw.githubusercontent.com/tailscale/tailscale/main/disco/disco.go):
+    `CallMeMaybe` is sent *only over DERP* after the sender has
+    already sent UDP, asking the peer to open a path back, and
+    carrying `MyNumber` endpoints (including a fresh STUN mapping).
+  - [`net/netcheck/netcheck.go`](https://raw.githubusercontent.com/tailscale/tailscale/main/net/netcheck/netcheck.go):
+    `MappingVariesByDestIP` is set when two IPv4 STUN replies show
+    different mapped `ip:port`s.
+  - [`wgengine/magicsock/endpoint.go`](https://raw.githubusercontent.com/tailscale/tailscale/main/wgengine/magicsock/endpoint.go)
+    and `magicsock.go`: `heartbeatInterval = 3s`,
+    `trustUDPAddrDuration = 6500ms`; `heartbeat` keeps the best UDP
+    path alive and, when needed, `sendDiscoPingsLocked` plus
+    `enqueueCallMeMaybe`.
+  - [`derp/README.md`](https://raw.githubusercontent.com/tailscale/tailscale/main/derp/README.md):
+    DERP relays disco *and* WireGuard; only the DERP-home connection
+    must stay up.
+
+### What is transferable vs not equivalent
+
+Transferable *strategy* (and what 0951 was missing):
+
+- A working relay path must not be torn down because direct
+  negotiation missed once. In Agentlink that relay path is **JPEG
+  over the existing WebSocket**, not DERP and not TURN.
+- Failures must stay visible, then a **bounded** retry / candidate
+  refresh may run, with backoff, instead of a single 12s wait and
+  a permanent close of the live attempt.
+- Upgrade to H.264 when a real frame arrives; downgrade to JPEG
+  if the live path dies, then retry within the budget.
+
+Not equivalent, and not claimed:
+
+- WireGuard + DERP + disco is not WebRTC ICE + TURN. Shipping
+  Tailscale’s overlay, or standing up DERP/TURN, is not “native
+  public P2P.”
+- Hard / symmetric NAT is **not** guaranteed to punch, even for
+  Tailscale (their own 2025 post says two hard NATs almost always
+  need a relay).
+- `CallMeMaybe`, multi-DERP STUN `MappingVariesByDestIP`, and
+  birthday-port probes need both peers and a side channel we do
+  not have in the current node signaling. They are not copied
+  here.
+- The current node **batches** ICE candidates in the offer
+  answer and accepts viewer trickle (`action: ice`) but does
+  **not** push late answer candidates back. Prior box↔sufa
+  probes already showed `gather_complete=true` and public `srflx`
+  in *both* inventories, so missing trickle is a real protocol
+  gap but **not** a proven root cause of the no-pair result.
+  A bidirectional `ice_pull` / trickle extension can be a later
+  both-sides candidate; it is **not deployed**.
+
+### Why typ srflx still does not prove a pair (no NAT verdict)
+
+Safe `get_stats()` snapshots (`agentlink live-ice:`) still report
+`pairs=0` / `req_sent=0` when nothing is selected. The public
+`webrtc-0.21.1` report is what we log; we did **not** patch
+third-party crates or capture STUN Binding packets (those carry
+ICE ufrag). `rtc-ice` *can* list all pairs on the Agent, but that
+API is not exposed through the PeerConnection stats we already
+use. Therefore “no pair despite real XOR-MAPPED srflx” remains
+an open connectivity question — **not** a diagnosed symmetric-NAT
+conclusion. No firewall, route, or online-node change was made
+to chase it.
+
+A fully local dual-peer experiment in this worktree: when a test
+fault strips remote candidates, no pair forms and JPEG stays;
+when a later attempt uses a normal same-host answer, H.264
+arrives. That only proves the retry machinery and the same-host
+stack, not public NAT traversal.
+
+### What was implemented (controller only, local)
+
+`LiveSchedule` (default: 3 attempts, 12s ICE wait, 3s then 6s
+backoff, session offer budget 6). After a *soft* miss (no pair,
+no first frame, connect error that is not a hard reject, or a
+later live-path loss) the Viewer is closed and released, JPEG
+stills continue, handshake shows the retry, and a new offer is
+sent. Hard rejects (`not allowed` / grant / denied) do **not**
+retry. After the budget is spent, the last reason is kept as a
+terminal handshake, including `stopped after N attempts` when
+N>1. A successful H.264 takeover resets the *streak* but still
+consumes the session offer budget, so a flapping path cannot
+hammer a node.
+
+### Tests run (2026-11-12 12:12 CST)
+
+This is additional coverage for the retry strategy; it is not a
+claim that public P2P is done.
+
+- `agentlink-core` rewrite/STUN tests: **3 passed**
+- `agentlink-view --lib`: **14 passed**
+- `agentlink-view --test loopback`: **3 passed**
+- `agentlink-cli --bin agentlink controller::`: **75 passed**,
+  including `live_retry_backoff_is_bounded_and_does_not_run_forever`,
+  `jpeg_retries_then_recovers_h264_without_claiming_p2p_early`
+  (two short no-pair attempts, third same-host attempt received
+  H.264; JPEG stayed `jpeg · relay` until then; 3 offers),
+  `exhausted_retries_keep_jpeg_release_viewer_and_stop`
+  (3 offers, terminal “stopped after 3 attempts”, viewer slot
+  released, JPEG still refreshing),
+  `missing_grant_does_not_spend_retry_budget` (0 offers).
+- `controller` + `controller_debug`: **1 + 6 passed**
+
+**102 passed, 0 failed** in that set. Not run: remaining
+`agentlink-core` lib tests, other bins, deploy/smoke, GUI, or any
+new sufa/phone probe.
+
+### Cross-machine P2P?
+
+**No.** This batch did not select a public ICE pair or receive
+H.264 from sufa. Same-host recovery in the harness is not public
+NAT P2P. TURN and Tailscale overlay are not native public P2P.
+
+### If a later close-the-loop needs user approval
+
+Do **not** deploy from here. The smallest useful authorized
+follow-up would be: (1) collect *safe* ICE check / candidate
+inventories from the **sufa node process logs** during one
+read-only View (no ufrag/password packet capture, no app
+input/clip/portal), and/or (2) a reviewed both-sides trickle /
+`ice_pull` deploy to a non-production node. Changing box or sufa
+firewall/routes to “make P2P work” is out of scope unless the
+user explicitly asks for that change and accepts the risk.
+
+## Parent GUI path (1212 candidate only)
+
+Use
+`/workspace/agentlink-t427-recovery/20261112-1212-t449-controller-p2p/`
+once created. Launch is for the parent, not this worker:
+
+`./run-controller.sh`
+
+**0951 is frozen** and was not overwritten (bin SHA
+`5d237d80ef4ae70a8de2abd63c41f76306951dbd0a3754f769df5b1d4b7ae612`).
+Isolated `--data-dir` `/tmp/agentlink-t449-1212-controller-data`.
+Do not mix binaries. Read-only View of sufa. Expect JPEG to
+remain through a no-pair miss, then up to two further offers
+(3s / 6s backoff) rather than a single 12s-and-done live
+attempt. Do not expect a selected public P2P pair.
