@@ -97,7 +97,7 @@ Not claimed as Windows or macOS real-device verification. Android unit/source ch
 
 Stop here for the same independent reviewer. Do not push `main` from this step. After the quality gate, the parent may push this branch onto `main` as a normal fast-forward/merge of a candidate that already contains sealed `main` + t447 + t449 + these fixes.
 
-## Post-cd30 residual delta (this commit, not a rewrite of `cd30c9e`)
+## Post-cd30 residual delta (`8143d2ee`, not a rewrite of `cd30c9e`)
 
 Incremental work on `integrate/security-main-t456` after the second review confirmed the core P1 fixes in `cd30c9e`. This commit is a small follow-up; `cd30c9e` is not amended.
 
@@ -122,10 +122,31 @@ Incremental work on `integrate/security-main-t456` after the second review confi
 | `cargo test -p agentlink-cli --bin agentlink node_cfg` | not re-run here (avoid a large CLI relink). The unreadable test is no longer a Windows no-op. |
 | `cargo audit` | not re-run; lock unchanged. Still expected exit 1: `libsqlite3-sys` `RUSTSEC-2026-0459`, lockfile `rsa` `RUSTSEC-2023-0071`, 12 unmaintained warnings. |
 
-UniFFI `NodeHost` signatures changed in Rust and in hand-written Kotlin (`AndroidHost`, `ShellSessions`, owner tests). Generated `android/app/src/main/java/uniffi/agentlink_ffi/agentlink_ffi.kt` was **not** regenerated in this step (`uniffi-bindgen` did not finish; NDK was not run). The generated trait is still id-only, so an Android compile against this tree will not type-check until bindgen is run from `libagentlink_ffi.so` (`/workspace/agentlink-integrate-t456/target/debug/libagentlink_ffi.so` was built). The Rust `HostSessionRegistry` (sealed peer + release token) is the authoritative gate.
+UniFFI `NodeHost` signatures changed in Rust and in hand-written Kotlin (`AndroidHost`, `ShellSessions`, owner tests) in `8143d2ee`. Generated `agentlink_ffi.kt` was still id-only in that commit (`uniffi-bindgen` was interrupted mid-compile of the `cli` binary; NDK was not the blocker). Regeneration is recorded in the follow-up section below. The Rust `HostSessionRegistry` (sealed peer + release token) is the authoritative gate.
 
-No controller / desktop UI files were changed in this delta. A separate worker is doing the t460 layout redo from `cd30c9e` in an isolated worktree.
+No controller / desktop UI files were changed in `8143d2ee`. A separate worker is doing the t460 layout redo from `cd30c9e` in an isolated worktree.
 
-Windows probe should re-run this new freeze (not `cd30c9e`) against the existing Windows target. Production `abf86f1` was not touched.
+Windows probe should re-run the `8143d2ee` freeze (not `cd30c9e`) against the existing Windows target. Production `abf86f1` was not touched. The Android binding follow-up does not change Windows sources, so that 8143 regression boundary stays valid.
 
-Do not push `main` from this executor step. The parent will do a read-only delta review and a normal push.
+Do not push `main` from this executor step. The parent will do a read-only delta review and a normal push after the UI worker lands and the final gate.
+
+## Post-8143 UniFFI Kotlin regenerate (this commit, not a rewrite of `8143d2ee`)
+
+Official path from `android/build-native.sh` lines 21–26, **without** the NDK `cargo ndk` half (lines 28–34). Kotlin generation does not need a phone or NDK: it is `uniffi-bindgen generate --library <host debug libagentlink_ffi.so> --language kotlin --no-format --out-dir android/app/src/main/java`. The previous bindgen attempt stopped because `cargo run -p agentlink-ffi --features cli --bin uniffi-bindgen` was interrupted after ~14s while still compiling `uniffi_bindgen` / clap; no `uniffi-bindgen` binary had been produced yet.
+
+The existing `/workspace/agentlink-integrate-t456/target/debug/libagentlink_ffi.so` (mtime 2026-11-12 21:17:03 CST, Asia/Shanghai, 273 MiB) was verified against 8143 before generate: it is linked from `/workspace/agentlink-integrate-t456-cont`, newer than all `crates/agentlink-ffi/src/*.rs` on that tree, exports `release_session`, and its UniFFI checksums were read from the `.so` (`poll_session` 44778, `close_session` 24950, `session_input` 4154, `release_session` 47851, `open_session` 63923). Those differ from the stale generated file (`poll_session` 29093, no `releaseSession`). After building only the missing `uniffi-bindgen` binary (`cargo build -p agentlink-ffi --offline --features cli --bin uniffi-bindgen`, 26s, reused `CARGO_TARGET_DIR`, no ffi lib rebuild — `.so` mtime unchanged), official generate wrote `agentlink_ffi.kt`. All 57 generated checksum comparisons match the same `.so`. The generated file was not hand-edited.
+
+Hand-written call sites already matched the new trait; no Kotlin/Rust call-site edits in this commit:
+
+- `NodeHost.pollSession(sessionId, caller)` / `sessionInput(..., caller)` / `closeSession(..., caller)` / `releaseSession(sessionId, release)`
+- `AndroidHost` overrides those exact signatures and forwards `caller` / `release` into `ShellSessions`
+- `ShellSessions` records `_owner_peer` at open (required; empty rejected), gates poll/input/resize/close with `requireOwner`, and `release()` only accepts the Rust-minted token — not an owner-string bypass
+- Trusted caller is `seal.peer` after E2E policy resolution in `node.rs` dispatch (`peer = grantee`); `run_exec` stamps `_owner_peer` and a Rust-minted `release` into the host open payload; `poll_until_end` calls `HostSessionRegistry::authorize_caller` before `poll_session`; in-process cleanup uses `take_release` then `release_session`. Public poll/close are not UI-writable owner strings. Interactive PTY input/resize/close stay on the Rust `PhonePty` path with `Some(peer)`. Internal UI session handles (`handle.poll()`) are unchanged.
+
+Typecheck / unit status (Asia/Shanghai, 2026-11-12):
+
+- Standalone `kotlinc` (Gradle 8.11.1 already-cached `kotlin-compiler-embeddable` 2.0.20 + stdlib, JDK 17) compiled an extracted `NodeHost` interface plus `AndroidHost` override stubs: exit 0. This checks signature sync only, not the full generated JNA file or Android SDK types.
+- AGP 8.7.3 and `org.jetbrains.kotlin.android` 2.0.21 are **not** in `/home/box/.gradle/caches`. `./gradlew` test/compile would need a large plugin + AndroidX/Robolectric download; that was not started (disk ~15G free). Robolectric `ShellSessionsOwnerTest` was not executed here. Android compile of the full app is therefore **untested** on this box.
+- No known inevitable Kotlin compile error remains between the generated trait and hand-written implementors/tests.
+
+No Windows sources changed; the 8143 Windows retest does not need a full re-run for this commit. Controller/UI was not touched. SQLite `RUSTSEC-2026-0459` remains accurately documented; cargo-audit is still expected exit 1 (bundled `libsqlite3-sys`, lockfile `rsa`, 12 unmaintained warnings). This executor does not push `main`.

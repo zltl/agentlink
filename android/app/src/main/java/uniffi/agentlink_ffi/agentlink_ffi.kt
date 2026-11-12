@@ -669,21 +669,24 @@ internal interface UniffiCallbackInterfaceNodeHostMethod1 : com.sun.jna.Callback
     fun callback(`uniffiHandle`: Long,`kind`: RustBuffer.ByValue,`payloadJson`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceNodeHostMethod2 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceNodeHostMethod3 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`dataB64`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`dataB64`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceNodeHostMethod4 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceNodeHostMethod5 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`guest`: RustBuffer.ByValue,`write`: Byte,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`release`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceNodeHostMethod6 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`guest`: RustBuffer.ByValue,`realPath`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`guest`: RustBuffer.ByValue,`write`: Byte,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceNodeHostMethod7 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`guest`: RustBuffer.ByValue,`realPath`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceNodeHostMethod8 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`statusJson`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceOutputSinkMethod0 : com.sun.jna.Callback {
@@ -711,16 +714,17 @@ internal open class UniffiVTableCallbackInterfaceKeySigner(
     }
 
 }
-@Structure.FieldOrder("unary", "openSession", "pollSession", "sessionInput", "closeSession", "preparePath", "publishPath", "onStatus", "uniffiFree")
+@Structure.FieldOrder("unary", "openSession", "pollSession", "sessionInput", "closeSession", "releaseSession", "preparePath", "publishPath", "onStatus", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceNodeHost(
     @JvmField internal var `unary`: UniffiCallbackInterfaceNodeHostMethod0? = null,
     @JvmField internal var `openSession`: UniffiCallbackInterfaceNodeHostMethod1? = null,
     @JvmField internal var `pollSession`: UniffiCallbackInterfaceNodeHostMethod2? = null,
     @JvmField internal var `sessionInput`: UniffiCallbackInterfaceNodeHostMethod3? = null,
     @JvmField internal var `closeSession`: UniffiCallbackInterfaceNodeHostMethod4? = null,
-    @JvmField internal var `preparePath`: UniffiCallbackInterfaceNodeHostMethod5? = null,
-    @JvmField internal var `publishPath`: UniffiCallbackInterfaceNodeHostMethod6? = null,
-    @JvmField internal var `onStatus`: UniffiCallbackInterfaceNodeHostMethod7? = null,
+    @JvmField internal var `releaseSession`: UniffiCallbackInterfaceNodeHostMethod5? = null,
+    @JvmField internal var `preparePath`: UniffiCallbackInterfaceNodeHostMethod6? = null,
+    @JvmField internal var `publishPath`: UniffiCallbackInterfaceNodeHostMethod7? = null,
+    @JvmField internal var `onStatus`: UniffiCallbackInterfaceNodeHostMethod8? = null,
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
 ) : Structure() {
     class UniffiByValue(
@@ -729,11 +733,12 @@ internal open class UniffiVTableCallbackInterfaceNodeHost(
         `pollSession`: UniffiCallbackInterfaceNodeHostMethod2? = null,
         `sessionInput`: UniffiCallbackInterfaceNodeHostMethod3? = null,
         `closeSession`: UniffiCallbackInterfaceNodeHostMethod4? = null,
-        `preparePath`: UniffiCallbackInterfaceNodeHostMethod5? = null,
-        `publishPath`: UniffiCallbackInterfaceNodeHostMethod6? = null,
-        `onStatus`: UniffiCallbackInterfaceNodeHostMethod7? = null,
+        `releaseSession`: UniffiCallbackInterfaceNodeHostMethod5? = null,
+        `preparePath`: UniffiCallbackInterfaceNodeHostMethod6? = null,
+        `publishPath`: UniffiCallbackInterfaceNodeHostMethod7? = null,
+        `onStatus`: UniffiCallbackInterfaceNodeHostMethod8? = null,
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
-    ): UniffiVTableCallbackInterfaceNodeHost(`unary`,`openSession`,`pollSession`,`sessionInput`,`closeSession`,`preparePath`,`publishPath`,`onStatus`,`uniffiFree`,), Structure.ByValue
+    ): UniffiVTableCallbackInterfaceNodeHost(`unary`,`openSession`,`pollSession`,`sessionInput`,`closeSession`,`releaseSession`,`preparePath`,`publishPath`,`onStatus`,`uniffiFree`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceNodeHost) {
         `unary` = other.`unary`
@@ -741,6 +746,7 @@ internal open class UniffiVTableCallbackInterfaceNodeHost(
         `pollSession` = other.`pollSession`
         `sessionInput` = other.`sessionInput`
         `closeSession` = other.`closeSession`
+        `releaseSession` = other.`releaseSession`
         `preparePath` = other.`preparePath`
         `publishPath` = other.`publishPath`
         `onStatus` = other.`onStatus`
@@ -780,6 +786,8 @@ internal open class UniffiVTableCallbackInterfaceProgressSink(
     }
 
 }
+
+
 
 
 
@@ -1073,6 +1081,8 @@ fun uniffi_agentlink_ffi_checksum_method_nodehost_session_input(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_nodehost_close_session(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_nodehost_release_session(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_nodehost_prepare_path(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_nodehost_publish_path(
@@ -1250,11 +1260,13 @@ fun uniffi_agentlink_ffi_fn_method_nodehost_unary(`ptr`: Pointer,`kind`: RustBuf
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_nodehost_open_session(`ptr`: Pointer,`kind`: RustBuffer.ByValue,`payloadJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-fun uniffi_agentlink_ffi_fn_method_nodehost_poll_session(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_agentlink_ffi_fn_method_nodehost_poll_session(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-fun uniffi_agentlink_ffi_fn_method_nodehost_session_input(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,`dataB64`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_agentlink_ffi_fn_method_nodehost_session_input(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,`dataB64`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-fun uniffi_agentlink_ffi_fn_method_nodehost_close_session(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_agentlink_ffi_fn_method_nodehost_close_session(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_nodehost_release_session(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,`release`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_nodehost_prepare_path(`ptr`: Pointer,`guest`: RustBuffer.ByValue,`write`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1551,22 +1563,25 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_open_session() != 63923.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_poll_session() != 29093.toShort()) {
+    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_poll_session() != 44778.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_session_input() != 48284.toShort()) {
+    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_session_input() != 4154.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_close_session() != 3367.toShort()) {
+    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_close_session() != 24950.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_prepare_path() != 21258.toShort()) {
+    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_release_session() != 47851.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_publish_path() != 1841.toShort()) {
+    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_prepare_path() != 21421.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_on_status() != 62379.toShort()) {
+    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_publish_path() != 46453.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_nodehost_on_status() != 14696.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_outputsink_on_output() != 52877.toShort()) {
@@ -3593,11 +3608,21 @@ public interface NodeHost {
     
     fun `openSession`(`kind`: kotlin.String, `payloadJson`: kotlin.String): kotlin.String
     
-    fun `pollSession`(`sessionId`: kotlin.String): kotlin.String
+    /**
+     * Public session poll. `caller` must be the authenticated E2E peer
+     * recorded at open; an empty caller is rejected.
+     */
+    fun `pollSession`(`sessionId`: kotlin.String, `caller`: kotlin.String): kotlin.String
     
-    fun `sessionInput`(`sessionId`: kotlin.String, `dataB64`: kotlin.String): kotlin.String
+    fun `sessionInput`(`sessionId`: kotlin.String, `dataB64`: kotlin.String, `caller`: kotlin.String): kotlin.String
     
-    fun `closeSession`(`sessionId`: kotlin.String): kotlin.String
+    fun `closeSession`(`sessionId`: kotlin.String, `caller`: kotlin.String): kotlin.String
+    
+    /**
+     * In-process cleanup for the task that opened the session. `release` is
+     * a capability minted at open and is not sent to the remote client.
+     */
+    fun `releaseSession`(`sessionId`: kotlin.String, `release`: kotlin.String): kotlin.String
     
     fun `preparePath`(`guest`: kotlin.String, `write`: kotlin.Boolean): kotlin.String
     
@@ -3714,36 +3739,56 @@ open class NodeHostImpl: Disposable, AutoCloseable, NodeHost
     }
     
 
-    override fun `pollSession`(`sessionId`: kotlin.String): kotlin.String {
+    
+    /**
+     * Public session poll. `caller` must be the authenticated E2E peer
+     * recorded at open; an empty caller is rejected.
+     */override fun `pollSession`(`sessionId`: kotlin.String, `caller`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_nodehost_poll_session(
-        it, FfiConverterString.lower(`sessionId`),_status)
+        it, FfiConverterString.lower(`sessionId`),FfiConverterString.lower(`caller`),_status)
 }
     }
     )
     }
     
 
-    override fun `sessionInput`(`sessionId`: kotlin.String, `dataB64`: kotlin.String): kotlin.String {
+    override fun `sessionInput`(`sessionId`: kotlin.String, `dataB64`: kotlin.String, `caller`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_nodehost_session_input(
-        it, FfiConverterString.lower(`sessionId`),FfiConverterString.lower(`dataB64`),_status)
+        it, FfiConverterString.lower(`sessionId`),FfiConverterString.lower(`dataB64`),FfiConverterString.lower(`caller`),_status)
 }
     }
     )
     }
     
 
-    override fun `closeSession`(`sessionId`: kotlin.String): kotlin.String {
+    override fun `closeSession`(`sessionId`: kotlin.String, `caller`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_nodehost_close_session(
-        it, FfiConverterString.lower(`sessionId`),_status)
+        it, FfiConverterString.lower(`sessionId`),FfiConverterString.lower(`caller`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * In-process cleanup for the task that opened the session. `release` is
+     * a capability minted at open and is not sent to the remote client.
+     */override fun `releaseSession`(`sessionId`: kotlin.String, `release`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_nodehost_release_session(
+        it, FfiConverterString.lower(`sessionId`),FfiConverterString.lower(`release`),_status)
 }
     }
     )
@@ -3823,11 +3868,12 @@ internal object uniffiCallbackInterfaceNodeHost {
         }
     }
     internal object `pollSession`: UniffiCallbackInterfaceNodeHostMethod2 {
-        override fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+        override fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeNodeHost.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`pollSession`(
                     FfiConverterString.lift(`sessionId`),
+                    FfiConverterString.lift(`caller`),
                 )
             }
             val writeReturn = { value: kotlin.String -> uniffiOutReturn.setValue(FfiConverterString.lower(value)) }
@@ -3835,12 +3881,13 @@ internal object uniffiCallbackInterfaceNodeHost {
         }
     }
     internal object `sessionInput`: UniffiCallbackInterfaceNodeHostMethod3 {
-        override fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`dataB64`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+        override fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`dataB64`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeNodeHost.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`sessionInput`(
                     FfiConverterString.lift(`sessionId`),
                     FfiConverterString.lift(`dataB64`),
+                    FfiConverterString.lift(`caller`),
                 )
             }
             val writeReturn = { value: kotlin.String -> uniffiOutReturn.setValue(FfiConverterString.lower(value)) }
@@ -3848,18 +3895,32 @@ internal object uniffiCallbackInterfaceNodeHost {
         }
     }
     internal object `closeSession`: UniffiCallbackInterfaceNodeHostMethod4 {
-        override fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+        override fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`caller`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeNodeHost.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`closeSession`(
                     FfiConverterString.lift(`sessionId`),
+                    FfiConverterString.lift(`caller`),
                 )
             }
             val writeReturn = { value: kotlin.String -> uniffiOutReturn.setValue(FfiConverterString.lower(value)) }
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
-    internal object `preparePath`: UniffiCallbackInterfaceNodeHostMethod5 {
+    internal object `releaseSession`: UniffiCallbackInterfaceNodeHostMethod5 {
+        override fun callback(`uniffiHandle`: Long,`sessionId`: RustBuffer.ByValue,`release`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeNodeHost.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`releaseSession`(
+                    FfiConverterString.lift(`sessionId`),
+                    FfiConverterString.lift(`release`),
+                )
+            }
+            val writeReturn = { value: kotlin.String -> uniffiOutReturn.setValue(FfiConverterString.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `preparePath`: UniffiCallbackInterfaceNodeHostMethod6 {
         override fun callback(`uniffiHandle`: Long,`guest`: RustBuffer.ByValue,`write`: Byte,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeNodeHost.handleMap.get(uniffiHandle)
             val makeCall = { ->
@@ -3872,7 +3933,7 @@ internal object uniffiCallbackInterfaceNodeHost {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
-    internal object `publishPath`: UniffiCallbackInterfaceNodeHostMethod6 {
+    internal object `publishPath`: UniffiCallbackInterfaceNodeHostMethod7 {
         override fun callback(`uniffiHandle`: Long,`guest`: RustBuffer.ByValue,`realPath`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeNodeHost.handleMap.get(uniffiHandle)
             val makeCall = { ->
@@ -3885,7 +3946,7 @@ internal object uniffiCallbackInterfaceNodeHost {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
-    internal object `onStatus`: UniffiCallbackInterfaceNodeHostMethod7 {
+    internal object `onStatus`: UniffiCallbackInterfaceNodeHostMethod8 {
         override fun callback(`uniffiHandle`: Long,`statusJson`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeNodeHost.handleMap.get(uniffiHandle)
             val makeCall = { ->
@@ -3910,6 +3971,7 @@ internal object uniffiCallbackInterfaceNodeHost {
         `pollSession`,
         `sessionInput`,
         `closeSession`,
+        `releaseSession`,
         `preparePath`,
         `publishPath`,
         `onStatus`,

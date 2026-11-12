@@ -96,3 +96,7 @@ Still not pushed.
 ## Post-cd30 residual (local, not pushed)
 
 The continuation worktree `/workspace/agentlink-integrate-t456-cont` on `integrate/security-main-t456` adds one incremental commit after frozen `cd30c9ed5233764567ea88da102776cbb67c69b2`. The 912 tree and `cd30c9e` are not rewritten. Windows probe of `cd30c9e` stays on its own tree and target; this delta is a later source package the Windows worker can build against the existing target. Live remote `main` remains `602887281932d254d3d8ee1d57f8e3a305ab9bd6` until the parent pushes. Cached `origin/cursor/owner-full-access-c6ef` (`4f115731`) stays excluded.
+
+## Post-8143 UniFFI Kotlin regenerate (local, not pushed)
+
+A second incremental commit on the same branch regenerates `android/app/src/main/java/uniffi/agentlink_ffi/agentlink_ffi.kt` with official `uniffi-bindgen` against the verified 8143 `libagentlink_ffi.so`. `8143d2ee` and `cd30c9e` are not rewritten. No Windows/Rust behavior change; the Windows 8143 retest boundary stays valid. Still not pushed; wait for the isolated UI worker and the parent’s final gate.
