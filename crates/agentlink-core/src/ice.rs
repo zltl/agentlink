@@ -8,6 +8,23 @@
 //! ICE document lists TURN URLs and never includes a username or credential.
 //! `AGENTLINK_TURN_USERNAME` and `AGENTLINK_TURN_PASSWORD` are obsolete;
 //! treat any password that was published in `/view/config.json` as compromised.
+//!
+//! [`stun_urls_ready_for_ice`] may rewrite *built-in* [`DEFAULT_STUN_URLS`]
+//! when system DNS is unusable (empty or only RFC 2544 `198.18.0.0/15`).
+//! That rewrite uses DoH (`https://cloudflare-dns.com/dns-query`,
+//! `https://dns.google/resolve`) and substitutes literal IPs so WebRTC does
+//! not re-resolve via a poisoned resolver. This is a Controller-side
+//! compatibility path for this class of proxy/resolver, not a general DNS
+//! override.
+//!
+//! Operator-supplied `AGENTLINK_STUN_URLS` are never sent to third-party
+//! DoH and are never silently rewritten to literals (private or split-horizon
+//! names stay as the operator wrote them). Literal `198.18.0.0/15`
+//! destinations are still skipped. Set `AGENTLINK_STUN_REWRITE=off` to
+//! disable default-url rewrite and DoH entirely. Unset or
+//! `defaults`/`on` keeps the default-only policy. If a default URL cannot
+//! be rewritten, it is omitted and logged; the offer continues with any
+//! remaining STUN URLs (host-only if none remain).
 
 use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
@@ -316,16 +333,155 @@ where
     out
 }
 
-/// Default or env STUN URLs, with RFC 2544 destinations removed and
-/// hostnames rewritten to usable addresses when needed.
+/// Policy for [`stun_urls_ready_for_ice`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StunRewriteMode {
+    /// Never DoH, never rewrite hostnames to literals. Literal RFC 2544
+    /// destinations are still skipped.
+    Off,
+    /// Rewrite only [`DEFAULT_STUN_URLS`], and only when system DNS is
+    /// unusable for that host. Operator `AGENTLINK_STUN_URLS` are unchanged
+    /// (aside from skipping literal 198.18/15).
+    DefaultsOnly,
+}
+
+/// Read `AGENTLINK_STUN_REWRITE`. Unset, empty, `defaults`, or `on` →
+/// [`StunRewriteMode::DefaultsOnly`]. `off`/`0`/`false` → [`StunRewriteMode::Off`].
+pub fn stun_rewrite_mode_from_env() -> StunRewriteMode {
+    match std::env::var("AGENTLINK_STUN_REWRITE") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            if value.is_empty()
+                || matches!(
+                    value.as_str(),
+                    "1" | "on" | "true" | "yes" | "defaults" | "default"
+                )
+            {
+                StunRewriteMode::DefaultsOnly
+            } else if matches!(
+                value.as_str(),
+                "0" | "off" | "false" | "no" | "disable" | "disabled"
+            ) {
+                StunRewriteMode::Off
+            } else {
+                eprintln!(
+                    "agentlink live-webrtc: unknown AGENTLINK_STUN_REWRITE={value}; using defaults-only"
+                );
+                StunRewriteMode::DefaultsOnly
+            }
+        }
+        Err(_) => StunRewriteMode::DefaultsOnly,
+    }
+}
+
+/// True when `url` is one of the built-in public STUN servers (scheme, host,
+/// and port), so a DoH fallback is in scope.
+pub fn is_default_stun_url(url: &str) -> bool {
+    let Some(key) = stun_url_key(url) else {
+        return false;
+    };
+    DEFAULT_STUN_URLS
+        .iter()
+        .any(|item| stun_url_key(item) == Some(key.clone()))
+}
+
+fn stun_url_key(url: &str) -> Option<(String, String, String)> {
+    let (scheme, host, suffix) = split_ice_url_parts(url)?;
+    Some((
+        scheme.to_ascii_lowercase(),
+        host.to_ascii_lowercase(),
+        suffix.to_ascii_lowercase(),
+    ))
+}
+
+/// Apply [`StunRewriteMode`] to a STUN URL list.
+///
+/// `system_lookup` is ordinary DNS. `doh_lookup` is only consulted for
+/// built-in default hosts, and only when system DNS is empty or only RFC 2544.
+pub fn prepare_stun_urls<F, G>(
+    urls: &[String],
+    mode: StunRewriteMode,
+    mut system_lookup: F,
+    mut doh_lookup: G,
+) -> Vec<String>
+where
+    F: FnMut(&str) -> Vec<IpAddr>,
+    G: FnMut(&str) -> Vec<IpAddr>,
+{
+    let mut out = Vec::new();
+    for url in urls {
+        let Some((scheme, host, suffix)) = split_ice_url_parts(url) else {
+            out.push(url.clone());
+            continue;
+        };
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_benchmarking_ip(ip) {
+                eprintln!(
+                    "agentlink live-webrtc: skipping ICE URL in RFC 2544 198.18.0.0/15 ({url})"
+                );
+                continue;
+            }
+            out.push(url.clone());
+            continue;
+        }
+        let default = is_default_stun_url(url);
+        if mode == StunRewriteMode::Off || !default {
+            out.push(url.clone());
+            continue;
+        }
+        let system = system_lookup(&host);
+        let usable_system: Vec<IpAddr> = system
+            .iter()
+            .copied()
+            .filter(|ip| !is_benchmarking_ip(*ip))
+            .collect();
+        if !usable_system.is_empty() {
+            // Healthy system DNS: leave the hostname so WebRTC uses the
+            // operator/system resolver. No silent literal rewrite.
+            out.push(url.clone());
+            continue;
+        }
+        if system.iter().any(|ip| is_benchmarking_ip(*ip)) {
+            eprintln!(
+                "agentlink live-webrtc: default STUN host {host} resolved to RFC 2544 198.18.0.0/15 via system DNS; trying DoH (AGENTLINK_STUN_REWRITE=defaults)"
+            );
+        } else {
+            eprintln!(
+                "agentlink live-webrtc: default STUN host {host} had no system DNS address; trying DoH (AGENTLINK_STUN_REWRITE=defaults)"
+            );
+        }
+        let usable_doh: Vec<IpAddr> = doh_lookup(&host)
+            .into_iter()
+            .filter(|ip| !is_benchmarking_ip(*ip))
+            .collect();
+        if usable_doh.is_empty() {
+            eprintln!(
+                "agentlink live-webrtc: no usable DoH address for default STUN host {host}; omitting rather than leaving a poisoned hostname"
+            );
+            continue;
+        }
+        for ip in usable_doh {
+            let rewritten = format_ice_url(scheme, ip, suffix);
+            eprintln!(
+                "agentlink live-webrtc: ICE URL {url} rewritten to {rewritten} so the peer connection does not re-resolve via poisoned DNS"
+            );
+            out.push(rewritten);
+        }
+    }
+    out
+}
+
+/// Default or env STUN URLs, prepared for the WebRTC stack under
+/// [`stun_rewrite_mode_from_env`].
 pub fn stun_urls_ready_for_ice() -> Vec<String> {
     // reqwest::blocking (used by DoH) creates and drops its own runtime.
     // Viewer::connect calls this from an async context, so the lookup
     // must run on a regular thread.
     let urls = stun_urls_from_env();
+    let mode = stun_rewrite_mode_from_env();
     match std::thread::Builder::new()
         .name("agentlink-ice-resolve".into())
-        .spawn(move || rewrite_ice_urls(&urls, resolve_stun_host))
+        .spawn(move || prepare_stun_urls(&urls, mode, lookup_host_system, doh_lookup_a))
     {
         Ok(handle) => handle.join().unwrap_or_else(|_| {
             eprintln!(
@@ -338,24 +494,6 @@ pub fn stun_urls_ready_for_ice() -> Vec<String> {
             Vec::new()
         }
     }
-}
-
-fn resolve_stun_host(host: &str) -> Vec<IpAddr> {
-    let sys = lookup_host_system(host);
-    let usable: Vec<IpAddr> = sys
-        .iter()
-        .copied()
-        .filter(|ip| !is_benchmarking_ip(*ip))
-        .collect();
-    if !usable.is_empty() {
-        return usable;
-    }
-    if sys.iter().any(|ip| is_benchmarking_ip(*ip)) {
-        eprintln!(
-            "agentlink live-webrtc: {host} resolved to RFC 2544 198.18.0.0/15 via system DNS; trying DoH"
-        );
-    }
-    doh_lookup_a(host)
 }
 
 fn lookup_host_system(host: &str) -> Vec<IpAddr> {
@@ -585,5 +723,71 @@ mod tests {
         // Already-good literals are kept.
         let kept = rewrite_ice_urls(&["stun:74.125.250.129:19302".into()], |_| Vec::new());
         assert_eq!(kept, vec!["stun:74.125.250.129:19302".to_string()]);
+    }
+
+    #[test]
+    fn prepare_rewrites_only_poisoned_default_stun_hosts() {
+        use std::net::IpAddr;
+        let defaults: Vec<String> = DEFAULT_STUN_URLS.iter().map(|u| (*u).to_string()).collect();
+        let system = |host: &str| match host {
+            "stun.l.google.com" | "stun1.l.google.com" | "stun.cloudflare.com" => {
+                vec!["198.18.0.1".parse::<IpAddr>().unwrap()]
+            }
+            _ => Vec::new(),
+        };
+        let doh = |host: &str| match host {
+            "stun.l.google.com" | "stun1.l.google.com" => {
+                vec!["74.125.250.129".parse::<IpAddr>().unwrap()]
+            }
+            "stun.cloudflare.com" => vec!["162.159.207.0".parse::<IpAddr>().unwrap()],
+            "stun.internal.example" => vec!["8.8.8.8".parse::<IpAddr>().unwrap()],
+            _ => Vec::new(),
+        };
+        let rewritten = prepare_stun_urls(&defaults, StunRewriteMode::DefaultsOnly, system, doh);
+        assert!(
+            rewritten.iter().all(|u| !u.contains("198.18")),
+            "{rewritten:?}"
+        );
+        assert!(
+            rewritten.iter().any(|u| u.contains("74.125.250.129")),
+            "{rewritten:?}"
+        );
+        assert!(
+            rewritten.iter().any(|u| u.contains("162.159.207.0")),
+            "{rewritten:?}"
+        );
+
+        // Healthy system DNS: keep hostnames, no literal rewrite, no DoH.
+        let healthy = |host: &str| match host {
+            "stun.l.google.com" | "stun1.l.google.com" => {
+                vec!["74.125.250.129".parse::<IpAddr>().unwrap()]
+            }
+            "stun.cloudflare.com" => vec!["162.159.207.0".parse::<IpAddr>().unwrap()],
+            _ => Vec::new(),
+        };
+        let kept = prepare_stun_urls(&defaults, StunRewriteMode::DefaultsOnly, healthy, doh);
+        assert_eq!(kept, defaults);
+
+        // Operator URL, even if system DNS is poisoned and DoH knows a public
+        // address: do not force third-party DoH or rewrite a split-horizon name.
+        let operator = vec!["stun:stun.internal.example:3478".into()];
+        let poisoned = |_: &str| vec!["198.18.0.1".parse::<IpAddr>().unwrap()];
+        let left = prepare_stun_urls(&operator, StunRewriteMode::DefaultsOnly, poisoned, doh);
+        assert_eq!(left, operator);
+
+        // Off: default hostnames stay even when system DNS is poisoned.
+        let off = prepare_stun_urls(&defaults, StunRewriteMode::Off, system, doh);
+        assert_eq!(off, defaults);
+
+        assert!(is_default_stun_url("stun:stun.l.google.com:19302"));
+        assert!(!is_default_stun_url("stun:stun.internal.example:3478"));
+        assert!(!is_default_stun_url("stun:stun.l.google.com:3478"));
+    }
+
+    #[test]
+    fn stun_rewrite_mode_parses_off_and_defaults() {
+        // Direct enum coverage; env parsing is exercised only when set.
+        assert_eq!(StunRewriteMode::Off, StunRewriteMode::Off);
+        assert_ne!(StunRewriteMode::Off, StunRewriteMode::DefaultsOnly);
     }
 }

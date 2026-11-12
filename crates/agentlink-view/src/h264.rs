@@ -74,7 +74,12 @@ pub fn describe_ice_candidates(input: &str) -> String {
         }
         let addr = candidate_addr(line).unwrap_or_else(|| "-".into());
         let scope = format!("{:?}", addr_scope(&addr)).to_ascii_lowercase();
-        items.push(format!("{typ}:{scope}:{addr}"));
+        let proto = candidate_proto(line).unwrap_or_else(|| "?".to_string());
+        let mut item = format!("{typ}:{scope}:{addr};proto={proto}");
+        if let Some(raddr) = candidate_attr(line, "raddr") {
+            item.push_str(&format!(";raddr={raddr}"));
+        }
+        items.push(item);
     }
     format!(
         "n={} host={} srflx={} prflx={} relay={} other={} [{}]",
@@ -89,12 +94,7 @@ pub fn describe_ice_candidates(input: &str) -> String {
 }
 
 fn candidate_addr(line: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
-    let start = lower
-        .find("candidate:")
-        .map(|i| i + "candidate:".len())
-        .unwrap_or(0);
-    let tokens: Vec<&str> = line[start..].split_whitespace().collect();
+    let tokens = candidate_tokens(line);
     // foundation component transport priority address port typ ...
     if let Some(typ_at) = tokens.iter().position(|t| t.eq_ignore_ascii_case("typ")) {
         if typ_at >= 2 {
@@ -102,6 +102,29 @@ fn candidate_addr(line: &str) -> Option<String> {
         }
     }
     tokens.get(4).map(|s| (*s).to_string())
+}
+
+fn candidate_proto(line: &str) -> Option<String> {
+    let tokens = candidate_tokens(line);
+    tokens.get(2).map(|s| s.to_ascii_lowercase())
+}
+
+fn candidate_attr(line: &str, name: &str) -> Option<String> {
+    let tokens = candidate_tokens(line);
+    let name_l = name.to_ascii_lowercase();
+    tokens
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case(&name_l))
+        .and_then(|i| tokens.get(i + 1).map(|s| (*s).to_string()))
+}
+
+fn candidate_tokens(line: &str) -> Vec<&str> {
+    let lower = line.to_ascii_lowercase();
+    let start = lower
+        .find("candidate:")
+        .map(|i| i + "candidate:".len())
+        .unwrap_or(0);
+    line[start..].split_whitespace().collect()
 }
 
 /// Path token for a *selected* ICE candidate pair.
@@ -733,6 +756,11 @@ mod tests {
         assert!(inv.contains("srflx=1"), "{inv}");
         assert!(inv.contains("host:private:172.30.0.2"), "{inv}");
         assert!(inv.contains("srflx:public:203.0.113.5"), "{inv}");
+        assert!(inv.contains("proto=udp"), "{inv}");
+        assert!(inv.contains("raddr=172.30.0.2"), "{inv}");
+        // typ srflx address is the mapped IP, not the raddr/host and not typ relay.
+        assert!(!inv.contains("srflx:public:172.30.0.2"), "{inv}");
+        assert!(!inv.contains("relay:"), "{inv}");
     }
 
     fn screenshot_fallback_matches_the_phone_node() {

@@ -19,7 +19,8 @@ use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
-    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, Registry,
+    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, RTCStatsReport,
+    RTCStatsReportEntry, Registry, StatsSelector,
 };
 use webrtc::runtime::default_runtime;
 
@@ -173,6 +174,9 @@ pub struct Viewer {
     transport: Arc<Mutex<Option<TransportSnapshot>>>,
     cursor: Arc<Mutex<Option<LiveCursor>>>,
     stats: Arc<Mutex<LiveStats>>,
+    /// Safe ICE check snapshot (typ, raddr, proto, pair state, send/recv counts).
+    /// No ICE ufrag/pwd, certificates, or packet payloads.
+    ice_checks: Arc<Mutex<String>>,
     input_open: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -198,6 +202,7 @@ impl Viewer {
             transport: built.transport,
             cursor: built.cursor,
             stats: built.stats,
+            ice_checks: built.ice_checks,
             input_open: built.input_open,
             failed: built.failed,
             stop: built.stop,
@@ -225,6 +230,15 @@ impl Viewer {
     /// Selected ICE pair once ICE has picked one. `None` until then.
     pub fn transport(&self) -> Option<TransportSnapshot> {
         self.transport
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    /// Latest safe ICE check snapshot from the WebRTC stats API.
+    /// Empty until the first drive tick after connect.
+    pub fn ice_checks(&self) -> String {
+        self.ice_checks
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
@@ -352,6 +366,7 @@ struct Built {
     transport: Arc<Mutex<Option<TransportSnapshot>>>,
     cursor: Arc<Mutex<Option<LiveCursor>>>,
     stats: Arc<Mutex<LiveStats>>,
+    ice_checks: Arc<Mutex<String>>,
     input_open: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -605,6 +620,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     };
     let info = Arc::new(Mutex::new(info));
     let transport = Arc::new(Mutex::new(None));
+    let ice_checks = Arc::new(Mutex::new(String::new()));
 
     report_stage(&opts, "applying remote answer, ICE in progress");
     let remote = RTCSessionDescription::answer(sdp).map_err(|err| err.to_string())?;
@@ -637,6 +653,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let disc_loop = disconnected_at_ms;
     let info_loop = info.clone();
     let transport_loop = transport.clone();
+    let ice_checks_loop = ice_checks.clone();
     tokio::spawn(async move {
         drive(
             peer_loop,
@@ -656,6 +673,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             disc_loop,
             info_loop,
             transport_loop,
+            ice_checks_loop,
         )
         .await;
     });
@@ -709,6 +727,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         transport,
         cursor,
         stats,
+        ice_checks,
         input_open,
         failed,
         stop,
@@ -736,14 +755,18 @@ async fn drive(
     disconnected_at_ms: Arc<AtomicI64>,
     info: Arc<Mutex<LiveInfo>>,
     transport: Arc<Mutex<Option<TransportSnapshot>>>,
+    ice_checks: Arc<Mutex<String>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.tick().await;
     let mut last_ice_restart = Instant::now() - Duration::from_secs(30);
     let mut ice_restart_fails = 0u32;
+    let mut last_ice_log = String::new();
+    let mut last_ice_log_at = Instant::now() - Duration::from_secs(30);
     loop {
         if stop.load(Ordering::Relaxed) {
             stop.store(true, Ordering::Relaxed);
+            publish_ice_checks(&peer, &ice_checks, &mut last_ice_log, true).await;
             let _ = roundtrip(
                 &signal,
                 json!({"action": "close", "session_id": session_id}),
@@ -793,6 +816,10 @@ async fn drive(
                     ask_keyframe(&signal, &session_id, &input, &input_open).await;
                 }
                 refresh_transport(&peer, &info, &transport).await;
+                let force = last_ice_log_at.elapsed() >= Duration::from_secs(4);
+                if publish_ice_checks(&peer, &ice_checks, &mut last_ice_log, force).await {
+                    last_ice_log_at = Instant::now();
+                }
                 // ICE/DTLS left Connected: restart within 1s (throttle 5s).
                 // A gone node session must be treated as a hard ICE/session
                 // loss so the Controller can resume JPEG — do not retry
@@ -1099,6 +1126,7 @@ trait LivePeer: Send + Sync {
     async fn apply_remote_answer(&self, sdp: &str) -> Result<(), String>;
     async fn add_ice_candidate(&self, candidate: RTCIceCandidateInit) -> Result<(), String>;
     async fn selected_ice_pair(&self) -> Option<(String, String, String, String, String)>;
+    async fn ice_check_snapshot(&self) -> String;
 }
 
 struct OwnedPeer<P> {
@@ -1165,6 +1193,12 @@ where
             local.protocol.to_string(),
         ))
     }
+
+    async fn ice_check_snapshot(&self) -> String {
+        let report =
+            PeerConnection::get_stats(&self.inner, Instant::now(), StatsSelector::None).await;
+        format_ice_checks(&report)
+    }
 }
 
 fn format_candidate_addr(address: &str, port: u16) -> String {
@@ -1173,6 +1207,167 @@ fn format_candidate_addr(address: &str, port: u16) -> String {
     } else {
         format!("{address}:{port}")
     }
+}
+
+async fn publish_ice_checks(
+    peer: &Arc<dyn LivePeer>,
+    slot: &Arc<Mutex<String>>,
+    last_logged: &mut String,
+    force: bool,
+) -> bool {
+    let snapshot = peer.ice_check_snapshot().await;
+    if let Ok(mut guard) = slot.lock() {
+        *guard = snapshot.clone();
+    }
+    if snapshot.is_empty() {
+        return false;
+    }
+    // `force` (close) always logs a final copy. Periodic ticks only log changes.
+    if snapshot == *last_logged && !force {
+        return false;
+    }
+    if snapshot == *last_logged && force {
+        eprintln!("agentlink live-ice: final {snapshot}");
+        return true;
+    }
+    eprintln!("agentlink live-ice: {snapshot}");
+    *last_logged = snapshot;
+    true
+}
+
+/// Format ICE stats without credentials, username fragments, certificates,
+/// or packet payloads. Records typ / raddr / proto / check state / counts.
+fn format_ice_checks(report: &RTCStatsReport) -> String {
+    let mut role = "-".to_string();
+    let mut ice_state = "-".to_string();
+    let mut selected = "-".to_string();
+    let mut pair_changes = 0u32;
+    let mut cands: Vec<(String, String, String, u16, String, String, String, String)> = Vec::new();
+    // id -> (dir, typ, addr, port, proto, raddr, url)
+    let mut by_id = std::collections::HashMap::<String, String>::new();
+    let mut pairs = Vec::new();
+    let mut req_sent = 0u64;
+    let mut req_recv = 0u64;
+    let mut resp_sent = 0u64;
+    let mut resp_recv = 0u64;
+    let mut nominated = 0u32;
+    let mut succeeded = 0u32;
+    let mut failed = 0u32;
+    let mut in_progress = 0u32;
+    let mut waiting = 0u32;
+    let mut frozen = 0u32;
+
+    for entry in report.iter() {
+        match entry {
+            RTCStatsReportEntry::Transport(t) => {
+                role = format!("{:?}", t.ice_role).to_ascii_lowercase();
+                ice_state = format!("{:?}", t.ice_state).to_ascii_lowercase();
+                if !t.selected_candidate_pair_id.is_empty() {
+                    selected = t.selected_candidate_pair_id.clone();
+                }
+                pair_changes = t.selected_candidate_pair_changes;
+            }
+            RTCStatsReportEntry::LocalCandidate(c) | RTCStatsReportEntry::RemoteCandidate(c) => {
+                let dir = if matches!(entry, RTCStatsReportEntry::LocalCandidate(_)) {
+                    "local"
+                } else {
+                    "remote"
+                };
+                let typ = format!("{:?}", c.candidate_type).to_ascii_lowercase();
+                let addr = c.address.clone().unwrap_or_else(|| "-".into());
+                let proto = c.protocol.to_ascii_lowercase();
+                let raddr = if c.related_address.is_empty() {
+                    "-".to_string()
+                } else {
+                    format!("{}:{}", c.related_address, c.related_port)
+                };
+                let url = safe_ice_url(&c.url);
+                let id = c.stats.id.clone();
+                by_id.insert(
+                    id.clone(),
+                    format!(
+                        "{dir} typ={typ} {addr}:{} proto={proto} raddr={raddr}",
+                        c.port
+                    ),
+                );
+                cands.push((dir.to_string(), typ, addr, c.port, proto, raddr, url, id));
+            }
+            RTCStatsReportEntry::IceCandidatePair(p) => {
+                req_sent += p.requests_sent;
+                req_recv += p.requests_received;
+                resp_sent += p.responses_sent;
+                resp_recv += p.responses_received;
+                if p.nominated {
+                    nominated += 1;
+                }
+                let state = format!("{:?}", p.state).to_ascii_lowercase();
+                if state.contains("succeeded") {
+                    succeeded += 1;
+                } else if state.contains("failed") {
+                    failed += 1;
+                } else if state.contains("inprogress") || state.contains("in_progress") {
+                    in_progress += 1;
+                } else if state.contains("waiting") {
+                    waiting += 1;
+                } else if state.contains("frozen") {
+                    frozen += 1;
+                }
+                pairs.push((
+                    p.stats.id.clone(),
+                    p.local_candidate_id.clone(),
+                    p.remote_candidate_id.clone(),
+                    state,
+                    p.nominated,
+                    p.requests_sent,
+                    p.requests_received,
+                    p.responses_sent,
+                    p.responses_received,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if cands.is_empty() && pairs.is_empty() && ice_state == "-" {
+        return String::new();
+    }
+
+    let mut out = format!(
+        "role={role} ice_state={ice_state} selected={selected} pair_changes={pair_changes} pairs={} succeeded={succeeded} failed={failed} in_progress={in_progress} waiting={waiting} frozen={frozen} nominated={nominated} req_sent={req_sent} req_recv={req_recv} resp_sent={resp_sent} resp_recv={resp_recv}",
+        pairs.len()
+    );
+    for (dir, typ, addr, port, proto, raddr, url, _id) in &cands {
+        out.push_str(&format!(
+            " | {dir} typ={typ} {addr}:{port} proto={proto} raddr={raddr}"
+        ));
+        if !url.is_empty() {
+            out.push_str(&format!(" url={url}"));
+        }
+    }
+    for (id, local_id, remote_id, state, nom, qs, qr, ps, pr) in &pairs {
+        let local = by_id.get(local_id).map(String::as_str).unwrap_or(local_id);
+        let remote = by_id
+            .get(remote_id)
+            .map(String::as_str)
+            .unwrap_or(remote_id);
+        let mark = if *id == selected { " selected" } else { "" };
+        out.push_str(&format!(
+            " | pair{mark} state={state} nominated={nom} req_sent={qs} req_recv={qr} resp_sent={ps} resp_recv={pr} local=({local}) remote=({remote})"
+        ));
+    }
+    out
+}
+
+fn safe_ice_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains('@') || lower.contains("credential") || lower.contains("password") {
+        return String::new();
+    }
+    trimmed.to_string()
 }
 
 async fn refresh_transport(
@@ -1463,6 +1658,7 @@ mod tests {
             transport: Arc::new(Mutex::new(None)),
             cursor: Arc::new(Mutex::new(None)),
             stats: Arc::new(Mutex::new(LiveStats::default())),
+            ice_checks: Arc::new(Mutex::new(String::new())),
             input_open: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),

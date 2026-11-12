@@ -229,28 +229,44 @@ to that address times out, so the 0910 / pre-fix Controller offer had
 **typ host only** (private `172.30.0.2` and `172.17.0.1`),
 `gather_complete=false`, and trickle ICE also carried typ host only.
 Host paths to sufa’s `192.168.1.12` / `10.67.0.2` / `100.91.104.2` are
-not on-net from this box.
+not on-net from this box (see routability below).
 
 `usable_ice_url` already skipped *literal* `198.18.0.0/15` in a URL, but
 WebRTC re-resolves hostnames via system DNS, so a hostname that later
 maps to 198.18 still poisons gathering.
 
-`stun_urls_ready_for_ice()` / `rewrite_ice_urls()` now:
+The first rewrite passed **every** STUN URL (including operator
+`AGENTLINK_STUN_URLS`) through system DNS and, if unusable, through
+third-party DoH, then replaced the hostname with a literal IP. That is
+too broad: it would force Google/Cloudflare DoH on a self-hosted STUN
+and could silently rewrite a private split-horizon name.
 
-- skip literal RFC 2544 destinations;
-- when system DNS only yields 198.18/15, look up A records over DoH
-  (`https://cloudflare-dns.com/dns-query`, `https://dns.google/resolve`)
-  and rewrite the ICE URL to a **literal IP** so webrtc does not
-  re-resolve;
-- run that lookup on a dedicated thread because `reqwest::blocking`
-  cannot drop a runtime from the Viewer async context.
+Current policy (`prepare_stun_urls`, default
+`AGENTLINK_STUN_REWRITE=defaults`):
 
-DoH from this box already returns usable addresses (e.g.
-`74.125.250.129`, `162.159.207.0`); STUN bindings to those succeed.
-This is not a new service, not TURN, and not a credentials change.
-The Controller offer also sends `gather_ms: 4000` (node `bc97ba1`
-already honors it). Local gather stays 1.5s; with working STUN it now
-finishes complete.
+- **Scope:** only built-in [`DEFAULT_STUN_URLS`] (scheme+host+port).
+- **When:** only if system DNS for that default host is empty or only
+  RFC 2544. Healthy system DNS leaves the hostname unchanged (no
+  silent literal rewrite on a normal network).
+- **How:** DoH A lookup (`https://cloudflare-dns.com/dns-query`,
+  `https://dns.google/resolve`) on a dedicated thread, then a literal
+  IP so WebRTC does not re-resolve via the poisoned resolver.
+- **Operator URLs:** `AGENTLINK_STUN_URLS` is never sent to third-party
+  DoH and is never rewritten to literals. Literal `198.18.0.0/15` is
+  still skipped.
+- **Off:** `AGENTLINK_STUN_REWRITE=off` (also `0`/`false`) disables
+  default-url rewrite and DoH entirely.
+- **Failure:** if a default URL cannot be rewritten, it is omitted and
+  logged; the offer continues with any remaining STUN URLs (host-only
+  if none remain). A poisoned hostname is not left in the list.
+
+This is a Controller-side compatibility path for this class of
+proxy/resolver, not a general DNS override, not a new service, and not
+TURN. The Controller offer also sends `gather_ms: 4000`. Node
+`bc97ba1` (`webrtc_session.rs` `gather_budget`) already reads
+`gather_ms`, default 1500ms, clamp 200–8000, so 4000 is compatible
+without a node deploy. Local viewer gather stays 1.5s; with working
+STUN it now finishes complete.
 
 ## Post-rewrite readonly sufa probe (2026-11-12 09:22 CST)
 
@@ -275,16 +291,124 @@ phone/probe SSH, 0910/0851 untouched.
 
 So the missing typ srflx / incomplete gather **was** a real Controller
 defect and is fixed for gathering, but it is **not sufficient** for a
-selected pair on box↔sufa. Across probes and tests, this box’s STUN
-xor-mapped addresses have been several distinct AWS-like public IPs
-(not a single stable mapping). That is consistent with
-destination-dependent SNAT on the box egress path; it is recorded as
-evidence, not as a closed NAT-type certificate, and not as a reason to
-deploy TURN or change firewall/routing from this worker. Further ICE
-check tracing can continue in this worktree only.
+selected pair on box↔sufa.
 
-TURN remains a media relay, not direct P2P. No TURN URLs or credentials
-were added.
+## typ srflx is STUN XOR-MAPPED, not a resolver or relay IP
+
+webrtc 0.21.1 `stun_gatherer.rs` builds typ srflx only from a STUN
+Binding success’s **XOR-MAPPED-ADDRESS**, with `raddr`/`rport` equal
+to the local host socket (`four_tuple.local_addr`). typ relay is a
+separate TURN allocation path and was **0** in every Controller offer
+and sufa answer here.
+
+Independent Binding requests from this box to the rewritten literal
+STUN servers (Asia/Shanghai 2026-11-12 09:27 CST), one attempt then a
+repeat, no credentials:
+
+- `74.125.250.129:19302` (Google STUN) → Binding success (`0x101`)
+  from that same peer, XOR-MAPPED `52.1.169.66:45535` then
+  `54.209.17.224:43320`. No MAPPED-ADDRESS attribute.
+- `162.159.207.0:3478` (Cloudflare STUN) → Binding success from that
+  peer, XOR-MAPPED `54.209.17.224:33986` then `52.1.169.66:25309`.
+
+Those mapped IPs are **not** the STUN server / DoH target IPs
+(`74.125…`, `162.159…`) and **not** typ relay. Offer inventories now
+print `typ:scope:addr;proto=udp;raddr=…`. typ srflx lines show
+`raddr=172.30.0.2` or `raddr=172.17.0.1` (this box’s host sockets).
+Sufa typ srflx is `120.85.255.194` with `raddr=192.168.1.12` (sufa’s
+WLAN host). Classification is not a resolver-target or relay
+mis-label.
+
+The mapped public IPs still change, including **two binds 0.2s apart
+to the same STUN server**. That is recorded only as a clue (egress
+SNAT pool / per-attempt mapping), not a closed NAT-type certificate.
+
+## Answer-candidate routability (read-only `ip route get`)
+
+All sufa answer addresses are reached from this box via the default
+gateway `172.30.0.1 dev enp0s3 src 172.30.0.2`:
+
+- typ host `192.168.1.12`, `10.67.0.2`, typ host/cgnat `100.91.104.2`:
+  not on-link. These are not a same-LAN or Tailscale path from this
+  box (`100.91.104.2` is still `cgnat`, not `tailscale`).
+- typ srflx `120.85.255.194`: also via the default route (has a next
+  hop). That is not proof that a STUN check or reply will pass NAT.
+
+No routing table or firewall was changed.
+
+## 4s gather, trickle, role, retry (bc97ba1 compatible)
+
+- `gather_ms: 4000` is honored by node `bc97ba1` as above. No node
+  deploy. There is still no node→viewer trickle after the answer;
+  lengthening node gather is how late node candidates get into the
+  answer. Sufa srflx was already in the answer.
+- Viewer→node trickle `ice` succeeded (host and typ srflx). No
+  trickle signal errors were observed, so retrying trickle is not
+  motivated by this evidence. Failed trickle would only be logged
+  today, not retried.
+- ICE role stayed `controlling` (offerer). No role-conflict signal
+  was observed.
+- `ice_restart` runs only after a session has been **Connected** and
+  then Disconnected (1s delay, 5s throttle). The initial
+  Connecting / no-pair wait does **not** ICE-restart, so it does not
+  tear down a forming checklist by restart. The 12s/15s wait then
+  closes the viewer; if a pair had already been selected it would be
+  closed with JPEG remaining. In these box↔sufa runs no pair was
+  selected first.
+
+## ICE library stats (2026-11-12 09:33 CST, one instrumented probe)
+
+Existing identity only, no second “just wait” hope loop after this
+snapshot. Safe fields only: typ, raddr, proto, ice role/state,
+nominated, request/response counts. No ufrag/pwd, certificates, or
+packet payloads. Same-host loopback already showed the API working
+after a selected pair (`role=controlling`, `nominated=true`,
+`req_sent`/`req_recv` > 0, typ srflx with raddr).
+
+Box↔sufa, `Viewer::connect` Ok 5941ms, then 15s:
+
+- Offer: `gather_complete=true`, host=4 srflx=8, proto=udp, typ srflx
+  `raddr` on `172.30.0.2` / `172.17.0.1`.
+- Answer: `ffmpeg:h264_vaapi`, host `192.168.1.12` / `10.67.0.2` /
+  `100.91.104.2`, typ srflx `120.85.255.194` with
+  `raddr=192.168.1.12`. Trickle ice ok (host + srflx).
+- `agentlink live-ice:` throughout: `role=controlling`
+  `ice_state=checking` `selected=-` `pair_changes=0` `pairs=0`
+  `succeeded=0` `failed=0` `in_progress=0` `waiting=0` `frozen=0`
+  `nominated=0` `req_sent=0` `req_recv=0` `resp_sent=0` `resp_recv=0`.
+  Local and remote candidates were listed; no selected pair; no
+  H.264; `failed=false`.
+
+webrtc 0.21.1 `get_stats()` only copies ICE agent
+`CandidatePairStats` **for the already-selected pair**
+(`peer_connection/internal.rs` `update_ice_agent_stats`). The public
+`IceTransport` API exposes local/remote candidates and the selected
+pair, not the full checklist. Therefore `pairs=0` / `req_sent=0` while
+`ice_state=checking` does **not** prove that Binding checks to
+`120.85.255.194` were never sent. It does prove the public stats
+surface never observed a nominated or selected pair, and never exposed
+per-pair send/recv counts for this session.
+
+Going further would need either rtc-ice private agent internals, a
+STUN packet capture (Binding checks carry ICE ufrag — not taken), or
+a network/node change we are not allowed to make. Stopped here.
+
+## What remains unverified (and is not claimed)
+
+- Whether the ICE agent actually transmitted connectivity checks to
+  sufa typ srflx `120.85.255.194:6594` / `:6600`, and whether any
+  request or response was dropped by NAT.
+- Whether this box’s changing XOR-MAPPED addresses would make an
+  advertised typ srflx unusable toward sufa even if checks are sent.
+- sufa-side check logs (readonly SSH was not expanded in this step;
+  no node restart).
+- Public NAT traversal success. typ srflx / `stun` is not a public
+  P2P success claim. TURN would be a media relay, not direct P2P.
+  typ host on `100.91.104.2` is `cgnat`, not Tailscale overlay, and
+  Tailscale overlay would not be public P2P either. No TURN was
+  added or deployed.
+
+0924 stays frozen and was not overwritten.
 
 ## Evidence (tests, real sockets where noted)
 
@@ -306,7 +430,10 @@ answered → ICE pair.
   `tailscale`; private typ host is `private`; public typ host is `host`.
   After the STUN rewrite, `offer_sdp_is_recvonly_h264` gathered typ
   srflx (`gather_complete=true`) on this box.
-- `agentlink-core` `rewrite_skips_rfc2544_literals_and_rewrites_poisoned_hosts`.
+- `agentlink-core` `rewrite_skips_rfc2544_literals_and_rewrites_poisoned_hosts`
+  and `prepare_rewrites_only_poisoned_default_stun_hosts` (DoH/literals
+  only for poisoned default STUN hosts; operator URLs untouched;
+  `AGENTLINK_STUN_REWRITE=off` leaves defaults alone).
 - `handshake_retention_tests` (3), including the 0910 close-overwrites-
   failure sequence.
 - `live_pipeline_tests::jpeg_stays_visible_when_ice_cannot_connect`:
@@ -368,4 +495,4 @@ answered → ICE pair.
 
 See the dated archive next to this document once created. SHA of the
 binary, the launch script, and the source commit go there. 0307 and 0851
-remain immutable, as does 0910.
+remain immutable, as do 0910 and 0924.

@@ -998,6 +998,10 @@ fn start_live_from(
                         } else {
                             "webrtc: no selected ICE pair within 12s; JPEG stills remain"
                         };
+                        let checks = viewer.ice_checks();
+                        if !checks.is_empty() {
+                            eprintln!("agentlink live-ice: timeout snapshot {checks}");
+                        }
                         thread_h264.store(false, Ordering::Relaxed);
                         thread_shared.set_handshake_terminal(reason);
                         thread_shared.push(UiEvent::Notice(

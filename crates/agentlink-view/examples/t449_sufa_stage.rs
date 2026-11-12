@@ -298,6 +298,12 @@ async fn main() {
                     viewer.failed()
                 );
             }
+            let checks = viewer.ice_checks();
+            if checks.is_empty() {
+                eprintln!("t449-probe: ice checks snapshot empty (stats not yet populated)");
+            } else {
+                eprintln!("t449-probe: ice checks {checks}");
+            }
             viewer.close();
             eprintln!("t449-probe: viewer closed");
         }
