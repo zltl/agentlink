@@ -1,8 +1,11 @@
 # t456 security integration status
 
-Recorded 2026-11-13 00:33 CST (Asia/Shanghai). Local candidate only; this
-step did not push. Independent review of tip `6674388` (copy-retry
-safety and tests) is in progress and is **not** treated as passed.
+Recorded 2026-11-13 00:37 CST (Asia/Shanghai). Independent read-only
+review of tip `6674388` (copy-retry safety and tests) completed
+2026-11-13 (Asia/Shanghai) with **no new block**. Authorized as an
+ordinary fast-forward of private source `main` only — not Actions,
+not a visibility change, not a release, not a deploy, and not a
+production-machine upgrade.
 
 - Current worktree: `/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo`
 - Branch: `integrate/security-main-t456` at `6674388027224441327d771e1d3e3adab0ec42f8`
@@ -20,7 +23,7 @@ safety and tests) is in progress and is **not** treated as passed.
 - UI source repo and the 7142 Linux GUI freeze were not modified in this
   docs step; no new GUI binary was built.
 - No production machine was upgraded. No GitHub Actions. Not public. No
-  release. This branch is not pushed. No production token was changed.
+  release. No deploy. No production token was changed.
 
 Trust model is unchanged: a full current-user shell with a grant may read the same-UID issuer and countersign. The first request without a grant is still denied. Relay login is not target authorization. Public NAT P2P remains unproven. Same-account grant bypass is not restored.
 
@@ -73,8 +76,15 @@ journaled `copy_upload`/`copy_download` may retry a `cancelled` result
 only as a **new** grant-checked `open_data_link` while the client is
 still alive. `Error::is_retryable` stays false for `cancelled`, so
 exec/PTY are not silently rerun. A client without a grant, and a
-revoked jti, stay denied after reconnect. Independent review of this
-copy-retry is in progress; it is not a closed security sign-off.
+revoked jti, stay denied after reconnect. Independent read-only
+review of this copy-retry completed 2026-11-13 (Asia/Shanghai) with
+no new block. Scope actually reviewed: 60s / backoff boundary;
+retry only while alive, as a fresh request id with authorization
+checks; journaled resume preserved; drop teardown still in place;
+auth errors not retried; merge is the full union of both parents.
+This is not a claim that Windows visual noflash, different DPI, a
+full Tab-order walk, Android full build or phone, cross-network NAT
+P2P, or cargo-audit findings are complete.
 
 **no_console_flash (`4e677c86` + docs `79f3d63b`).** Static review
 passed (13 sites classified, guard not relaxed; helper stays a visible
@@ -275,22 +285,28 @@ Windows probe of `40f551c` compiled the size helper and printed `AL_SIZE_BEFORE`
 
 This commit does not change production resize. On Windows the handshake write is `\r\n`; Unix stays `\n`. The Windows helper waits for CR or LF before reading `GetConsoleScreenBufferInfo` again. Assertions are unchanged: window/winsize must be `80x24` before and `100x30` after, with `AL_DONE`. Not run on this box (no rustc 1.99). Windows worker retest is required.
 
-## Post-6674388 status snapshot (local, not pushed)
+## Post-6674388 status snapshot
 
-The current integrate tip is `6674388027224441327d771e1d3e3adab0ec42f8`,
-not `40f551c`. The sections above stay as historical review notes.
-See **Current tip `6674388` — what is and is not claimed** for the
-live snapshot: 7142 GUI defects (focus / cards) closed on a real
-window with computerUse still partial; 16 MiB workspace 1548 / 0 / 2
-ignored; default test-thread CLI help still overflows; 8 MiB product
-help exits 0; reconnect keeps the drop-teardown gate and recovers
-via a grant-checked fresh session; noflash static review passed,
-Windows visual untested; official Kotlin regen and signature
-typecheck done, Android full build and phone untested; Windows AC
-resize still awaits an offline probe retest; NAT P2P unproven across
-networks; `RUSTSEC-2026-0459` unpatched; `rsa` lock-only and
-default-unreachable; 12 unmaintained warnings; mitigations are not a
-fix; production machines not upgraded; no Actions, not public, no
-release, not pushed. Independent review of `6674388` is in progress
-and is not treated as passed. This executor does not push `main`.
+The product merge tip remains `6674388027224441327d771e1d3e3adab0ec42f8`,
+not `40f551c`. Later docs-only commits on this branch record status;
+they are not a full product retest. The sections above stay as
+historical review notes. See **Current tip `6674388` — what is and
+is not claimed** for the live snapshot: 7142 GUI defects (focus /
+cards) closed on a real window with computerUse still partial;
+16 MiB workspace 1548 / 0 / 2 ignored; default test-thread CLI help
+still overflows; 8 MiB product help exits 0; reconnect keeps the
+drop-teardown gate and recovers via a grant-checked fresh session;
+noflash static review passed, Windows visual untested; official
+Kotlin regen and signature typecheck done, Android full build and
+phone untested; Windows AC resize still awaits an offline probe
+retest; NAT P2P unproven across networks; `RUSTSEC-2026-0459`
+unpatched; `rsa` lock-only and default-unreachable; 12 unmaintained
+warnings; mitigations are not a fix; production machines not
+upgraded; no Actions, not public, no release, no deploy.
+Independent read-only review of `6674388` completed 2026-11-13
+(Asia/Shanghai) with no new block (copy 60s / backoff, alive +
+fresh request id + authz, resume journal, drop teardown still in
+place, auth errors not retried, merge is the full union). That
+review is not a sign-off of the untested Windows / DPI / Tab /
+Android / NAT / audit items listed above.
 

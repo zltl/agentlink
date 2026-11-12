@@ -1,6 +1,6 @@
 # t456 branch matrix
 
-Recorded 2026-11-13 00:33 CST (Asia/Shanghai).
+Recorded 2026-11-13 00:37 CST (Asia/Shanghai).
 
 This integration starts from `feat/controller-p2p-observe-t449`
 (`ebfb6f22cef5509fce923e77c5494a44a5d7d9f4`). Live remote `main`
@@ -19,9 +19,12 @@ remote value treated as current. An HTTPS `git fetch` of all heads
 still needs credentials; this check did not use fetch, tokens, or
 internal APIs. The repository remains **private** (`visibility=private`).
 `pushed_at` on the GitHub API was `2026-11-12T00:40:25Z`
-(2026-11-12 08:40:25 Asia/Shanghai). This branch is a local candidate
-and is **not pushed**. Independent review of `6674388` (copy-retry
-safety and tests) is in progress and is not treated as passed.
+(2026-11-12 08:40:25 Asia/Shanghai) at the earlier re-verify.
+Independent read-only review of product merge `6674388` (copy-retry
+safety and tests) completed 2026-11-13 (Asia/Shanghai) with **no new
+block**. This update is authorized as an ordinary fast-forward of
+private source `main` only — not Actions, not a visibility change,
+not a release, not a deploy, and not a production-machine upgrade.
 
 ## Live remote heads (GitHub API)
 
@@ -34,7 +37,7 @@ no tags (`list_tags` returned an empty page).
 | `integrate/controller-android-t447` | `684e1adf3cd2b441a167c735be3f9d6937d3d4b7` | Already an ancestor of the t449 baseline. |
 | `cursor/android-invite-crash-6d47` | `447fa55e96a1114e8e97ab7ef574a2f32a4a92f1` | Already an ancestor of t447 / t449. |
 
-## Current local candidate (not pushed, review in progress)
+## Current local candidate (667 review complete, no new block)
 
 Local branch `integrate/security-main-t456` in
 `/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo` was
@@ -56,9 +59,17 @@ Earlier UI commits already on this line (also ancestors of `7142d936`):
 The UI source repo and the 7142 Linux GUI freeze were not modified in
 this docs step, and no new GUI binary was built.
 
-Independent review of `6674388` is running (copy retry safety and
-tests). A later block from that review is not auto-fixed here. Do
-not push until the parent confirms.
+Independent read-only review of `6674388` completed 2026-11-13
+(Asia/Shanghai) with no new block. Scope actually reviewed: copy
+retry has a 60s / backoff boundary; a retry proceeds only while the
+client is alive, as a fresh request id with authorization checks;
+journaled resume is preserved; relay-drop teardown remains in place;
+auth errors are not retried; the merge is the full union of both
+parents (reconnect + noflash). This is not a sign-off of Windows
+visual noflash, different DPI, a full Tab-order walk, an Android
+full build or phone run, cross-network NAT P2P, or cargo-audit
+findings. Product workspace tests already recorded on `6674388`
+are unchanged; a later docs-only SHA is not a full product retest.
 
 ## Cached `origin/*` not on the live remote — do not merge
 
@@ -124,7 +135,7 @@ The historical continuation worktree
 were not rewritten. Current integrate work is
 `/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo` at
 `6674388` (see the current-candidate section above). See
-`docs/integrate-t456-security-status.md`. Still not pushed.
+`docs/integrate-t456-security-status.md`.
 
 ## Post-cd30 residual (local, not pushed)
 
@@ -142,13 +153,15 @@ A third incremental commit on the same branch fixes `real_pty_resize_changes_chi
 
 A further incremental commit on the same branch wakes the Windows size-helper handshake with CR/LF (`\r\n` on Windows, `\n` on Unix). `40f551c`, `8df767a`, and `8143d2ee` are not rewritten. Production resize is unchanged. Still not pushed.
 
-## Post-6674388 docs snapshot (local, not pushed)
+## Post-6674388 docs snapshot
 
 After `7142d936`, the integrate branch was fast-forwarded to
 `6674388027224441327d771e1d3e3adab0ec42f8` (parents `4fef74f7` and
-`79f3d63b`; noflash reviewed statically, reconnect independently
-reviewed but that review is still running). The preceding
-Post-40f551c / Post-8df / Post-8143 notes remain historical and
-are not the current tip. See the current-candidate section at the
-top and `docs/integrate-t456-security-status.md`. Still not pushed.
+`79f3d63b`). noflash was reviewed statically. Independent read-only
+review of the `6674388` copy-retry / merge union completed 2026-11-13
+(Asia/Shanghai) with no new block (see the current-candidate
+section for the reviewed scope). The preceding Post-40f551c /
+Post-8df / Post-8143 notes remain historical and are not the
+current tip. See the current-candidate section at the top and
+`docs/integrate-t456-security-status.md`.
 
