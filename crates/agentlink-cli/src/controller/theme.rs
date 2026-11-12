@@ -271,6 +271,23 @@ pub fn apply(ctx: &egui::Context) {
     });
 }
 
+/// Honor the platform scale (Windows 150% stays 1.5). Never force a 2/3
+/// shrink: if the backend reports a sub-100% `native_pixels_per_point`,
+/// pin the UI at 1.0 so 14–16 pt body text stays physically readable.
+///
+/// Takes effect on the next egui pass. Do not call this from layout
+/// tests that inject an explicit sub-1.0 scale.
+pub fn apply_platform_zoom(ctx: &egui::Context) {
+    let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+    if native > 0.0 && native < 1.0 {
+        ctx.set_pixels_per_point(1.0);
+    }
+}
+
+pub fn focus_stroke() -> Stroke {
+    Stroke::new(2.0_f32, ACCENT)
+}
+
 fn styled(base: &Style) -> Style {
     let mut style = base.clone();
     style.spacing.interact_size = egui::vec2(BTN_PAD_X * 2.0, BTN_TOOLBAR_H);
@@ -314,7 +331,7 @@ fn styled(base: &Style) -> Style {
     visuals.popup_shadow = popup_shadow();
     visuals.window_shadow = popup_shadow();
     visuals.selection.bg_fill = ACCENT_BG;
-    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.selection.stroke = Stroke::new(2.0_f32, ACCENT);
     visuals.hyperlink_color = ACCENT;
     visuals.warn_fg_color = WARN;
     visuals.error_fg_color = DANGER;
@@ -334,13 +351,13 @@ fn styled(base: &Style) -> Style {
 
     visuals.widgets.hovered.bg_fill = BG_HOVER;
     visuals.widgets.hovered.weak_bg_fill = BG_HOVER;
-    visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.hovered.corner_radius = r;
 
     visuals.widgets.active.bg_fill = ACCENT_BG;
     visuals.widgets.active.weak_bg_fill = ACCENT_BG;
-    visuals.widgets.active.bg_stroke = Stroke::NONE;
+    visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, ACCENT);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_ON_ACCENT);
     visuals.widgets.active.corner_radius = r;
 

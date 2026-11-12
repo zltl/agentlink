@@ -4,25 +4,25 @@
 //! [`super::worker`] on the same client the phone uses. Visual tokens live in
 //! [`super::theme`].
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentlink_core::{NodeInfo, NodePolicy};
 use eframe::egui;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::chrome::{
+    BAR_HEIGHT, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
     classify_connect_error, connection_bar_visible, encoder_label, estimate_right_width_with,
     link_is_connecting, pick_bar_density, session_chrome_top_height, session_phase, stats_chip,
-    stats_line, text_advance, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
-    BAR_HEIGHT,
+    stats_line, text_advance,
 };
 use super::model::{
-    self, access_summary, card_buttons, connection_label, display_note, has_saved_session,
-    node_presence_label, Action, CardButtonKind,
+    self, Action, CardButtonKind, access_summary, card_buttons, connection_label, display_note,
+    has_saved_session, node_presence_label,
 };
 use super::term::Emulator;
 use super::theme;
@@ -300,10 +300,8 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
     if opts.preview_ui {
         // Force a throwaway directory. Never read or write the caller's
         // production config, data dir, or start-on-login state.
-        let root = std::env::temp_dir().join(format!(
-            "agentlink-preview-ui-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agentlink-preview-ui-{}", std::process::id()));
         let _ = std::fs::create_dir_all(root.join("config"));
         let _ = std::fs::create_dir_all(root.join("data"));
         opts.config_dir = root.join("config");
@@ -377,6 +375,7 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
+            theme::apply_platform_zoom(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
     ) {
@@ -543,14 +542,7 @@ impl ControllerApp {
         live: super::LiveHooks,
     ) -> Self {
         let mut app = Self::new(
-            tx,
-            shared,
-            config_dir,
-            data_dir,
-            tray,
-            flags,
-            preview_ui,
-            live,
+            tx, shared, config_dir, data_dir, tray, flags, preview_ui, live,
         );
         app.mock = mock;
         app.logical_size = logical_size;
@@ -1235,6 +1227,7 @@ impl ControllerApp {
             );
         }
         self.debug_layout.clear();
+        self.sync_window_size(ctx);
         self.pump(ctx);
         if matches!(self.screen, Screen::Terminal { .. }) && self.terminal.focused {
             self.terminal.consume_focused_keys(ctx);
@@ -1253,7 +1246,10 @@ impl ControllerApp {
             let show_rail = matches!(
                 self.screen,
                 Screen::Machines | Screen::Terminal { .. } | Screen::Files { .. }
-            ) && model::machine_rail_visible(ctx.screen_rect().width());
+            ) && model::machine_rail_visible_at(
+                ctx.screen_rect().width(),
+                ctx.pixels_per_point(),
+            );
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(theme::BG_PAGE))
                 .show(ctx, |ui| {
@@ -1566,7 +1562,7 @@ impl ControllerApp {
         let loading = self.nodes.is_empty()
             && self.user.is_some()
             && (link_is_connecting(&self.link) || self.link == "relay");
-        let rail = model::machine_rail_visible(self.logical_size.0);
+        let rail = self.rail_visible_for(ui.ctx());
         let clip = ui.clip_rect();
         if self.nodes.is_empty() {
             let avail = ui.available_size();
@@ -1599,8 +1595,7 @@ impl ControllerApp {
                         ui.set_width(ui.available_width());
                         self.machine_detail(ui, &node);
                     });
-                self.debug_layout
-                    .set_page_visible(detail.inner_rect, clip);
+                self.debug_layout.set_page_visible(detail.inner_rect, clip);
             } else {
                 let hint = ui.label(theme::muted_text("Select a machine."));
                 self.debug_layout.set_page_visible(hint.rect, clip);
@@ -1729,7 +1724,23 @@ impl ControllerApp {
             .show(ui, |ui| {
                 ui.set_width(inner_w);
                 ui.set_max_width(inner_w);
-                name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
+                let (name_rect, badge_rect) = machine_name_and_status(
+                    ui,
+                    &node.name,
+                    node.online,
+                    theme::TEXT_PRIMARY,
+                    false,
+                );
+                self.debug_layout.note_visible(
+                    &format!("nav_name:{}", node.id),
+                    name_rect,
+                    ui.clip_rect(),
+                );
+                self.debug_layout.note_visible(
+                    &format!("nav_badge:{}", node.id),
+                    badge_rect,
+                    ui.clip_rect(),
+                );
                 ui.label(theme::muted_text(node_presence_label(
                     node.online,
                     node.has_display,
@@ -1740,12 +1751,21 @@ impl ControllerApp {
             })
             .response
             .interact(egui::Sense::click());
+        let response = if response.has_focus() {
+            let focused = response.clone();
+            ui.painter().rect_stroke(
+                focused.rect.expand(1.0),
+                egui::CornerRadius::same(theme::RADIUS_CONTROL),
+                theme::focus_stroke(),
+                egui::StrokeKind::Outside,
+            );
+            focused
+        } else {
+            response
+        };
         self.debug_layout
             .note_item(&format!("nav_row:{}", node.id), response.rect);
         ui.data_mut(|d| d.insert_temp(hover_id, response.hovered()));
-        if response.has_focus() {
-            response.surrender_focus();
-        }
         if response.clicked() {
             self.selected_id = Some(node.id.clone());
         }
@@ -1753,81 +1773,151 @@ impl ControllerApp {
 
     fn machine_detail(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
         let clip = ui.clip_rect();
-        name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
-        let host = [node.hostname.as_str(), node.os.as_str(), node.arch.as_str()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let presence = node_presence_label(node.online, node.has_display);
-        let subtitle = if host.is_empty() {
-            presence.to_string()
-        } else {
-            format!("{presence} · {host}")
-        };
-        ui.label(theme::muted_text(&subtitle));
-        if let Some(note) = display_note(node.has_display, node.effective) {
-            let resp = ui.add(egui::Label::new(theme::muted_text(note)).wrap());
+        let content_w = ui.available_width().min(640.0);
+        ui.vertical(|ui| {
+            ui.set_width(content_w);
+            ui.set_max_width(content_w);
+            let (name_rect, badge_rect) =
+                machine_name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY, true);
             self.debug_layout
-                .note_visible("display_note", resp.rect, clip);
-        }
-        ui.add_space(theme::SPACE_SM);
-        self.session_actions(ui, node);
-        ui.add_space(theme::SPACE_SM);
-        egui::CollapsingHeader::new("Details")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(theme::muted_text(format!(
-                    "Access: {}",
-                    access_summary(&node.access, node.effective)
-                )));
-                if !node.id.is_empty() {
-                    ui.label(theme::muted_text("Node id"));
-                    truncated_copy_line(ui, &node.id, &mut self.notice);
-                    self.debug_layout.note_item("detail_node_id", ui.min_rect());
-                }
-                if !node.version.is_empty() {
-                    ui.label(theme::muted_text(format!("Version: {}", node.version)));
-                }
-                if !node.owner.is_empty() {
-                    ui.label(theme::muted_text(format!("Owner: {}", node.owner)));
-                }
-            });
+                .note_visible("detail_name", name_rect, clip);
+            self.debug_layout
+                .note_visible("detail_badge", badge_rect, clip);
+            let host = [node.hostname.as_str(), node.os.as_str(), node.arch.as_str()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let presence = node_presence_label(node.online, node.has_display);
+            let subtitle = if host.is_empty() {
+                presence.to_string()
+            } else {
+                format!("{presence} · {host}")
+            };
+            ui.label(theme::muted_text(&subtitle));
+            ui.label(theme::muted_text(format!(
+                "Access: {}",
+                access_summary(&node.access, node.effective)
+            )));
+            if let Some(note) = display_note(node.has_display, node.effective) {
+                let resp = ui.add(egui::Label::new(theme::muted_text(note)).wrap());
+                self.debug_layout
+                    .note_visible("display_note", resp.rect, clip);
+            }
+            ui.add_space(theme::SPACE_MD);
+            let prompt = ui.label(theme::section_text("Choose how to connect"));
+            self.debug_layout
+                .note_visible("connect_prompt", prompt.rect, clip);
+            if self.preview_ui {
+                ui.label(theme::muted_text(
+                    "Sample actions for layout review. This is not a live session.",
+                ));
+            } else if matches!(self.screen, Screen::Machines) {
+                ui.label(theme::muted_text(
+                    "Start a terminal, files, or desktop session when the machine allows it.",
+                ));
+            }
+            ui.add_space(theme::SPACE_SM);
+            self.session_actions(ui, node, false);
+            ui.add_space(theme::SPACE_LG);
+            egui::CollapsingHeader::new("Details")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if !node.id.is_empty() {
+                        ui.label(theme::muted_text("Node id"));
+                        truncated_copy_line(ui, &node.id, &mut self.notice);
+                        self.debug_layout.note_item("detail_node_id", ui.min_rect());
+                    }
+                    if !node.version.is_empty() {
+                        ui.label(theme::muted_text(format!("Version: {}", node.version)));
+                    }
+                    if !node.owner.is_empty() {
+                        ui.label(theme::muted_text(format!("Owner: {}", node.owner)));
+                    }
+                });
+        });
     }
 
-    fn session_actions(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
+    fn session_actions(&mut self, ui: &mut egui::Ui, node: &NodeInfo, compact: bool) {
         let clip = ui.clip_rect();
         let mut disabled = Vec::new();
-        ui.horizontal_wrapped(|ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
-            for button in card_buttons(node.online, node.has_display, node.effective) {
-                let action = Action {
-                    enabled: button.enabled,
-                    reason: button.reason,
-                };
-                let id = format!("action:{}:{}", node.id, button.label);
-                let response = action_button_response(ui, &id, button.label, &action);
-                self.debug_layout.note_button_raw_vis(
-                    &format!("action_btn:{}:{}", node.id, button.label),
-                    response.rect,
-                    clip,
-                );
-                if response.has_focus() {
-                    response.surrender_focus();
+        if compact {
+            ui.horizontal_wrapped(|ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
+                for button in card_buttons(node.online, node.has_display, node.effective) {
+                    let action = Action {
+                        enabled: button.enabled,
+                        reason: button.reason,
+                    };
+                    let id = format!("action:{}:{}", node.id, button.label);
+                    let response = action_button_response(ui, &id, button.label, &action);
+                    self.debug_layout.note_button_raw_vis(
+                        &format!("action_btn:{}:{}", node.id, button.label),
+                        response.rect,
+                        clip,
+                    );
+                    // Keep session-page buttons from taking Enter away from the terminal.
+                    if response.has_focus() {
+                        response.surrender_focus();
+                    }
+                    if !action.enabled {
+                        disabled.push((button.label, action.reason));
+                    }
+                    if response.clicked() {
+                        self.activate(node, &action, button.kind);
+                    }
                 }
-                if !action.enabled {
-                    disabled.push((button.label, action.reason));
-                }
-                if response.clicked() {
-                    self.activate(node, &action, button.kind);
-                }
+            });
+        } else {
+            let gap = theme::SPACE_MD;
+            let avail = ui.available_width();
+            let min_card = 200.0;
+            let max_card = 260.0;
+            let buttons = card_buttons(node.online, node.has_display, node.effective);
+            let cols = ((avail + gap) / (min_card + gap))
+                .floor()
+                .max(1.0)
+                .min(buttons.len().max(1) as f32) as usize;
+            let card_w = ((avail - gap * (cols.saturating_sub(1) as f32)) / cols as f32)
+                .clamp(min_card, max_card)
+                .min(avail);
+            // Rows of horizontal groups shrink to content. A Grid inside a
+            // tall ScrollArea stretches the last row through the leftover page.
+            for row in buttons.chunks(cols) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+                    for button in row {
+                        let action = Action {
+                            enabled: button.enabled,
+                            reason: button.reason,
+                        };
+                        let blurb = action_card_blurb(button.kind);
+                        let response = action_card(ui, card_w, button.label, blurb, &action);
+                        self.debug_layout.note_button_raw_vis(
+                            &format!("action_btn:{}:{}", node.id, button.label),
+                            response.rect,
+                            clip,
+                        );
+                        self.debug_layout.note_visible(
+                            &format!("action_card:{}:{}", node.id, button.label),
+                            response.rect,
+                            clip,
+                        );
+                        if !action.enabled {
+                            disabled.push((button.label, action.reason));
+                        }
+                        if response.clicked() {
+                            self.activate(node, &action, button.kind);
+                        }
+                    }
+                });
+                ui.add_space(gap);
             }
-        });
+        }
         for (label, reason) in disabled {
-            let resp = ui.add(
-                egui::Label::new(theme::muted_text(format!("{label}: {reason}"))).wrap(),
-            );
+            let resp =
+                ui.add(egui::Label::new(theme::muted_text(format!("{label}: {reason}"))).wrap());
             self.debug_layout.note_visible(
                 &format!("action_reason:{}:{label}", node.id),
                 resp.rect,
@@ -2077,7 +2167,7 @@ impl ControllerApp {
             _ => None,
         };
         if let Some(node) = id.and_then(|id| self.nodes.iter().find(|n| n.id == id).cloned()) {
-            self.session_actions(ui, &node);
+            self.session_actions(ui, &node, true);
         }
     }
 
@@ -3611,6 +3701,17 @@ impl ControllerApp {
         self.seen_seq += 1;
     }
 
+    fn sync_window_size(&mut self, ctx: &egui::Context) {
+        let rect = ctx.screen_rect();
+        if rect.width() > 1.0 && rect.height() > 1.0 {
+            self.logical_size = (rect.width(), rect.height());
+        }
+    }
+
+    fn rail_visible_for(&self, ctx: &egui::Context) -> bool {
+        model::machine_rail_visible_at(self.logical_size.0, ctx.pixels_per_point())
+    }
+
     pub(super) fn debug_is_mock(&self) -> bool {
         self.mock
     }
@@ -4190,33 +4291,31 @@ fn status_pill(
         .response
 }
 
-/// Name on the left, status pill on the right. The name is truncated so
-/// it cannot shove the pill off the card or rail.
-fn name_and_status(ui: &mut egui::Ui, name: &str, online: bool, color: egui::Color32) {
-    ui.horizontal(|ui| {
-        // "ONLINE" pill: padding + status dot + 11px label ≈ 92 px.
-        let pill_reserve = 96.0;
-        let name_w = (ui.available_width() - pill_reserve).max(32.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(name_w, ui.spacing().interact_size.y.max(22.0)),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(name)
-                            .size(theme::SECTION_SIZE)
-                            .color(color)
-                            .strong(),
-                    )
-                    .truncate(),
-                );
-            },
-        );
-        online_pill(ui, online);
-    });
+/// Name on its own row (wraps, full text in the tooltip). Status pill on
+/// the next row so a long name cannot clip the badge.
+fn machine_name_and_status(
+    ui: &mut egui::Ui,
+    name: &str,
+    online: bool,
+    color: egui::Color32,
+    heading: bool,
+) -> (egui::Rect, egui::Rect) {
+    let size = if heading {
+        theme::TITLE_SIZE
+    } else {
+        theme::BODY_SIZE
+    };
+    let name_resp = ui.add(
+        egui::Label::new(egui::RichText::new(name).size(size).color(color).strong())
+            .wrap()
+            .sense(egui::Sense::hover()),
+    );
+    let name_resp = name_resp.on_hover_text(name);
+    let badge_resp = online_pill(ui, online);
+    (name_resp.rect, badge_resp.rect)
 }
 
-fn online_pill(ui: &mut egui::Ui, online: bool) {
+fn online_pill(ui: &mut egui::Ui, online: bool) -> egui::Response {
     let (label, color) = if online {
         ("ONLINE", theme::SUCCESS)
     } else {
@@ -4240,11 +4339,85 @@ fn online_pill(ui: &mut egui::Ui, online: bool) {
                 painter.circle_filled(resp.rect.center(), theme::STATUS_DOT * 0.5, color);
                 ui.label(
                     egui::RichText::new(label)
-                        .size(11.0)
+                        .size(theme::SECONDARY_SIZE)
                         .color(theme::TEXT_MUTED),
                 );
             });
-        });
+        })
+        .response
+}
+
+fn action_card_blurb(kind: CardButtonKind) -> &'static str {
+    match kind {
+        CardButtonKind::Terminal => "Open a shell on this machine.",
+        CardButtonKind::Files => "Browse and transfer files.",
+        CardButtonKind::ViewDesktop => "Watch the remote display.",
+        CardButtonKind::ControlDesktop => "Control the remote display.",
+    }
+}
+
+fn action_card(
+    ui: &mut egui::Ui,
+    width: f32,
+    label: &str,
+    blurb: &str,
+    action: &Action,
+) -> egui::Response {
+    let (fill, title_color, body_color) = if action.enabled {
+        (theme::BG_SURFACE, theme::TEXT_PRIMARY, theme::TEXT_BODY)
+    } else {
+        (theme::BG_PANEL, theme::TEXT_MUTED, theme::TEXT_FAINT)
+    };
+    let status = action.reason;
+    let max_h = 140.0;
+    let max_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, max_h));
+    let inner = ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(max_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| {
+            theme::card_frame().fill(fill).show(ui, |ui| {
+                ui.set_max_width(width);
+                ui.set_min_width(width);
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(theme::SECTION_SIZE)
+                        .color(title_color)
+                        .strong(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(blurb)
+                            .size(theme::BODY_SIZE)
+                            .color(body_color),
+                    )
+                    .wrap(),
+                );
+                ui.add(egui::Label::new(theme::muted_text(status)).wrap());
+            })
+        },
+    );
+    let mut response = inner
+        .inner
+        .response
+        .interact(if action.enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        })
+        .on_hover_text(action.reason);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.expand(1.0),
+            egui::CornerRadius::same(theme::RADIUS_CARD),
+            theme::focus_stroke(),
+            egui::StrokeKind::Outside,
+        );
+    }
+    if !action.enabled {
+        response = response.on_disabled_hover_text(action.reason);
+    }
+    response
 }
 
 fn labeled(ui: &mut egui::Ui, name: &str, text: &mut String, secret: bool) {
@@ -4366,11 +4539,7 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
     }
     let n = delta / 120;
     if n == 0 {
-        if delta > 0 {
-            1
-        } else {
-            -1
-        }
+        if delta > 0 { 1 } else { -1 }
     } else {
         n
     }
@@ -4379,8 +4548,8 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -4410,11 +4579,20 @@ mod geometry_tests {
         ctx: egui::Context,
         time: f64,
         pending_events: Vec<egui::Event>,
+        pixels_per_point: f32,
     }
 
     impl Harness {
         fn new(w: f32, h: f32) -> Self {
             Self::new_with(w, h, false, super::super::LiveHooks::production())
+        }
+
+        /// `w`/`h` are physical pixels. `pixels_per_point` is the platform scale.
+        fn new_physical(phys_w: f32, phys_h: f32, pixels_per_point: f32) -> Self {
+            let ppp = pixels_per_point.max(0.01);
+            let mut harn = Self::new(phys_w / ppp, phys_h / ppp);
+            harn.pixels_per_point = ppp;
+            harn
         }
 
         fn preview(w: f32, h: f32, live: super::super::LiveHooks) -> Self {
@@ -4423,12 +4601,7 @@ mod geometry_tests {
             harn
         }
 
-        fn new_with(
-            w: f32,
-            h: f32,
-            preview_ui: bool,
-            live: super::super::LiveHooks,
-        ) -> Self {
+        fn new_with(w: f32, h: f32, preview_ui: bool, live: super::super::LiveHooks) -> Self {
             let tmp = TempDir::new().expect("tmpdir");
             let config = tmp.path().join("config");
             let data = tmp.path().join("data");
@@ -4474,6 +4647,7 @@ mod geometry_tests {
                 ctx,
                 time: 0.0,
                 pending_events: Vec::new(),
+                pixels_per_point: 1.0,
             }
         }
 
@@ -4488,11 +4662,19 @@ mod geometry_tests {
         /// One UI pass; returns egui viewport commands emitted this frame.
         fn pass_output(&mut self) -> egui::FullOutput {
             let (w, h) = self.app.debug_window_size();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            let mut viewports = egui::ViewportIdMap::default();
+            viewports.insert(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    native_pixels_per_point: Some(self.pixels_per_point),
+                    inner_rect: Some(screen),
+                    ..Default::default()
+                },
+            );
             let raw = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(w, h),
-                )),
+                screen_rect: Some(screen),
+                viewports,
                 time: Some(self.time),
                 predicted_dt: 1.0 / 60.0,
                 focused: true,
@@ -4772,11 +4954,7 @@ mod geometry_tests {
                 assert_eq!(harn.app.debug_layout.rail_rect, [0.0; 4]);
             }
             // quant67 is headless: toolbar has Terminal/Files, not a fake desktop.
-            assert_action_fully_visible(
-                &harn.app.debug_layout,
-                "action_btn:quant67:Terminal",
-                w,
-            );
+            assert_action_fully_visible(&harn.app.debug_layout, "action_btn:quant67:Terminal", w);
 
             let node = harn.app.nodes[0].clone();
             harn.app.open_files(&node);
@@ -4885,14 +5063,22 @@ mod geometry_tests {
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, 1280.0, 800.0, true);
-            assert_action_fully_visible(&harn.app.debug_layout, "action_btn:quant67:Terminal", 1280.0);
+            assert_action_fully_visible(
+                &harn.app.debug_layout,
+                "action_btn:quant67:Terminal",
+                1280.0,
+            );
 
             // Restored-window size from screenshot (~1085), not the preview 725.
             harn.resize(1080.0, 800.0);
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, 1080.0, 800.0, true);
-            assert_action_fully_visible(&harn.app.debug_layout, "action_btn:quant67:Terminal", 1080.0);
+            assert_action_fully_visible(
+                &harn.app.debug_layout,
+                "action_btn:quant67:Terminal",
+                1080.0,
+            );
 
             harn.resize(725.0, 800.0);
             harn.pass();
@@ -4910,7 +5096,11 @@ mod geometry_tests {
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, 1920.0, 1200.0, true);
-            assert_action_fully_visible(&harn.app.debug_layout, "action_btn:quant67:Terminal", 1920.0);
+            assert_action_fully_visible(
+                &harn.app.debug_layout,
+                "action_btn:quant67:Terminal",
+                1920.0,
+            );
 
             harn.resize(1280.0, 800.0);
             harn.pass();
@@ -5303,9 +5493,14 @@ mod geometry_tests {
         assert!(harn.app.preview_ui && harn.app.mock);
         assert!(!harn.app.hide_on_close);
         assert!(!harn.app.autostart);
-        assert!(harn.app.nodes.iter().all(|n| n.id.starts_with("preview-fixture-")
-            && n.name.contains("Fixture")
-            && n.name.contains("sample")));
+        assert!(
+            harn.app
+                .nodes
+                .iter()
+                .all(|n| n.id.starts_with("preview-fixture-")
+                    && n.name.contains("Fixture")
+                    && n.name.contains("sample"))
+        );
         let layout = &harn.app.debug_layout;
         assert!(
             item_rect(layout, "preview_banner").is_some(),
@@ -5340,7 +5535,12 @@ mod geometry_tests {
         );
         assert_eq!(harn.app.node_line, super::super::PREVIEW_NODE_LINE);
         assert!(!harn.app.autostart);
-        assert!(harn.app.nodes.iter().all(|n| n.id.starts_with("preview-fixture-")));
+        assert!(
+            harn.app
+                .nodes
+                .iter()
+                .all(|n| n.id.starts_with("preview-fixture-"))
+        );
         harn.app.last_node = Instant::now() - Duration::from_secs(3);
         harn.pass();
         harn.pass();
@@ -5350,7 +5550,12 @@ mod geometry_tests {
             "pump past 2s must not call live resolver/autostart/load in preview"
         );
         assert_eq!(harn.app.node_line, super::super::PREVIEW_NODE_LINE);
-        assert!(harn.app.nodes.iter().all(|n| n.id.starts_with("preview-fixture-")));
+        assert!(
+            harn.app
+                .nodes
+                .iter()
+                .all(|n| n.id.starts_with("preview-fixture-"))
+        );
         assert!(!harn.app.hide_on_close);
         assert!(item_rect(&harn.app.debug_layout, "preview_banner").is_some());
     }
@@ -5417,5 +5622,104 @@ mod geometry_tests {
             item_rect(&harn.app.debug_layout, "detail_node_id").is_none(),
             "collapsed Details must not push the node id into the primary column"
         );
+    }
+
+    #[test]
+    fn rail_geometry_includes_dpi_and_folds_719_physical() {
+        // Keep a 756-point-tall frame so scale tests are about width/DPI,
+        // not a chopped window. Physical height is 756 * ppp.
+        for &(phys_w, ppp, expect_rail) in &[
+            (719.0_f32, 1.0_f32, false),
+            (1024.0, 1.0, true),
+            (1080.0, 1.0, true),
+            // Sub-1 scale: 719 physical must fold even if logical is ~1078.5.
+            (719.0, 2.0 / 3.0, false),
+            (1024.0, 2.0 / 3.0, true),
+            // Windows 150%: 1024 points (1536 physical) keeps the rail.
+            (1536.0, 1.5, true),
+        ] {
+            let phys_h = 756.0 * ppp;
+            let mut harn = Harness::new_physical(phys_w, phys_h, ppp);
+            harn.app.screen = Screen::Machines;
+            harn.pass();
+            harn.pass();
+            let logical_w = phys_w / ppp;
+            assert_eq!(
+                model::machine_rail_visible_at(logical_w, ppp),
+                expect_rail,
+                "breakpoint at phys={phys_w} ppp={ppp}"
+            );
+            assert_eq!(
+                harn.ctx.pixels_per_point(),
+                ppp,
+                "harness ppp at {phys_w}/{ppp}"
+            );
+            assert_machines_shell(&harn, logical_w, 756.0, expect_rail);
+        }
+        // 1024 physical at 150% is 682.67 points and must fold. Do not
+        // require the connect cards to fit un-scrolled in that short frame.
+        let mut harn = Harness::new_physical(1024.0, 756.0, 1.5);
+        harn.app.screen = Screen::Machines;
+        harn.pass();
+        harn.pass();
+        assert!(!model::machine_rail_visible_at(1024.0 / 1.5, 1.5));
+        assert_eq!(harn.app.debug_layout.rail_rect, [0.0; 4]);
+    }
+
+    #[test]
+    fn long_offline_name_keeps_badge_and_does_not_share_the_name_row() {
+        let mut harn = Harness::new(1024.0, 756.0);
+        let mut node = harn.app.nodes[0].clone();
+        node.id = "long-offline".into();
+        node.name = "Fixture · offline workstation with a long display name (sample)".into();
+        node.online = false;
+        harn.app.nodes.insert(0, node);
+        harn.app.selected_id = Some("long-offline".into());
+        harn.app.screen = Screen::Machines;
+        harn.pass();
+        harn.pass();
+        let layout = &harn.app.debug_layout;
+        let name = item_rect(layout, "nav_name:long-offline").expect("nav name");
+        let badge = item_rect(layout, "nav_badge:long-offline").expect("nav badge");
+        assert!(
+            badge[1] + 0.5 >= name[1] + name[3] - 1.0,
+            "badge must sit on the next row, not beside the name: name={name:?} badge={badge:?}"
+        );
+        assert!(
+            badge[2] >= 64.0 && badge[3] >= 16.0,
+            "offline badge clipped: {badge:?}"
+        );
+        assert!(
+            name[2] >= 140.0,
+            "name should use the rail width, not a leftover strip: {name:?}"
+        );
+        let detail_badge = item_rect(layout, "detail_badge").expect("detail badge");
+        assert!(
+            detail_badge[2] >= 64.0,
+            "detail offline badge clipped: {detail_badge:?}"
+        );
+    }
+
+    #[test]
+    fn unconnected_detail_shows_connect_cards_not_empty_toolbar() {
+        let mut harn = Harness::new(1024.0, 756.0);
+        harn.app.screen = Screen::Machines;
+        harn.pass();
+        harn.pass();
+        let layout = &harn.app.debug_layout;
+        assert!(
+            item_rect(layout, "connect_prompt").is_some(),
+            "Choose how to connect missing"
+        );
+        let selected = harn.app.selected_id.clone().expect("selection");
+        for label in ["Terminal", "Files"] {
+            let card = item_rect(layout, &format!("action_card:{selected}:{label}"))
+                .unwrap_or_else(|| panic!("missing action card {label}"));
+            assert!(
+                card[2] >= 199.0 && card[3] >= 80.0,
+                "{label} card too small (still a tiny toolbar?): {card:?}"
+            );
+            assert_action_fully_visible(layout, &format!("action_btn:{selected}:{label}"), 1024.0);
+        }
     }
 }

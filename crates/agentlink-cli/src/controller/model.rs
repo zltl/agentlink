@@ -528,7 +528,28 @@ pub fn ellipsize_chars(text: &str, max_chars: usize) -> String {
 }
 
 pub fn machine_rail_visible(window_width: f32) -> bool {
-    window_width >= MACHINE_RAIL_SHOW_AT
+    machine_rail_visible_at(window_width, 1.0)
+}
+
+/// Usable width for rail / stack breakpoints, in points when scale is
+/// 100% or higher, or in physical pixels when the scale is below 100%.
+///
+/// Layout constants (`MACHINE_RAIL_WIDTH`, `MACHINE_RAIL_SHOW_AT`) are in
+/// points. On Windows 150% (`pixels_per_point = 1.5`) a 1024-point window
+/// still uses 1024, so high-DPI is not flattened to physical pixels. When
+/// something reports a sub-1.0 scale (a 719-pixel window would otherwise
+/// look like 1078 points and miss the fold), the physical width is used
+/// so a real 719-pixel frame still folds.
+pub fn usable_layout_width(logical_width: f32, pixels_per_point: f32) -> f32 {
+    if pixels_per_point > 0.0 && pixels_per_point < 1.0 {
+        logical_width * pixels_per_point
+    } else {
+        logical_width
+    }
+}
+
+pub fn machine_rail_visible_at(logical_width: f32, pixels_per_point: f32) -> bool {
+    usable_layout_width(logical_width, pixels_per_point) >= MACHINE_RAIL_SHOW_AT
 }
 
 /// Plain-text terminal with a fixed scrollback. Cursor motion is enough for
@@ -861,16 +882,29 @@ mod tests {
         assert!(!machine_rail_visible(799.0));
         assert!(!machine_rail_visible(719.0));
         assert!(!machine_rail_visible(725.0));
+        // 100% DPI: physical == points.
+        assert_eq!(usable_layout_width(719.0, 1.0), 719.0);
+        assert!(!machine_rail_visible_at(719.0, 1.0));
+        assert!(machine_rail_visible_at(1024.0, 1.0));
+        // Sub-1 scale: 719 physical must not be treated as 1078 points.
+        let logical_at_two_thirds = 719.0 / (2.0 / 3.0);
+        assert!((logical_at_two_thirds - 1078.5_f32).abs() < 0.01);
+        assert!((usable_layout_width(logical_at_two_thirds, 2.0 / 3.0) - 719.0_f32).abs() < 0.01);
+        assert!(!machine_rail_visible_at(logical_at_two_thirds, 2.0 / 3.0));
+        assert!(machine_rail_visible_at(1024.0 / (2.0 / 3.0), 2.0 / 3.0));
+        // Windows 150%: honor points so a 1024-point window keeps the rail.
+        // A 1024-physical window is 682.67 points and correctly folds.
+        assert_eq!(usable_layout_width(1024.0, 1.5), 1024.0);
+        assert!(machine_rail_visible_at(1024.0, 1.5));
+        assert!(!machine_rail_visible_at(1024.0 / 1.5, 1.5));
+        assert!(machine_rail_visible_at(1536.0 / 1.5, 1.5));
         assert_eq!(
             ellipsize_chars("iZ7xv88es0zy9ogs1ny63Z", 12),
             "iZ7xv88es0z…"
         );
         assert_eq!(ellipsize_chars("short", 12), "short");
         assert_eq!(node_presence_label(false, Some(true)), "Offline");
-        assert_eq!(
-            node_presence_label(true, Some(false)),
-            "Online · Headless"
-        );
+        assert_eq!(node_presence_label(true, Some(false)), "Online · Headless");
         assert_eq!(short_node_id("abcd"), "abcd");
         assert_eq!(short_node_id("0123456789abcdef"), "0123456789a…");
         let fixtures = preview_fixture_nodes();
@@ -878,12 +912,25 @@ mod tests {
         assert!(fixtures.iter().all(|n| n.id.starts_with("preview-fixture-")
             && n.name.contains("Fixture")
             && n.name.contains("sample")));
-        let headless = fixtures.iter().find(|n| n.id.ends_with("headless")).unwrap();
+        let headless = fixtures
+            .iter()
+            .find(|n| n.id.ends_with("headless"))
+            .unwrap();
         let buttons = card_buttons(headless.online, headless.has_display, headless.effective);
-        assert!(buttons.iter().all(|b| b.label != "View desktop" && b.label != "Control desktop"));
-        let view_only = fixtures.iter().find(|n| n.id.ends_with("view-only")).unwrap();
+        assert!(
+            buttons
+                .iter()
+                .all(|b| b.label != "View desktop" && b.label != "Control desktop")
+        );
+        let view_only = fixtures
+            .iter()
+            .find(|n| n.id.ends_with("view-only"))
+            .unwrap();
         let buttons = card_buttons(view_only.online, view_only.has_display, view_only.effective);
-        let control = buttons.iter().find(|b| b.label == "Control desktop").unwrap();
+        let control = buttons
+            .iter()
+            .find(|b| b.label == "Control desktop")
+            .unwrap();
         assert!(!control.enabled);
         assert!(
             control.reason.contains("remote-control") || control.reason.contains("View desktop")
