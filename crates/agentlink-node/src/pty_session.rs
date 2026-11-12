@@ -986,8 +986,15 @@ fn main() {
     report("AL_SIZE_BEFORE");
     let _ = writeln!(std::io::stdout(), "AL_READY");
     let _ = std::io::stdout().flush();
-    let mut buf = [0u8; 64];
-    let _ = std::io::stdin().read(&mut buf);
+    // Wait for Enter. Windows cooked input typically delivers CR; Unix LF.
+    let mut byte = [0u8; 1];
+    loop {
+        match std::io::stdin().read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if byte[0] == b'\r' || byte[0] == b'\n' => break,
+            Ok(_) => {}
+        }
+    }
     report("AL_SIZE_AFTER");
     let _ = writeln!(std::io::stdout(), "AL_DONE");
     let _ = std::io::stdout().flush();
@@ -1092,7 +1099,11 @@ printf 'AL_DONE\\n'\n",
         );
         mgr.resize(&sid, 30, 100, "alice").expect("resize");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        mgr.write(&sid, b"\n", "alice")
+        // Windows cooked console input completes a line on CR (Enter).
+        // A bare LF is not a reliable wake there and must not be used as
+        // the handshake. Unix line reads still use LF.
+        let wake: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\n" };
+        mgr.write(&sid, wake, "alice")
             .expect("signal after resize");
         let text =
             wait_transcript_sentinel(&resp, "AL_DONE", std::time::Duration::from_secs(8)).await;

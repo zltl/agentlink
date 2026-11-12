@@ -170,3 +170,9 @@ Linux (this box, rustc 1.99.1, Asia/Shanghai, 2026-11-12, reused target, `--offl
 `8df767a` generated Kotlin is unchanged. Controller/UI and production `abf86f1` were not touched. The review finding that `poll_until_end` does not `close_quiet` on a normal `"exit"` (registry / Android `ShellSessions` map can remain) is still open: it is FFI host-session lifecycle, not this ConPTY test, and was left out of this small delta.
 
 SQLite `RUSTSEC-2026-0459` remains accurately documented; cargo-audit is still expected exit 1. This executor does not push `main`.
+
+## Post-40f551c ConPTY Enter handshake (this commit, not a rewrite of `40f551c`)
+
+Windows probe of `40f551c` compiled the size helper and printed `AL_SIZE_BEFORE` 80x24 plus `AL_READY`. After resize the host transcript had `ESC[8;30;100t` and a redraw of the old BEFORE/READY lines, but no `AL_SIZE_AFTER` / `AL_DONE` (`wait_transcript_sentinel` timed out at 8s). The test wrote a bare LF; Windows cooked console input completes a line on CR (Enter).
+
+This commit does not change production resize. On Windows the handshake write is `\r\n`; Unix stays `\n`. The Windows helper waits for CR or LF before reading `GetConsoleScreenBufferInfo` again. Assertions are unchanged: window/winsize must be `80x24` before and `100x30` after, with `AL_DONE`. Not run on this box (no rustc 1.99). Windows worker retest is required.

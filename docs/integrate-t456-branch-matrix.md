@@ -104,3 +104,7 @@ A second incremental commit on the same branch regenerates `android/app/src/main
 ## Post-8df ConPTY resize test (local, not pushed)
 
 A third incremental commit on the same branch fixes `real_pty_resize_changes_child_winsize` (structured GetConsoleScreenBufferInfo / `stty size` handshake; no production resize-path change). `8df767a`, `8143d2ee`, and `cd30c9e` are not rewritten. Generated Kotlin from `8df767a` is kept. Windows worker should re-run this freeze only for this test (plus any chosen regression slice); not pushed.
+
+## Post-40f551c ConPTY Enter handshake (local, not pushed)
+
+A further incremental commit on the same branch wakes the Windows size-helper handshake with CR/LF (`\r\n` on Windows, `\n` on Unix). `40f551c`, `8df767a`, and `8143d2ee` are not rewritten. Production resize is unchanged. Still not pushed.
