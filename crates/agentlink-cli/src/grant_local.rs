@@ -108,11 +108,12 @@ fn command_exists(name: &str) -> bool {
 
 /// Visible local grant dialog process (zenity / kdialog).
 ///
-/// Do not route this through `agentlink_core::process::hidden` or `detached`.
-/// Those apply `CREATE_NO_WINDOW` on Windows, and this process *is* the
-/// Allow/Deny or paste UI the local user must see in order to grant.
-/// The tools are Unix GUI prompts, invoked only when a display and the
-/// binary exist; the constructor stays un-hidden on every OS.
+/// A plain `Command` is kept here to express "this is a visible UI prompt"
+/// and to make that intent easy to maintain. It is not a required functional
+/// fix: on Linux, `process::hidden` is already a plain `Command`, and on
+/// Windows `CREATE_NO_WINDOW` only suppresses a console window — it does not
+/// prevent a normal GUI from showing. These tools are Unix GUI prompts,
+/// invoked only when a display and the binary exist.
 fn grant_ui_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     std::process::Command::new(program) // no-window-reviewed: visible Unix grant UI; do not hide
 }
