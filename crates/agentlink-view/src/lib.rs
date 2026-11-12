@@ -12,6 +12,10 @@ mod queue;
 mod session;
 
 pub use h264::{
-    access_unit_is_idr, classify_media_path, clamp_offer, feedback_ratio, is_screenshot_fallback,
+    AddrScope, access_unit_is_idr, addr_scope, clamp_offer, classify_media_path,
+    classify_selected_path, feedback_ratio, is_screenshot_fallback, is_tailscale_range,
+    media_path_hint,
 };
-pub use session::{LiveCursor, LiveFrame, LiveInfo, LiveOptions, LiveStats, Signal, Viewer};
+pub use session::{
+    LiveCursor, LiveFrame, LiveInfo, LiveOptions, LiveStats, Signal, TransportSnapshot, Viewer,
+};

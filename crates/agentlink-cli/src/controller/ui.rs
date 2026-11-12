@@ -4,24 +4,24 @@
 //! [`super::worker`] on the same client the phone uses. Visual tokens live in
 //! [`super::theme`].
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentlink_core::{NodeInfo, NodePolicy};
 use eframe::egui;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::chrome::{
+    BAR_HEIGHT, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
     classify_connect_error, connection_bar_visible, encoder_label, estimate_right_width_with,
     link_is_connecting, pick_bar_density, session_chrome_top_height, session_phase, stats_chip,
-    stats_line, text_advance, BarDensity, BarMeasure, ConnDot, SessionPhase, SessionSignals,
-    BAR_HEIGHT,
+    stats_line, text_advance,
 };
 use super::model::{
-    self, card_buttons, connection_label, display_note, has_saved_session, Action, CardButtonKind,
+    self, Action, CardButtonKind, card_buttons, connection_label, display_note, has_saved_session,
 };
 use super::term::Emulator;
 use super::theme;
@@ -861,6 +861,7 @@ impl ControllerApp {
                 encoder: "minih264".into(),
                 hardware: false,
                 frames_dropped: 0,
+                path_note: String::new(),
             };
             self.screen = Screen::Desktop {
                 id: node.id.clone(),
@@ -1074,9 +1075,7 @@ impl ControllerApp {
             Screen::Terminal { name, .. } => format!("{name} — terminal — agentlink"),
             Screen::Files { name, .. } => format!("{name} — files — agentlink"),
             // Login / Restoring / Machines: no active session.
-            Screen::Login | Screen::Restoring | Screen::Machines => {
-                "agentlink controller".into()
-            }
+            Screen::Login | Screen::Restoring | Screen::Machines => "agentlink controller".into(),
         }
     }
 
@@ -1678,8 +1677,7 @@ impl ControllerApp {
                         // place View desktop past the clip when max_rect grew.
                         ui.vertical(|ui| {
                             ui.set_max_width(card_inner_w);
-                            ui.spacing_mut().item_spacing =
-                                egui::vec2(0.0, theme::SPACE_XS);
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, theme::SPACE_XS);
                             for button in
                                 card_buttons(node.online, node.has_display, node.effective)
                             {
@@ -2687,7 +2685,7 @@ impl ControllerApp {
     }
 
     fn desktop_stats_popover(&mut self, ui: &mut egui::Ui, pane_rect: egui::Rect) {
-        let size = egui::vec2(240.0, 168.0);
+        let size = egui::vec2(280.0, 236.0);
         let origin = egui::pos2(
             (pane_rect.center().x - size.x / 2.0).max(pane_rect.left() + theme::SPACE_SM),
             pane_rect.top() + theme::SPACE_MD,
@@ -2711,7 +2709,19 @@ impl ControllerApp {
                     });
                 });
                 ui.add_space(theme::SPACE_XS);
+                let path = if self.desk_hud.path.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    self.desk_hud.path.clone()
+                };
+                let path_line = format!("{} · {}", self.desk_hud.kind, path);
+                let hint = if self.desk_hud.path_note.is_empty() {
+                    super::model::connection_path_hint(&self.desk_hud.kind, &path).to_string()
+                } else {
+                    self.desk_hud.path_note.clone()
+                };
                 let lines = [
+                    format!("path  {path_line}"),
                     format!("fps  {:.1}", self.desk_hud.fps),
                     format!("bitrate  {} kbps", self.desk_hud.bitrate_kbps),
                     format!("latency  {} ms", self.desk_hud.latency_ms),
@@ -2721,6 +2731,7 @@ impl ControllerApp {
                         "resolution  {}×{}",
                         self.desk_hud.width, self.desk_hud.height
                     ),
+                    hint,
                 ];
                 for line in lines {
                     ui.label(theme::mono_bar_text(line));
@@ -3483,6 +3494,10 @@ impl ControllerApp {
                 "state": conn_state,
                 "mode": self.session_mode(),
                 "error": conn_error,
+                "kind": self.desk_hud.kind,
+                "path": self.desk_hud.path,
+                "path_note": self.desk_hud.path_note,
+                "link": self.link,
                 "fps": self.desk_hud.fps,
                 "bitrate_kbps": bitrate,
                 "latency_ms": self.desk_hud.latency_ms,
@@ -4032,11 +4047,7 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
     }
     let n = delta / 120;
     if n == 0 {
-        if delta > 0 {
-            1
-        } else {
-            -1
-        }
+        if delta > 0 { 1 } else { -1 }
     } else {
         n
     }
@@ -4045,8 +4056,8 @@ fn pixel_delta_to_notches(delta: i32) -> i32 {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     /// Visible page / Back must cover a real fraction of the window.
@@ -4304,11 +4315,7 @@ mod geometry_tests {
                 "gap between rail and main: rail={rail:?} main={main:?}"
             );
         } else {
-            assert_eq!(
-                layout.rail_rect,
-                [0.0; 4],
-                "rail should fold below show-at"
-            );
+            assert_eq!(layout.rail_rect, [0.0; 4], "rail should fold below show-at");
         }
         let page = layout.page_rect;
         assert!(
@@ -4361,10 +4368,7 @@ mod geometry_tests {
             harn.app.screen = Screen::Machines;
             harn.pass();
             let main = harn.app.debug_layout.main_rect;
-            assert!(
-                main[2] > w * 0.5,
-                "machines main width {main:?} at {w}x{h}"
-            );
+            assert!(main[2] > w * 0.5, "machines main width {main:?} at {w}x{h}");
             assert!(
                 main[3] > h * 0.5,
                 "machines main height {main:?} at {w}x{h}"
@@ -4404,14 +4408,8 @@ mod geometry_tests {
             harn.pass();
             harn.pass();
             let pane = harn.app.debug_layout.pane_rect;
-            assert!(
-                pane[2] > w * 0.5,
-                "desktop pane width {pane:?} at {w}x{h}"
-            );
-            assert!(
-                pane[3] > h * 0.4,
-                "desktop pane height {pane:?} at {w}x{h}"
-            );
+            assert!(pane[2] > w * 0.5, "desktop pane width {pane:?} at {w}x{h}");
+            assert!(pane[3] > h * 0.4, "desktop pane height {pane:?} at {w}x{h}");
         }
     }
 
@@ -4656,8 +4654,11 @@ mod geometry_tests {
     /// to drag below ≈1080 is fixed (WM/drag may still pin).
     #[test]
     fn offscreen_640_and_725_session_geometry_without_raising_min_inner() {
-        for &(w, h) in &[(640.0_f32, 480.0_f32), (725.0_f32, 480.0_f32), (725.0_f32, 800.0_f32)]
-        {
+        for &(w, h) in &[
+            (640.0_f32, 480.0_f32),
+            (725.0_f32, 480.0_f32),
+            (725.0_f32, 800.0_f32),
+        ] {
             let mut harn = Harness::new(w, h);
             harn.pass();
             harn.open_quant_terminal();

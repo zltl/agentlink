@@ -9,15 +9,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::client::{login_user, maintain_session};
 use agentlink_core::{
-    apply_relay_defaults, parse_access, Client, ClientSettings, DirEntry, Identity, NodeInfo, Op,
-    PtyEvent, PtySession, RelayTrust, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
+    Client, ClientSettings, DirEntry, Identity, NodeInfo, Op, PHASE2_INJECT_INPUT,
+    PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL, PtyEvent, PtySession, RelayTrust,
+    apply_relay_defaults, parse_access,
 };
 use agentlink_view::{LiveOptions, Signal, Viewer};
 use base64::Engine;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use super::decode::{decode_image, H264Decoder};
+use super::decode::{H264Decoder, decode_image};
 use super::model::enroll_command;
 
 pub struct Picture {
@@ -53,6 +54,8 @@ pub struct LiveHud {
     pub encoder: String,
     pub hardware: bool,
     pub frames_dropped: u64,
+    /// Human-readable path explanation (not a candidate inventory).
+    pub path_note: String,
 }
 
 /// Sliding client-side timing samples (microseconds / counts) for `--perf-log` and debug `state`.
@@ -645,6 +648,29 @@ fn quality_offer(quality: u32) -> (u32, u32) {
     }
 }
 
+fn live_path_for_hud(viewer: &Viewer) -> (String, String) {
+    let snap = viewer.transport();
+    let info = viewer.info();
+    let raw = if let Some(ref snap) = snap {
+        snap.path.clone()
+    } else if info.path != "connecting" && !info.path.is_empty() {
+        info.path.clone()
+    } else {
+        "unknown".into()
+    };
+    let path = super::model::connection_label(&raw).to_string();
+    let note = if let Some(ref snap) = snap {
+        if !snap.note.is_empty() {
+            snap.note.clone()
+        } else {
+            super::model::connection_path_hint("h264", &path).to_string()
+        }
+    } else {
+        super::model::connection_path_hint("h264", &path).to_string()
+    };
+    (path, note)
+}
+
 fn start_live(
     client: Arc<Client>,
     node: String,
@@ -695,13 +721,7 @@ fn start_live(
                 Ok(viewer) => Arc::new(viewer),
                 Err(err) => {
                     // Keep JPEG bootstrap for soft failures, but surface hard rejects.
-                    let lower = err.to_ascii_lowercase();
-                    if lower.contains("not allowed")
-                        || lower.contains("offline")
-                        || lower.contains("forbidden")
-                        || lower.contains("denied")
-                        || lower.contains("unauthorized")
-                    {
+                    if super::model::webrtc_connect_is_hard_reject(&err) {
                         thread_shared.push(UiEvent::Failed(err));
                         return;
                     }
@@ -713,6 +733,7 @@ fn start_live(
                         path: "relay".into(),
                         kind: "jpeg".into(),
                         encoder: "jpeg".into(),
+                        path_note: super::model::connection_path_hint("jpeg", "relay").into(),
                         ..LiveHud::default()
                     });
                     let _ = control;
@@ -723,7 +744,8 @@ fn start_live(
                 *slot = Some(Arc::clone(&viewer));
             }
             let info = viewer.info();
-            let path_label = super::model::connection_label(&info.path).to_string();
+            // Do not publish an SDP inventory as the live path. JPEG stills
+            // may still be on screen until the first H.264 frame arrives.
             let encoder = if info.encoder.is_empty() {
                 if info.hardware {
                     "h264_hw".into()
@@ -733,15 +755,16 @@ fn start_live(
             } else {
                 info.encoder.clone()
             };
-            thread_shared.push(UiEvent::Link(format!("h264 · {path_label}")));
+            thread_shared.push(UiEvent::Link("h264 · connecting".into()));
             thread_shared.set_hud(LiveHud {
-                path: path_label.clone(),
+                path: "connecting".into(),
                 kind: "h264".into(),
                 width: info.width,
                 height: info.height,
                 bitrate_kbps: (bitrate / 1000).max(1),
                 encoder: encoder.clone(),
                 hardware: info.hardware,
+                path_note: super::model::connection_path_hint("h264", "connecting").into(),
                 ..LiveHud::default()
             });
             let mut decoder = H264Decoder::new();
@@ -759,14 +782,25 @@ fn start_live(
             while !thread_stop.load(Ordering::Relaxed) {
                 let Some(frame) = viewer.poll_frame(Duration::from_millis(50)) else {
                     if viewer.failed() {
-                        // Peer failed/closed: surface immediately. Do not leave
-                        // the UI spinning on "Connecting…".
-                        let msg = if saw_frame {
-                            "WebRTC connection failed".to_string()
-                        } else {
-                            "WebRTC connection failed before the first frame".to_string()
-                        };
-                        thread_shared.push(UiEvent::Failed(msg));
+                        if super::model::webrtc_loss_keeps_jpeg(saw_frame) {
+                            // Offer or ICE failed before H.264; JPEG stills over
+                            // the WebSocket relay must stay usable.
+                            thread_shared.push(UiEvent::Notice(
+                                "WebRTC live video is not up. Showing JPEG over the relay."
+                                    .into(),
+                            ));
+                            thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                            thread_shared.set_hud(LiveHud {
+                                path: "relay".into(),
+                                kind: "jpeg".into(),
+                                encoder: "jpeg".into(),
+                                path_note: super::model::connection_path_hint("jpeg", "relay")
+                                    .into(),
+                                ..LiveHud::default()
+                            });
+                            break;
+                        }
+                        thread_shared.push(UiEvent::Failed("WebRTC connection failed".into()));
                         break;
                     }
                     if saw_frame && last_frame_at.elapsed() > Duration::from_millis(200) {
@@ -800,6 +834,7 @@ fn start_live(
                     decoded
                 };
                 if let Some((rgba, width, height)) = frame {
+                    let first_h264 = !saw_frame;
                     saw_frame = true;
                     last_frame_at = Instant::now();
                     thread_h264.store(true, Ordering::Relaxed);
@@ -819,15 +854,19 @@ fn start_live(
                         }
                     }
                     thread_shared.perf.frames.fetch_add(1, Ordering::Relaxed);
-                    thread_shared.set_picture(rgba, width, height, "h264", &info.path);
+                    let (path_label, path_note) = live_path_for_hud(&viewer);
+                    thread_shared.set_picture(rgba, width, height, "h264", &path_label);
                     window_frames += 1;
                     let elapsed = window_start.elapsed();
-                    if elapsed >= Duration::from_millis(500) {
-                        let fps = window_frames as f32 / elapsed.as_secs_f32().max(0.001);
-                        thread_shared.perf.note_fps(fps);
+                    if elapsed >= Duration::from_millis(500) || first_h264 {
+                        let fps = if elapsed >= Duration::from_millis(500) {
+                            window_frames as f32 / elapsed.as_secs_f32().max(0.001)
+                        } else {
+                            0.0
+                        };
                         let stats = viewer.stats();
                         thread_shared.set_hud(LiveHud {
-                            path: path_label.clone(),
+                            path: path_label,
                             kind: "h264".into(),
                             width: width as u32,
                             height: height as u32,
@@ -837,6 +876,7 @@ fn start_live(
                             encoder: encoder.clone(),
                             hardware: info.hardware,
                             frames_dropped: stats.frames_dropped,
+                            path_note,
                         });
                         window_start = Instant::now();
                         window_frames = 0;
@@ -886,6 +926,8 @@ fn start_live(
                                 width: width as u32,
                                 height: height as u32,
                                 encoder: "jpeg".into(),
+                                path_note: super::model::connection_path_hint("jpeg", "relay")
+                                    .into(),
                                 ..LiveHud::default()
                             });
                         }
@@ -1180,11 +1222,7 @@ async fn sign_in(
     let parsed = RelayTrust::parse(pin, trust.as_deref()).map_err(|err| err.to_string())?;
     let totp = {
         let code = totp.trim();
-        if code.is_empty() {
-            None
-        } else {
-            Some(code)
-        }
+        if code.is_empty() { None } else { Some(code) }
     };
     let session = login_user(
         &relay,

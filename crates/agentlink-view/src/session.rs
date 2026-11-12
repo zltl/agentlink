@@ -12,19 +12,20 @@ use rtc::peer_connection::configuration::RTCOfferOptions;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
-    register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
-    PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
-    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, Registry,
+    MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer, RTCPeerConnectionIceEvent,
+    RTCPeerConnectionState, RTCSessionDescription, Registry, register_default_interceptors,
 };
 use webrtc::runtime::default_runtime;
 
 use crate::h264::{
-    feedback_ratio, is_screenshot_fallback, AccessUnit, H264Depacketizer, LossWindow,
+    AccessUnit, AddrScope, H264Depacketizer, LossWindow, addr_scope, classify_media_path,
+    classify_selected_path, feedback_ratio, is_screenshot_fallback, media_path_hint,
 };
 use crate::queue::{FrameBus, Queued};
 
@@ -67,8 +68,25 @@ pub struct LiveInfo {
     pub width: u32,
     pub height: u32,
     pub control: bool,
-    /// `host`, `stun`, `turn`, `quic`, or `relay`.
+    /// Confirmed media path: `host`, `stun`, `turn`, `tailscale`,
+    /// `connecting`, `unknown`, or `relay` (legacy). Set from the selected
+    /// ICE pair once ICE connects, not from the answer SDP inventory.
     pub path: String,
+    /// `classify_media_path` of the answer SDP. Log-only; never the HUD path.
+    pub sdp_inventory: String,
+}
+
+/// Selected ICE pair as observed on the viewer's peer connection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransportSnapshot {
+    pub path: String,
+    pub local_typ: String,
+    pub remote_typ: String,
+    pub local_addr: String,
+    pub remote_addr: String,
+    pub protocol: String,
+    pub sdp_inventory: String,
+    pub note: String,
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +128,8 @@ enum Cmd {
 pub struct Viewer {
     cmd: mpsc::Sender<Cmd>,
     frames: Arc<FrameBus>,
-    info: LiveInfo,
+    info: Arc<Mutex<LiveInfo>>,
+    transport: Arc<Mutex<Option<TransportSnapshot>>>,
     cursor: Arc<Mutex<Option<LiveCursor>>>,
     stats: Arc<Mutex<LiveStats>>,
     input_open: Arc<AtomicBool>,
@@ -135,6 +154,7 @@ impl Viewer {
             cmd: built.cmd,
             frames: built.frames,
             info: built.info,
+            transport: built.transport,
             cursor: built.cursor,
             stats: built.stats,
             input_open: built.input_open,
@@ -148,7 +168,25 @@ impl Viewer {
     }
 
     pub fn info(&self) -> LiveInfo {
-        self.info.clone()
+        let mut info = self
+            .info
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if let Some(snap) = self.transport() {
+            if !snap.path.is_empty() {
+                info.path = snap.path;
+            }
+        }
+        info
+    }
+
+    /// Selected ICE pair once ICE has picked one. `None` until then.
+    pub fn transport(&self) -> Option<TransportSnapshot> {
+        self.transport
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
     }
 
     pub fn poll_frame(&self, timeout: Duration) -> Option<LiveFrame> {
@@ -161,8 +199,8 @@ impl Viewer {
             annex_b: queued.bytes,
             keyframe: queued.keyframe,
             captured_unix_ms: queued.captured_unix_ms,
-            width: self.info.width,
-            height: self.info.height,
+            width: self.info().width,
+            height: self.info().height,
         })
     }
 
@@ -178,8 +216,8 @@ impl Viewer {
             annex_b: queued.bytes,
             keyframe: queued.keyframe,
             captured_unix_ms: queued.captured_unix_ms,
-            width: self.info.width,
-            height: self.info.height,
+            width: self.info().width,
+            height: self.info().height,
         })
     }
 
@@ -269,7 +307,8 @@ fn in_tokio_runtime() -> bool {
 struct Built {
     cmd: mpsc::Sender<Cmd>,
     frames: Arc<FrameBus>,
-    info: LiveInfo,
+    info: Arc<Mutex<LiveInfo>>,
+    transport: Arc<Mutex<Option<TransportSnapshot>>>,
     cursor: Arc<Mutex<Option<LiveCursor>>>,
     stats: Arc<Mutex<LiveStats>>,
     input_open: Arc<AtomicBool>,
@@ -437,8 +476,11 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             .get("control")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
-        path: crate::h264::classify_media_path(&sdp).to_string(),
+        path: "connecting".into(),
+        sdp_inventory: classify_media_path(&sdp).to_string(),
     };
+    let info = Arc::new(Mutex::new(info));
+    let transport = Arc::new(Mutex::new(None));
 
     let remote = RTCSessionDescription::answer(sdp).map_err(|err| err.to_string())?;
     PeerConnection::set_remote_description(&pc, remote)
@@ -468,6 +510,8 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let failed_loop = failed.clone();
     let gather_ice = gather_done.clone();
     let disc_loop = disconnected_at_ms;
+    let info_loop = info.clone();
+    let transport_loop = transport.clone();
     tokio::spawn(async move {
         drive(
             peer_loop,
@@ -485,6 +529,8 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             failed_loop,
             gather_ice,
             disc_loop,
+            info_loop,
+            transport_loop,
         )
         .await;
     });
@@ -519,6 +565,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         cmd: cmd_tx,
         frames,
         info,
+        transport,
         cursor,
         stats,
         input_open,
@@ -546,6 +593,8 @@ async fn drive(
     _failed: Arc<AtomicBool>,
     gather_done: Arc<AtomicBool>,
     disconnected_at_ms: Arc<AtomicI64>,
+    info: Arc<Mutex<LiveInfo>>,
+    transport: Arc<Mutex<Option<TransportSnapshot>>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.tick().await;
@@ -601,6 +650,7 @@ async fn drive(
                 if needs || !frames.saw_keyframe() {
                     ask_keyframe(&signal, &session_id, &input, &input_open).await;
                 }
+                refresh_transport(&peer, &info, &transport).await;
                 // ICE/DTLS left Connected: restart within 1s (throttle 5s).
                 let disc = disconnected_at_ms.load(Ordering::Relaxed);
                 if disc > 0 {
@@ -876,6 +926,7 @@ trait LivePeer: Send + Sync {
     async fn local_sdp(&self) -> Option<String>;
     async fn apply_remote_answer(&self, sdp: &str) -> Result<(), String>;
     async fn add_ice_candidate(&self, candidate: RTCIceCandidateInit) -> Result<(), String>;
+    async fn selected_ice_pair(&self) -> Option<(String, String, String, String, String)>;
 }
 
 struct OwnedPeer<P> {
@@ -926,6 +977,108 @@ where
         PeerConnection::add_ice_candidate(&self.inner, candidate)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    async fn selected_ice_pair(&self) -> Option<(String, String, String, String, String)> {
+        let sctp = PeerConnection::sctp(&self.inner).await?;
+        let ice = sctp.transport().ice_transport();
+        let pair = ice.get_selected_candidate_pair().await.ok().flatten()?;
+        let local = pair.local();
+        let remote = pair.remote();
+        Some((
+            local.typ.to_string(),
+            format_candidate_addr(local.address.as_str(), local.port),
+            remote.typ.to_string(),
+            format_candidate_addr(remote.address.as_str(), remote.port),
+            local.protocol.to_string(),
+        ))
+    }
+}
+
+fn format_candidate_addr(address: &str, port: u16) -> String {
+    if address.contains(':') && !address.starts_with('[') {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
+    }
+}
+
+async fn refresh_transport(
+    peer: &Arc<dyn LivePeer>,
+    info: &Arc<Mutex<LiveInfo>>,
+    transport: &Arc<Mutex<Option<TransportSnapshot>>>,
+) {
+    let Some((local_typ, local_addr, remote_typ, remote_addr, protocol)) =
+        peer.selected_ice_pair().await
+    else {
+        return;
+    };
+    let inventory = info
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .sdp_inventory
+        .clone();
+    let local_ip = strip_port(&local_addr);
+    let remote_ip = strip_port(&remote_addr);
+    let path = classify_selected_path(&local_typ, &remote_typ, local_ip, remote_ip).to_string();
+    let note = selected_pair_note(&path, local_ip, remote_ip);
+    let snap = TransportSnapshot {
+        path: path.clone(),
+        local_typ,
+        remote_typ,
+        local_addr,
+        remote_addr,
+        protocol,
+        sdp_inventory: inventory,
+        note: note.clone(),
+    };
+    if std::env::var_os("AGENTLINK_LIVE_PATH_LOG").is_some() {
+        eprintln!(
+            "agentlink live-path: path={} local={} {} remote={} {} proto={} inventory={} note={}",
+            snap.path,
+            snap.local_typ,
+            snap.local_addr,
+            snap.remote_typ,
+            snap.remote_addr,
+            snap.protocol,
+            snap.sdp_inventory,
+            snap.note
+        );
+    }
+    if let Ok(mut slot) = info.lock() {
+        slot.path = path;
+    }
+    if let Ok(mut slot) = transport.lock() {
+        *slot = Some(snap);
+    }
+}
+
+fn strip_port(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    if addr.chars().filter(|c| *c == ':').count() == 1 {
+        return addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    }
+    addr
+}
+
+fn selected_pair_note(path: &str, local_ip: &str, remote_ip: &str) -> String {
+    let scopes = [addr_scope(local_ip), addr_scope(remote_ip)];
+    let extra = if scopes.contains(&AddrScope::Loopback) {
+        "loopback (same host); not cross-machine or public NAT"
+    } else if scopes.contains(&AddrScope::CgnatTailscale) {
+        "address in 100.64.0.0/10 or fd7a:115c:a1e0::/48 (Tailscale KB 1015); overlay, not public NAT"
+    } else if scopes.contains(&AddrScope::PrivateLan) {
+        "private/LAN typ host; not public NAT traversal"
+    } else {
+        ""
+    };
+    let hint = media_path_hint("h264", path);
+    if extra.is_empty() {
+        hint.to_string()
+    } else {
+        format!("{hint} ({extra})")
     }
 }
 
@@ -1106,7 +1259,7 @@ mod tests {
         let viewer = Viewer {
             cmd,
             frames: Arc::new(FrameBus::new(1)),
-            info: LiveInfo {
+            info: Arc::new(Mutex::new(LiveInfo {
                 session_id: "test".into(),
                 codec: "h264".into(),
                 encoder: "test".into(),
@@ -1115,7 +1268,9 @@ mod tests {
                 height: 1,
                 control: false,
                 path: "relay".into(),
-            },
+                sdp_inventory: String::new(),
+            })),
+            transport: Arc::new(Mutex::new(None)),
             cursor: Arc::new(Mutex::new(None)),
             stats: Arc::new(Mutex::new(LiveStats::default())),
             input_open: Arc::new(AtomicBool::new(false)),

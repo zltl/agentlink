@@ -211,17 +211,46 @@ pub fn has_saved_session(refresh_token: Option<&str>) -> bool {
 /// `host` beats `stun`, which beats `turn`. Empty input is the relay socket.
 pub fn connection_label(raw: &str) -> &'static str {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("quic") {
+    if lower.contains("tailscale") || lower.contains("cgnat") {
+        "tailscale"
+    } else if lower.contains("quic") {
         "quic"
+    } else if lower.contains("connecting") {
+        "connecting"
+    } else if lower.contains("unknown") {
+        "unknown"
     } else if lower.contains("host") {
         "host"
-    } else if lower.contains("stun") || lower.contains("srflx") {
+    } else if lower.contains("stun") || lower.contains("srflx") || lower.contains("prflx") {
         "stun"
     } else if lower.contains("turn") || lower.contains(" typ relay") {
         "turn"
     } else {
         "relay"
     }
+}
+
+/// Honest status line for the desktop HUD. JPEG over the WebSocket is never
+/// labeled as WebRTC or P2P.
+pub fn connection_path_hint(kind: &str, path: &str) -> &'static str {
+    agentlink_view::media_path_hint(kind, path)
+}
+
+/// Grant / policy rejects stay fatal. Soft WebRTC failures must leave the
+/// JPEG-over-relay fallback running.
+pub fn webrtc_connect_is_hard_reject(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("not allowed")
+        || lower.contains("forbidden")
+        || lower.contains("denied")
+        || lower.contains("unauthorized")
+        || lower.contains("offline")
+}
+
+/// After offer, a lost ICE/DTLS session should not tear down JPEG stills
+/// that have not been replaced by H.264.
+pub fn webrtc_loss_keeps_jpeg(saw_h264_frame: bool) -> bool {
+    !saw_h264_frame
 }
 
 pub fn asks_for_totp(message: &str) -> bool {
@@ -567,9 +596,11 @@ mod tests {
         let buttons = card_buttons(true, Some(false), full);
         let labels: Vec<_> = buttons.iter().map(|b| b.label).collect();
         assert_eq!(labels, ["Terminal", "Files"]);
-        assert!(!labels
-            .iter()
-            .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop")));
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.contains("View") || l.contains("Control") || l.contains("Desktop"))
+        );
     }
 
     #[test]
@@ -632,6 +663,17 @@ mod tests {
         assert_eq!(connection_label("via STUN srflx"), "stun");
         assert_eq!(connection_label("TURN udp"), "turn");
         assert_eq!(connection_label("quic"), "quic");
+        assert_eq!(connection_label("tailscale"), "tailscale");
+        assert_eq!(connection_label("connecting"), "connecting");
+        assert_eq!(
+            connection_path_hint("jpeg", "relay"),
+            "JPEG stills over the WebSocket relay — not WebRTC P2P"
+        );
+        assert!(webrtc_connect_is_hard_reject("not allowed: missing grant"));
+        assert!(webrtc_connect_is_hard_reject("node offline"));
+        assert!(!webrtc_connect_is_hard_reject("ICE failed to gather"));
+        assert!(webrtc_loss_keeps_jpeg(false));
+        assert!(!webrtc_loss_keeps_jpeg(true));
     }
 
     #[test]

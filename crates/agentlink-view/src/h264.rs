@@ -4,11 +4,14 @@
 //! decoder wants Annex-B (start code plus NAL), which is what the desktop
 //! encoders already produce before the payloader splits them.
 
-/// Best media path described by an answer SDP.
+/// Inventory of candidate types found in an answer SDP.
 ///
-/// Host wins over STUN, STUN over TURN. An SDP with no candidates is still
-/// the websocket relay. `quic` is not an ICE type; callers pass it through
-/// from a direct transfer.
+/// This is **not** the media path. A typical ICE answer lists host, srflx,
+/// and relay candidates together; host would always win here even when the
+/// selected pair is TURN. The Controller HUD and `Viewer` path must use
+/// [`classify_selected_path`] on the selected ICE pair (or `relay` for
+/// JPEG stills over the WebSocket). `quic` is not an ICE type; callers
+/// pass it through from a direct file/exec transfer.
 pub fn classify_media_path(sdp: &str) -> &'static str {
     let mut host = false;
     let mut stun = false;
@@ -37,6 +40,153 @@ pub fn classify_media_path(sdp: &str) -> &'static str {
         "turn"
     } else {
         "relay"
+    }
+}
+
+/// Path token for a *selected* ICE candidate pair (`host`, `stun`, `turn`,
+/// `tailscale`, or `unknown`).
+///
+/// TURN (`typ relay`) always wins: media then goes through a TURN server,
+/// not a direct peer path. STUN (`typ srflx`/`prflx`) is NAT-assisted
+/// WebRTC, not a Tailscale tunnel. `typ host` addresses in 100.64.0.0/10
+/// or `fd7a:115c:a1e0::/48` are labeled `tailscale` (Tailscale's CGNAT /
+/// ULA ranges; see Tailscale KB 1015). That is an overlay, not public NAT
+/// traversal, and is not unique to Tailscale for IPv4 CGNAT.
+pub fn classify_selected_path(
+    local_typ: &str,
+    remote_typ: &str,
+    local_ip: &str,
+    remote_ip: &str,
+) -> &'static str {
+    let local_typ = typ_token(local_typ);
+    let remote_typ = typ_token(remote_typ);
+    if local_typ == "relay" || remote_typ == "relay" {
+        return "turn";
+    }
+    if matches!(local_typ, "srflx" | "prflx") || matches!(remote_typ, "srflx" | "prflx") {
+        return "stun";
+    }
+    if local_typ == "host" || remote_typ == "host" {
+        if is_tailscale_range(local_ip) || is_tailscale_range(remote_ip) {
+            return "tailscale";
+        }
+        return "host";
+    }
+    "unknown"
+}
+
+fn typ_token(raw: &str) -> &str {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.contains("relay") {
+        "relay"
+    } else if lower.contains("srflx") {
+        "srflx"
+    } else if lower.contains("prflx") {
+        "prflx"
+    } else if lower.contains("host") {
+        "host"
+    } else {
+        raw.trim()
+    }
+}
+
+/// Address class for a selected-pair IP (no port).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddrScope {
+    Loopback,
+    PrivateLan,
+    /// 100.64.0.0/10 (RFC 6598) or Tailscale IPv6 ULA fd7a:115c:a1e0::/48.
+    CgnatTailscale,
+    Public,
+    Other,
+}
+
+/// Classify a literal IP (IPv4 or IPv6). Ports and brackets are stripped.
+pub fn addr_scope(ip: &str) -> AddrScope {
+    let host = strip_host(ip);
+    let Ok(addr) = host.parse::<std::net::IpAddr>() else {
+        return AddrScope::Other;
+    };
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                AddrScope::Loopback
+            } else if is_cgnat(v4) {
+                AddrScope::CgnatTailscale
+            } else if v4.is_private() || v4.is_link_local() {
+                AddrScope::PrivateLan
+            } else if v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() {
+                AddrScope::Other
+            } else {
+                AddrScope::Public
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                AddrScope::Loopback
+            } else if is_tailscale_ula(v6) {
+                AddrScope::CgnatTailscale
+            } else if v6.is_unique_local() || v6.is_unicast_link_local() {
+                AddrScope::PrivateLan
+            } else if v6.is_unspecified() || v6.is_multicast() {
+                AddrScope::Other
+            } else {
+                AddrScope::Public
+            }
+        }
+    }
+}
+
+pub fn is_tailscale_range(ip: &str) -> bool {
+    addr_scope(ip) == AddrScope::CgnatTailscale
+}
+
+fn strip_host(raw: &str) -> &str {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // IPv4 host:port (not IPv6)
+    if raw.chars().filter(|c| *c == ':').count() == 1 {
+        return raw.rsplit_once(':').map(|(h, _)| h).unwrap_or(raw);
+    }
+    raw
+}
+
+fn is_cgnat(addr: std::net::Ipv4Addr) -> bool {
+    // RFC 6598 shared address space, also used by Tailscale (KB 1015).
+    let o = addr.octets();
+    o[0] == 100 && (o[1] & 0xc0) == 64
+}
+
+fn is_tailscale_ula(addr: std::net::Ipv6Addr) -> bool {
+    // Tailscale IPv6 unique-local prefix fd7a:115c:a1e0::/48 (KB 1015 / 1033).
+    let s = addr.segments();
+    s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+}
+
+/// Short explanation for the HUD. Distinguishes WebSocket JPEG, TURN, STUN,
+/// LAN host, and a Tailscale/CGNAT host overlay.
+pub fn media_path_hint(kind: &str, path: &str) -> &'static str {
+    let kind = kind.trim().to_ascii_lowercase();
+    let path = path.trim().to_ascii_lowercase();
+    if kind == "jpeg" || (kind.is_empty() && path == "relay") {
+        return "JPEG stills over the WebSocket relay — not WebRTC P2P";
+    }
+    match path.as_str() {
+        "host" => {
+            "WebRTC ICE typ host on a loopback or private address — same machine or LAN, not public NAT traversal"
+        }
+        "stun" => "WebRTC ICE typ srflx/prflx — STUN-assisted path, not a Tailscale tunnel",
+        "turn" => "WebRTC media through a TURN relay — not a direct P2P path",
+        "tailscale" => {
+            "WebRTC typ host in 100.64.0.0/10 or fd7a:115c:a1e0::/48 (Tailscale/CGNAT range) — overlay, not public NAT traversal"
+        }
+        "relay" => "WebSocket relay — not WebRTC P2P",
+        "quic" => "Direct QUIC used for file/exec, not the desktop video path",
+        "connecting" => "WebRTC is still connecting; this is not a confirmed path",
+        "unknown" => "H.264 arrived before a selected ICE pair was observed",
+        _ => "Path is taken from the selected ICE pair, not from gathered SDP candidates",
     }
 }
 
@@ -71,11 +221,7 @@ impl H264Depacketizer {
                 self.nals.push(payload.to_vec());
             }
         }
-        if marker {
-            self.finish()
-        } else {
-            None
-        }
+        if marker { self.finish() } else { None }
     }
 
     fn stap_a(&mut self, payload: &[u8]) {
@@ -316,6 +462,52 @@ mod tests {
             ),
             "host"
         );
+    }
+
+    #[test]
+    fn selected_pair_not_the_sdp_inventory() {
+        // Inventory still prefers host when both typ host and typ relay
+        // appear. The selected pair must not inherit that preference.
+        let sdp = "a=candidate:1 1 UDP 1 10.0.0.2 9 typ host\r\na=candidate:2 1 UDP 1 198.51.100.8 9 typ relay";
+        assert_eq!(classify_media_path(sdp), "host");
+        assert_eq!(
+            classify_selected_path("host", "relay", "10.0.0.2", "198.51.100.8"),
+            "turn"
+        );
+        assert_eq!(
+            classify_selected_path("typ host", "typ srflx", "10.0.0.2", "203.0.113.5"),
+            "stun"
+        );
+        assert_eq!(
+            classify_selected_path("host", "host", "127.0.0.1", "127.0.0.1"),
+            "host"
+        );
+        assert_eq!(
+            classify_selected_path("host", "host", "100.64.1.2", "100.64.1.3"),
+            "tailscale"
+        );
+        assert_eq!(
+            classify_selected_path("host", "host", "192.168.1.12", "100.65.0.4"),
+            "tailscale"
+        );
+        assert_eq!(
+            classify_selected_path("host", "host", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2"),
+            "tailscale"
+        );
+        assert_eq!(addr_scope("127.0.0.1:9"), AddrScope::Loopback);
+        assert_eq!(addr_scope("192.168.1.12"), AddrScope::PrivateLan);
+        assert_eq!(addr_scope("10.0.0.2"), AddrScope::PrivateLan);
+        assert_eq!(addr_scope("100.64.0.1"), AddrScope::CgnatTailscale);
+        assert_eq!(addr_scope("203.0.113.5"), AddrScope::Public);
+        assert_eq!(
+            media_path_hint("jpeg", "relay"),
+            "JPEG stills over the WebSocket relay — not WebRTC P2P"
+        );
+        assert!(
+            !media_path_hint("h264", "host").contains("P2P")
+                || media_path_hint("h264", "host").contains("LAN")
+        );
+        assert!(media_path_hint("h264", "turn").contains("not a direct P2P"));
     }
 
     #[test]

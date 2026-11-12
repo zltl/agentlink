@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use agentlink_core::{NodeExtension, NodePolicy};
 use agentlink_desktop::{ConsentMode, Desktop, StreamHandler, StreamSettings};
-use agentlink_view::{access_unit_is_idr, LiveOptions, Signal, Viewer};
+use agentlink_view::{LiveOptions, Signal, Viewer, access_unit_is_idr};
 use serde_json::Value;
 
 struct NodeSignal {
@@ -70,6 +70,56 @@ fn mock_desktop_delivers_an_idr_and_a_mouse() {
         audits.lock().unwrap_or_else(|err| err.into_inner())
     );
 
+    // Selected ICE pair, not the answer SDP inventory. This is a
+    // single-machine loopback; typ host here is not public NAT traversal.
+    let path_deadline = Instant::now() + Duration::from_secs(5);
+    let mut snap = viewer.transport();
+    while snap.is_none() && Instant::now() < path_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        snap = viewer.transport();
+    }
+    let snap = snap.expect("selected ICE pair was not observed after an IDR");
+    eprintln!(
+        "agentlink live-path loopback: path={} local={} {} remote={} {} proto={} inventory={} note={}",
+        snap.path,
+        snap.local_typ,
+        snap.local_addr,
+        snap.remote_typ,
+        snap.remote_addr,
+        snap.protocol,
+        snap.sdp_inventory,
+        snap.note
+    );
+    assert_eq!(
+        snap.path, "host",
+        "loopback media should be typ host, got {snap:?}"
+    );
+    assert_eq!(viewer.info().path, "host");
+    // Inventory is log-only. A host inventory is not itself the media path.
+    assert!(
+        !snap.sdp_inventory.is_empty(),
+        "expected the answer SDP inventory to be recorded, got {snap:?}"
+    );
+    let local_is_loop = snap.local_addr.starts_with("127.")
+        || snap.local_addr.starts_with("[::1]")
+        || snap.local_addr.starts_with("::1");
+    let remote_is_loop = snap.remote_addr.starts_with("127.")
+        || snap.remote_addr.starts_with("[::1]")
+        || snap.remote_addr.starts_with("::1");
+    // Host may also be a private LAN address of this machine.
+    assert!(
+        local_is_loop
+            || remote_is_loop
+            || snap.note.contains("loopback")
+            || snap.note.contains("private")
+            || snap.note.contains("LAN"),
+        "expected loopback/LAN note, got {snap:?}"
+    );
+    assert_ne!(
+        snap.path, "relay",
+        "must not label a host ICE pair as relay"
+    );
+
     let input_deadline = Instant::now() + Duration::from_secs(5);
     let mut sent = false;
     while Instant::now() < input_deadline {
@@ -108,5 +158,63 @@ fn mock_desktop_delivers_an_idr_and_a_mouse() {
     assert!(
         actions.iter().any(|action| action == "stream_stop"),
         "stream_stop missing: {actions:?}"
+    );
+}
+
+struct DenySignal;
+
+impl Signal for DenySignal {
+    fn signal(&self, _payload: &Value) -> Result<Value, String> {
+        Err("not allowed: missing grant".into())
+    }
+}
+
+struct ScreenshotFallbackSignal;
+
+impl Signal for ScreenshotFallbackSignal {
+    fn signal(&self, _payload: &Value) -> Result<Value, String> {
+        Ok(serde_json::json!({
+            "status": "unavailable",
+            "fallback": "screenshot"
+        }))
+    }
+}
+
+#[test]
+fn webrtc_offer_without_a_grant_is_rejected() {
+    let err = match Viewer::connect(
+        Arc::new(DenySignal),
+        LiveOptions {
+            viewer: "desktop".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("missing grant must not open a live session"),
+        Err(err) => err,
+    };
+    let lower = err.to_ascii_lowercase();
+    assert!(
+        lower.contains("not allowed") || lower.contains("grant"),
+        "unexpected reject: {err}"
+    );
+}
+
+#[test]
+fn screenshot_fallback_does_not_look_like_p2p() {
+    let err = match Viewer::connect(
+        Arc::new(ScreenshotFallbackSignal),
+        LiveOptions {
+            viewer: "desktop".into(),
+            control: false,
+            ..LiveOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("screenshot fallback must not return a Viewer"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("fallback screenshot") || err.contains("live video is not available"),
+        "unexpected fallback: {err}"
     );
 }
