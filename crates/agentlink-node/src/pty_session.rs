@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::audit::{self, Origin};
@@ -29,12 +29,25 @@ struct LivePty {
     grant_exp_unix: Option<i64>,
 }
 
+pub type PtyGrantHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct PtyManager {
     sessions: Arc<Mutex<HashMap<String, LivePty>>>,
+    grant_active: Arc<RwLock<Option<PtyGrantHook>>>,
 }
 
 impl PtyManager {
+    pub fn set_grant_active(&self, hook: Option<PtyGrantHook>) {
+        if let Ok(mut slot) = self.grant_active.write() {
+            *slot = hook;
+        }
+    }
+
+    fn grant_hook(&self) -> Option<PtyGrantHook> {
+        self.grant_active.read().ok().and_then(|guard| guard.clone())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn open(
         &self,
@@ -156,6 +169,16 @@ impl PtyManager {
             return Err(err);
         }
 
+        // Re-check after the session is visible: a revoke that landed during
+        // spawn must still close it.
+        if let Err(err) = self.check_session(&session_id, Some(&owner_peer)) {
+            self.close(&session_id, None).ok();
+            tokio::task::spawn_blocking(move || {
+                let _ = child.wait();
+            });
+            return Err(err);
+        }
+
         let request_id = resp.request_id.clone();
         let resp_reader = resp.clone();
         let transcript = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -244,7 +267,7 @@ impl PtyManager {
             let live = sessions
                 .get(session_id)
                 .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
-            require_pty_access(live, Some(peer))?;
+            require_pty_access(live, Some(peer), self.grant_hook().as_deref())?;
             live.writer.clone()
         };
         let mut guard = writer
@@ -264,7 +287,7 @@ impl PtyManager {
             let live = sessions
                 .get(session_id)
                 .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
-            require_pty_access(live, Some(peer))?;
+            require_pty_access(live, Some(peer), self.grant_hook().as_deref())?;
             live.master.clone()
         };
         let guard = master
@@ -288,7 +311,9 @@ impl PtyManager {
                 .lock()
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
             if let Some(existing) = sessions.get(session_id) {
-                require_pty_access(existing, peer)?;
+                // Owner may tear down after expiry or revoke; those states
+                // still deny write/resize. A mismatched peer cannot close.
+                require_pty_owner(&existing.owner_peer, peer)?;
             }
             sessions.remove(session_id)
         };
@@ -347,6 +372,43 @@ impl PtyManager {
         n
     }
 
+    fn check_session(&self, session_id: &str, peer: Option<&str>) -> Result<()> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Error::Message("pty map poisoned".into()))?;
+        let live = sessions
+            .get(session_id)
+            .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
+        require_pty_access(live, peer, self.grant_hook().as_deref())
+    }
+
+    /// Close sessions whose stored grant is revoked or expired, without
+    /// consulting an inflight-RPC index.
+    pub fn close_inactive(&self, revoked: &std::collections::BTreeSet<String>) -> usize {
+        let hook = self.grant_hook();
+        let now = agentlink_core::util::unix_now();
+        let victims = {
+            let mut sessions = match self.sessions.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let ids: Vec<String> = sessions
+                .iter()
+                .filter(|(_, live)| pty_session_inactive(live, revoked, hook.as_deref(), now))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| sessions.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let n = victims.len();
+        for mut live in victims {
+            live.killer.kill().ok();
+        }
+        n
+    }
+
     pub fn close_all(&self) {
         let sessions = match self.sessions.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
@@ -358,11 +420,64 @@ impl PtyManager {
     }
 }
 
-fn require_pty_access(live: &LivePty, peer: Option<&str>) -> Result<()> {
-    pty_access_error(&live.owner_peer, live.grant_exp_unix, peer)
+fn require_pty_owner(owner_peer: &str, peer: Option<&str>) -> Result<()> {
+    if let Some(peer) = peer {
+        if owner_peer != peer {
+            return Err(Error::NotFound(
+                "pty session not found for this peer".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
-fn pty_access_error(owner_peer: &str, grant_exp_unix: Option<i64>, peer: Option<&str>) -> Result<()> {
+fn require_pty_access(
+    live: &LivePty,
+    peer: Option<&str>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+) -> Result<()> {
+    require_pty_owner(&live.owner_peer, peer)?;
+    pty_access_error(
+        &live.owner_peer,
+        &live.grant_jti,
+        live.grant_exp_unix,
+        None, // owner already checked
+        hook,
+    )
+}
+
+fn pty_session_inactive(
+    live: &LivePty,
+    revoked: &std::collections::BTreeSet<String>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    now: i64,
+) -> bool {
+    if live.grant_exp_unix.is_some_and(|exp| now >= exp) {
+        return true;
+    }
+    let jti = live.grant_jti.trim();
+    if !jti.is_empty()
+        && revoked
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(jti))
+    {
+        return true;
+    }
+    if let Some(hook) = hook {
+        if jti.is_empty() || !hook(jti) {
+            return true;
+        }
+    }
+    false
+}
+
+fn pty_access_error(
+    owner_peer: &str,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
+    peer: Option<&str>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+) -> Result<()> {
     if let Some(peer) = peer {
         if owner_peer != peer {
             return Err(Error::NotFound(
@@ -373,6 +488,15 @@ fn pty_access_error(owner_peer: &str, grant_exp_unix: Option<i64>, peer: Option<
     if let Some(exp) = grant_exp_unix {
         if agentlink_core::util::unix_now() >= exp {
             return Err(Error::Auth("grant expired".into()));
+        }
+    }
+    if let Some(hook) = hook {
+        let jti = grant_jti.trim();
+        if jti.is_empty() {
+            return Err(Error::Auth("grant is required".into()));
+        }
+        if !hook(jti) {
+            return Err(Error::Auth("grant was revoked".into()));
         }
     }
     Ok(())
@@ -500,16 +624,103 @@ mod tests {
 
     #[test]
     fn alice_cannot_access_bobs_pty_record() {
-        let err = pty_access_error("bob", None, Some("alice")).unwrap_err();
+        let err = pty_access_error("bob", "jti-b", None, Some("alice"), None).unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
-        pty_access_error("bob", None, Some("bob")).unwrap();
-        pty_access_error("bob", None, None).unwrap();
+        pty_access_error("bob", "jti-b", None, Some("bob"), None).unwrap();
+        pty_access_error("bob", "jti-b", None, None, None).unwrap();
         let err = pty_access_error(
             "bob",
+            "jti-b",
             Some(agentlink_core::util::unix_now() - 5),
             Some("bob"),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("expired"), "{err}");
+        let hook = |jti: &str| jti != "revoked";
+        let err = pty_access_error("bob", "revoked", None, Some("bob"), Some(&hook)).unwrap_err();
+        assert!(err.to_string().contains("revoked"), "{err}");
+        pty_access_error("bob", "still-good", None, Some("bob"), Some(&hook)).unwrap();
+    }
+
+    fn test_responder() -> (crate::ops::Responder, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = crate::ops::Responder {
+            socket: std::sync::Arc::new(crate::resume::SocketSlot::default()),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            seal: None,
+            extra: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::pipeline::AuditExtra::default(),
+            )),
+            log: std::sync::Arc::new(crate::resume::ReplayLog::default()),
+        };
+        (resp, dir)
+    }
+
+    #[tokio::test]
+    async fn real_pty_entry_enforces_owner_and_revoked_grant() {
+        let mgr = PtyManager::default();
+        mgr.set_grant_active(Some(std::sync::Arc::new(|jti: &str| jti != "revoked")));
+        let (resp, dir) = test_responder();
+        let service = crate::pipeline::AuditService::open_quiet(dir.path(), "node", "box");
+        let origin = crate::audit::Origin {
+            path: dir.path().join("audit.log"),
+            node: "box".into(),
+            node_id: "node".into(),
+        };
+        let bob = mgr
+            .open(
+                Some("cat".into()),
+                None,
+                24,
+                80,
+                resp,
+                origin,
+                Some("bob".into()),
+                service,
+                "bob",
+                "jti-bob",
+                None,
+            )
+            .await
+            .expect("bob open");
+        assert!(uuid::Uuid::parse_str(&bob).is_ok(), "{bob}");
+        let err = mgr.write(&bob, b"x", "alice").unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        mgr.write(&bob, b"from-bob\n", "bob").expect("owner write");
+        mgr.resize(&bob, 30, 100, "bob").expect("owner resize");
+        let err = mgr.resize(&bob, 30, 100, "alice").unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+
+        let (resp2, dir2) = test_responder();
+        let service2 = crate::pipeline::AuditService::open_quiet(dir2.path(), "node", "box");
+        let origin2 = crate::audit::Origin {
+            path: dir2.path().join("audit.log"),
+            node: "box".into(),
+            node_id: "node".into(),
+        };
+        let revoked = mgr
+            .open(
+                Some("cat".into()),
+                None,
+                24,
+                80,
+                resp2,
+                origin2,
+                Some("bob".into()),
+                service2,
+                "bob",
+                "revoked",
+                None,
+            )
+            .await;
+        assert!(revoked.is_err(), "open must re-check a revoked grant");
+
+        // A session that becomes revoked after open is closed by metadata sweep.
+        let mut revoked_set = std::collections::BTreeSet::new();
+        revoked_set.insert("jti-bob".into());
+        assert_eq!(mgr.close_inactive(&revoked_set), 1);
+        let err = mgr.write(&bob, b"x", "bob").unwrap_err();
+        assert!(err.to_string().contains("not found") || err.to_string().contains("pty session"), "{err}");
     }
 }

@@ -416,7 +416,7 @@ pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: O
                     ctx.grant_exp_unix,
                 );
             }
-            extension_op(&resp, ctx.extensions, &name, &payload, ctx.client_id)
+            extension_op(&resp, ctx.extensions, &name, &payload, ctx.peer_id)
                 .await
                 .map(|()| already(Outcome::ok(Value::Null)))
         }
@@ -2317,5 +2317,94 @@ mod tests {
         assert!(extra.before.is_none(), "over-cap file must not be read");
         assert!(extra.after.is_none(), "over-cap file must be filtered");
         assert_eq!(fs::metadata(&path).unwrap().len(), (MAX_WRITE + 1) as u64);
+    }
+
+    struct RecordingExt {
+        peer: std::sync::Mutex<Option<String>>,
+        payload_client_id: std::sync::Mutex<Option<String>>,
+    }
+
+    impl agentlink_core::NodeExtension for RecordingExt {
+        fn name(&self) -> &'static str {
+            agentlink_core::PHASE3_WEBRTC_SIGNAL
+        }
+        fn handle(&self, payload: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+            self.handle_peer(payload, "")
+        }
+        fn handle_peer(
+            &self,
+            payload: &serde_json::Value,
+            peer: &str,
+        ) -> std::result::Result<serde_json::Value, String> {
+            *self.peer.lock().unwrap() = Some(peer.to_string());
+            *self.payload_client_id.lock().unwrap() = payload
+                .get("client_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if payload.get("action").and_then(serde_json::Value::as_str) == Some("keyframe") {
+                if peer != "alice" {
+                    // The production handler would also deny; record the peer
+                    // and reject so the test proves dispatch used seal.peer.
+                }
+            }
+            Ok(serde_json::json!({"peer": peer}))
+        }
+    }
+
+    #[tokio::test]
+    async fn webrtc_extension_uses_seal_peer_not_inner_client_id() {
+        let ext = Arc::new(RecordingExt {
+            peer: std::sync::Mutex::new(None),
+            payload_client_id: std::sync::Mutex::new(None),
+        });
+        let extensions: Vec<Arc<dyn agentlink_core::NodeExtension>> = vec![ext.clone()];
+        let pty = crate::pty_session::PtyManager::default();
+        let procs = crate::proc::ProcManager::new();
+        let watches = crate::watch::WatchManager::default();
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::pipeline::AuditService::open_quiet(dir.path(), "node", "box");
+        let commands = agentlink_core::sandbox::CommandPolicy::baseline();
+        let resp = test_responder();
+        let session = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::json!({
+            "action": "keyframe",
+            "session_id": session,
+            "client_id": "bob",
+        });
+        let ctx = OpContext {
+            root: None,
+            policy: agentlink_core::NodePolicy::full(),
+            extensions: &extensions,
+            pty: &pty,
+            procs: &procs,
+            watches: &watches,
+            audit_path: dir.path(),
+            client_id: "bob", // forged inner / outer client_id
+            node_name: "box",
+            node_id: "node",
+            commands: &commands,
+            audit,
+            user: None,
+            device_id: None,
+            peer_id: "alice",
+            grant_jti: Some("jti-alice"),
+            grant_exp_unix: None,
+        };
+        dispatch(
+            Op::Extension {
+                name: agentlink_core::PHASE3_WEBRTC_SIGNAL.to_string(),
+                payload,
+            },
+            resp,
+            CancellationToken::new(),
+            ctx,
+        )
+        .await;
+        assert_eq!(ext.peer.lock().unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            ext.payload_client_id.lock().unwrap().as_deref(),
+            Some("bob"),
+            "forged client_id may still ride in the payload; the handler peer must be the seal identity"
+        );
     }
 }

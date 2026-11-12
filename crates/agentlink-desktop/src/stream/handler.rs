@@ -143,6 +143,30 @@ impl StreamHandler {
             .unwrap_or(0)
     }
 
+    pub fn close_inactive_sessions(&self) -> usize {
+        let Ok(sessions) = self.sessions() else {
+            return 0;
+        };
+        let Ok(handle) = self.runtime_handle() else {
+            return 0;
+        };
+        std::thread::spawn(move || handle.block_on(sessions.close_inactive_sessions()))
+            .join()
+            .unwrap_or(0)
+    }
+
+    pub fn close_all_sessions(&self) -> usize {
+        let Ok(sessions) = self.sessions() else {
+            return 0;
+        };
+        let Ok(handle) = self.runtime_handle() else {
+            return 0;
+        };
+        std::thread::spawn(move || handle.block_on(sessions.close_all_sessions()))
+            .join()
+            .unwrap_or(0)
+    }
+
     pub fn set_policy(&self, policy: NodePolicy) {
         if let Ok(mut slot) = self.shared.policy.write() {
             *slot = policy;
@@ -248,6 +272,20 @@ pub fn close_streams_for_jti(extensions: &[Arc<dyn NodeExtension>], jti: &str) -
 pub fn close_expired_streams(extensions: &[Arc<dyn NodeExtension>]) -> usize {
     find(extensions)
         .map(|handler| handler.close_expired_sessions())
+        .unwrap_or(0)
+}
+
+/// Close live media sessions whose stored grant metadata is revoked or expired.
+pub fn close_inactive_streams(extensions: &[Arc<dyn NodeExtension>]) -> usize {
+    find(extensions)
+        .map(|handler| handler.close_inactive_sessions())
+        .unwrap_or(0)
+}
+
+/// Close every live media session (relay disconnect / node shutdown).
+pub fn close_all_streams(extensions: &[Arc<dyn NodeExtension>]) -> usize {
+    find(extensions)
+        .map(|handler| handler.close_all_sessions())
         .unwrap_or(0)
 }
 

@@ -396,6 +396,44 @@ impl SessionManager {
         n
     }
 
+    /// Walk live sessions by stored grant metadata (jti/expiry + hook), not
+    /// by an inflight-RPC index. Revoking one jti leaves other grants up.
+    pub async fn close_inactive_sessions(&self) -> usize {
+        let ids: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions
+                .iter()
+                .filter(|session| {
+                    session_grant_error(&self.shared, session, &session.peer_id).is_some()
+                })
+                .map(|session| session.id.clone())
+                .collect()
+        };
+        let n = ids.len();
+        for id in ids {
+            let _ = self
+                .close_owned(&json!({"session_id": id}), None)
+                .await;
+        }
+        n
+    }
+
+    /// Stop every live media session. Used when the relay link drops so a
+    /// media pump cannot outlive the node session.
+    pub async fn close_all_sessions(&self) -> usize {
+        let ids: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.iter().map(|session| session.id.clone()).collect()
+        };
+        let n = ids.len();
+        for id in ids {
+            let _ = self
+                .close_owned(&json!({"session_id": id}), None)
+                .await;
+        }
+        n
+    }
+
     fn list_monitors(&self) -> std::result::Result<Value, String> {
         let monitors = self
             .desktop
@@ -426,7 +464,7 @@ impl SessionManager {
             .shared
             .policy
             .read()
-            .unwrap_or_else(|err| err.into_inner());
+            .map_err(|_| "node policy is unavailable".to_string())?;
         if !policy.allows_remote_view() {
             return Err("remote_view is not allowed on this node".into());
         }
@@ -531,6 +569,19 @@ impl SessionManager {
                 grant_jti: payload_grant_jti(payload),
                 grant_exp_unix: payload_grant_exp(payload),
             });
+        // Re-check after insert: a revoke/expiry that landed while the answer
+        // was being built must still tear the session down.
+        if let Some(err) = grant_still_active(
+            &self.shared,
+            &payload_grant_jti(payload),
+            payload_grant_exp(payload),
+            peer,
+        ) {
+            let _ = self
+                .close_owned(&json!({"session_id": built.answer["session_id"]}), None)
+                .await;
+            return Err(err);
+        }
         let _ = self.started_cleanup();
         Ok(built.answer)
     }
@@ -882,6 +933,12 @@ impl SessionManager {
     }
 }
 
+/// Production stream session id. Always a random UUID v4, never a peer
+/// name, timestamp, or client-supplied request id.
+pub(crate) fn new_stream_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 async fn build_answer(
     desktop: Arc<Desktop>,
     shared: Arc<StreamShared>,
@@ -958,7 +1015,7 @@ async fn build_answer(
         .get("audio")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = new_stream_session_id();
     let _ = (peer_id, &SESSION_SEQ);
 
     // Target encode size from the (possibly capped) scale. Capture-side
@@ -1926,9 +1983,13 @@ impl PeerConnectionEventHandler for Handler {
         let grant_jti = self.grant_jti.clone();
         let grant_exp_unix = self.grant_exp_unix;
         let aimd = self.aimd.clone();
+        let stop = self.stop.clone();
         let input = label == "input" || label.is_empty();
         tokio::spawn(async move {
             loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 match channel.poll().await {
                     Some(DataChannelEvent::OnMessage(message)) => {
                         if !input {
@@ -1948,6 +2009,7 @@ impl PeerConnectionEventHandler for Handler {
                             &grant_jti,
                             grant_exp_unix,
                             &aimd,
+                            &stop,
                         )
                         .await;
                     }
@@ -1972,11 +2034,17 @@ async fn handle_input(
     grant_jti: &str,
     grant_exp_unix: Option<i64>,
     aimd: &AimdState,
+    stop: &AtomicBool,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
     };
-    if let Some(_err) = grant_still_active(shared, grant_jti, grant_exp_unix, peer) {
+    if let Some(err) = grant_still_active(shared, grant_jti, grant_exp_unix, peer) {
+        // Same teardown as a revoked/expired signaling call: stop the media
+        // pump, do not leave the datachannel reject as a no-op.
+        stop.store(true, Ordering::Relaxed);
+        let body = json!({"type": "error", "error": err}).to_string();
+        let _ = channel.send_text(&body).await;
         return;
     }
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -2885,11 +2953,93 @@ mod tests {
     }
 
     #[test]
-    fn new_stream_session_ids_are_uuids_not_peer_timestamps() {
-        let a = uuid::Uuid::new_v4().to_string();
-        let b = uuid::Uuid::new_v4().to_string();
+    fn production_stream_session_ids_are_uuid_v4_and_not_peer_derived() {
+        let a = super::new_stream_session_id();
+        let b = super::new_stream_session_id();
         assert_ne!(a, b);
-        assert!(uuid::Uuid::parse_str(&a).is_ok());
-        assert!(!a.contains("alice"), "session id must not embed the peer");
+        let parsed = uuid::Uuid::parse_str(&a).expect("production id must be a uuid");
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+        assert!(!a.contains("alice") && !a.contains("bob"));
+    }
+
+    #[test]
+    fn handler_rejects_forged_client_id_even_when_the_session_uuid_is_known() {
+        let mgr = test_manager();
+        let session_id = super::new_stream_session_id();
+        mgr.sessions.lock().unwrap().push(dummy_session(
+            &session_id,
+            "bob",
+            "jti-bob",
+            None,
+        ));
+        // Alice knows Bob's session UUID and presents Bob's client_id as the
+        // caller. The handler peer is the seal identity, not that field.
+        let err = mgr
+            .keyframe("alice", &json!({"session_id": session_id, "client_id": "bob"}))
+            .unwrap_err();
+        assert!(err.contains("unknown stream session"), "{err}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(mgr.close("alice", &json!({"session_id": session_id, "client_id": "bob"})))
+            .unwrap_err();
+        assert!(err.contains("unknown stream session"), "{err}");
+        let sessions = mgr.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+        assert!(!sessions[0].stop.load(Ordering::Relaxed));
+        drop(sessions);
+        mgr.keyframe("bob", &json!({"session_id": session_id}))
+            .expect("owner must still be able to keyframe");
+    }
+
+    #[test]
+    fn inactive_sweep_uses_session_grant_metadata_not_an_rpc_index() {
+        let mgr = test_manager();
+        {
+            let mut hook = mgr.shared.grant_active.write().unwrap();
+            *hook = Some(Arc::new(|jti: &str, _peer: &str| jti != "revoked"));
+        }
+        let revoked_id = super::new_stream_session_id();
+        let ok_id = super::new_stream_session_id();
+        mgr.sessions.lock().unwrap().extend([
+            dummy_session(&revoked_id, "alice", "revoked", None),
+            dummy_session(&ok_id, "alice", "still-good", None),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // No prior keyframe / grant_sessions entry: the sweep must still see
+        // the stored jti on the live session.
+        let closed = runtime.block_on(mgr.close_inactive_sessions());
+        assert_eq!(closed, 1);
+        let left: Vec<_> = mgr
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(left, vec![ok_id.clone()]);
+        mgr.keyframe("alice", &json!({"session_id": ok_id}))
+            .expect("surviving grant must still keyframe");
+    }
+
+    #[test]
+    fn close_all_sessions_stops_media_when_the_relay_drops() {
+        let mgr = test_manager();
+        mgr.sessions.lock().unwrap().extend([
+            dummy_session("a", "alice", "jti-a", None),
+            dummy_session("b", "bob", "jti-b", None),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(mgr.close_all_sessions()), 2);
+        assert!(mgr.sessions.lock().unwrap().is_empty());
     }
 }

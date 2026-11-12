@@ -183,6 +183,18 @@ pub async fn serve_node(
         revoked_jtis: RwLock::new(revoked_jtis),
         node_id: node_id.clone(),
     };
+    {
+        let dir = live.data_dir.clone();
+        live.shells
+            .set_grant_active(Some(std::sync::Arc::new(move |jti: &str| {
+                match agentlink_core::grant::load_revoked_jtis(&dir) {
+                    Ok(revoked) => !revoked
+                        .iter()
+                        .any(|item| item.trim().eq_ignore_ascii_case(jti.trim())),
+                    Err(_) => false,
+                }
+            })));
+    }
     publish(
         &host,
         &io,
@@ -423,6 +435,7 @@ async fn connect_once(
     let (sink, mut stream) = ws.split();
     let (tx, rx) = mpsc::channel(256);
     let generation = live.socket.attach(tx.clone());
+    spawn_grant_watch(live, generation);
     let writer = ws::WriterTask::spawn(sink, rx, shutdown.clone());
     let dead_after = ws::silence_limit(heartbeat_secs);
     let ping_tx = tx.clone();
@@ -695,7 +708,16 @@ async fn handle_env(
             };
             let grantee = seal_ref.peer.clone();
             let _relay_says = (&client_id, relay_admin, relay_grant);
-            let ceiling = policy.read().map(|g| *g).unwrap_or(config.ceiling);
+            let ceiling = match live_policy(policy) {
+                Ok(policy) => policy,
+                Err(err) => {
+                    let deny = Envelope::result_err(request_id.clone(), err.to_string());
+                    if let Ok(out) = ws::encode(&deny) {
+                        let _ = tx.send(out).await;
+                    }
+                    return;
+                }
+            };
             let owner_keys = live.current_owner_keys();
             let revoked_jtis = live.current_revoked_jtis();
             let policy_now = match agentlink_core::grant::resolve_e2e_policy(
@@ -727,9 +749,23 @@ async fn handle_env(
             let shells = live.shells.clone();
             let tools = tools.clone();
             let audit_hub = audit_hub.clone();
+            let grant_jti = authz.as_ref().map(|g| g.jti.clone()).unwrap_or_default();
+            let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
+            let peer = grantee.clone();
             tokio::spawn(async move {
                 dispatch(
-                    op, resp, token, policy_now, &paths, &audit_hub, &client_id, &host_cb, &shells,
+                    op,
+                    resp,
+                    token,
+                    policy_now,
+                    &paths,
+                    &audit_hub,
+                    &client_id,
+                    &peer,
+                    &grant_jti,
+                    grant_exp_unix,
+                    &host_cb,
+                    &shells,
                     &tools,
                 )
                 .await;
@@ -769,7 +805,16 @@ async fn handle_env(
             };
             let grantee = seal_ref.peer.clone();
             let _relay_says = (&client_id, relay_admin, relay_grant);
-            let ceiling = policy.read().map(|g| *g).unwrap_or(config.ceiling);
+            let ceiling = match live_policy(policy) {
+                Ok(policy) => policy,
+                Err(err) => {
+                    let deny = Envelope::result_err(request_id, err.to_string());
+                    if let Ok(out) = ws::encode(&deny) {
+                        let _ = tx.send(out).await;
+                    }
+                    return;
+                }
+            };
             let owner_keys = live.current_owner_keys();
             let revoked_jtis = live.current_revoked_jtis();
             if let Err(err) = agentlink_core::grant::resolve_e2e_policy(
@@ -887,6 +932,9 @@ async fn dispatch(
     paths: &PathMap,
     audit_hub: &AuditHub,
     client_id: &str,
+    peer: &str,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
     host: &Arc<dyn NodeHost>,
     shells: &PhonePty,
     tools: &ToolState,
@@ -911,7 +959,20 @@ async fn dispatch(
         return;
     }
     let audit_this = !matches!(op, Op::PtyInput { .. });
-    let result = perform(&op, &resp, &cancel, paths, host, shells, tools, policy).await;
+    let result = perform(
+        &op,
+        &resp,
+        &cancel,
+        paths,
+        host,
+        shells,
+        tools,
+        policy,
+        peer,
+        grant_jti,
+        grant_exp_unix,
+    )
+    .await;
     if audit_this {
         match &result {
             Ok(()) => audit::submit_op(audit_hub, &kind, client_id, &detail, true, None),
@@ -941,6 +1002,9 @@ async fn perform(
     shells: &PhonePty,
     tools: &ToolState,
     policy: NodePolicy,
+    peer: &str,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
 ) -> Result<()> {
     match op {
         Op::Stat { path } => {
@@ -1002,6 +1066,7 @@ async fn perform(
                 *timeout_ms,
                 *shell,
                 stdin_b64.as_deref(),
+                peer,
             )
             .await?;
         }
@@ -1020,6 +1085,9 @@ async fn perform(
                 cwd.as_deref(),
                 *rows,
                 *cols,
+                peer,
+                grant_jti,
+                grant_exp_unix,
             )
             .await?;
         }
@@ -1188,7 +1256,7 @@ async fn perform(
             data_b64,
         } => {
             let data = util::b64_decode(data_b64)?;
-            shells.write(session_id, &data)?;
+            shells.write(session_id, &data, Some(peer))?;
             resp.ok(json!({"bytes": data.len()})).await?;
         }
         Op::PtyResize {
@@ -1196,11 +1264,11 @@ async fn perform(
             rows,
             cols,
         } => {
-            shells.resize(session_id, *rows, *cols)?;
+            shells.resize(session_id, *rows, *cols, Some(peer))?;
             resp.ok(json!({"rows": rows, "cols": cols})).await?;
         }
         Op::PtyClose { session_id } => {
-            shells.close(session_id)?;
+            shells.close(session_id, Some(peer))?;
             resp.ok(json!({"closed": session_id})).await?;
         }
         Op::RevokeGrant { .. } => {
@@ -1210,22 +1278,15 @@ async fn perform(
         }
         Op::Extension { name, payload } => {
             let mut payload = payload.clone();
-            // Overwrite flags from the verified policy. Drop any client
-            // `_grant_*` — this FFI path does not attach a node-verified jti.
-            if name == PHASE3_WEBRTC_SIGNAL {
-                if let Some(obj) = payload.as_object_mut() {
-                    obj.insert(
-                        "_allow_view".to_string(),
-                        json!(policy.allows_remote_view()),
-                    );
-                    obj.insert(
-                        "_allow_control".to_string(),
-                        json!(policy.allows_remote_control()),
-                    );
-                    obj.remove("_grant_jti");
-                    obj.remove("_grant_exp");
-                }
-            }
+            // Overwrite flags and stamp the verified grant. Client-supplied
+            // `_grant_*` cannot raise or replace the node-checked jti/expiry.
+            stamp_verified_grant(
+                name,
+                &mut payload,
+                policy,
+                Some(grant_jti),
+                grant_exp_unix,
+            );
             let body =
                 host::call_unary(host, "extension", json!({"name": name, "payload": payload}))
                     .await?;
@@ -1288,6 +1349,7 @@ async fn run_exec(
     timeout_ms: Option<u64>,
     shell: bool,
     stdin_b64: Option<&str>,
+    peer: &str,
 ) -> Result<()> {
     if program.is_empty() {
         return Err(Error::Message("command is empty".into()));
@@ -1308,6 +1370,7 @@ async fn run_exec(
         "timeout_ms": timeout_ms,
         "shell": shell,
         "stdin_b64": stdin_b64,
+        "_owner_peer": peer,
     });
     let body = open_session(host, "exec", payload).await?;
     let session_id = body
@@ -1327,6 +1390,9 @@ async fn run_pty(
     cwd: Option<&str>,
     rows: u16,
     cols: u16,
+    peer: &str,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
 ) -> Result<()> {
     let rows = rows.max(1);
     let cols = cols.max(1);
@@ -1334,7 +1400,15 @@ async fn run_pty(
         Some(path) if !path.is_empty() => paths::real_target(&paths.roots, path, false)?,
         _ => paths.roots.files.clone(),
     };
-    let session_id = shells.open(command, rows, cols, &dir)?;
+    let session_id = shells.open(
+        command,
+        rows,
+        cols,
+        &dir,
+        peer,
+        grant_jti,
+        grant_exp_unix,
+    )?;
     if let Err(err) = resp
         .ack(json!({
             "session_id": session_id,
@@ -1343,20 +1417,31 @@ async fn run_pty(
         }))
         .await
     {
-        shells.close(&session_id).ok();
+        shells.close(&session_id, None).ok();
+        return Err(err);
+    }
+    // Re-check after the session is visible: a revoke that landed during
+    // spawn must still close it.
+    if let Err(err) = shells.check_session(&session_id, Some(peer)) {
+        shells.close(&session_id, None).ok();
         return Err(err);
     }
     loop {
         if cancel.is_cancelled() {
-            shells.close(&session_id).ok();
+            shells.close(&session_id, None).ok();
             resp.end(None, Some("cancelled".into())).await?;
+            return Ok(());
+        }
+        if let Err(err) = shells.check_session(&session_id, Some(peer)) {
+            shells.close(&session_id, None).ok();
+            resp.end(None, Some(err.to_string())).await?;
             return Ok(());
         }
         match shells.poll(&session_id) {
             PtyPoll::Pending => tokio::time::sleep(Duration::from_millis(20)).await,
             PtyPoll::Chunk(bytes) => resp.chunk("pty", &bytes).await?,
             PtyPoll::Exit(code) => {
-                shells.close(&session_id).ok();
+                shells.close(&session_id, None).ok();
                 resp.end(Some(code), None).await?;
                 return Ok(());
             }
@@ -1478,6 +1563,71 @@ fn publish(
     host.on_status(body);
 }
 
+
+fn live_policy(policy: &RwLock<NodePolicy>) -> Result<NodePolicy> {
+    policy
+        .read()
+        .map(|guard| *guard)
+        .map_err(|_| Error::Message("node policy is unavailable".into()))
+}
+
+fn stamp_verified_grant(
+    name: &str,
+    payload: &mut Value,
+    policy: NodePolicy,
+    grant_jti: Option<&str>,
+    grant_exp_unix: Option<i64>,
+) {
+    if name != PHASE3_WEBRTC_SIGNAL {
+        return;
+    }
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "_allow_view".to_string(),
+        json!(policy.allows_remote_view()),
+    );
+    obj.insert(
+        "_allow_control".to_string(),
+        json!(policy.allows_remote_control()),
+    );
+    obj.remove("_grant_jti");
+    obj.remove("_grant_exp");
+    if let Some(jti) = grant_jti.map(str::trim).filter(|s| !s.is_empty()) {
+        obj.insert("_grant_jti".to_string(), json!(jti));
+    }
+    if let Some(exp) = grant_exp_unix {
+        obj.insert("_grant_exp".to_string(), json!(exp));
+    }
+}
+
+fn spawn_grant_watch(live: &PhoneLive, generation: u64) {
+    let shells = live.shells.clone();
+    let data_dir = live.data_dir.clone();
+    let socket = live.socket.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if socket.generation() != generation {
+                break;
+            }
+            match agentlink_core::grant::load_revoked_jtis(&data_dir) {
+                Ok(revoked) => {
+                    shells.close_inactive(&revoked);
+                }
+                Err(_) => {
+                    // Deny-list unreadable: close every session the hook
+                    // already treats as inactive (hook is fail-closed).
+                    shells.close_inactive(&std::collections::BTreeSet::new());
+                }
+            }
+        }
+    });
+}
+
 fn cancel_all(cancels: &Mutex<HashMap<String, CancellationToken>>) {
     if let Ok(map) = cancels.lock() {
         for token in map.values() {
@@ -1495,21 +1645,11 @@ fn normalized_relay(relay_url: &str, fingerprint: &str) -> (String, Option<Strin
 
 fn drop_link(live: &PhoneLive, generation: u64, audit: &AuditHub) {
     live.socket.detach(generation);
-    schedule_idle_cleanup(live, generation);
+    // Stop PTY immediately. A reconnect grace window must not leave an
+    // inbound shell or media pump running after the relay is gone.
+    live.shells.close_all();
+    cancel_all(&live.cancels);
     audit.set_tx(None);
-}
-
-fn schedule_idle_cleanup(live: &PhoneLive, generation: u64) {
-    let shells = live.shells.clone();
-    let cancels = live.cancels.clone();
-    let socket = live.socket.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(agentlink_core::resume::RECONNECT_GIVE_UP).await;
-        if socket.generation() == generation {
-            shells.close_all();
-            cancel_all(&cancels);
-        }
-    });
 }
 
 async fn replay_log(
@@ -1562,4 +1702,62 @@ where
     .await
     .map_err(|_| Error::Timeout)??;
     Ok(msg)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn poisoned_policy_lock_is_fail_closed() {
+        let policy = Arc::new(RwLock::new(NodePolicy::full()));
+        let panic_lock = policy.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = panic_lock.write().unwrap();
+            panic!("poison the policy lock");
+        })
+        .join();
+        let err = live_policy(&policy).unwrap_err();
+        assert!(
+            err.to_string().contains("unavailable"),
+            "expected fail-closed policy error, got {err}"
+        );
+    }
+
+    #[test]
+    fn webrtc_stamp_overwrites_client_grant_metadata() {
+        let mut payload = json!({
+            "session_id": "known-uuid",
+            "_allow_view": false,
+            "_allow_control": true,
+            "_grant_jti": "forged",
+            "_grant_exp": 1,
+        });
+        stamp_verified_grant(
+            PHASE3_WEBRTC_SIGNAL,
+            &mut payload,
+            NodePolicy::full(),
+            Some("real-jti"),
+            Some(99),
+        );
+        assert_eq!(payload["_grant_jti"], json!("real-jti"));
+        assert_eq!(payload["_grant_exp"], json!(99));
+        assert_eq!(payload["_allow_view"], json!(true));
+        // Client-supplied values must not survive the stamp.
+        assert_ne!(payload["_grant_jti"], json!("forged"));
+        stamp_verified_grant("other.ext", &mut payload, NodePolicy::full(), Some("x"), Some(1));
+        assert_eq!(payload["_grant_jti"], json!("real-jti"));
+        let mut empty_jti = json!({"_grant_jti": "forged", "_grant_exp": 1});
+        stamp_verified_grant(
+            PHASE3_WEBRTC_SIGNAL,
+            &mut empty_jti,
+            NodePolicy::full(),
+            Some("  "),
+            None,
+        );
+        assert!(empty_jti.get("_grant_jti").is_none());
+        assert!(empty_jti.get("_grant_exp").is_none());
+    }
 }

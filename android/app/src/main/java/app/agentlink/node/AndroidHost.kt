@@ -55,7 +55,8 @@ class AndroidHost(
                 hostOk(JSONObject())
             }
             "pty_resize" -> {
-                shells.resize(payload.optString("session_id"))
+                val caller = payload.optString("_caller_peer").ifBlank { payload.optString("_owner_peer") }
+                shells.resize(payload.optString("session_id"), caller)
                 hostOk(JSONObject())
             }
             "extension" -> hostOk(extension(payload.getString("name"), payload.optJSONObject("payload") ?: JSONObject()))
@@ -74,8 +75,9 @@ class AndroidHost(
 
     override fun sessionInput(sessionId: String, dataB64: String): String = guard {
         val data = unb64(dataB64)
-        shells.input(sessionId, data)
-        hostOk(JSONObject().put("bytes", data.size))
+        // UniFFI has no caller argument. This path is not used for the
+        // interactive Rust PTY; fail closed rather than write by id alone.
+        throw IllegalStateException("session input requires a caller owner")
     }
 
     override fun closeSession(sessionId: String): String = guard {

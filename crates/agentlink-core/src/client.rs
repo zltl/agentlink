@@ -1324,6 +1324,22 @@ impl Client {
         })
     }
 
+
+    /// Server-issued PTY id from the open ack. The client's `request_id` is
+    /// only the stream route for later chunks; it is never the session key.
+    fn pty_open_session_id(body: Option<&Value>) -> Result<String> {
+        let id = body
+            .and_then(|value| value.get("session_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::Protocol("pty open missing session_id".into()))?;
+        uuid::Uuid::parse_str(id).map_err(|_| {
+            Error::Protocol("pty open session_id is not a uuid".into())
+        })?;
+        Ok(id.to_string())
+    }
+
     pub async fn open_pty(
         &self,
         node: &str,
@@ -1368,8 +1384,8 @@ impl Client {
             .map_err(|_| Error::Timeout)?
             .ok_or_else(|| Error::Message("connection closed".into()))?;
         match first {
-            Envelope::Result { ok: true, .. } => Ok(PtySession {
-                session_id: request_id,
+            Envelope::Result { ok: true, body, .. } => Ok(PtySession {
+                session_id: Self::pty_open_session_id(body.as_ref())?,
                 node_id,
                 client_id: self.client_id.clone(),
                 inner: self.inner.clone(),
@@ -2542,6 +2558,33 @@ mod tests {
         let second = PtySession::test_io();
         let _ = second.session.close().await;
     }
+
+    #[test]
+    fn pty_open_uses_the_server_uuid_and_rejects_a_request_id_standin() {
+        let server = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({"session_id": server, "rows": 24, "cols": 80});
+        assert_eq!(
+            Client::pty_open_session_id(Some(&body)).unwrap(),
+            server
+        );
+        assert!(Client::pty_open_session_id(None).is_err());
+        assert!(Client::pty_open_session_id(Some(&serde_json::json!({}))).is_err());
+        assert!(Client::pty_open_session_id(Some(&serde_json::json!({"session_id": ""}))).is_err());
+        // Client request ids and path fragments must not become the session key.
+        assert!(Client::pty_open_session_id(Some(&serde_json::json!({
+            "session_id": "not-a-uuid"
+        })))
+        .is_err());
+        assert!(Client::pty_open_session_id(Some(&serde_json::json!({
+            "session_id": "../evil"
+        })))
+        .is_err());
+        assert!(Client::pty_open_session_id(Some(&serde_json::json!({
+            "session_id": "pty-test"
+        })))
+        .is_err());
+    }
+
 
     #[tokio::test]
     async fn drop_without_close_does_not_panic_inside_the_runtime() {

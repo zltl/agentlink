@@ -94,6 +94,12 @@ pub fn applescript_string_literal(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // Unicode line/paragraph separators can end an AppleScript
+            // statement if copied raw into the source. Fold them into the
+            // same escaped newline the ASCII case uses.
+            '\u{0085}' | '\u{2028}' | '\u{2029}' | '\u{000b}' | '\u{000c}' => {
+                out.push_str("\\n")
+            }
             _ => out.push(ch),
         }
     }
@@ -331,6 +337,25 @@ mod tests {
             assert_no_code_breakout(&plan, BREAKOUT_VIEWER, BREAKOUT_SESSION);
             let ps = notify_plan(os, PS_BREAKOUT, "sess");
             assert_no_code_breakout(&ps, PS_BREAKOUT, "sess");
+        }
+    }
+
+    #[test]
+    fn applescript_literal_escapes_unicode_line_separators() {
+        // Coverage of the literal API and notify_plan shape only. Not a real macOS run.
+        let seps = ['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}', '\u{000b}', '\u{000c}'];
+        for sep in seps {
+            let viewer = format!("eve{sep}id");
+            let plan = notify_plan("macos", &viewer, "sess-1");
+            assert_no_code_breakout(&plan, &viewer, "sess-1");
+            let script = plan.args.last().expect("script");
+            assert!(!script.contains('\u{2028}'), "{script}");
+            assert!(!script.contains('\u{2029}'), "{script}");
+            assert!(!script.contains('\u{0085}'), "{script}");
+            let literal = applescript_string_literal(&notification_body(&viewer, "sess-1"));
+            assert!(applescript_literal_is_closed(&literal), "{literal}");
+            assert!(!literal.contains('\u{2028}'));
+            assert!(!literal.contains('\u{2029}'));
         }
     }
 }

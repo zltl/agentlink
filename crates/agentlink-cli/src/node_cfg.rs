@@ -33,7 +33,7 @@ pub fn load(args: NodeArgs) -> Result<NodeConfig> {
         Some(dir) => dir,
         None => agentlink_core::config::default_data_dir("node")?,
     };
-    let saved = read_json(&data_dir.join("node.json"));
+    let saved = read_saved_node_json(&data_dir.join("node.json"))?;
     let invited = match args
         .invite
         .as_deref()
@@ -188,9 +188,70 @@ pub fn machine_name() -> String {
         .unwrap_or_else(|_| "node".into())
 }
 
-fn read_json(path: &std::path::Path) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+/// Missing `node.json` is a first start. A present file that cannot be
+/// read or parsed must fail closed — never treated as "no config, default
+/// to full".
+fn read_saved_node_json(path: &std::path::Path) -> Result<Option<Value>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map(Some).map_err(|err| {
+            anyhow!(
+                "node.json exists but is not valid JSON ({err}); refusing to start. Repair or replace the file and restart."
+            )
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow!(
+            "node.json could not be read ({err}); refusing to start."
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_node_json_is_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.json");
+        assert!(read_saved_node_json(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_node_json_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let err = read_saved_node_json(&path).unwrap_err().to_string();
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_node_json_fails_closed() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("node.json");
+            std::fs::write(&path, r#"{"name":"box"}"#).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let result = read_saved_node_json(&path);
+            // Restore so the tempdir can be cleaned up.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("could not be read"), "{err}");
+            assert!(err.contains("refusing to start"), "{err}");
+        }
+    }
+
+    #[test]
+    fn valid_node_json_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.json");
+        std::fs::write(&path, r#"{"name":"box","max_policy":"full"}"#).unwrap();
+        let value = read_saved_node_json(&path).unwrap().unwrap();
+        assert_eq!(value["name"], "box");
+    }
 }
 
 fn first_string(flag: Option<String>, file: Option<&str>) -> Option<String> {

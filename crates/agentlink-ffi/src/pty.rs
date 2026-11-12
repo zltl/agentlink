@@ -9,13 +9,15 @@
 //! `portable-pty` is not used here. Its `termios` dependency does not compile
 //! for `target_os = "android"`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use agentlink_core::{Error, Result};
+
+pub type PtyGrantHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 pub enum PtyPoll {
     Pending,
@@ -23,19 +25,41 @@ pub enum PtyPoll {
     Exit(i32),
 }
 
+#[cfg(unix)]
+struct Session {
+    live: unix::Live,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
+}
+
 #[derive(Default)]
 pub struct PhonePty {
     #[cfg(unix)]
-    sessions: Mutex<HashMap<String, unix::Live>>,
+    sessions: Mutex<HashMap<String, Session>>,
+    grant_active: Arc<RwLock<Option<PtyGrantHook>>>,
 }
 
 impl PhonePty {
+    pub fn set_grant_active(&self, hook: Option<PtyGrantHook>) {
+        if let Ok(mut slot) = self.grant_active.write() {
+            *slot = hook;
+        }
+    }
+
+    fn grant_hook(&self) -> Option<PtyGrantHook> {
+        self.grant_active.read().ok().and_then(|guard| guard.clone())
+    }
+
     pub fn open(
         &self,
         command: Option<&str>,
         rows: u16,
         cols: u16,
         cwd: &Path,
+        owner_peer: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
     ) -> Result<String> {
         let session_id = uuid::Uuid::new_v4().to_string();
         #[cfg(unix)]
@@ -45,15 +69,42 @@ impl PhonePty {
                 .sessions
                 .lock()
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
-            if let Some(previous) = sessions.insert(session_id.clone(), live) {
-                unix::kill_live(previous);
+            if let Some(previous) = sessions.insert(
+                session_id.clone(),
+                Session {
+                    live,
+                    owner_peer: owner_peer.to_string(),
+                    grant_jti: grant_jti.trim().to_string(),
+                    grant_exp_unix,
+                },
+            ) {
+                unix::kill_live(previous.live);
             }
             Ok(session_id)
         }
         #[cfg(not(unix))]
         {
-            let _ = (command, rows, cols, cwd);
+            let _ = (command, rows, cols, cwd, owner_peer, grant_jti, grant_exp_unix);
             let _ = session_id;
+            Err(Error::Message("pty is only built for unix".into()))
+        }
+    }
+
+    pub fn check_session(&self, session_id: &str, peer: Option<&str>) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| Error::Message("pty map poisoned".into()))?;
+            let live = sessions
+                .get(session_id)
+                .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
+            require_pty_access(live, peer, self.grant_hook().as_deref())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (session_id, peer);
             Err(Error::Message("pty is only built for unix".into()))
         }
     }
@@ -70,31 +121,33 @@ impl PhonePty {
         }
     }
 
-    pub fn write(&self, session_id: &str, data: &[u8]) -> Result<()> {
+    pub fn write(&self, session_id: &str, data: &[u8], peer: Option<&str>) -> Result<()> {
         #[cfg(unix)]
         {
+            self.check_session(session_id, peer)?;
             unix::write(&self.sessions, session_id, data)
         }
         #[cfg(not(unix))]
         {
-            let _ = (session_id, data);
+            let _ = (session_id, data, peer);
             Err(Error::Message("pty is only built for unix".into()))
         }
     }
 
-    pub fn resize(&self, session_id: &str, rows: u16, cols: u16) -> Result<()> {
+    pub fn resize(&self, session_id: &str, rows: u16, cols: u16, peer: Option<&str>) -> Result<()> {
         #[cfg(unix)]
         {
+            self.check_session(session_id, peer)?;
             unix::resize(&self.sessions, session_id, rows.max(1), cols.max(1))
         }
         #[cfg(not(unix))]
         {
-            let _ = (session_id, rows, cols);
+            let _ = (session_id, rows, cols, peer);
             Err(Error::Message("pty is only built for unix".into()))
         }
     }
 
-    pub fn close(&self, session_id: &str) -> Result<()> {
+    pub fn close(&self, session_id: &str, peer: Option<&str>) -> Result<()> {
         #[cfg(unix)]
         {
             let removed = {
@@ -102,17 +155,56 @@ impl PhonePty {
                     .sessions
                     .lock()
                     .map_err(|_| Error::Message("pty map poisoned".into()))?;
+                if let Some(existing) = sessions.get(session_id) {
+                    require_pty_owner(&existing.owner_peer, peer)?;
+                }
                 sessions.remove(session_id)
             };
-            if let Some(live) = removed {
-                unix::kill_live(live);
+            if let Some(session) = removed {
+                unix::kill_live(session.live);
             }
             Ok(())
         }
         #[cfg(not(unix))]
         {
-            let _ = session_id;
+            let _ = (session_id, peer);
             Ok(())
+        }
+    }
+
+    /// Close sessions whose stored grant is expired or revoked. Walks live
+    /// metadata; this is not keyed off an inflight RPC index.
+    pub fn close_inactive(&self, revoked: &BTreeSet<String>) -> usize {
+        #[cfg(unix)]
+        {
+            let hook = self.grant_hook();
+            let now = agentlink_core::util::unix_now();
+            let victims = {
+                let mut sessions = match self.sessions.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return 0,
+                };
+                let ids: Vec<String> = sessions
+                    .iter()
+                    .filter(|(_, session)| {
+                        pty_session_inactive(session, revoked, hook.as_deref(), now)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| sessions.remove(&id))
+                    .collect::<Vec<_>>()
+            };
+            let n = victims.len();
+            for session in victims {
+                unix::kill_live(session.live);
+            }
+            n
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = revoked;
+            0
         }
     }
 
@@ -123,11 +215,73 @@ impl PhonePty {
                 Ok(mut guard) => std::mem::take(&mut *guard),
                 Err(poison) => std::mem::take(&mut *poison.into_inner()),
             };
-            for (_, live) in sessions {
-                unix::kill_live(live);
+            for (_, session) in sessions {
+                unix::kill_live(session.live);
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn require_pty_owner(owner_peer: &str, peer: Option<&str>) -> Result<()> {
+    if let Some(peer) = peer {
+        if owner_peer != peer {
+            return Err(Error::NotFound(
+                "pty session not found for this peer".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_pty_access(
+    session: &Session,
+    peer: Option<&str>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+) -> Result<()> {
+    require_pty_owner(&session.owner_peer, peer)?;
+    if let Some(exp) = session.grant_exp_unix {
+        if agentlink_core::util::unix_now() >= exp {
+            return Err(Error::Auth("grant expired".into()));
+        }
+    }
+    if let Some(hook) = hook {
+        let jti = session.grant_jti.trim();
+        if jti.is_empty() {
+            return Err(Error::Auth("grant is required".into()));
+        }
+        if !hook(jti) {
+            return Err(Error::Auth("grant was revoked".into()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pty_session_inactive(
+    session: &Session,
+    revoked: &BTreeSet<String>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    now: i64,
+) -> bool {
+    if session.grant_exp_unix.is_some_and(|exp| now >= exp) {
+        return true;
+    }
+    let jti = session.grant_jti.trim();
+    if !jti.is_empty()
+        && revoked
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(jti))
+    {
+        return true;
+    }
+    if let Some(hook) = hook {
+        if jti.is_empty() || !hook(jti) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -284,19 +438,19 @@ mod unix {
         })
     }
 
-    pub fn poll(sessions: &Mutex<HashMap<String, Live>>, session_id: &str) -> PtyPoll {
+    pub fn poll(sessions: &Mutex<HashMap<String, Session>>, session_id: &str) -> PtyPoll {
         let Ok(sessions) = sessions.lock() else {
             return PtyPoll::Exit(-1);
         };
-        let Some(live) = sessions.get(session_id) else {
+        let Some(session) = sessions.get(session_id) else {
             return PtyPoll::Exit(-1);
         };
-        if let Ok(mut queue) = live.chunks.lock() {
+        if let Ok(mut queue) = session.live.chunks.lock() {
             if let Some(chunk) = queue.pop_front() {
                 return PtyPoll::Chunk(chunk);
             }
         }
-        if let Ok(slot) = live.exit_code.lock() {
+        if let Ok(slot) = session.live.exit_code.lock() {
             if let Some(code) = *slot {
                 return PtyPoll::Exit(code);
             }
@@ -305,7 +459,7 @@ mod unix {
     }
 
     pub fn write(
-        sessions: &Mutex<HashMap<String, Live>>,
+        sessions: &Mutex<HashMap<String, Session>>,
         session_id: &str,
         data: &[u8],
     ) -> Result<()> {
@@ -315,7 +469,7 @@ mod unix {
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
             sessions
                 .get(session_id)
-                .map(|live| live.writer.clone())
+                .map(|session| session.live.writer.clone())
                 .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?
         };
         let mut guard = writer
@@ -327,7 +481,7 @@ mod unix {
     }
 
     pub fn resize(
-        sessions: &Mutex<HashMap<String, Live>>,
+        sessions: &Mutex<HashMap<String, Session>>,
         session_id: &str,
         rows: u16,
         cols: u16,
@@ -338,7 +492,7 @@ mod unix {
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
             sessions
                 .get(session_id)
-                .map(|live| live.master.clone())
+                .map(|session| session.live.master.clone())
                 .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?
         };
         let guard = master
@@ -413,7 +567,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pty = PhonePty::default();
         let sid = pty
-            .open(Some("echo hello-pty; stty size"), 30, 90, dir.path())
+            .open(
+                Some("echo hello-pty; stty size"),
+                30,
+                90,
+                dir.path(),
+                "owner",
+                "jti-test",
+                None,
+            )
             .unwrap();
         assert!(uuid::Uuid::parse_str(&sid).is_ok(), "{sid}");
         let mut out = Vec::new();
@@ -436,6 +598,81 @@ mod tests {
         assert_eq!(code, 0, "{text}");
         assert!(text.contains("hello-pty"), "{text}");
         assert!(text.contains("30 90"), "winsize was not applied: {text}");
-        pty.close(&sid).unwrap();
+        pty.close(&sid, Some("owner")).unwrap();
+    }
+
+    #[test]
+    fn real_pty_entry_enforces_owner_and_revoked_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let pty = PhonePty::default();
+        let revoked = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+        let hook_set = revoked.clone();
+        pty.set_grant_active(Some(Arc::new(move |jti: &str| {
+            !hook_set
+                .lock()
+                .map(|set| set.iter().any(|item| item.eq_ignore_ascii_case(jti)))
+                .unwrap_or(true)
+        })));
+
+        let bob = pty
+            .open(
+                Some("cat"),
+                24,
+                80,
+                dir.path(),
+                "bob",
+                "jti-bob",
+                Some(agentlink_core::util::unix_now() + 60),
+            )
+            .unwrap();
+        let alice = pty
+            .open(
+                Some("cat"),
+                24,
+                80,
+                dir.path(),
+                "alice",
+                "jti-alice",
+                Some(agentlink_core::util::unix_now() + 60),
+            )
+            .unwrap();
+        assert!(pty.write(&bob, b"x", Some("alice")).is_err());
+        assert!(pty.resize(&bob, 20, 20, Some("alice")).is_err());
+        assert!(pty.close(&bob, Some("alice")).is_err());
+        pty.write(&bob, b"ok\n", Some("bob")).unwrap();
+        pty.write(&alice, b"ok\n", Some("alice")).unwrap();
+
+        revoked.lock().unwrap().insert("jti-bob".into());
+        let err = pty.write(&bob, b"no\n", Some("bob")).unwrap_err();
+        assert!(
+            err.to_string().contains("revoked"),
+            "expected revoked grant, got {err}"
+        );
+        // A revoke of Bob's jti must not take Alice's session with it.
+        pty.write(&alice, b"still\n", Some("alice")).unwrap();
+        assert_eq!(pty.close_inactive(&BTreeSet::from(["jti-bob".into()])), 1);
+        assert!(pty.write(&bob, b"x", Some("bob")).is_err());
+        pty.close(&alice, Some("alice")).unwrap();
+
+        let expired = pty
+            .open(
+                Some("cat"),
+                24,
+                80,
+                dir.path(),
+                "bob",
+                "jti-exp",
+                Some(1),
+            )
+            .unwrap();
+        let err = pty.write(&expired, b"x", Some("bob")).unwrap_err();
+        assert!(
+            err.to_string().contains("expired"),
+            "expected expired grant, got {err}"
+        );
+        // Expiry is enforced on write; the metadata sweep, not a grant-skipping
+        // close, tears the session down.
+        assert_eq!(pty.close_inactive(&BTreeSet::new()), 1);
     }
 }
+

@@ -31,6 +31,9 @@ pub struct OpenOptions<'a> {
     pub schema: Option<&'a str>,
     /// Create `admin` with a random password when the user table is empty.
     pub bootstrap_admin: bool,
+    /// When true, a missing legacy admin token is minted and dated. New
+    /// deployments leave this false so no usable token is issued.
+    pub mint_legacy_admin: bool,
 }
 
 pub struct Opened {
@@ -280,7 +283,7 @@ impl Database {
             schema,
         };
         let (bootstrap_password, admin_token_created) =
-            db.finish_open(opts.bootstrap_admin).await?;
+            db.finish_open(opts.bootstrap_admin, opts.mint_legacy_admin).await?;
         Ok(Opened {
             db,
             bootstrap_password,
@@ -322,7 +325,11 @@ impl Database {
         Ok(())
     }
 
-    async fn finish_open(&mut self, bootstrap_admin: bool) -> Result<(Option<String>, bool)> {
+    async fn finish_open(
+        &mut self,
+        bootstrap_admin: bool,
+        mint_legacy_admin: bool,
+    ) -> Result<(Option<String>, bool)> {
         let ready = self.meta("schema_ready").await?.as_deref() == Some("1");
         if !ready {
             let store_path = self.data_dir.join("store.json");
@@ -333,25 +340,29 @@ impl Database {
         } else if self.data_dir.join("store.json").exists() {
             rotate_backup(&self.data_dir.join("store.json"))?;
         }
-        let admin_token_created = self.secret("admin_token").await?.is_none();
+        let had_token = self.secret("admin_token").await?.is_some();
+        let admin_token_created = !had_token && mint_legacy_admin;
         if admin_token_created {
             let token = util::random_token();
             self.set_secret("admin_token", &token).await?;
-        }
-        self.admin_token = self.secret("admin_token").await?.unwrap_or_default();
-        if self.secret("admin_token_created_unix").await?.is_none() {
             self.set_secret("admin_token_created_unix", &util::unix_now().to_string())
                 .await?;
         }
+        self.admin_token = self.secret("admin_token").await?.unwrap_or_default();
+        // Existing tokens with no recorded creation time must not be backdated
+        // to "now" — that would restart their TTL. Leave the stamp missing
+        // (created_unix = 0) so the gate treats them as unusable.
         self.admin_token_created_unix = self
             .secret("admin_token_created_unix")
             .await?
             .and_then(|text| text.parse().ok())
             .unwrap_or(0);
-        util::write_secret(
-            &self.data_dir.join("admin.token"),
-            self.admin_token.as_bytes(),
-        )?;
+        if !self.admin_token.is_empty() {
+            util::write_secret(
+                &self.data_dir.join("admin.token"),
+                self.admin_token.as_bytes(),
+            )?;
+        }
         let mut bootstrap_password = None;
         if bootstrap_admin && self.user_row(ADMIN_USER).await?.is_none() {
             let password = util::random_token();

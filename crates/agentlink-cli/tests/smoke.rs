@@ -28,6 +28,8 @@ fn cli_and_mcp_round_trip() {
     let relay_log = std::fs::File::create(log_dir.join("relay.log")).unwrap();
     let relay = Guard(
         Command::new(bin)
+            .env("AGENTLINK_LEGACY_ADMIN", "1")
+            .env("AGENTLINK_LEGACY_ADMIN_TTL_SECS", "86400")
             .args([
                 "relay",
                 "--bind",

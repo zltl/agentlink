@@ -156,6 +156,17 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
         grant_sessions: Mutex::new(HashMap::new()),
         extensions: config.extensions.clone(),
     });
+    {
+        let dir = live.data_dir.clone();
+        live.pty.set_grant_active(Some(std::sync::Arc::new(move |jti: &str| {
+            match agentlink_core::grant::load_revoked_jtis(&dir) {
+                Ok(revoked) => !revoked
+                    .iter()
+                    .any(|item| item.trim().eq_ignore_ascii_case(jti.trim())),
+                Err(_) => false,
+            }
+        })));
+    }
     pipeline::spawn_recorder(service.clone(), config.capture.clone());
 
     // `--max-access` is this machine's ceiling. A grant cannot raise it,
@@ -577,6 +588,7 @@ async fn connect_once(
     let (sink, mut stream) = ws.split();
     let (tx, rx) = mpsc::channel(256);
     let generation = live.socket.attach(tx.clone());
+    spawn_grant_watch(live.clone(), generation);
     // The write task used to be detached. If it stopped, or if a proxy ACKed
     // bytes the relay never saw, `stream.next` waited forever and the process
     // stayed "online" in its own log while the relay had already dropped it.
@@ -660,14 +672,16 @@ async fn connect_once(
     match end {
         SessionEnd::Shutdown => {
             cancel_all(&cancels);
-            pty.close_all();
+            stop_live_sessions(&live);
             Ok(())
         }
         SessionEnd::Closed => {
+            stop_live_sessions(&live);
             release_link(&live, generation);
             Ok(())
         }
         SessionEnd::Dead(err) => {
+            stop_live_sessions(&live);
             release_link(&live, generation);
             Err(err)
         }
@@ -687,13 +701,12 @@ fn release_link(live: &Arc<Live>, generation: u64) {
 }
 
 fn schedule_idle_cleanup(live: Arc<Live>, generation: u64) {
-    let pty = live.pty.clone();
     let cancels = live.cancels.clone();
     let socket = live.socket.clone();
     tokio::spawn(async move {
         tokio::time::sleep(agentlink_core::resume::RECONNECT_GIVE_UP).await;
         if socket.generation() == generation {
-            pty.close_all();
+            stop_live_sessions(&live);
             cancel_all(&cancels);
         }
     });
@@ -784,11 +797,15 @@ async fn handle_env(
                 return;
             };
             if let Envelope::Invoke {
+                client_id: client_slot,
                 user: slot,
                 device_id: device_slot,
                 ..
             } = &mut inner
             {
+                // The inner client_id is writable by the sealed peer. Always
+                // overwrite it with the key that opened the body.
+                *client_slot = peer.clone();
                 if slot.is_none() {
                     *slot = user;
                 }
@@ -1173,8 +1190,43 @@ async fn handle_env(
     }
 }
 
-fn sweep_revoked_sessions(live: &Live) {
+fn spawn_grant_watch(live: Arc<Live>, generation: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if live.socket.generation() != generation {
+                break;
+            }
+            enforce_live_grants(&live);
+        }
+    });
+}
+
+fn stop_live_sessions(live: &Live) {
+    live.pty.close_all();
+    let _ = agentlink_desktop::close_all_streams(&live.extensions);
+    if let Ok(mut sessions) = live.grant_sessions.lock() {
+        for (_jti, inflight) in sessions.drain() {
+            for (_request_id, token) in inflight {
+                token.cancel();
+            }
+        }
+    }
+}
+
+/// Walk live WebRTC/PTY sessions by the grant metadata they stored at
+/// creation. This is not keyed off the inflight RPC index, so a session
+/// that is inserted after a jti is dropped from `grant_sessions` is still
+/// closed, and a disconnect with no further inbound frames still tears
+/// media down on the independent watcher.
+fn enforce_live_grants(live: &Live) {
     let revoked = live.current_revoked_jtis();
+    live.pty.close_inactive(&revoked);
+    live.pty.close_expired();
+    let _ = agentlink_desktop::close_inactive_streams(&live.extensions);
+    let _ = agentlink_desktop::close_expired_streams(&live.extensions);
     if let Ok(mut sessions) = live.grant_sessions.lock() {
         sessions.retain(|jti, inflight| {
             let dead = revoked
@@ -1186,13 +1238,13 @@ fn sweep_revoked_sessions(live: &Live) {
             for (_request_id, token) in inflight.drain(..) {
                 token.cancel();
             }
-            live.pty.close_for_jti(jti);
-            let _ = agentlink_desktop::close_streams_for_jti(&live.extensions, jti);
             false
         });
     }
-    live.pty.close_expired();
-    let _ = agentlink_desktop::close_expired_streams(&live.extensions);
+}
+
+fn sweep_revoked_sessions(live: &Live) {
+    enforce_live_grants(live);
 }
 
 async fn replay_log(

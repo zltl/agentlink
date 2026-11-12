@@ -50,7 +50,8 @@ class ShellSessions {
         val argv = rootWithCwd(plan.argv, plan.via, cwd)
         val process = start(argv, env, if (plan.via == "root") null else cwd, plan.via)
         val stream = if (kind == "pty") "pty" else "stdout"
-        val running = Running(process, stream)
+        val ownerPeer = payload.optString("_owner_peer").trim()
+        val running = Running(process, stream, ownerPeer)
         sessions[id] = running
         running.pump()
         return id
@@ -61,19 +62,34 @@ class ShellSessions {
         return running.poll()
     }
 
-    fun input(id: String, data: ByteArray) {
+    fun input(id: String, data: ByteArray, caller: String) {
         val running = sessions[id] ?: error("shell session is gone")
+        requireOwner(running, caller)
         running.process.outputStream.write(data)
         running.process.outputStream.flush()
     }
 
-    fun close(id: String) {
+    fun close(id: String, caller: String? = null) {
+        if (caller != null) {
+            val running = sessions[id] ?: return
+            requireOwner(running, caller)
+        }
         sessions.remove(id)?.process?.destroy()
     }
 
-    fun resize(@Suppress("UNUSED_PARAMETER") id: String) {
+    fun resize(id: String, caller: String) {
+        val running = sessions[id] ?: error("shell session is gone")
+        requireOwner(running, caller)
         // One-shot exec is a pipe. Interactive shells use the Rust PTY, which
         // honors TIOCSWINSZ, and do not come through this map.
+    }
+
+    private fun requireOwner(running: Running, caller: String) {
+        val owner = running.ownerPeer.trim()
+        val who = caller.trim()
+        if (owner.isEmpty() || who.isEmpty() || !owner.equals(who, ignoreCase = true)) {
+            error("shell session not found for this peer")
+        }
     }
 
     private fun start(argv: List<String>, env: Map<String, String>, cwd: String?, via: String): Process {
@@ -94,7 +110,7 @@ class ShellSessions {
         return listOf(argv[0], argv[1], "cd $quoted && ${argv[2]}")
     }
 
-    private class Running(val process: Process, private val stdoutName: String) {
+    private class Running(val process: Process, private val stdoutName: String, val ownerPeer: String) {
         private val events = ArrayDeque<JSONObject>()
         private val lock = Any()
         private var exitCode: Int? = null

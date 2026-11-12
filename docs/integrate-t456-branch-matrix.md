@@ -9,10 +9,42 @@ This integration starts from `feat/controller-p2p-observe-t449`
 `684e1adf3cd2b441a167c735be3f9d6937d3d4b7`, then 10 P2P commits).
 Original branches and frozen t452 artifacts were not moved or overwritten.
 
-Remote heads were verified read-only (GitHub API). An HTTPS `git fetch`
-of all heads failed for lack of an interactive credential; cached
-`origin/main` already matched the live SHA. The repository remains private.
-This branch is a local candidate and is not pushed in this step.
+Remote heads were re-verified read-only on 2026-11-12 20:30 CST
+(Asia/Shanghai) with the GitHub API (`list_branches` page size 100,
+page 1, plus `list_tags` page size 100). That is a live list of every
+remote head, not an assumption that `main` stands for all heads. An
+HTTPS `git fetch` of all heads still needs credentials; this check
+did not use fetch. The repository remains private. This branch is a
+local candidate and is not pushed in this step.
+
+## Live remote heads (GitHub API)
+
+These are the only branches currently on `zltl/agentlink`. There are
+no tags (`list_tags` returned an empty page).
+
+| Ref | Tip | Notes |
+| --- | --- | --- |
+| `main` | `602887281932d254d3d8ee1d57f8e3a305ab9bd6` | Sealed integration baseline. |
+| `integrate/controller-android-t447` | `684e1adf3cd2b441a167c735be3f9d6937d3d4b7` | Already an ancestor of the t449 baseline. |
+| `cursor/android-invite-crash-6d47` | `447fa55e96a1114e8e97ab7ef574a2f32a4a92f1` | Already an ancestor of t447 / t449. |
+
+## Cached `origin/*` not on the live remote — do not merge
+
+These refs exist only in the local cache (`/workspace/agentlink-control-plane/.git`).
+`get_branch` for `cursor/owner-full-access-c6ef` returns 404. Each has
+merge-base **NONE** with live `origin/main` (old history). Keep the
+original ref; do not reattach it onto main. **Never restore same-account
+grant bypass.**
+
+| Cached ref | Tip | Subject / reason to exclude |
+| --- | --- | --- |
+| `origin/cursor/owner-full-access-c6ef` | `4f115731904d22a4e96671c8667b7755996f71d6` | “Give connected owners full access without grant paste.” Skips the grant for a connected owner. Explicitly excluded. Must not come back. |
+| `origin/fix/mv-into-directory` | `ed7516e4bda705e2b5bca14b955b067dab5708f0` | “fix(mv): move into existing directory like Unix mv”. No merge-base with sealed main. |
+| `origin/fix/peercopy-e2e-open-routed` | `0f2322a2e8ef34697c00a7237b1ed1927d6ea588` | “fix(cp): open node↔node e2e replies with peer node_id”. No merge-base with sealed main. |
+| `origin/fix/v0.1.145-node-not-found-tip` | `d8e5116fec49ba75f86a0478548d793bac319b70` | “fix(cli): tip when node name is not found”. No merge-base with sealed main. Pre-seal tip history. |
+| `origin/tip/v0.1.233-mcp-grant-capability` | `f7ad9853334ca30b5e693574419195cbbd626ce4` | “fix(mcp): tip when a grant capability is denied”. No merge-base with sealed main. Pre-seal tip history (`v0.1.233`). |
+
+Those five cached tips, plus the broader local `feat/grant-*` / `tip/v0.1.*` set already listed below, stay off this integration.
 
 Public NAT P2P is still unproven. That fact is not changed in product docs.
 
@@ -55,7 +87,8 @@ Security repairs from the t454 review (notification injection, grant-flag overwr
 
 ## Integration candidate (this step)
 
-Local branch `integrate/security-main-t456` in worktree
-`/workspace/agentlink-integrate-t456`. Security fixes, licenses, and the
-zstd advisory upgrades landed on this branch after the matrix above was
-written. See `docs/integrate-t456-security-status.md`. Still not pushed.
+Local branch `integrate/security-main-t456` in the continuation worktree
+`/workspace/agentlink-integrate-t456-cont` (the 9122522 tree stays frozen
+and clean). Security fixes, licenses, and the zstd advisory upgrades
+landed on this branch. See `docs/integrate-t456-security-status.md`.
+Still not pushed.

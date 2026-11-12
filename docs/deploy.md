@@ -8,7 +8,7 @@ The same repository API is compiled into the binary for both engines. Migrations
 agentlink relay --bind 0.0.0.0:7443 --data-dir /var/lib/agentlink
 ```
 
-The first start generates `cert.pem`, `key.pem`, and `admin.token`, and prints the admin token. Later starts print the path of `admin.token` and do not print the secret. `--print-admin-token` prints it again. Do not leave that flag in a service unit; `deploy/agentlink-relay.service` does not. When the user table is empty, the first start also prints a one-time password for the `admin` account and writes `bootstrap.password` (mode 0600). Change it with `agentlink relay user passwd admin`. That change deletes `bootstrap.password`. If the file is still there, delete it. Do not leave the bootstrap password on disk.
+The first start generates `cert.pem` and `key.pem`. It does not mint or write `admin.token` unless legacy admin is explicitly enabled (see [Legacy admin token](#legacy-admin-token)). When the user table is empty, the first start also prints a one-time password for the `admin` account and writes `bootstrap.password` (mode 0600). Change it with `agentlink relay user passwd admin`. That change deletes `bootstrap.password`. If the file is still there, delete it. Do not leave the bootstrap password on disk.
 
 ## systemd
 
@@ -285,7 +285,7 @@ A desktop link minted from the dashboard or `agentlink view` is view-only unless
 
 ## Legacy admin token
 
-`admin.token` is disabled by default. Prefer an account plus TOTP for people. The file is not rotated or rewritten automatically. To enable it for automation, set `AGENTLINK_LEGACY_ADMIN=1` (also `true`, `on`, `yes`, `enable`, `enabled`) and a positive `AGENTLINK_LEGACY_ADMIN_TTL_SECS` measured from the start that created the token. Enabling without a TTL is rejected. Each use, including a rejection, is appended to `audit.jsonl` as `legacy.admin` on the hash chain. `agentlink relay` prints the path, not the secret, after the first start.
+`admin.token` is disabled by default. A new deploy with legacy admin off does not mint a usable token and does not write `admin.token`. Prefer an account plus TOTP for people. Existing deployments that already have a token file or a `relay_secrets` row are not rotated, rewritten, or deleted by a start with legacy off. To enable the token for automation, set `AGENTLINK_LEGACY_ADMIN=1` (also `true`, `on`, `yes`, `enable`, `enabled`) and a positive `AGENTLINK_LEGACY_ADMIN_TTL_SECS`. Enabling without a TTL is rejected. The TTL is measured from the recorded `created_unix` of that token. A token that has no recorded creation time (legacy rows that stored `created_unix` as 0 or omitted it) is rejected; the migration does not default the missing timestamp to “now”, which would restart the TTL. `--print-admin-token` prints an already-issued token again. Do not leave that flag in a service unit; `deploy/agentlink-relay.service` does not. After the first start, `agentlink relay` prints the path of `admin.token` when a token was issued, or a line that no token was issued when legacy admin is off. Each use, including a rejection, is appended to `audit.jsonl` as `legacy.admin` on the hash chain.
 
 ## Node name pins
 

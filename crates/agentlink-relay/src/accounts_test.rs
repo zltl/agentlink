@@ -507,6 +507,7 @@ async fn open_db(dir: &Path, url: Option<&str>, schema: Option<&str>) -> Databas
         database_url: url,
         schema,
         bootstrap_admin: false,
+        mint_legacy_admin: false,
     })
     .await
     .unwrap()

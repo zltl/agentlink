@@ -107,11 +107,16 @@ impl RelayHandle {
         util::ensure_dir(&config.data_dir)?;
         let trust_proxy = parse_proxy_cidrs(&config.trust_proxy)?;
         let cert = agentlink_core::tls::RelayCert::load_or_create(&config.data_dir)?;
+        let (legacy_enabled, legacy_ttl) = config
+            .legacy_admin_override
+            .unwrap_or_else(|| (legacy_admin_enabled(), legacy_admin_ttl()));
+        let mint_legacy_admin = legacy_enabled && legacy_ttl.is_some_and(|ttl| ttl > 0);
         let opened = Database::open(OpenOptions {
             data_dir: &config.data_dir,
             database_url: config.database_url.as_deref(),
             schema: config.db_schema.as_deref(),
             bootstrap_admin: config.bootstrap_admin,
+            mint_legacy_admin,
         })
         .await?;
         let admin_token = opened.db.admin_token().to_string();
@@ -132,9 +137,6 @@ impl RelayHandle {
 
         let shutdown = CancellationToken::new();
         let kick = Arc::new(Mutex::new(Vec::new()));
-        let (legacy_enabled, legacy_ttl) = config
-            .legacy_admin_override
-            .unwrap_or_else(|| (legacy_admin_enabled(), legacy_admin_ttl()));
         let hub = Arc::new(Hub {
             db: opened.db,
             online: Mutex::new(HashMap::new()),
@@ -572,7 +574,12 @@ fn print_banner(handle: &RelayHandle, force_token: bool) {
     let _ = writeln!(out, "agentlink relay");
     let _ = writeln!(out, "  listen:       {}", handle.local_addr);
     let _ = writeln!(out, "  fingerprint:  {}", handle.fingerprint);
-    if force_token || handle.admin_token_created {
+    if handle.admin_token.is_empty() {
+        let _ = writeln!(
+            out,
+            "  admin token:  not issued (legacy admin is off; set AGENTLINK_LEGACY_ADMIN=1 and AGENTLINK_LEGACY_ADMIN_TTL_SECS to mint one)"
+        );
+    } else if force_token || handle.admin_token_created {
         let _ = writeln!(out, "  admin token:  {}", handle.admin_token);
     } else {
         let _ = writeln!(
@@ -4011,6 +4018,9 @@ fn legacy_gate_at(
     let Some(ttl) = ttl else {
         return Err("legacy admin token requires AGENTLINK_LEGACY_ADMIN_TTL_SECS");
     };
+    if created_unix <= 0 {
+        return Err("legacy admin token has no recorded creation time");
+    }
     if ttl <= 0 || now > created_unix.saturating_add(ttl) {
         return Err("legacy admin token expired");
     }
@@ -5147,6 +5157,12 @@ mod view_ticket_tests {
         assert_eq!(
             legacy_gate_at(true, Some(0), 10, 10).unwrap_err(),
             "legacy admin token expired"
+        );
+        // A pre-existing token with no recorded mint time must not start a
+        // new TTL window at "now".
+        assert_eq!(
+            legacy_gate_at(true, Some(86_400), 0, 1_700_000_000).unwrap_err(),
+            "legacy admin token has no recorded creation time"
         );
     }
 

@@ -894,6 +894,8 @@ fn spawn_relay(bin: &str, data_dir: &Path) -> Guard {
     std::fs::create_dir_all(data_dir).ok();
     Guard(
         Command::new(bin)
+            .env("AGENTLINK_LEGACY_ADMIN", "1")
+            .env("AGENTLINK_LEGACY_ADMIN_TTL_SECS", "86400")
             .args([
                 "relay",
                 "--bind",
@@ -912,6 +914,8 @@ fn restart_relay(bin: &str, data_dir: &Path, addr: &str) -> Guard {
     for _ in 0..20 {
         let mut child = Guard(
             Command::new(bin)
+                .env("AGENTLINK_LEGACY_ADMIN", "1")
+                .env("AGENTLINK_LEGACY_ADMIN_TTL_SECS", "86400")
                 .args([
                     "relay",
                     "--bind",

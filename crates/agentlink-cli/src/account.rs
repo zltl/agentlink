@@ -165,6 +165,7 @@ pub async fn relay_user(
         database_url,
         schema: None,
         bootstrap_admin: false,
+        mint_legacy_admin: false,
     })
     .await
     .map_err(|err| anyhow!(err.to_string()))?;

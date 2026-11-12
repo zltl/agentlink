@@ -1008,24 +1008,107 @@ fn qr_svg(text: &str) -> Result<String> {
         .ok_or_else(|| Error::Message("qr: refused to emit a non-svg document".into()))
 }
 
-/// Bound: only a server-rendered SVG is returned. Script / event-handler
-/// markup is rejected so a dashboard `innerHTML` fallback cannot run it.
+/// Strict allowlist for a server-generated QR SVG. This is not a general
+/// HTML sanitizer: only `svg`/`path`/`rect`/`g`/`circle`/`line`/`polyline`/
+/// `polygon`/`title`/`desc` and a fixed attribute set are accepted. Event
+/// handlers (`onclick`, `onload`, `onerror` with or without spaces) and
+/// foreign namespaces are rejected.
 fn safe_qr_svg(svg: &str) -> Option<&str> {
     let trimmed = svg.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    // The qrcode crate prefixes an XML declaration.
-    let body = if let Some(rest) = lower.strip_prefix("<?xml") {
+    let body = if let Some(rest) = trimmed.strip_prefix("<?xml") {
         rest.split_once("?>").map(|(_, rest)| rest.trim_start()).unwrap_or("")
     } else {
-        lower.as_str()
+        trimmed
     };
-    if !body.starts_with("<svg") {
+    if !body.trim_start().to_ascii_lowercase().starts_with("<svg") {
         return None;
     }
-    if lower.contains("<script") || lower.contains("foreignobject") || lower.contains("onerror=") {
-        return None;
+    if qr_svg_is_allowlisted(body) {
+        Some(trimmed)
+    } else {
+        None
     }
-    Some(trimmed)
+}
+
+fn qr_svg_is_allowlisted(body: &str) -> bool {
+    const TAGS: &[&str] = &[
+        "svg", "path", "rect", "g", "circle", "line", "polyline", "polygon", "title", "desc",
+    ];
+    const ATTRS: &[&str] = &[
+        "viewbox", "xmlns", "width", "height", "d", "fill", "stroke", "stroke-width",
+        "transform", "x", "y", "rx", "ry", "cx", "cy", "r", "points", "x1", "y1", "x2", "y2",
+        "version", "shape-rendering", "standalone",
+    ];
+    let mut rest = body;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return true;
+        }
+        if rest.starts_with("<!--") {
+            return false;
+        }
+        if rest.starts_with("<!") || rest.starts_with("<?") {
+            return false;
+        }
+        if let Some(name) = rest.strip_prefix("</") {
+            let (tag, after) = name.split_once('>').unwrap_or(("", ""));
+            if !TAGS.contains(&tag.trim().to_ascii_lowercase().as_str()) {
+                return false;
+            }
+            rest = after;
+            continue;
+        }
+        if !rest.starts_with('<') {
+            // Text nodes only inside title/desc; keep conservative and reject.
+            return rest.chars().all(|c| c.is_ascii_whitespace());
+        }
+        let Some(inside) = rest.strip_prefix('<') else {
+            return false;
+        };
+        let Some((tag_and_attrs, after)) = inside.split_once('>') else {
+            return false;
+        };
+        rest = after;
+        let tag_and_attrs = tag_and_attrs.trim().trim_end_matches('/');
+        let mut parts = tag_and_attrs.split_whitespace();
+        let Some(tag) = parts.next() else {
+            return false;
+        };
+        if !TAGS.contains(&tag.to_ascii_lowercase().as_str()) {
+            return false;
+        }
+        let attrs = tag_and_attrs[tag.len()..].trim();
+        if !qr_svg_attrs_allowed(attrs, ATTRS) {
+            return false;
+        }
+    }
+}
+
+fn qr_svg_attrs_allowed(attrs: &str, allow: &[&str]) -> bool {
+    let mut s = attrs.trim();
+    while !s.is_empty() {
+        let eq = match s.find('=') {
+            Some(i) => i,
+            None => return s.chars().all(|c| c.is_ascii_whitespace()),
+        };
+        let name = s[..eq].trim().to_ascii_lowercase();
+        if name.starts_with("on") || name.contains("href") || !allow.contains(&name.as_str()) {
+            return false;
+        }
+        let mut rest = s[eq + 1..].trim_start();
+        let quote = rest.chars().next();
+        if quote != Some('"') && quote != Some('\'') {
+            return false;
+        }
+        let q = quote.unwrap();
+        rest = &rest[1..];
+        let Some(end) = rest.find(q) else {
+            return false;
+        };
+        s = rest[end + 1..].trim_start();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1044,6 +1127,12 @@ mod tests {
         assert!(safe_qr_svg(&svg).is_some());
         assert!(safe_qr_svg("<script>alert(1)</script>").is_none());
         assert!(safe_qr_svg("<svg onerror=alert(1)></svg>").is_none());
+        assert!(safe_qr_svg("<svg onclick=alert(1)></svg>").is_none());
+        assert!(safe_qr_svg("<svg onload=alert(1)></svg>").is_none());
+        assert!(safe_qr_svg("<svg onerror =alert(1)></svg>").is_none());
+        assert!(safe_qr_svg("<svg on error=alert(1)></svg>").is_none());
+        assert!(safe_qr_svg("<svg><foreignObject></foreignObject></svg>").is_none());
+        assert!(safe_qr_svg("<svg><script>alert(1)</script></svg>").is_none());
     }
 
     #[test]
