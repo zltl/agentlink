@@ -44,7 +44,8 @@ use agentlink_relay::{serve, RelayConfig};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use endpoint::{parse_endpoint, Endpoint};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -1128,7 +1129,7 @@ fn main() {
         eprintln!("error: {hint}");
         std::process::exit(2);
     }
-    let cli = Cli::parse_from(argv);
+    let (cli, matches) = parse_cli_from(argv);
     if let Command::Service {
         action: service::Action::Run { data_dir },
     } = &cli.command
@@ -1137,6 +1138,18 @@ fn main() {
     }
     // The window owns the main thread. Starting it inside the CLI runtime makes
     // the Linux accessibility bus look for a Tokio reactor that is not there.
+    if let Command::Controller {
+        check: false,
+        preview_ui: true,
+        ..
+    } = &cli.command
+    {
+        if let Some(err) = preview_incompatible_flags(&matches) {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+        std::process::exit(controller::enter_preview());
+    }
     if let Command::Controller {
         data_dir,
         background,
@@ -1430,6 +1443,11 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
             )
             .await
         }
+        Command::Controller {
+            preview_ui: true,
+            check: false,
+            ..
+        } => Ok(controller::enter_preview()),
         Command::Controller {
             data_dir,
             background,
@@ -16991,6 +17009,66 @@ fn prepare_stdio() {
     }
 }
 
+fn parse_cli_from(
+    argv: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
+) -> (Cli, clap::ArgMatches) {
+    let matches = match Cli::command().try_get_matches_from(argv) {
+        Ok(matches) => matches,
+        Err(err) => err.exit(),
+    };
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    };
+    (cli, matches)
+}
+
+fn is_user_supplied(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches!(
+        matches.value_source(id),
+        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+    )
+}
+
+/// Reject explicit live flags combined with `--preview-ui`.
+///
+/// Uses clap `ValueSource` so defaulted values (for example `--max-fps`
+/// / `--connect-timeout-secs`) are not treated as user-supplied.
+fn preview_incompatible_flags(matches: &clap::ArgMatches) -> Option<String> {
+    let Some(("controller", sub)) = matches.subcommand() else {
+        return None;
+    };
+    if sub.value_source("preview_ui") != Some(ValueSource::CommandLine) {
+        return None;
+    }
+    let mut flags = Vec::new();
+    if is_user_supplied(sub, "data_dir") {
+        flags.push("--data-dir");
+    }
+    if is_user_supplied(matches, "config_dir") {
+        flags.push("--config-dir");
+    }
+    if is_user_supplied(sub, "debug_socket") {
+        flags.push("--debug-socket");
+    }
+    if is_user_supplied(sub, "headless") {
+        flags.push("--headless");
+    }
+    if is_user_supplied(sub, "open_desktop") {
+        flags.push("--open-desktop");
+    }
+    if is_user_supplied(sub, "background") {
+        flags.push("--background");
+    }
+    if flags.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "--preview-ui cannot be combined with {}. Isolated preview uses its own temporary directories and does not start a live session.",
+        flags.join(", ")
+    ))
+}
+
 fn config_dir(cli: &Cli) -> Result<PathBuf> {
     if let Some(dir) = &cli.config_dir {
         return Ok(dir.clone());
@@ -21705,5 +21783,168 @@ mod cp_progress_tests {
             100
         ));
         assert!(cp_newline_due(Some(start), start, 100, 100));
+    }
+}
+
+
+#[cfg(test)]
+mod preview_combo_tests {
+    use super::{preview_incompatible_flags, Cli};
+    use clap::CommandFactory;
+
+    fn with_clean_config_env<T>(f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var_os("AGENTLINK_CONFIG_DIR");
+        std::env::remove_var("AGENTLINK_CONFIG_DIR");
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var("AGENTLINK_CONFIG_DIR", value),
+            None => std::env::remove_var("AGENTLINK_CONFIG_DIR"),
+        }
+        result
+    }
+
+    fn preview_matches(args: &[&str]) -> clap::ArgMatches {
+        // The full `Cli` command graph is large; rustc's default test thread
+        // stack (often 2 MiB) overflows while building it. Production `main`
+        // uses the process stack.
+        let argv: Vec<std::ffi::OsString> = args.iter().map(|s| (*s).into()).collect();
+        std::thread::Builder::new()
+            .name("preview-clap".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                Cli::command()
+                    .try_get_matches_from(argv)
+                    .map_err(|err| err.to_string())
+            })
+            .expect("spawn preview clap parse")
+            .join()
+            .expect("preview clap parse thread")
+            .unwrap_or_else(|err| panic!("parse error: {err}"))
+    }
+
+    fn preview_combo(args: &[&str]) -> Result<(), String> {
+        with_clean_config_env(|| {
+            let matches = preview_matches(args);
+            match preview_incompatible_flags(&matches) {
+                Some(msg) => Err(msg),
+                None => Ok(()),
+            }
+        })
+    }
+
+    #[test]
+    fn preview_alone_is_accepted_and_defaults_are_not_user_supplied() {
+        assert_eq!(
+            preview_combo(&["agentlink", "controller", "--preview-ui"]),
+            Ok(())
+        );
+        // Defaulted numeric flags must not be mistaken for user-supplied live paths.
+        assert_eq!(
+            preview_combo(&[
+                "agentlink",
+                "controller",
+                "--preview-ui",
+                "--max-fps",
+                "30",
+                "--connect-timeout-secs",
+                "12",
+            ]),
+            Ok(())
+        );
+    }
+
+    fn assert_rejects(extra: &[&str], flag: &str) {
+        let mut args = vec!["agentlink", "controller", "--preview-ui"];
+        args.extend_from_slice(extra);
+        let err = preview_combo(&args).expect_err(flag);
+        assert!(
+            err.contains(flag),
+            "expected {flag} in rejection, got: {err}"
+        );
+        assert!(
+            err.contains("--preview-ui"),
+            "rejection should mention --preview-ui: {err}"
+        );
+    }
+
+    #[test]
+    fn preview_rejects_explicit_data_dir() {
+        assert_rejects(&["--data-dir", "/tmp/agentlink-review-data"], "--data-dir");
+    }
+
+    #[test]
+    fn preview_rejects_explicit_config_dir() {
+        assert_rejects(
+            &["--config-dir", "/tmp/agentlink-review-config"],
+            "--config-dir",
+        );
+    }
+
+    #[test]
+    fn preview_rejects_config_dir_from_env() {
+        with_clean_config_env(|| {
+            std::env::set_var("AGENTLINK_CONFIG_DIR", "/tmp/agentlink-review-env-config");
+            let matches = preview_matches(&["agentlink", "controller", "--preview-ui"]);
+            let err = preview_incompatible_flags(&matches)
+                .expect("env config-dir must be rejected");
+            assert!(
+                err.contains("--config-dir"),
+                "expected --config-dir in {err}"
+            );
+            std::env::remove_var("AGENTLINK_CONFIG_DIR");
+        });
+    }
+
+    #[test]
+    fn preview_rejects_debug_socket() {
+        assert_rejects(
+            &["--debug-socket", "/tmp/agentlink-review.sock"],
+            "--debug-socket",
+        );
+    }
+
+    #[test]
+    fn preview_rejects_headless() {
+        assert_rejects(&["--headless"], "--headless");
+    }
+
+    #[test]
+    fn preview_rejects_open_desktop() {
+        assert_rejects(&["--open-desktop", "preview-fixture-desktop"], "--open-desktop");
+    }
+
+    #[test]
+    fn preview_rejects_background() {
+        assert_rejects(&["--background"], "--background");
+    }
+
+    #[test]
+    fn preview_rejects_combined_incompatible_flags() {
+        let err = preview_combo(&[
+            "agentlink",
+            "controller",
+            "--preview-ui",
+            "--data-dir",
+            "/tmp/d",
+            "--config-dir",
+            "/tmp/c",
+            "--debug-socket",
+            "/tmp/s",
+            "--headless",
+            "--open-desktop",
+            "n1",
+            "--background",
+        ])
+        .expect_err("combo");
+        for flag in [
+            "--data-dir",
+            "--config-dir",
+            "--debug-socket",
+            "--headless",
+            "--open-desktop",
+            "--background",
+        ] {
+            assert!(err.contains(flag), "missing {flag} in {err}");
+        }
     }
 }

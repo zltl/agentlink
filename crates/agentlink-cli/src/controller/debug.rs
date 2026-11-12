@@ -108,6 +108,8 @@ fn run_headless(config_dir: PathBuf, data_dir: PathBuf, debug: DebugOpts) -> i32
         debug.fail_connect,
         debug.connect_timeout_secs,
         debug.max_fps,
+        false,
+        super::LiveHooks::production(),
     );
     app.perf_log = debug.perf_log;
 

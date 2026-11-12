@@ -268,6 +268,8 @@ pub struct ControllerApp {
     settings_open: bool,
     /// Isolated preview fixture; not a live account.
     preview_ui: bool,
+    /// Live autostart / view / data-dir hooks (counted; skipped in preview).
+    live: super::LiveHooks,
 }
 
 pub fn enter(
@@ -347,6 +349,8 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
         opts.fail_connect,
         opts.connect_timeout_secs,
         opts.max_fps,
+        opts.preview_ui,
+        super::LiveHooks::production(),
     );
     app.hide_on_close = hide_on_close;
     app.perf_log = opts.perf_log;
@@ -396,19 +400,33 @@ impl ControllerApp {
         data_dir: std::path::PathBuf,
         tray: bool,
         flags: TrayFlags,
+        preview_ui: bool,
+        live: super::LiveHooks,
     ) -> Self {
-        let file = agentlink_core::config::load_file(&config_dir).unwrap_or_default();
-        let relay = file
-            .relay
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default();
-        let pin = file.fingerprint.unwrap_or_default();
-        let trust = file.trust.unwrap_or_default();
-        let node_line = node_summary(&data_dir, &config_dir);
-        let autostart = start_on_login();
-        let saved_session = {
+        let (relay, pin, trust, node_line, autostart, saved_session) = if preview_ui {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                super::PREVIEW_NODE_LINE.to_string(),
+                false,
+                false,
+            )
+        } else {
             let file = agentlink_core::config::load_file(&config_dir).unwrap_or_default();
-            has_saved_session(file.refresh_token.as_deref())
+            let relay = file
+                .relay
+                .filter(|value| !value.is_empty())
+                .unwrap_or_default();
+            let pin = file.fingerprint.unwrap_or_default();
+            let trust = file.trust.unwrap_or_default();
+            let node_line = node_summary(&live, &data_dir, &config_dir);
+            let autostart = live.start_on_login();
+            let saved_session = {
+                let file = agentlink_core::config::load_file(&config_dir).unwrap_or_default();
+                has_saved_session(file.refresh_token.as_deref())
+            };
+            (relay, pin, trust, node_line, autostart, saved_session)
         };
         Self {
             tx,
@@ -504,7 +522,8 @@ impl ControllerApp {
             auto_opened: false,
             selected_id: None,
             settings_open: false,
-            preview_ui: false,
+            preview_ui,
+            live,
         }
     }
 
@@ -520,8 +539,19 @@ impl ControllerApp {
         fail_connect: bool,
         connect_timeout_secs: u64,
         max_fps: u32,
+        preview_ui: bool,
+        live: super::LiveHooks,
     ) -> Self {
-        let mut app = Self::new(tx, shared, config_dir, data_dir, tray, flags);
+        let mut app = Self::new(
+            tx,
+            shared,
+            config_dir,
+            data_dir,
+            tray,
+            flags,
+            preview_ui,
+            live,
+        );
         app.mock = mock;
         app.logical_size = logical_size;
         app.fail_connect = fail_connect;
@@ -537,8 +567,10 @@ impl ControllerApp {
     fn pump(&mut self, ctx: &egui::Context) {
         if self.last_node.elapsed() > Duration::from_secs(2) {
             self.last_node = Instant::now();
-            self.node_line = node_summary(&self.data_dir, &self.config_dir);
-            self.autostart = start_on_login();
+            if !self.preview_ui {
+                self.node_line = node_summary(&self.live, &self.data_dir, &self.config_dir);
+                self.autostart = self.live.start_on_login();
+            }
         }
         for event in self.shared.drain() {
             match event {
@@ -1587,13 +1619,25 @@ impl ControllerApp {
     }
 
     fn pair_toggle(&mut self, ui: &mut egui::Ui) {
-        let resp = ui.add(theme::secondary_button(if self.enroll_open {
+        let label = if self.enroll_open {
             "Hide pairing"
         } else {
             "Pair a machine"
-        }));
+        };
+        let button = theme::secondary_button(label);
+        let resp = if self.preview_ui {
+            ui.add_enabled(false, button)
+                .on_hover_text("Pairing is disabled in isolated preview.")
+        } else {
+            ui.add(button)
+        };
         self.debug_layout
             .note_visible("pair_toggle", resp.rect, ui.clip_rect());
+        if self.preview_ui {
+            self.debug_layout
+                .note_visible("pair_toggle_disabled", resp.rect, ui.clip_rect());
+            return;
+        }
         if resp.clicked() {
             self.enroll_open = !self.enroll_open;
         }
@@ -1610,7 +1654,7 @@ impl ControllerApp {
         self.screen = Screen::Machines;
         self.link = "isolated preview".into();
         self.window_title = "agentlink controller (preview)".into();
-        self.node_line = "This computer is not used in preview.".into();
+        self.node_line = super::PREVIEW_NODE_LINE.into();
         self.error.clear();
         self.notice.clear();
     }
@@ -1859,7 +1903,7 @@ impl ControllerApp {
         };
         match result {
             Ok(()) => {
-                self.autostart = start_on_login();
+                self.autostart = self.live.start_on_login();
                 self.notice = if self.autostart {
                     "Start on login is on.".into()
                 } else {
@@ -1967,10 +2011,18 @@ impl ControllerApp {
                     }
                 });
             labeled(ui, "Minutes", &mut self.enroll_minutes, false);
-            if ui
-                .add(theme::primary_button("Create install command"))
-                .clicked()
-            {
+            let create = ui.add_enabled(
+                !self.preview_ui,
+                theme::primary_button("Create install command"),
+            );
+            if self.preview_ui {
+                self.debug_layout.note_visible(
+                    "enroll_create_disabled",
+                    create.rect,
+                    ui.clip_rect(),
+                );
+            }
+            if create.clicked() && !self.preview_ui {
                 let minutes = self.enroll_minutes.trim().parse::<u64>().unwrap_or(15);
                 let name = if self.enroll_name.trim().is_empty() {
                     "machine".into()
@@ -4290,23 +4342,16 @@ fn action_button(ui: &mut egui::Ui, id: &str, label: &str, action: &Action) -> b
     response.clicked()
 }
 
-fn node_summary(data_dir: &std::path::Path, config_dir: &std::path::Path) -> String {
-    let view = crate::tray::load_view(data_dir, config_dir);
+fn node_summary(
+    live: &super::LiveHooks,
+    data_dir: &std::path::Path,
+    config_dir: &std::path::Path,
+) -> String {
+    let view = live.load_view(data_dir, config_dir);
     format!(
         "This computer: {} · {} · {}",
         view.connection, view.pairing, view.account
     )
-}
-
-fn start_on_login() -> bool {
-    #[cfg(windows)]
-    {
-        crate::tray::autostart_enabled()
-    }
-    #[cfg(not(windows))]
-    {
-        super::autostart::enabled()
-    }
 }
 
 fn trust_is_custom(trust: &str) -> bool {
@@ -4336,6 +4381,7 @@ mod geometry_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     /// Visible page / Back must cover a real fraction of the window.
@@ -4359,14 +4405,30 @@ mod geometry_tests {
 
     struct Harness {
         app: ControllerApp,
-        _cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
         _tmpdir: TempDir,
         ctx: egui::Context,
         time: f64,
+        pending_events: Vec<egui::Event>,
     }
 
     impl Harness {
         fn new(w: f32, h: f32) -> Self {
+            Self::new_with(w, h, false, super::super::LiveHooks::production())
+        }
+
+        fn preview(w: f32, h: f32, live: super::super::LiveHooks) -> Self {
+            let mut harn = Self::new_with(w, h, true, live);
+            harn.app.apply_preview_fixture();
+            harn
+        }
+
+        fn new_with(
+            w: f32,
+            h: f32,
+            preview_ui: bool,
+            live: super::super::LiveHooks,
+        ) -> Self {
             let tmp = TempDir::new().expect("tmpdir");
             let config = tmp.path().join("config");
             let data = tmp.path().join("data");
@@ -4390,23 +4452,28 @@ mod geometry_tests {
                 false,
                 12,
                 30,
+                preview_ui,
+                live,
             );
-            app.user = Some("debug".into());
-            // Realistic session rail: exec-only + full-capability desktop node
-            // (sufa) so "View desktop" is present for clip regressions.
-            app.nodes = realistic_nodes();
-            for node in &app.nodes {
-                app.control.insert(node.id.clone(), true);
+            if !preview_ui {
+                app.user = Some("debug".into());
+                // Realistic session rail: exec-only + full-capability desktop node
+                // (sufa) so "View desktop" is present for clip regressions.
+                app.nodes = realistic_nodes();
+                for node in &app.nodes {
+                    app.control.insert(node.id.clone(), true);
+                }
+                app.screen = Screen::Machines;
             }
-            app.screen = Screen::Machines;
             let ctx = egui::Context::default();
             apply_theme_public(&ctx);
             Self {
                 app,
-                _cmd_rx: rx,
+                cmd_rx: rx,
                 _tmpdir: tmp,
                 ctx,
                 time: 0.0,
+                pending_events: Vec::new(),
             }
         }
 
@@ -4429,12 +4496,34 @@ mod geometry_tests {
                 time: Some(self.time),
                 predicted_dt: 1.0 / 60.0,
                 focused: true,
+                events: std::mem::take(&mut self.pending_events),
                 ..Default::default()
             };
             self.time += 1.0 / 60.0;
             self.ctx.run(raw, |ctx| {
                 self.app.ui_frame(ctx);
             })
+        }
+
+        fn click_item(&mut self, id: &str) {
+            let rect = item_rect(&self.app.debug_layout, id).expect(id);
+            let pos = egui::pos2(rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0);
+            self.pending_events.push(egui::Event::PointerMoved(pos));
+            self.pending_events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            });
+            self.pass();
+            self.pending_events.push(egui::Event::PointerMoved(pos));
+            self.pending_events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            self.pass();
         }
 
         fn titles_from(output: &egui::FullOutput) -> Vec<String> {
@@ -5197,8 +5286,7 @@ mod geometry_tests {
 
     #[test]
     fn preview_fixture_is_isolated_and_labeled() {
-        let mut harn = Harness::new(1024.0, 756.0);
-        harn.app.apply_preview_fixture();
+        let mut harn = Harness::preview(1024.0, 756.0, super::super::LiveHooks::production());
         harn.pass();
         let out = harn.pass_output();
         let titles = Harness::titles_from(&out);
@@ -5239,6 +5327,54 @@ mod geometry_tests {
             "preview headless must not look like a usable desktop"
         );
         assert!(item_rect(&harn.app.debug_layout, "display_note").is_some());
+    }
+
+    #[test]
+    fn preview_entry_and_pump_skip_live_resolver_autostart_and_load() {
+        let live = super::super::LiveHooks::production();
+        let mut harn = Harness::preview(1024.0, 756.0, live.clone());
+        assert_eq!(
+            live.counts(),
+            (0, 0, 0),
+            "preview construction must not resolve data-dir, read autostart, or load_view"
+        );
+        assert_eq!(harn.app.node_line, super::super::PREVIEW_NODE_LINE);
+        assert!(!harn.app.autostart);
+        assert!(harn.app.nodes.iter().all(|n| n.id.starts_with("preview-fixture-")));
+        harn.app.last_node = Instant::now() - Duration::from_secs(3);
+        harn.pass();
+        harn.pass();
+        assert_eq!(
+            live.counts(),
+            (0, 0, 0),
+            "pump past 2s must not call live resolver/autostart/load in preview"
+        );
+        assert_eq!(harn.app.node_line, super::super::PREVIEW_NODE_LINE);
+        assert!(harn.app.nodes.iter().all(|n| n.id.starts_with("preview-fixture-")));
+        assert!(!harn.app.hide_on_close);
+        assert!(item_rect(&harn.app.debug_layout, "preview_banner").is_some());
+    }
+
+    #[test]
+    fn preview_pair_toggle_is_disabled_and_drops_no_enroll() {
+        let mut harn = Harness::preview(1024.0, 756.0, super::super::LiveHooks::production());
+        harn.pass();
+        harn.pass();
+        assert!(
+            item_rect(&harn.app.debug_layout, "pair_toggle").is_some(),
+            "Pair stays visible (disabled) so layout does not regress"
+        );
+        assert!(item_rect(&harn.app.debug_layout, "pair_toggle_disabled").is_some());
+        assert!(!harn.app.enroll_open);
+        harn.click_item("pair_toggle");
+        assert!(
+            !harn.app.enroll_open,
+            "disabled Pair must not open the enroll panel"
+        );
+        assert!(
+            harn.cmd_rx.try_recv().is_err(),
+            "preview must not queue an enroll command"
+        );
     }
 
     #[test]
