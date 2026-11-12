@@ -148,7 +148,13 @@ fn mock_desktop_delivers_an_idr_and_a_mouse() {
         drop(actions);
         std::thread::sleep(Duration::from_millis(40));
     }
+    let close_started = Instant::now();
     viewer.close();
+    let close_wait = close_started.elapsed();
+    assert!(
+        close_wait <= Duration::from_secs(3),
+        "Viewer::close must finish within the 2s wait plus slack, got {close_wait:?}"
+    );
     let stop_deadline = Instant::now() + Duration::from_secs(4);
     while Instant::now() < stop_deadline {
         let actions = audits.lock().unwrap_or_else(|err| err.into_inner());

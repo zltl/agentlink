@@ -345,33 +345,37 @@ pub enum StunRewriteMode {
     DefaultsOnly,
 }
 
-/// Read `AGENTLINK_STUN_REWRITE`. Unset, empty, `defaults`, or `on` →
-/// [`StunRewriteMode::DefaultsOnly`]. `off`/`0`/`false` → [`StunRewriteMode::Off`].
-pub fn stun_rewrite_mode_from_env() -> StunRewriteMode {
-    match std::env::var("AGENTLINK_STUN_REWRITE") {
-        Ok(value) => {
-            let value = value.trim().to_ascii_lowercase();
-            if value.is_empty()
-                || matches!(
-                    value.as_str(),
-                    "1" | "on" | "true" | "yes" | "defaults" | "default"
-                )
-            {
-                StunRewriteMode::DefaultsOnly
-            } else if matches!(
-                value.as_str(),
-                "0" | "off" | "false" | "no" | "disable" | "disabled"
-            ) {
-                StunRewriteMode::Off
-            } else {
-                eprintln!(
-                    "agentlink live-webrtc: unknown AGENTLINK_STUN_REWRITE={value}; using defaults-only"
-                );
-                StunRewriteMode::DefaultsOnly
-            }
-        }
-        Err(_) => StunRewriteMode::DefaultsOnly,
+/// Parse `AGENTLINK_STUN_REWRITE`. `None` (unset), empty, `defaults`, or
+/// `on` → [`StunRewriteMode::DefaultsOnly`]. `off`/`0`/`false` →
+/// [`StunRewriteMode::Off`]. Unknown values log and use defaults-only.
+pub fn stun_rewrite_mode_from_value(value: Option<&str>) -> StunRewriteMode {
+    let Some(value) = value else {
+        return StunRewriteMode::DefaultsOnly;
+    };
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || matches!(
+            value.as_str(),
+            "1" | "on" | "true" | "yes" | "defaults" | "default"
+        )
+    {
+        StunRewriteMode::DefaultsOnly
+    } else if matches!(
+        value.as_str(),
+        "0" | "off" | "false" | "no" | "disable" | "disabled"
+    ) {
+        StunRewriteMode::Off
+    } else {
+        eprintln!(
+            "agentlink live-webrtc: unknown AGENTLINK_STUN_REWRITE={value}; using defaults-only"
+        );
+        StunRewriteMode::DefaultsOnly
     }
+}
+
+/// Read `AGENTLINK_STUN_REWRITE` for [`stun_urls_ready_for_ice`].
+pub fn stun_rewrite_mode_from_env() -> StunRewriteMode {
+    stun_rewrite_mode_from_value(std::env::var("AGENTLINK_STUN_REWRITE").ok().as_deref())
 }
 
 /// True when `url` is one of the built-in public STUN servers (scheme, host,
@@ -765,19 +769,55 @@ mod tests {
             "stun.cloudflare.com" => vec!["162.159.207.0".parse::<IpAddr>().unwrap()],
             _ => Vec::new(),
         };
-        let kept = prepare_stun_urls(&defaults, StunRewriteMode::DefaultsOnly, healthy, doh);
+        let doh_healthy = std::cell::Cell::new(0u32);
+        let kept = prepare_stun_urls(&defaults, StunRewriteMode::DefaultsOnly, healthy, |host| {
+            doh_healthy.set(doh_healthy.get() + 1);
+            doh(host)
+        });
         assert_eq!(kept, defaults);
+        assert_eq!(doh_healthy.get(), 0, "healthy system DNS must not use DoH");
+
+        // Empty system DNS (not only RFC 2544) still DoH-rewrites defaults.
+        let doh_empty = std::cell::Cell::new(0u32);
+        let from_empty = prepare_stun_urls(
+            &defaults,
+            StunRewriteMode::DefaultsOnly,
+            |_| Vec::new(),
+            |host| {
+                doh_empty.set(doh_empty.get() + 1);
+                doh(host)
+            },
+        );
+        assert!(doh_empty.get() >= 1, "empty system DNS must try DoH");
+        assert!(
+            from_empty.iter().any(|u| u.contains("74.125.250.129")),
+            "{from_empty:?}"
+        );
 
         // Operator URL, even if system DNS is poisoned and DoH knows a public
         // address: do not force third-party DoH or rewrite a split-horizon name.
         let operator = vec!["stun:stun.internal.example:3478".into()];
         let poisoned = |_: &str| vec!["198.18.0.1".parse::<IpAddr>().unwrap()];
-        let left = prepare_stun_urls(&operator, StunRewriteMode::DefaultsOnly, poisoned, doh);
+        let doh_operator = std::cell::Cell::new(0u32);
+        let left = prepare_stun_urls(&operator, StunRewriteMode::DefaultsOnly, poisoned, |host| {
+            doh_operator.set(doh_operator.get() + 1);
+            doh(host)
+        });
         assert_eq!(left, operator);
+        assert_eq!(
+            doh_operator.get(),
+            0,
+            "operator STUN URLs must never be sent to DoH"
+        );
 
-        // Off: default hostnames stay even when system DNS is poisoned.
-        let off = prepare_stun_urls(&defaults, StunRewriteMode::Off, system, doh);
+        // Off: default hostnames stay even when system DNS is poisoned; no DoH.
+        let doh_off = std::cell::Cell::new(0u32);
+        let off = prepare_stun_urls(&defaults, StunRewriteMode::Off, system, |host| {
+            doh_off.set(doh_off.get() + 1);
+            doh(host)
+        });
         assert_eq!(off, defaults);
+        assert_eq!(doh_off.get(), 0, "REWRITE=off must not call DoH");
 
         assert!(is_default_stun_url("stun:stun.l.google.com:19302"));
         assert!(!is_default_stun_url("stun:stun.internal.example:3478"));
@@ -786,8 +826,19 @@ mod tests {
 
     #[test]
     fn stun_rewrite_mode_parses_off_and_defaults() {
-        // Direct enum coverage; env parsing is exercised only when set.
-        assert_eq!(StunRewriteMode::Off, StunRewriteMode::Off);
-        assert_ne!(StunRewriteMode::Off, StunRewriteMode::DefaultsOnly);
+        assert_eq!(stun_rewrite_mode_from_value(None), StunRewriteMode::DefaultsOnly);
+        assert_eq!(stun_rewrite_mode_from_value(Some("")), StunRewriteMode::DefaultsOnly);
+        assert_eq!(
+            stun_rewrite_mode_from_value(Some(" defaults ")),
+            StunRewriteMode::DefaultsOnly
+        );
+        assert_eq!(stun_rewrite_mode_from_value(Some("on")), StunRewriteMode::DefaultsOnly);
+        assert_eq!(stun_rewrite_mode_from_value(Some("off")), StunRewriteMode::Off);
+        assert_eq!(stun_rewrite_mode_from_value(Some("0")), StunRewriteMode::Off);
+        assert_eq!(stun_rewrite_mode_from_value(Some("false")), StunRewriteMode::Off);
+        assert_eq!(
+            stun_rewrite_mode_from_value(Some("mystery")),
+            StunRewriteMode::DefaultsOnly
+        );
     }
 }

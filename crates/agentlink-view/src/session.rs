@@ -1746,4 +1746,38 @@ mod tests {
         });
         runtime.shutdown_timeout(Duration::from_secs(2));
     }
+
+    /// Off the GUI/net runtime, `close` waits for drive to set `stopped`
+    /// (up to 2s) and `drop` shuts down the viewer runtime (up to 2s).
+    /// A simulated drive that exits on `Cmd::Close` must finish well
+    /// inside those deadlines and leave no runtime in the viewer.
+    #[test]
+    fn close_off_runtime_finishes_within_deadline_and_releases_runtime() {
+        let (viewer, mut rx) = test_viewer(4);
+        let stopped = Arc::clone(&viewer.stopped);
+        let drive = std::thread::Builder::new()
+            .name("t449-sim-drive".into())
+            .spawn(move || {
+                let _ = rx.blocking_recv();
+                stopped.store(true, Ordering::Relaxed);
+            })
+            .expect("sim drive");
+        let started = Instant::now();
+        viewer.close();
+        let close_wait = started.elapsed();
+        assert!(
+            close_wait < Duration::from_secs(2),
+            "close must return before the 2s wait when drive exits, got {close_wait:?}"
+        );
+        assert!(viewer.stop.load(Ordering::Relaxed));
+        assert!(viewer.stopped.load(Ordering::Relaxed));
+        let started = Instant::now();
+        drop(viewer);
+        let drop_wait = started.elapsed();
+        assert!(
+            drop_wait < Duration::from_secs(3),
+            "runtime shutdown_timeout is 2s; drop must finish, got {drop_wait:?}"
+        );
+        drive.join().expect("sim drive join");
+    }
 }

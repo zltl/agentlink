@@ -496,3 +496,72 @@ answered → ICE pair.
 See the dated archive next to this document once created. SHA of the
 binary, the launch script, and the source commit go there. 0307 and 0851
 remain immutable, as do 0910 and 0924.
+
+## Three evidence classes (do not mix)
+
+1. **GUI 0924 already accepted (frozen bin, not this source).** Parent
+   GUI used
+   `/workspace/agentlink-t427-recovery/20261112-0924-t449-controller-p2p/`
+   (debug bin SHA
+   `f6497e7ab0b0f6e9186613f4cef4bb629fb6054f98e1e0b447cf5ca430d2c2f4`,
+   SOURCE-COMMIT `d98f8a8`). That run showed JPEG stills continuing and
+   the 12s “no selected ICE pair” terminal handshake kept after close
+   (not overwritten by `signal close ok`). 0924 is frozen and was not
+   overwritten.
+2. **This worktree’s final code (DNS scope + ICE instrumentation +
+   tests) has not had a GUI pass.** After `d98f8a8`, commit
+   `a597ffe` narrowed DoH/literal rewrite and added safe ICE check
+   logs; a follow-up commit adds branch tests and timed close/cleanup
+   assertions. Parent should retest **once**, read-only, with the new
+   dated archive — not 0924, not 0910, not 0851. Expect the same JPEG
+   fallback and sticky no-pair handshake; also expect
+   `AGENTLINK_STUN_REWRITE` defaults-only behavior and `live-ice:`
+   lines. This is a code/instrumentation change, not a new P2P result.
+3. **Actual public NAT P2P is still not passed.** Box↔sufa never
+   selected an ICE pair. typ srflx is confirmed XOR-MAPPED, but that
+   is not public P2P success. TURN and Tailscale overlay are not
+   public P2P. No further probes, packet captures, or network/service
+   changes were made after the 09:33 CST instrumented snapshot.
+
+## Local regression actually run (2026-11-12 09:38 CST)
+
+These commands were executed on this machine; this is not a claim
+that every test in the repository is green.
+
+- `cargo test -p agentlink-core --lib -- prepare_rewrites stun_rewrite rewrite_skips`:
+  **3 passed** (healthy DNS keeps hostnames and DoH call count is 0;
+  empty/RFC 2544 default hosts use DoH; operator URLs never call DoH;
+  `off` never calls DoH; mode parser covers unset/empty/defaults/on/off/0/false/unknown).
+- `cargo test -p agentlink-view --lib`: **13 passed**, including
+  `close_off_runtime_finishes_within_deadline_and_releases_runtime`
+  and the existing close/drop-on-tokio-runtime tests.
+- `cargo test -p agentlink-view --test loopback`: **3 passed**,
+  including `Viewer::close` finishing within the 2s wait plus slack
+  and `stream_stop` audit after close. Same-host typ host / `private`
+  only — not public NAT.
+- `cargo test -p agentlink-cli --bin agentlink controller::`:
+  **67 passed**, including `handshake_retention_tests` (3) and
+  `live_pipeline_tests` (3).
+- `cargo test -p agentlink-cli --test controller --test controller_debug`:
+  **1 + 6 passed**.
+
+**93 passed, 0 failed** in that set. Not run: the rest of
+`agentlink-core` (267 other lib tests), other `agentlink-cli` bins
+tests outside `controller::`, deploy/functional/smoke, and any GUI.
+
+## Parent GUI path (this final candidate only)
+
+Use
+`/workspace/agentlink-t427-recovery/20261112-0938-t449-controller-p2p/`
+once created. Launch is for the parent, not this worker:
+
+`./run-controller.sh`
+
+`AGENTLINK_CONFIG_DIR` may be set to the existing config. `--data-dir`
+is isolated (`/tmp/agentlink-t449-0938-controller-data`). Do not point
+it at a production node data dir. Do not mix with 0924/0910/0851/0307.
+
+Read-only View of sufa. Confirm JPEG stills keep refreshing, handshake
+keeps a no-pair (or no-first-frame) terminal reason after close, no
+redundant stats `link` row, and stderr `agentlink live-ice:` / rewrite
+logs. Do not expect a selected public P2P pair.
