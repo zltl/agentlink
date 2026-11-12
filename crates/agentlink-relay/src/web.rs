@@ -999,15 +999,60 @@ fn url_encode(text: &str) -> String {
 fn qr_svg(text: &str) -> Result<String> {
     let code =
         qrcode::QrCode::new(text.as_bytes()).map_err(|err| Error::Message(format!("qr: {err}")))?;
-    Ok(code
+    let svg = code
         .render::<qrcode::render::svg::Color>()
         .min_dimensions(220, 220)
-        .build())
+        .build();
+    safe_qr_svg(&svg)
+        .map(str::to_string)
+        .ok_or_else(|| Error::Message("qr: refused to emit a non-svg document".into()))
+}
+
+/// Bound: only a server-rendered SVG is returned. Script / event-handler
+/// markup is rejected so a dashboard `innerHTML` fallback cannot run it.
+fn safe_qr_svg(svg: &str) -> Option<&str> {
+    let trimmed = svg.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // The qrcode crate prefixes an XML declaration.
+    let body = if let Some(rest) = lower.strip_prefix("<?xml") {
+        rest.split_once("?>").map(|(_, rest)| rest.trim_start()).unwrap_or("")
+    } else {
+        lower.as_str()
+    };
+    if !body.starts_with("<svg") {
+        return None;
+    }
+    if lower.contains("<script") || lower.contains("foreignobject") || lower.contains("onerror=") {
+        return None;
+    }
+    Some(trimmed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qr_svg_is_a_scriptless_svg() {
+        let svg = qr_svg("agentlink-invite-test").expect("svg");
+        assert!(
+            svg.to_ascii_lowercase().contains("<svg"),
+            "expected svg markup, got {}",
+            &svg[..svg.len().min(80)]
+        );
+        assert!(!svg.to_ascii_lowercase().contains("<script"));
+        assert!(safe_qr_svg(&svg).is_some());
+        assert!(safe_qr_svg("<script>alert(1)</script>").is_none());
+        assert!(safe_qr_svg("<svg onerror=alert(1)></svg>").is_none());
+    }
+
+    #[test]
+    fn dashboard_page_uses_trusted_svg_helper() {
+        let page = dashboard_page();
+        let text = String::from_utf8(page.body).unwrap();
+        assert!(text.contains("function setTrustedSvg"));
+        assert!(!text.contains("holder.innerHTML = issued.qr_svg"));
+    }
 
     #[test]
     fn dashboard_page_is_self_contained() {

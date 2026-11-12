@@ -969,7 +969,20 @@
     span.textContent = text;
     return span;
   }
-  function reveal(el) {
+  function setTrustedSvg(parent, svg) {
+      parent.replaceChildren();
+      if (typeof svg !== "string") return;
+      const trimmed = svg.trim();
+      const body = trimmed.replace(/^<\?xml[^?]*\?>\s*/i, "");
+      if (!/^<svg[\s>]/i.test(body) || /<script|on\w+\s*=/i.test(body)) return;
+      const parsed = new DOMParser().parseFromString(trimmed, "image/svg+xml");
+      const el = parsed.documentElement;
+      if (!el || el.namespaceURI !== "http://www.w3.org/2000/svg" || el.tagName.toLowerCase() !== "svg") return;
+      if (parsed.querySelector("script, foreignObject")) return;
+      parent.appendChild(document.importNode(el, true));
+    }
+
+    function reveal(el) {
     if (!el || !el.scrollIntoView) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     el.scrollIntoView({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
@@ -1322,7 +1335,7 @@
       qr.replaceChildren();
       if (issued.qr_svg) {
         const holder = document.createElement("div");
-        holder.innerHTML = issued.qr_svg;
+        setTrustedSvg(holder, issued.qr_svg);
         qr.appendChild(holder);
       }
       reveal(out);
