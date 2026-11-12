@@ -71,6 +71,7 @@ struct PhoneLive {
     sessions: Arc<Sessions>,
     cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
     shells: Arc<PhonePty>,
+    host_sessions: Arc<crate::host::HostSessionRegistry>,
     /// Node data dir. Owner keys are reloaded from here before each authz
     /// decision so `grant trust-owner` applies without a restart.
     data_dir: PathBuf,
@@ -178,6 +179,7 @@ pub async fn serve_node(
         sessions: Arc::new(Sessions::default()),
         cancels: Arc::new(Mutex::new(HashMap::new())),
         shells: Arc::new(PhonePty::default()),
+        host_sessions: Arc::new(crate::host::HostSessionRegistry::default()),
         data_dir: config.data_dir.clone(),
         owner_keys: RwLock::new(owner_keys),
         revoked_jtis: RwLock::new(revoked_jtis),
@@ -747,6 +749,7 @@ async fn handle_env(
             let host_cb = host_cb.clone();
             let cancels = live.cancels.clone();
             let shells = live.shells.clone();
+            let host_sessions = live.host_sessions.clone();
             let tools = tools.clone();
             let audit_hub = audit_hub.clone();
             let grant_jti = authz.as_ref().map(|g| g.jti.clone()).unwrap_or_default();
@@ -766,6 +769,7 @@ async fn handle_env(
                     grant_exp_unix,
                     &host_cb,
                     &shells,
+                    &host_sessions,
                     &tools,
                 )
                 .await;
@@ -937,6 +941,7 @@ async fn dispatch(
     grant_exp_unix: Option<i64>,
     host: &Arc<dyn NodeHost>,
     shells: &PhonePty,
+    host_sessions: &crate::host::HostSessionRegistry,
     tools: &ToolState,
 ) {
     let kind = op.kind();
@@ -966,6 +971,7 @@ async fn dispatch(
         paths,
         host,
         shells,
+        host_sessions,
         tools,
         policy,
         peer,
@@ -1000,6 +1006,7 @@ async fn perform(
     paths: &PathMap,
     host: &Arc<dyn NodeHost>,
     shells: &PhonePty,
+    host_sessions: &crate::host::HostSessionRegistry,
     tools: &ToolState,
     policy: NodePolicy,
     peer: &str,
@@ -1059,6 +1066,7 @@ async fn perform(
                 cancel,
                 paths,
                 host,
+                host_sessions,
                 program,
                 args,
                 cwd.as_deref(),
@@ -1342,6 +1350,7 @@ async fn run_exec(
     cancel: &CancellationToken,
     paths: &PathMap,
     host: &Arc<dyn NodeHost>,
+    host_sessions: &crate::host::HostSessionRegistry,
     program: &str,
     args: &[String],
     cwd: Option<&str>,
@@ -1361,6 +1370,7 @@ async fn run_exec(
     }
     let cwd = map_cwd(&paths.roots, cwd)?.or_else(|| Some(paths.roots.files.display().to_string()));
     let session_id = resp.request_id.clone();
+    let release = crate::host::HostSessionRegistry::mint_release();
     let payload = json!({
         "session_id": session_id,
         "program": program,
@@ -1371,6 +1381,7 @@ async fn run_exec(
         "shell": shell,
         "stdin_b64": stdin_b64,
         "_owner_peer": peer,
+        "release": release,
     });
     let body = open_session(host, "exec", payload).await?;
     let session_id = body
@@ -1378,7 +1389,19 @@ async fn run_exec(
         .and_then(|v| v.as_str())
         .unwrap_or(&session_id)
         .to_string();
-    poll_until_end(resp, cancel, host, &session_id, timeout_ms, "stdout").await
+    host_sessions.register(&session_id, peer, &release)?;
+    poll_until_end(
+        resp,
+        cancel,
+        host_sessions,
+        host,
+        &session_id,
+        peer,
+        &release,
+        timeout_ms,
+        "stdout",
+    )
+    .await
 }
 
 async fn run_pty(
@@ -1462,28 +1485,34 @@ async fn open_session(host: &Arc<dyn NodeHost>, kind: &str, payload: Value) -> R
 async fn poll_until_end(
     resp: &Responder,
     cancel: &CancellationToken,
+    registry: &crate::host::HostSessionRegistry,
     host: &Arc<dyn NodeHost>,
     session_id: &str,
+    caller: &str,
+    release: &str,
     timeout_ms: Option<u64>,
     default_stream: &str,
 ) -> Result<()> {
     let started = Instant::now();
     loop {
         if cancel.is_cancelled() {
-            close_quiet(host, session_id).await;
+            close_quiet(registry, host, session_id, release).await;
             resp.end(None, Some("cancelled".into())).await?;
             return Ok(());
         }
         if let Some(ms) = timeout_ms {
             if started.elapsed() >= Duration::from_millis(ms) {
-                close_quiet(host, session_id).await;
+                close_quiet(registry, host, session_id, release).await;
                 resp.end(None, Some("timed out".into())).await?;
                 return Ok(());
             }
         }
         let host = host.clone();
         let sid = session_id.to_string();
-        let raw = tokio::task::spawn_blocking(move || host.poll_session(sid))
+        let caller_s = caller.to_string();
+        // Registry check happens here so a forged caller never reaches the host.
+        registry.authorize_caller(session_id, caller)?;
+        let raw = tokio::task::spawn_blocking(move || host.poll_session(sid, caller_s))
             .await
             .map_err(|e| Error::Message(format!("host task: {e}")))?;
         let body = host::parse_host(&raw)?;
@@ -1511,10 +1540,19 @@ async fn poll_until_end(
     }
 }
 
-async fn close_quiet(host: &Arc<dyn NodeHost>, session_id: &str) {
+async fn close_quiet(
+    registry: &crate::host::HostSessionRegistry,
+    host: &Arc<dyn NodeHost>,
+    session_id: &str,
+    release: &str,
+) {
     let host = host.clone();
     let sid = session_id.to_string();
-    let _ = tokio::task::spawn_blocking(move || host.close_session(sid)).await;
+    let release = release.to_string();
+    if registry.take_release(&sid, &release).is_err() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || host.release_session(sid, release)).await;
 }
 
 fn map_cwd(roots: &Roots, cwd: Option<&str>) -> Result<Option<String>> {

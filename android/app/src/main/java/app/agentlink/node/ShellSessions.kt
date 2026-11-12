@@ -51,14 +51,20 @@ class ShellSessions {
         val process = start(argv, env, if (plan.via == "root") null else cwd, plan.via)
         val stream = if (kind == "pty") "pty" else "stdout"
         val ownerPeer = payload.optString("_owner_peer").trim()
-        val running = Running(process, stream, ownerPeer)
+        if (ownerPeer.isEmpty()) {
+            process.destroy()
+            error("session owner is required")
+        }
+        val release = payload.optString("release").trim()
+        val running = Running(process, stream, ownerPeer, release)
         sessions[id] = running
         running.pump()
         return id
     }
 
-    fun poll(id: String): JSONObject {
+    fun poll(id: String, caller: String): JSONObject {
         val running = sessions[id] ?: return JSONObject().put("event", "exit").put("code", -1)
+        requireOwner(running, caller)
         return running.poll()
     }
 
@@ -69,10 +75,19 @@ class ShellSessions {
         running.process.outputStream.flush()
     }
 
-    fun close(id: String, caller: String? = null) {
-        if (caller != null) {
-            val running = sessions[id] ?: return
-            requireOwner(running, caller)
+    fun close(id: String, caller: String) {
+        val running = sessions[id] ?: return
+        requireOwner(running, caller)
+        sessions.remove(id)?.process?.destroy()
+    }
+
+    /// In-process cleanup for the task that opened the session. The release
+    /// token is minted by Rust and is not a client-supplied owner string.
+    fun release(id: String, release: String) {
+        val running = sessions[id] ?: return
+        val token = release.trim()
+        if (running.release.isEmpty() || token.isEmpty() || running.release != token) {
+            error("shell session not found for this peer")
         }
         sessions.remove(id)?.process?.destroy()
     }
@@ -110,7 +125,12 @@ class ShellSessions {
         return listOf(argv[0], argv[1], "cd $quoted && ${argv[2]}")
     }
 
-    private class Running(val process: Process, private val stdoutName: String, val ownerPeer: String) {
+    private class Running(
+        val process: Process,
+        private val stdoutName: String,
+        val ownerPeer: String,
+        val release: String,
+    ) {
         private val events = ArrayDeque<JSONObject>()
         private val lock = Any()
         private var exitCode: Int? = null

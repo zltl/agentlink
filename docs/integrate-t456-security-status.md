@@ -87,7 +87,7 @@ Not claimed as Windows or macOS real-device verification. Android unit/source ch
 ## Untested / honest bounds
 
 - Public NAT / cross-network P2P: still unproven.
-- Windows and macOS: no real device in this step. AppleScript Unicode coverage is a strict literal/API unit test only.
+- Windows: a later probe built frozen `cd30c9e` in-tree (debug) and ran `agentlink-node --lib` (81 pass / 4 fail of 85), `agentlink-desktop --lib` (75), `agentlink-ffi --lib` (24), `security` (1), `functional` (5 pass / 1 skip true-desktop), CLI controller (75), `node_cfg` (4, but `unreadable_node_json_fails_closed` was a Unix-only no-op). The four lib failures (`\\?\` cwd, locale `os error 3` path tips, absolute filename pattern with backslashes) are addressed in the residual delta below and need a Windows re-run of that new freeze; they were not marked green by relaxing assertions. macOS was not run. AppleScript Unicode coverage is a strict literal/API unit test only.
 - Android: no phone/emulator; Gradle plugin cache missing, so JVM unit tests were not executed here.
 - Browser control remains disabled; not re-enabled.
 - ICE LAN/VPN host candidates remain accepted on purpose.
@@ -96,3 +96,36 @@ Not claimed as Windows or macOS real-device verification. Android unit/source ch
 ## Parent next step
 
 Stop here for the same independent reviewer. Do not push `main` from this step. After the quality gate, the parent may push this branch onto `main` as a normal fast-forward/merge of a candidate that already contains sealed `main` + t447 + t449 + these fixes.
+
+## Post-cd30 residual delta (this commit, not a rewrite of `cd30c9e`)
+
+Incremental work on `integrate/security-main-t456` after the second review confirmed the core P1 fixes in `cd30c9e`. This commit is a small follow-up; `cd30c9e` is not amended.
+
+- Transfer `ensure` / `ensure_exec` (node and FFI) and desktop `offer()` consent: a poisoned policy/consent lock is fail-closed (`node policy is unavailable` / `stream consent is unavailable`). No `max_policy` / `into_inner` ceiling fallback. Unit tests cover both transfer entries and a poisoned consent lock.
+- Public FFI `poll_session` / `session_input` / `close_session` take a trusted caller (the sealed E2E peer recorded at open). An empty caller is rejected. In-process cleanup uses a Rust-minted release token and `release_session`, not an id-only UniFFI close. Alice cannot poll, read, or close Bob's session. Kotlin `ShellSessions` / `AndroidHost` and `ShellSessionsOwnerTest` follow the same rule. Internal UI session handles (`handle.poll()`) are unchanged.
+- `spawn_grant_watch` has a production-loop integration test: a real `cat` PTY plus an injected stream session, no inflight RPC index and no new incoming, close within 1s after `revoked-grants.json` is written; a post-create revoke is either rejected on open re-check or closed by the same watcher.
+- SQLite: default remains bundled `libsqlite3-sys` 0.30.1 / sqlx 0.8.6 (advisory still open; no default switch, no `--ignore`, no third-party fork). Relay data dir stays 0700; `relay.db` / `-wal` / `-shm` are restricted after open; untrusted `sqlite://` URLs stay rejected; `store.json` import is operator-local only. `rsa` remains lockfile-unreachable for the workspace feature set; cargo-audit still exits 1 with that finding plus 12 unmaintained warnings (not reported as zero).
+- Windows portability (found on the `cd30c9e` probe, fixed here, not hidden): `resolve_path` / `resolve_lexical` strip the `\\?\` prefix so a sandbox cwd is comparable to `C:\…` and usable as a process directory; missing cwd and “path below a file” use structured classification that covers Windows `ERROR_PATH_NOT_FOUND` (3) and Chinese OS sentences; filename search matches an absolute pattern after slash-normalizing backslashes (literal path equality first). `node_cfg` unreadable coverage uses a directory-occupying path on every OS, plus a Windows exclusive share-lock fixture (no operator ACL changes). Real ConPTY tests cover UTF-8 session output (`你好` through the PTY, not just file I/O), child-visible resize (`stty size` / `mode con`), and a non-zero PTY exit code 9.
+
+
+### Residual tests on this box (rustc 1.99.1, Asia/Shanghai, 2026-11-12)
+
+`CARGO_TARGET_DIR=/workspace/agentlink-integrate-t456/target`, `CARGO_INCREMENTAL=0`, `--offline`. Not a full workspace rebuild. Not a Windows or Android run of this tree.
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p agentlink-core --lib` | 272 passed (includes verbatim-prefix strip, `is_not_found` / os error 3, diagnose-below-a-file) |
+| `cargo test -p agentlink-node --lib` | 106 passed (was 101): the four cd30 Windows-failing tests pass here; `spawn_grant_watch` production loop; real PTY Unicode/`stty size`/exit 9; transfer poison fail-closed) |
+| `cargo test -p agentlink-desktop --lib` | 113 passed (was 112): poisoned consent lock fail-closed) |
+| `cargo test -p agentlink-ffi --lib` | 28 passed (was 26): Alice cannot poll/close Bob; FFI transfer poison fail-closed) |
+| `cargo test -p agentlink-relay --lib` | 43 passed (was 42): `relay.db` / WAL mode 0600; `sqlite://` URL rejected) |
+| `cargo test -p agentlink-cli --bin agentlink node_cfg` | not re-run here (avoid a large CLI relink). The unreadable test is no longer a Windows no-op. |
+| `cargo audit` | not re-run; lock unchanged. Still expected exit 1: `libsqlite3-sys` `RUSTSEC-2026-0459`, lockfile `rsa` `RUSTSEC-2023-0071`, 12 unmaintained warnings. |
+
+UniFFI `NodeHost` signatures changed in Rust and in hand-written Kotlin (`AndroidHost`, `ShellSessions`, owner tests). Generated `android/app/src/main/java/uniffi/agentlink_ffi/agentlink_ffi.kt` was **not** regenerated in this step (`uniffi-bindgen` did not finish; NDK was not run). The generated trait is still id-only, so an Android compile against this tree will not type-check until bindgen is run from `libagentlink_ffi.so` (`/workspace/agentlink-integrate-t456/target/debug/libagentlink_ffi.so` was built). The Rust `HostSessionRegistry` (sealed peer + release token) is the authoritative gate.
+
+No controller / desktop UI files were changed in this delta. A separate worker is doing the t460 layout redo from `cd30c9e` in an isolated worktree.
+
+Windows probe should re-run this new freeze (not `cd30c9e`) against the existing Windows target. Production `abf86f1` was not touched.
+
+Do not push `main` from this executor step. The parent will do a read-only delta review and a normal push.

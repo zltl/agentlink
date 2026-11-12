@@ -409,6 +409,14 @@ impl PtyManager {
         n
     }
 
+    pub fn has_session(&self, id: &str) -> bool {
+        let sessions = match self.sessions.lock() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+        sessions.contains_key(id)
+    }
+
     pub fn close_all(&self) {
         let sessions = match self.sessions.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
@@ -722,5 +730,191 @@ mod tests {
         assert_eq!(mgr.close_inactive(&revoked_set), 1);
         let err = mgr.write(&bob, b"x", "bob").unwrap_err();
         assert!(err.to_string().contains("not found") || err.to_string().contains("pty session"), "{err}");
+    }
+
+    fn pty_transcript(resp: &crate::ops::Responder) -> String {
+        let extra = resp.extra.lock().unwrap_or_else(|err| err.into_inner());
+        String::from_utf8_lossy(&extra.transcript).replace('\r', "")
+    }
+
+    fn pty_exit(resp: &crate::ops::Responder) -> Option<i32> {
+        resp.extra
+            .lock()
+            .ok()
+            .and_then(|extra| extra.exit_code)
+            .or_else(|| {
+                resp.log.snapshot().into_iter().rev().find_map(|env| match env {
+                    agentlink_core::Envelope::End { exit_code, .. } => exit_code,
+                    _ => None,
+                })
+            })
+    }
+
+    async fn wait_transcript_contains(
+        resp: &crate::ops::Responder,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let text = pty_transcript(resp);
+            if text.contains(needle) {
+                return text;
+            }
+            if std::time::Instant::now() >= deadline {
+                return text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    }
+
+    async fn wait_exit(resp: &crate::ops::Responder, timeout: std::time::Duration) -> Option<i32> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(code) = pty_exit(resp) {
+                return Some(code);
+            }
+            if std::time::Instant::now() >= deadline {
+                return pty_exit(resp);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn real_pty_emits_unicode_output() {
+        let mgr = PtyManager::default();
+        let (resp, dir) = test_responder();
+        let service = crate::pipeline::AuditService::open_quiet(dir.path(), "node", "box");
+        let origin = crate::audit::Origin {
+            path: dir.path().join("audit.log"),
+            node: "box".into(),
+            node_id: "node".into(),
+        };
+        let sid = mgr
+            .open(
+                Some("cat".into()),
+                None,
+                24,
+                80,
+                resp.clone(),
+                origin,
+                Some("alice".into()),
+                service,
+                "alice",
+                "jti-unicode",
+                None,
+            )
+            .await
+            .expect("open cat pty");
+        mgr.write(&sid, "你好\n".as_bytes(), "alice")
+            .expect("write unicode");
+        let text = wait_transcript_contains(&resp, "你好", std::time::Duration::from_secs(3)).await;
+        let _ = mgr.close(&sid, Some("alice"));
+        assert!(
+            text.contains("你好"),
+            "PTY must emit the UTF-8 written to the session, got {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_pty_resize_changes_child_winsize() {
+        let mgr = PtyManager::default();
+        let (resp, dir) = test_responder();
+        let service = crate::pipeline::AuditService::open_quiet(dir.path(), "node", "box");
+        let origin = crate::audit::Origin {
+            path: dir.path().join("audit.log"),
+            node: "box".into(),
+            node_id: "node".into(),
+        };
+        let script = if cfg!(windows) {
+            let path = dir.path().join("report-size.cmd");
+            std::fs::write(&path, "@echo off\r\necho READY\r\nset /p x=\r\nmode con\r\n").unwrap();
+            format!("\"{}\"", path.display())
+        } else {
+            let path = dir.path().join("report-size.sh");
+            std::fs::write(&path, "#!/bin/sh\nprintf 'READY\\n'\nIFS= read -r _\nstty size\n")
+                .unwrap();
+            format!("sh '{}'", path.display())
+        };
+        let sid = mgr
+            .open(
+                Some(script),
+                None,
+                24,
+                80,
+                resp.clone(),
+                origin,
+                Some("alice".into()),
+                service,
+                "alice",
+                "jti-resize",
+                None,
+            )
+            .await
+            .expect("open size pty");
+        let ready = wait_transcript_contains(&resp, "READY", std::time::Duration::from_secs(3)).await;
+        assert!(ready.contains("READY"), "child did not start, got {ready:?}");
+        mgr.resize(&sid, 30, 100, "alice").expect("resize");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        mgr.write(&sid, b"\n", "alice").expect("signal after resize");
+        let text = wait_transcript_contains(&resp, "30", std::time::Duration::from_secs(3)).await;
+        let _ = mgr.close(&sid, Some("alice"));
+        if cfg!(windows) {
+            assert!(
+                text.contains("30") && text.contains("100")
+                    && (text.to_ascii_lowercase().contains("lines")
+                        || text.to_ascii_lowercase().contains("columns")
+                        || text.contains("30 100")
+                        || text.contains("100 30")),
+                "child must observe the resized ConPTY, got {text:?}"
+            );
+        } else {
+            assert!(
+                text.contains("30 100") || text.contains("30\t100"),
+                "child stty size must report the resized winsize, got {text:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_pty_reports_nonzero_exit_code() {
+        let mgr = PtyManager::default();
+        let (resp, dir) = test_responder();
+        let service = crate::pipeline::AuditService::open_quiet(dir.path(), "node", "box");
+        let origin = crate::audit::Origin {
+            path: dir.path().join("audit.log"),
+            node: "box".into(),
+            node_id: "node".into(),
+        };
+        let command = if cfg!(windows) {
+            "exit /b 9".to_string()
+        } else {
+            "exit 9".to_string()
+        };
+        let sid = mgr
+            .open(
+                Some(command),
+                None,
+                24,
+                80,
+                resp.clone(),
+                origin,
+                Some("alice".into()),
+                service,
+                "alice",
+                "jti-exit",
+                None,
+            )
+            .await
+            .expect("open exit pty");
+        let code = wait_exit(&resp, std::time::Duration::from_secs(3)).await;
+        let _ = mgr.close(&sid, Some("alice"));
+        assert_eq!(
+            code,
+            Some(9),
+            "PTY child exit code must be reported, transcript={:?}",
+            pty_transcript(&resp)
+        );
     }
 }

@@ -434,6 +434,32 @@ impl SessionManager {
         n
     }
 
+    /// Test helper: record a live session with grant metadata so the
+    /// production grant watcher can close it without a real SDP offer.
+    pub fn insert_test_grant_session(&self, id: &str, peer: &str, jti: &str, exp: Option<i64>) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.push(LiveSession {
+            id: id.to_string(),
+            stop: Arc::new(AtomicBool::new(false)),
+            control: crate::stream::pipeline::PumpControl::default(),
+            peer: Mutex::new(None),
+            started: std::time::Instant::now(),
+            viewer: "viewer".into(),
+            peer_id: peer.to_string(),
+            control_held: Arc::new(AtomicBool::new(false)),
+            remote_ufrag: Mutex::new(None),
+            grant_jti: jti.to_string(),
+            grant_exp_unix: exp,
+        });
+    }
+
+    pub fn test_session_is_live(&self, id: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.iter().any(|session| {
+            session.id == id && !session.stop.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
     fn list_monitors(&self) -> std::result::Result<Value, String> {
         let monitors = self
             .desktop
@@ -476,11 +502,7 @@ impl SessionManager {
         let session_hint = format!("pending-{peer}");
         // Account ticket already granted control — do not wait on a human
         // allow/deny file (ConsentMode::Prompt). Notify still fires.
-        let mut consent = *self
-            .shared
-            .consent
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut consent = super::consent::read_consent_mode(&self.shared.consent)?;
         if consent == super::consent::ConsentMode::Prompt
             && session_allows_control(payload, &policy)
         {

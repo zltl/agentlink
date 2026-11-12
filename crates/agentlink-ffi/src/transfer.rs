@@ -873,11 +873,14 @@ fn audit_result(hub: &AuditHub, op: &str, detail: &str, result: &Result<Transfer
 }
 
 fn ensure(host: &TransferHost, write: bool) -> Result<()> {
-    ensure_policy(&host.policy, host.max_policy, write)
+    ensure_policy(&host.policy, write)
 }
 
-fn ensure_policy(policy: &RwLock<NodePolicy>, fallback: NodePolicy, write: bool) -> Result<()> {
-    let current = policy.read().map(|guard| *guard).unwrap_or(fallback);
+fn ensure_policy(policy: &RwLock<NodePolicy>, write: bool) -> Result<()> {
+    let current = policy
+        .read()
+        .map(|guard| *guard)
+        .map_err(|_| Error::Message("node policy is unavailable".into()))?;
     if write && !current.allow_write {
         return Err(Error::PermissionDenied(
             "write is not allowed on this node".into(),
@@ -958,6 +961,23 @@ mod tests {
         }
         assert!(copied.load(Ordering::SeqCst));
         sender.await.unwrap();
+    }
+
+    #[test]
+    fn poisoned_policy_lock_fails_closed_on_ensure() {
+        let policy = Arc::new(RwLock::new(NodePolicy::full()));
+        ensure_policy(&policy, false).unwrap();
+        let lock = policy.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = lock.write().unwrap();
+            panic!("poison the ffi transfer policy lock");
+        })
+        .join();
+        let err = ensure_policy(&policy, true).unwrap_err();
+        assert!(
+            err.to_string().contains("unavailable"),
+            "must not fall back to max_policy, got {err}"
+        );
     }
 }
 

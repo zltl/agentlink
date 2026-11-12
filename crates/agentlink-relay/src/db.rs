@@ -273,6 +273,10 @@ impl Database {
                 .run(&pool)
                 .await
                 .map_err(|err| Error::Message(format!("database migration: {err}")))?;
+            // SQLite creates relay.db / -wal / -shm with a default umask
+            // (often 0644). The data dir is already 0700; tighten the files
+            // after open so a crafted sibling WAL is not world-readable.
+            protect_sqlite_files(opts.data_dir);
             Backend::Sqlite(pool)
         };
         let mut db = Database {
@@ -2454,6 +2458,74 @@ async fn fetch_optional_web(
                     row.try_get(3).map_err(db_err)?,
                     row.try_get(4).map_err(db_err)?,
                 ))),
+            }
+        }
+    }
+}
+
+fn protect_sqlite_files(data_dir: &Path) {
+    for name in ["relay.db", "relay.db-wal", "relay.db-shm"] {
+        let path = data_dir.join(name);
+        if let Err(err) = util::restrict_existing_file(&path) {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "could not restrict sqlite file mode"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn sqlite_files_are_owner_only_and_postgres_urls_are_required() {
+        let rejected = tempdir().unwrap();
+        let err = match Database::open(OpenOptions {
+            data_dir: rejected.path(),
+            database_url: Some("sqlite:///tmp/evil.db"),
+            schema: None,
+            bootstrap_admin: false,
+            mint_legacy_admin: false,
+        })
+        .await
+        {
+            Ok(_) => panic!("sqlite:// URLs must be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("postgres://"), "{err}");
+        assert!(!err.to_lowercase().contains("attached"), "{err}");
+
+        let dir = tempdir().unwrap();
+        let opened = Database::open(OpenOptions {
+            data_dir: dir.path(),
+            database_url: None,
+            schema: None,
+            bootstrap_admin: false,
+            mint_legacy_admin: false,
+        })
+        .await
+        .expect("sqlite open");
+        drop(opened.db);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "data dir {dir_mode:o}");
+            let db = dir.path().join("relay.db");
+            assert!(db.is_file(), "relay.db must exist");
+            let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "relay.db {mode:o}");
+            for name in ["relay.db-wal", "relay.db-shm"] {
+                let path = dir.path().join(name);
+                if path.exists() {
+                    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600, "{name} {mode:o}");
+                }
             }
         }
     }

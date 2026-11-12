@@ -1543,17 +1543,36 @@ mod tests {
         let nested = dir.path().join("work");
         fs::create_dir(&nested).unwrap();
         let (path, display) = confine_cwd(None, Some(nested.to_str().unwrap())).unwrap();
-        assert_eq!(path.as_deref(), Some(nested.as_path()));
-        assert_eq!(
-            display.as_deref().map(PathBuf::from).as_deref(),
-            Some(nested.as_path())
+        assert!(
+            agentlink_core::paths::paths_equivalent(path.as_deref().unwrap(), nested.as_path()),
+            "path {path:?} vs {nested:?}"
+        );
+        assert!(
+            agentlink_core::paths::paths_equivalent(
+                Path::new(display.as_deref().unwrap()),
+                nested.as_path()
+            ),
+            "display {display:?} vs {nested:?}"
         );
 
         let (path, display) = confine_cwd(Some(dir.path()), None).unwrap();
-        assert_eq!(path.as_deref(), Some(dir.path()));
-        assert_eq!(
-            display.as_deref().map(PathBuf::from).as_deref(),
-            Some(dir.path())
+        assert!(
+            agentlink_core::paths::paths_equivalent(path.as_deref().unwrap(), dir.path()),
+            "sandbox cwd {path:?} vs {}; canonical prefixes must not leak",
+            dir.path().display()
+        );
+        assert!(
+            agentlink_core::paths::paths_equivalent(
+                Path::new(display.as_deref().unwrap()),
+                dir.path()
+            ),
+            "display {display:?} vs {}",
+            dir.path().display()
+        );
+        let shown = display.unwrap();
+        assert!(
+            !shown.contains(r"\\?\") && !shown.contains(r"//?/"),
+            "cwd display must not use a verbatim prefix: {shown}"
         );
     }
 

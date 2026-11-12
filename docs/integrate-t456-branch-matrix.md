@@ -92,3 +92,7 @@ Local branch `integrate/security-main-t456` in the continuation worktree
 and clean). Security fixes, licenses, and the zstd advisory upgrades
 landed on this branch. See `docs/integrate-t456-security-status.md`.
 Still not pushed.
+
+## Post-cd30 residual (local, not pushed)
+
+The continuation worktree `/workspace/agentlink-integrate-t456-cont` on `integrate/security-main-t456` adds one incremental commit after frozen `cd30c9ed5233764567ea88da102776cbb67c69b2`. The 912 tree and `cd30c9e` are not rewritten. Windows probe of `cd30c9e` stays on its own tree and target; this delta is a later source package the Windows worker can build against the existing target. Live remote `main` remains `602887281932d254d3d8ee1d57f8e3a305ab9bd6` until the parent pushes. Cached `origin/cursor/owner-full-access-c6ef` (`4f115731`) stays excluded.

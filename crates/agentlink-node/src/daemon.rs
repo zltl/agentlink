@@ -1544,4 +1544,206 @@ mod tests {
         let bare = agentlink_core::parse_relay_url("relay.example.com").unwrap();
         assert_eq!(bare.port, 7443);
     }
+
+    fn test_live(dir: &std::path::Path, extensions: Vec<Arc<dyn NodeExtension>>) -> Arc<Live> {
+        let identity = Identity::generate();
+        let live = Arc::new(Live {
+            endpoint: Endpoint::new(identity.clone()),
+            node_id: identity.node_id().to_string(),
+            node_name: "box".into(),
+            service: AuditService::open_quiet(dir, identity.node_id(), "box"),
+            data_dir: dir.to_path_buf(),
+            owner_keys: RwLock::new(Default::default()),
+            revoked_jtis: RwLock::new(Default::default()),
+            commands: CommandPolicy::baseline(),
+            confirm: ConfirmPolicy::baseline(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            approvals: Arc::new(Mutex::new(HashMap::new())),
+            procs: ProcManager::new(),
+            watches: WatchManager::default(),
+            socket: Arc::new(SocketSlot::default()),
+            sessions: Arc::new(Sessions::default()),
+            pty: PtyManager::default(),
+            cancels: Arc::new(Mutex::new(HashMap::new())),
+            grant_sessions: Mutex::new(HashMap::new()),
+            extensions,
+        });
+        {
+            let dir = live.data_dir.clone();
+            live.pty.set_grant_active(Some(Arc::new(move |jti: &str| {
+                match agentlink_core::grant::load_revoked_jtis(&dir) {
+                    Ok(revoked) => !revoked
+                        .iter()
+                        .any(|item| item.trim().eq_ignore_ascii_case(jti.trim())),
+                    Err(_) => false,
+                }
+            })));
+        }
+        live
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_grant_watch_stops_pty_and_stream_within_one_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream = Arc::new(agentlink_desktop::StreamHandler::new(
+            agentlink_desktop::Desktop::mock(),
+        ));
+        {
+            let data = dir.path().to_path_buf();
+            stream.set_grant_active(Some(Arc::new(move |jti: &str, _peer: &str| {
+                match agentlink_core::grant::load_revoked_jtis(&data) {
+                    Ok(revoked) => !revoked
+                        .iter()
+                        .any(|item| item.trim().eq_ignore_ascii_case(jti.trim())),
+                    Err(_) => false,
+                }
+            })));
+        }
+        let live = test_live(
+            dir.path(),
+            vec![stream.clone() as Arc<dyn NodeExtension>],
+        );
+        live.pty.set_grant_active(Some({
+            let data = dir.path().to_path_buf();
+            Arc::new(move |jti: &str| {
+                match agentlink_core::grant::load_revoked_jtis(&data) {
+                    Ok(revoked) => !revoked
+                        .iter()
+                        .any(|item| item.trim().eq_ignore_ascii_case(jti.trim())),
+                    Err(_) => false,
+                }
+            })
+        }));
+
+        let (resp, _hold) = {
+            let resp = Responder {
+                socket: live.socket.clone(),
+                request_id: Uuid::new_v4().to_string(),
+                seal: None,
+                extra: Arc::new(Mutex::new(crate::pipeline::AuditExtra::default())),
+                log: Arc::new(ReplayLog::default()),
+            };
+            (resp, dir.path().to_path_buf())
+        };
+        let origin = crate::audit::Origin {
+            path: dir.path().join("audit.log"),
+            node: "box".into(),
+            node_id: live.node_id.clone(),
+        };
+        let sid = live
+            .pty
+            .open(
+                Some("cat".into()),
+                None,
+                24,
+                80,
+                resp,
+                origin,
+                Some("alice".into()),
+                live.service.clone(),
+                "alice",
+                "jti-watch",
+                None,
+            )
+            .await
+            .expect("open cat pty");
+        assert!(live.pty.has_session(&sid));
+        stream
+            .insert_test_grant_session("stream-1", "alice", "jti-watch", None)
+            .expect("inject stream");
+        assert!(stream.test_session_is_live("stream-1"));
+        assert!(
+            live.grant_sessions
+                .lock()
+                .map(|map| map.is_empty())
+                .unwrap_or(false),
+            "this coverage must not use the inflight RPC index"
+        );
+
+        // Production timer: first tick is immediate (sessions still valid),
+        // later ticks are 1s. No further inbound frames.
+        spawn_grant_watch(live.clone(), live.socket.generation());
+        let mut revoked = std::collections::BTreeSet::new();
+        revoked.insert("jti-watch".into());
+        agentlink_core::grant::save_revoked_jtis(dir.path(), &revoked).unwrap();
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(1500);
+        loop {
+            let pty_live = live.pty.has_session(&sid);
+            let stream_live = stream.test_session_is_live("stream-1");
+            if !pty_live && !stream_live {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "grant watch must stop the PTY and stream within 1s without an RPC index (pty_live={pty_live}, stream_live={stream_live}, elapsed={:?})",
+                    started.elapsed()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            started.elapsed() <= Duration::from_millis(1500),
+            "elapsed {:?}",
+            started.elapsed()
+        );
+
+        // Post-create race: a session opened under a just-revoked jti is
+        // either rejected by the open re-check or closed by the same watcher
+        // without a new inbound frame.
+        let (resp2, _dir2_keep) = {
+            let resp = Responder {
+                socket: live.socket.clone(),
+                request_id: Uuid::new_v4().to_string(),
+                seal: None,
+                extra: Arc::new(Mutex::new(crate::pipeline::AuditExtra::default())),
+                log: Arc::new(ReplayLog::default()),
+            };
+            (resp, ())
+        };
+        let origin2 = crate::audit::Origin {
+            path: dir.path().join("audit.log"),
+            node: "box".into(),
+            node_id: live.node_id.clone(),
+        };
+        let opened = live
+            .pty
+            .open(
+                Some("cat".into()),
+                None,
+                24,
+                80,
+                resp2,
+                origin2,
+                Some("alice".into()),
+                live.service.clone(),
+                "alice",
+                "jti-watch",
+                None,
+            )
+            .await;
+        match opened {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("revoked") || msg.contains("not found"),
+                    "post-create re-check must fail closed, got {msg}"
+                );
+            }
+            Ok(sid2) => {
+                let started = Instant::now();
+                let deadline = started + Duration::from_millis(1500);
+                while live.pty.has_session(&sid2) {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "post-create revoked PTY must be closed by the production watch within 1s"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        let _ = live.pty.close_all();
+    }
 }

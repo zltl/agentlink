@@ -228,19 +228,48 @@ mod tests {
 
     #[test]
     fn unreadable_node_json_fails_closed() {
+        fn assert_unreadable(path: &std::path::Path) {
+            let err = read_saved_node_json(path).unwrap_err().to_string();
+            assert!(err.contains("could not be read"), "{err}");
+            assert!(err.contains("refusing to start"), "{err}");
+            assert!(!err.contains("not valid JSON"), "{err}");
+        }
+
+        // A directory occupying the path is a portable I/O failure (no ACL
+        // changes on the operator's real files). Must not be treated as missing.
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("node.json");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert_unreadable(&as_dir);
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("node.json");
+            let path = dir.path().join("chmod000.json");
             std::fs::write(&path, r#"{"name":"box"}"#).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
             let result = read_saved_node_json(&path);
             // Restore so the tempdir can be cleaned up.
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
             let err = result.unwrap_err().to_string();
             assert!(err.contains("could not be read"), "{err}");
             assert!(err.contains("refusing to start"), "{err}");
+        }
+
+        // Exclusive share lock: a second open of a well-formed node.json fails
+        // with a sharing violation instead of being parsed or treated as missing.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let path = dir.path().join("locked.json");
+            std::fs::write(&path, r#"{"name":"box"}"#).unwrap();
+            let _hold = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&path)
+                .expect("exclusive lock on temp node.json");
+            assert_unreadable(&path);
         }
     }
 

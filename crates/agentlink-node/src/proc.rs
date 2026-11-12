@@ -69,7 +69,13 @@ fn finish_command(
         // Fail before spawn so agents see "cwd …" instead of opaque ENOENT
         // (posix_spawn/CreateProcess also use ENOENT when the program is missing).
         let meta = std::fs::metadata(cwd).map_err(|err| {
-            Error::Message(format!("cwd {}: {err}", cwd.display()))
+            if agentlink_core::util::is_not_found(&err) {
+                Error::Message(format!("cwd `{}` does not exist", cwd.display()))
+            } else if let Some(tip) = agentlink_core::util::path_component_not_dir_error(cwd) {
+                Error::Message(format!("cwd: {tip}"))
+            } else {
+                Error::Message(format!("cwd `{}`: {err}", cwd.display()))
+            }
         })?;
         if !meta.is_dir() {
             return Err(Error::Message(format!(
@@ -739,15 +745,31 @@ mod tests {
 
     #[test]
     fn finish_command_rejects_missing_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-agentlink-cwd");
         let mut cmd = tokio::process::Command::new("true"); // no-window-reviewed
-        let err = finish_command(&mut cmd, Some(std::path::Path::new("/no/such/agentlink-cwd")), &[])
+        let err = finish_command(&mut cmd, Some(&missing), &[])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("cwd /no/such/agentlink-cwd"), "{err}");
-        assert!(
-            err.contains("No such file") || err.contains("os error 2") || err.contains("cannot find"),
-            "{err}"
-        );
+        assert!(err.contains("cwd"), "{err}");
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+        // Locale-specific OS sentences (English, Chinese, os error 2 vs 3)
+        // must not be the classification.
+        assert!(!err.contains("os error"), "{err}");
+
+        let mut cmd = tokio::process::Command::new("true"); // no-window-reviewed
+        let err = finish_command(
+            &mut cmd,
+            Some(std::path::Path::new("/no/such/agentlink-cwd")),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cwd"), "{err}");
+        assert!(err.contains("/no/such/agentlink-cwd"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!err.contains("os error"), "{err}");
     }
 
     #[test]

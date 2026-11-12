@@ -131,22 +131,41 @@ pub fn path_component_not_dir_error(path: &Path) -> Option<Error> {
     })
 }
 
+/// True when `err` reports a missing file or a missing intermediate directory.
+/// Windows uses `ERROR_FILE_NOT_FOUND` (2) and `ERROR_PATH_NOT_FOUND` (3);
+/// the kind may be `NotFound`, but tests and tips must not depend on a
+/// localized OS sentence.
+pub fn is_not_found(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound
+        || err.raw_os_error() == Some(2)
+        || err.raw_os_error() == Some(3)
+}
+
 /// True when `err` reports ENOTDIR, including platforms where the kind or raw
-/// OS error does not round-trip.
+/// OS error does not round-trip. Windows `ERROR_PATH_NOT_FOUND` (3) is *not*
+/// ENOTDIR; use [`path_component_not_dir_error`] to classify a file ancestor.
 pub fn is_not_a_directory(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::NotADirectory
         || err.raw_os_error() == Some(20)
         || err.to_string().contains("Not a directory")
 }
 
-/// When `err` is ENOTDIR, tip the first ancestor that exists as a non-directory.
+/// When a path operation failed, tip the first ancestor that exists as a
+/// non-directory. Windows reports `file\child` as path-not-found (os error 3)
+/// rather than ENOTDIR, so this inspects the path instead of the locale text.
 pub fn diagnose_enotdir_component(path: &Path, err: std::io::Error) -> Error {
-    if is_not_a_directory(&err) {
-        if let Some(tip) = path_component_not_dir_error(path) {
-            return tip;
-        }
+    if let Some(tip) = path_component_not_dir_error(path) {
+        return tip;
     }
     err.into()
+}
+
+/// Restrict an existing file to owner-only access (0600 / private ACL).
+pub fn restrict_existing_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        restrict_file(path)?;
+    }
+    Ok(())
 }
 
 fn diagnose_create_dir_as_dir(path: &Path, err: std::io::Error) -> Error {
@@ -760,6 +779,15 @@ mod tests {
             ErrorKind::NotFound,
             "No such file or directory"
         )));
+        // Windows ERROR_PATH_NOT_FOUND is a missing-path class, not ENOTDIR.
+        let path_not_found = std::io::Error::from_raw_os_error(3);
+        assert!(!is_not_a_directory(&path_not_found), "{path_not_found}");
+        assert!(is_not_found(&path_not_found));
+        assert!(is_not_found(&std::io::Error::from_raw_os_error(2)));
+        assert!(is_not_found(&std::io::Error::new(
+            ErrorKind::NotFound,
+            "No such file or directory"
+        )));
     }
 
     #[test]
@@ -771,6 +799,16 @@ mod tests {
         let msg = diagnose_enotdir_component(&file.join("nope"), err).to_string();
         assert!(msg.contains("exists but is not a directory"), "{msg}");
         assert!(msg.contains(&file.display().to_string()), "{msg}");
+        let windows_path = std::io::Error::from_raw_os_error(3);
+        let msg = diagnose_enotdir_component(&file.join("nope"), windows_path).to_string();
+        assert!(msg.contains("exists but is not a directory"), "{msg}");
+        assert!(msg.contains(&file.display().to_string()), "{msg}");
+        let missing = dir.path().join("missing-child");
+        let msg = diagnose_enotdir_component(&missing, std::io::Error::from_raw_os_error(3)).to_string();
+        assert!(
+            !msg.contains("exists but is not a directory"),
+            "a genuinely missing path must stay not-found, got {msg}"
+        );
     }
 
     #[test]

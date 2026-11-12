@@ -10,6 +10,12 @@ agentlink relay --bind 0.0.0.0:7443 --data-dir /var/lib/agentlink
 
 The first start generates `cert.pem` and `key.pem`. It does not mint or write `admin.token` unless legacy admin is explicitly enabled (see [Legacy admin token](#legacy-admin-token)). When the user table is empty, the first start also prints a one-time password for the `admin` account and writes `bootstrap.password` (mode 0600). Change it with `agentlink relay user passwd admin`. That change deletes `bootstrap.password`. If the file is still there, delete it. Do not leave the bootstrap password on disk.
 
+## Relay data directory and SQLite
+
+`<data-dir>` is created mode 0700 (`util::ensure_dir`). New secret files (`write_secret`, `admin.token`, `bootstrap.password`, `node.json`) are 0600. After the default SQLite backend opens `<data-dir>/relay.db` in WAL mode, the relay also restricts `relay.db`, `relay.db-wal`, and `relay.db-shm` to owner-only access (0600, or a private ACL on Windows). There is no API that imports a client-supplied SQLite file: `AGENTLINK_DATABASE_URL` / `--database-url` must be a `postgres://` (or `postgresql://`) URL, otherwise the process refuses to start. The only file import is `store.json` already in the operator data directory, which is renamed to `store.json.bak` after a one-time read. Operators should not point the data directory at a folder writable by untrusted accounts.
+
+The default build still links a **bundled** `libsqlite3-sys` 0.30.1 (`RUSTSEC-2026-0459`, bundled SQLite before 3.54.0). The published exploit needs a crafted local database plus a sibling WAL with a mismatched page size. sqlx 0.8.6 cannot legally take `libsqlite3-sys` 0.39, and this tree does not vendor or split sqlx. The platform default is left buildable; cargo-audit is not `--ignore`d. An optional system SQLite 3.54+ build is possible by compiling `libsqlite3-sys` without `bundled` against a distro library, but that is not the default and must be validated on the target OS (`pkg-config sqlite3` / `sqlite3 --version`) before use.
+
 ## systemd
 
 ```bash

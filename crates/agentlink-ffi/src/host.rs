@@ -6,21 +6,145 @@
 //! The methods run on a Rust worker thread and must not call back into a
 //! blocking agentlink call.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use agentlink_core::{Error, Result};
 use serde_json::Value;
+use uuid::Uuid;
 
 #[uniffi::export(with_foreign)]
 pub trait NodeHost: Send + Sync {
     fn unary(&self, kind: String, payload_json: String) -> String;
     fn open_session(&self, kind: String, payload_json: String) -> String;
-    fn poll_session(&self, session_id: String) -> String;
-    fn session_input(&self, session_id: String, data_b64: String) -> String;
-    fn close_session(&self, session_id: String) -> String;
+    /// Public session poll. `caller` must be the authenticated E2E peer
+    /// recorded at open; an empty caller is rejected.
+    fn poll_session(&self, session_id: String, caller: String) -> String;
+    fn session_input(&self, session_id: String, data_b64: String, caller: String) -> String;
+    fn close_session(&self, session_id: String, caller: String) -> String;
+    /// In-process cleanup for the task that opened the session. `release` is
+    /// a capability minted at open and is not sent to the remote client.
+    fn release_session(&self, session_id: String, release: String) -> String;
     fn prepare_path(&self, guest: String, write: bool) -> String;
     fn publish_path(&self, guest: String, real_path: String) -> String;
     fn on_status(&self, status_json: String);
+}
+
+struct HostSession {
+    owner_peer: String,
+    release: String,
+}
+
+/// Rust-side owner/release gate. The registered owner is the sealed E2E
+/// peer from the opening invoke, not a client-supplied string.
+#[derive(Default)]
+pub struct HostSessionRegistry {
+    inner: Mutex<HashMap<String, HostSession>>,
+}
+
+impl HostSessionRegistry {
+    pub fn mint_release() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    pub fn register(&self, session_id: &str, owner_peer: &str, release: &str) -> Result<()> {
+        let owner = owner_peer.trim();
+        if owner.is_empty() || release.trim().is_empty() || session_id.trim().is_empty() {
+            return Err(Error::Auth("session owner is required".into()));
+        }
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Message("host session map poisoned".into()))?;
+        map.insert(
+            session_id.to_string(),
+            HostSession {
+                owner_peer: owner.to_string(),
+                release: release.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn authorize_caller(&self, session_id: &str, caller: &str) -> Result<()> {
+        let caller = caller.trim();
+        if caller.is_empty() {
+            return Err(Error::Auth("session access requires a caller owner".into()));
+        }
+        let map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Message("host session map poisoned".into()))?;
+        let Some(session) = map.get(session_id) else {
+            return Err(Error::NotFound("session not found for this peer".into()));
+        };
+        if session.owner_peer != caller {
+            return Err(Error::NotFound("session not found for this peer".into()));
+        }
+        Ok(())
+    }
+
+    pub fn authorize_release(&self, session_id: &str, release: &str) -> Result<()> {
+        if release.trim().is_empty() {
+            return Err(Error::Auth("session release is required".into()));
+        }
+        let map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Message("host session map poisoned".into()))?;
+        let Some(session) = map.get(session_id) else {
+            return Err(Error::NotFound("session not found for this peer".into()));
+        };
+        if session.release != release {
+            return Err(Error::NotFound("session not found for this peer".into()));
+        }
+        Ok(())
+    }
+
+    pub fn take_release(&self, session_id: &str, release: &str) -> Result<()> {
+        self.authorize_release(session_id, release)?;
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Message("host session map poisoned".into()))?;
+        map.remove(session_id);
+        Ok(())
+    }
+}
+
+pub fn poll_for_peer(
+    registry: &HostSessionRegistry,
+    host: &Arc<dyn NodeHost>,
+    session_id: &str,
+    caller: &str,
+) -> Result<Value> {
+    registry.authorize_caller(session_id, caller)?;
+    let host = host.clone();
+    let sid = session_id.to_string();
+    let caller = caller.to_string();
+    // Caller is the sealed peer already checked against the registry.
+    parse_host(&host.poll_session(sid, caller))
+}
+
+pub fn close_for_peer(
+    registry: &HostSessionRegistry,
+    host: &Arc<dyn NodeHost>,
+    session_id: &str,
+    caller: &str,
+) -> Result<Value> {
+    registry.authorize_caller(session_id, caller)?;
+    parse_host(&host.close_session(session_id.to_string(), caller.to_string()))
+}
+
+pub fn release_owned(
+    registry: &HostSessionRegistry,
+    host: &Arc<dyn NodeHost>,
+    session_id: &str,
+    release: &str,
+) -> Result<()> {
+    registry.take_release(session_id, release)?;
+    let _ = parse_host(&host.release_session(session_id.to_string(), release.to_string()));
+    Ok(())
 }
 
 pub fn parse_host(raw: &str) -> Result<Value> {
@@ -53,4 +177,102 @@ pub fn host_ok(body: Value) -> String {
 
 pub fn host_err(message: impl Into<String>) -> String {
     serde_json::json!({"ok": false, "error": message.into()}).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    struct RecordingHost {
+        polls: Mutex<Vec<(String, String)>>,
+        closes: Mutex<Vec<(String, String)>>,
+        releases: Mutex<Vec<(String, String)>>,
+        output: String,
+    }
+
+    impl RecordingHost {
+        fn new(output: &str) -> Self {
+            Self {
+                polls: Mutex::new(Vec::new()),
+                closes: Mutex::new(Vec::new()),
+                releases: Mutex::new(Vec::new()),
+                output: output.to_string(),
+            }
+        }
+    }
+
+    impl NodeHost for RecordingHost {
+        fn unary(&self, _kind: String, _payload_json: String) -> String {
+            host_err("unused")
+        }
+        fn open_session(&self, _kind: String, _payload_json: String) -> String {
+            host_err("unused")
+        }
+        fn poll_session(&self, session_id: String, caller: String) -> String {
+            self.polls.lock().unwrap().push((session_id, caller));
+            host_ok(json!({"event": "chunk", "stream": "stdout", "data_b64": self.output}))
+        }
+        fn session_input(&self, _session_id: String, _data_b64: String, _caller: String) -> String {
+            host_err("unused")
+        }
+        fn close_session(&self, session_id: String, caller: String) -> String {
+            self.closes.lock().unwrap().push((session_id.clone(), caller));
+            host_ok(json!({"closed": session_id}))
+        }
+        fn release_session(&self, session_id: String, release: String) -> String {
+            self.releases.lock().unwrap().push((session_id.clone(), release));
+            host_ok(json!({"closed": session_id}))
+        }
+        fn prepare_path(&self, _guest: String, _write: bool) -> String {
+            host_err("unused")
+        }
+        fn publish_path(&self, _guest: String, _real_path: String) -> String {
+            host_ok(json!({}))
+        }
+        fn on_status(&self, _status_json: String) {}
+    }
+
+    #[test]
+    fn alice_cannot_poll_or_close_bobs_host_session() {
+        let registry = HostSessionRegistry::default();
+        let host = Arc::new(RecordingHost::new("Ym9iLW91dA==")); // not used if denied
+        let release = HostSessionRegistry::mint_release();
+        registry.register("sid-bob", "bob", &release).unwrap();
+
+        let err = poll_for_peer(&registry, &(host.clone() as Arc<dyn NodeHost>), "sid-bob", "alice")
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        assert!(host.polls.lock().unwrap().is_empty(), "alice must not read Bob output");
+
+        let err = poll_for_peer(&registry, &(host.clone() as Arc<dyn NodeHost>), "sid-bob", "")
+            .unwrap_err();
+        assert!(err.to_string().contains("requires a caller"), "{err}");
+        assert!(host.polls.lock().unwrap().is_empty());
+
+        let err = close_for_peer(&registry, &(host.clone() as Arc<dyn NodeHost>), "sid-bob", "alice")
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        assert!(host.closes.lock().unwrap().is_empty());
+
+        // Forged owner string is not enough without the registered sealed peer.
+        let err = close_for_peer(&registry, &(host.clone() as Arc<dyn NodeHost>), "sid-bob", "bob-forged")
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+
+        let body = poll_for_peer(&registry, &(host.clone() as Arc<dyn NodeHost>), "sid-bob", "bob").unwrap();
+        assert_eq!(body["event"], "chunk");
+        assert_eq!(host.polls.lock().unwrap().as_slice(), &[("sid-bob".into(), "bob".into())]);
+
+        let err = release_owned(&registry, &(host.clone() as Arc<dyn NodeHost>), "sid-bob", "wrong-release")
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        assert!(host.releases.lock().unwrap().is_empty());
+
+        release_owned(&registry, &(host.clone() as Arc<dyn NodeHost>), "sid-bob", &release).unwrap();
+        assert_eq!(host.releases.lock().unwrap().len(), 1);
+        // After trusted release, even Bob cannot poll.
+        assert!(poll_for_peer(&registry, &(host.clone() as Arc<dyn NodeHost>), "sid-bob", "bob").is_err());
+    }
 }

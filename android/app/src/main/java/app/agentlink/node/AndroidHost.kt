@@ -69,19 +69,23 @@ class AndroidHost(
         hostOk(JSONObject().put("session_id", id))
     }
 
-    override fun pollSession(sessionId: String): String = guard {
-        hostOk(shells.poll(sessionId))
+    override fun pollSession(sessionId: String, caller: String): String = guard {
+        hostOk(shells.poll(sessionId, caller))
     }
 
-    override fun sessionInput(sessionId: String, dataB64: String): String = guard {
+    override fun sessionInput(sessionId: String, dataB64: String, caller: String): String = guard {
         val data = unb64(dataB64)
-        // UniFFI has no caller argument. This path is not used for the
-        // interactive Rust PTY; fail closed rather than write by id alone.
-        throw IllegalStateException("session input requires a caller owner")
+        shells.input(sessionId, data, caller)
+        hostOk(JSONObject())
     }
 
-    override fun closeSession(sessionId: String): String = guard {
-        shells.close(sessionId)
+    override fun closeSession(sessionId: String, caller: String): String = guard {
+        shells.close(sessionId, caller)
+        hostOk(JSONObject().put("closed", sessionId))
+    }
+
+    override fun releaseSession(sessionId: String, release: String): String = guard {
+        shells.release(sessionId, release)
         hostOk(JSONObject().put("closed", sessionId))
     }
 

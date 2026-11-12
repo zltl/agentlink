@@ -191,6 +191,25 @@ impl StreamHandler {
             .inject_gathered_candidate(session_id, candidate)
     }
 
+    pub fn insert_test_grant_session(
+        &self,
+        id: &str,
+        peer: &str,
+        jti: &str,
+        exp: Option<i64>,
+    ) -> std::result::Result<(), String> {
+        let sessions = self.sessions()?;
+        let _ = self.runtime_handle()?;
+        sessions.insert_test_grant_session(id, peer, jti, exp);
+        Ok(())
+    }
+
+    pub fn test_session_is_live(&self, id: &str) -> bool {
+        self.sessions()
+            .ok()
+            .is_some_and(|sessions| sessions.test_session_is_live(id))
+    }
+
     fn sessions(&self) -> std::result::Result<Arc<SessionManager>, String> {
         let mut guard = self.engine.lock().unwrap_or_else(|err| err.into_inner());
         if guard.is_none() {

@@ -426,11 +426,7 @@ fn take_waiting_stream(token: &str) -> Result<TcpStream> {
 fn ensure_exec(host: &TransferHost, policy: Option<NodePolicy>) -> Result<()> {
     let current = match policy {
         Some(p) => p,
-        None => host
-            .policy
-            .read()
-            .map(|g| *g)
-            .unwrap_or(host.max_policy),
+        None => live_transfer_policy(&host.policy)?,
     };
     if current.allow_exec {
         Ok(())
@@ -988,8 +984,15 @@ fn audit_result(audit: &AuditService, op: &str, detail: &str, result: &Result<Tr
 fn ensure(host: &TransferHost, policy: Option<NodePolicy>, write: bool) -> Result<()> {
     match policy {
         Some(current) => policy_allows(current, write),
-        None => ensure_policy(&host.policy, host.max_policy, write),
+        None => ensure_policy(&host.policy, write),
     }
+}
+
+fn live_transfer_policy(policy: &RwLock<NodePolicy>) -> Result<NodePolicy> {
+    policy
+        .read()
+        .map(|guard| *guard)
+        .map_err(|_| Error::Message("node policy is unavailable".into()))
 }
 
 fn policy_allows(current: NodePolicy, write: bool) -> Result<()> {
@@ -1006,9 +1009,8 @@ fn policy_allows(current: NodePolicy, write: bool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_policy(policy: &RwLock<NodePolicy>, fallback: NodePolicy, write: bool) -> Result<()> {
-    let current = policy.read().map(|guard| *guard).unwrap_or(fallback);
-    policy_allows(current, write)
+fn ensure_policy(policy: &RwLock<NodePolicy>, write: bool) -> Result<()> {
+    policy_allows(live_transfer_policy(policy)?, write)
 }
 
 fn xfer_opts(
@@ -1176,5 +1178,61 @@ mod tests {
             }
             other => panic!("request id swap was accepted: {other:?}"),
         }
+    }
+
+    fn poison_policy(policy: &Arc<RwLock<NodePolicy>>) {
+        let lock = policy.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = lock.write().unwrap();
+            panic!("poison the transfer policy lock");
+        })
+        .join();
+    }
+
+    fn host_with_policy(policy: NodePolicy) -> (TransferHost, tempfile::TempDir) {
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let node_key = agentlink_core::identity::Identity::generate();
+        let host = TransferHost {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            direct_wait: Arc::new(Mutex::new(HashMap::new())),
+            allowed: Arc::new(Mutex::new(HashMap::new())),
+            quic: None,
+            tx: out_tx,
+            policy: Arc::new(RwLock::new(policy)),
+            max_policy: NodePolicy::full(),
+            root: None,
+            e2e: Endpoint::new(node_key.clone()),
+            node_id: node_key.public_hex().to_string(),
+            seals: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            audit: crate::pipeline::AuditService::open_quiet(dir.path(), "node", "node"),
+        };
+        (host, dir)
+    }
+
+    #[test]
+    fn poisoned_policy_lock_fails_closed_on_ensure_and_ensure_exec() {
+        let (host, _dir) = host_with_policy(NodePolicy::full());
+        ensure(&host, None, false).unwrap();
+        ensure_exec(&host, None).unwrap();
+        // An explicit policy still wins when the lock is healthy.
+        let mut no_exec = NodePolicy::full();
+        no_exec.allow_exec = false;
+        assert!(ensure_exec(&host, Some(no_exec)).is_err());
+        poison_policy(&host.policy);
+        let err = ensure(&host, None, true).unwrap_err();
+        assert!(
+            err.to_string().contains("unavailable"),
+            "ensure (policy=None) must not fall back to max_policy, got {err}"
+        );
+        let err = ensure_exec(&host, None).unwrap_err();
+        assert!(
+            err.to_string().contains("unavailable"),
+            "ensure_exec (policy=None) must not fall back to max_policy, got {err}"
+        );
+        // A provided policy still does not read the poisoned lock.
+        ensure(&host, Some(NodePolicy::full()), false).unwrap();
+        ensure_exec(&host, Some(NodePolicy::full())).unwrap();
     }
 }

@@ -4,6 +4,49 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
 
+/// Drop a Windows `\\?\` / `\\?\UNC\` prefix that `fs::canonicalize`
+/// adds. Sandbox checks still use the prefixed form; returned paths should
+/// be usable as a process cwd and comparable to a user-supplied `C:\…`.
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    if let Some(rest) = raw.strip_prefix("//?/UNC/") {
+        return PathBuf::from(format!("//{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix("//?/") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+/// True when two paths name the same location after stripping a Windows
+/// verbatim prefix. On Windows the comparison is case-insensitive.
+pub fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    let a = strip_verbatim_prefix(a);
+    let b = strip_verbatim_prefix(b);
+    if a == b {
+        return true;
+    }
+    let a = a.to_string_lossy();
+    let b = b.to_string_lossy();
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        false
+    }
+}
+
+/// Slash-normalize a path or glob so `C:\foo\bar` and `C:/foo/bar` compare.
+pub fn normalize_path_text(value: &str) -> String {
+    strip_verbatim_prefix(Path::new(value))
+        .to_string_lossy()
+        .replace('\\', "/")
+}
 
 /// Agents usually mean a drive root when they write `C:` (or `C:Users\…` without a
 /// separator). On Windows those forms are *drive-relative* to the process cwd on that
@@ -48,7 +91,7 @@ pub fn resolve_path(root: Option<&Path>, user_path: &str) -> Result<PathBuf> {
         std::fs::canonicalize(root).map_err(|e| Error::Message(format!("sandbox root: {e}")))?;
     let candidate = canonicalize_allow_missing(&joined)?;
     assert_inside(&root_c, &candidate, user_path.as_ref())?;
-    Ok(candidate)
+    Ok(strip_verbatim_prefix(&candidate))
 }
 
 /// Lexical normalization for `mkdir -p`, where intermediate directories may not exist yet.
@@ -83,7 +126,7 @@ pub fn resolve_lexical(root: Option<&Path>, user_path: &str) -> Result<PathBuf> 
     })?;
     let candidate = normalize(&ancestor_c.join(suffix));
     assert_inside(&root_c, &candidate, user_path.as_ref())?;
-    Ok(candidate)
+    Ok(strip_verbatim_prefix(&candidate))
 }
 
 fn join_root(root: Option<&Path>, raw: &Path) -> Result<PathBuf> {
@@ -216,7 +259,8 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let resolved = resolve_lexical(Some(&root), "a/b").unwrap();
         assert!(resolved.ends_with("a/b") || resolved.ends_with(r"a\b"));
-        assert!(resolved.starts_with(std::fs::canonicalize(&root).unwrap()));
+        let root_c = strip_verbatim_prefix(&std::fs::canonicalize(&root).unwrap());
+        assert!(strip_verbatim_prefix(&resolved).starts_with(&root_c), "{resolved:?} not in {root_c:?}");
     }
 
     #[cfg(unix)]
@@ -331,5 +375,22 @@ mod tests {
     fn resolve_path_keeps_unix_root() {
         let resolved = resolve_path(None, "/").unwrap();
         assert_eq!(resolved, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_drops_windows_extended_path() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\Users\x")),
+            PathBuf::from(r"C:\Users\x")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\f")),
+            PathBuf::from(r"\\server\share\f")
+        );
+        assert!(paths_equivalent(
+            Path::new(r"\\?\C:\Temp\work"),
+            Path::new(r"C:\Temp\work")
+        ));
+        assert_eq!(normalize_path_text(r"C:\Temp\a.txt"), "C:/Temp/a.txt");
     }
 }

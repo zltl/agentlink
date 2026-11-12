@@ -72,6 +72,30 @@ pub struct PumpControl {
     pub last_error: Arc<Mutex<String>>,
 }
 
+impl Default for PumpControl {
+    fn default() -> Self {
+        Self {
+            bitrate: Arc::new(AtomicU32::new(0)),
+            keyframe: Arc::new(AtomicBool::new(false)),
+            frames_sent: Arc::new(AtomicU64::new(0)),
+            bytes_sent: Arc::new(AtomicU64::new(0)),
+            encoded_frames: Arc::new(AtomicU64::new(0)),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            encode_us_ema: Arc::new(AtomicU64::new(0)),
+            capture_us_ema: Arc::new(AtomicU64::new(0)),
+            convert_us_ema: Arc::new(AtomicU64::new(0)),
+            queue_us_ema: Arc::new(AtomicU64::new(0)),
+            keyframes: Arc::new(AtomicU64::new(0)),
+            capture_w: Arc::new(AtomicU32::new(0)),
+            capture_h: Arc::new(AtomicU32::new(0)),
+            encode_w: Arc::new(AtomicU32::new(0)),
+            encode_h: Arc::new(AtomicU32::new(0)),
+            encoder_name: Arc::new(Mutex::new(String::new())),
+            last_error: Arc::new(Mutex::new(String::new())),
+        }
+    }
+}
+
 impl PumpControl {
     /// Sliding-average encode time in milliseconds.
     pub fn encode_ms(&self) -> f64 {

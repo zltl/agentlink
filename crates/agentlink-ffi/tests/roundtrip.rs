@@ -83,7 +83,7 @@ impl NodeHost for PhoneHost {
         host_ok(json!({"session_id": session_id}))
     }
 
-    fn poll_session(&self, session_id: String) -> String {
+    fn poll_session(&self, session_id: String, _caller: String) -> String {
         let mut map = self.sessions.lock().unwrap();
         let Some(session) = map.get_mut(&session_id) else {
             return host_err("unknown session");
@@ -103,11 +103,18 @@ impl NodeHost for PhoneHost {
         host_ok(json!({"event": "exit", "code": session.exit_code}))
     }
 
-    fn session_input(&self, _session_id: String, data_b64: String) -> String {
+    fn session_input(&self, _session_id: String, data_b64: String, _caller: String) -> String {
         host_ok(json!({"bytes": data_b64.len()}))
     }
 
-    fn close_session(&self, session_id: String) -> String {
+    fn close_session(&self, session_id: String, _caller: String) -> String {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(&session_id) {
+            session.closed = true;
+        }
+        host_ok(json!({"closed": session_id}))
+    }
+
+    fn release_session(&self, session_id: String, _release: String) -> String {
         if let Some(session) = self.sessions.lock().unwrap().get_mut(&session_id) {
             session.closed = true;
         }

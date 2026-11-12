@@ -205,6 +205,48 @@ fn skippable_search_io(err: &io::Error) -> bool {
     )
 }
 
+
+fn filename_pattern_hits(
+    pattern: &str,
+    rel: &str,
+    name: &str,
+    abs: &str,
+    case_insensitive: bool,
+    regex: Option<&regex::Regex>,
+    glob: Option<&globset::GlobMatcher>,
+) -> bool {
+    let pat = agentlink_core::paths::normalize_path_text(pattern);
+    let rel_n = agentlink_core::paths::normalize_path_text(rel);
+    let abs_n = agentlink_core::paths::normalize_path_text(abs);
+    let same = |a: &str, b: &str| {
+        if case_insensitive {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    // Literal path equality first so an absolute file path is not parsed as a
+    // glob (`[` in a name, `\` as an escape on Windows).
+    if same(&pat, &rel_n) || same(&pat, name) || same(&pat, &abs_n) {
+        return true;
+    }
+    if let Some(regex) = regex {
+        regex.is_match(rel)
+            || regex.is_match(name)
+            || regex.is_match(abs)
+            || regex.is_match(&rel_n)
+            || regex.is_match(&abs_n)
+    } else if let Some(glob) = glob {
+        glob.is_match(rel)
+            || glob.is_match(name)
+            || glob.is_match(abs)
+            || glob.is_match(&rel_n)
+            || glob.is_match(&abs_n)
+    } else {
+        false
+    }
+}
+
 fn filename_search_blocking(sandbox: Option<&Path>, query: &NameQuery) -> Result<Value> {
     validate_pattern(&query.pattern)?;
     if query.offset > MAX_OFFSET {
@@ -232,15 +274,18 @@ fn filename_search_blocking(sandbox: Option<&Path>, query: &NameQuery) -> Result
     let glob = if query.regex {
         None
     } else {
-        Some(
-            globset::GlobBuilder::new(&query.pattern)
+        Some({
+            // Windows absolute paths use backslashes. With backslash_escape
+            // those would be glob escapes (`C:\temp\a.txt` would not match).
+            let pattern = agentlink_core::paths::normalize_path_text(&query.pattern);
+            globset::GlobBuilder::new(&pattern)
                 .case_insensitive(query.case_insensitive)
                 .literal_separator(false)
                 .backslash_escape(true)
                 .build()
                 .map_err(|err| Error::Message(format!("glob: {err}")))?
-                .compile_matcher(),
-        )
+                .compile_matcher()
+        })
     };
 
     let mut found = Vec::new();
@@ -258,14 +303,16 @@ fn filename_search_blocking(sandbox: Option<&Path>, query: &NameQuery) -> Result
             .unwrap_or_default();
         // Agents often pass an absolute path as the pattern (`find NODE /tmp/a.txt /`).
         // Match against the absolute form too, not only the root-relative strip.
-        let abs = path.to_string_lossy().replace('\\', "/");
-        let matched = if let Some(regex) = &regex {
-            regex.is_match(&rel) || regex.is_match(&name) || regex.is_match(&abs)
-        } else if let Some(glob) = &glob {
-            glob.is_match(&rel) || glob.is_match(&name) || glob.is_match(&abs)
-        } else {
-            false
-        };
+        let abs = agentlink_core::paths::normalize_path_text(&path.to_string_lossy());
+        let matched = filename_pattern_hits(
+            &query.pattern,
+            &rel,
+            &name,
+            &abs,
+            query.case_insensitive,
+            regex.as_ref(),
+            glob.as_ref(),
+        );
         if !matched {
             return false;
         }
@@ -865,7 +912,7 @@ mod tests {
         let names = filename_search_blocking(
             None,
             &NameQuery {
-                path: root,
+                path: root.clone(),
                 pattern: abs.clone(),
                 regex: false,
                 gitignore: false,
@@ -880,6 +927,32 @@ mod tests {
         assert!(
             matches.iter().any(|m| m["path"].as_str() == Some(abs.as_str())),
             "{names}"
+        );
+        // Same path written with the other separator must still hit, including
+        // a Windows `C:\…\target.txt` pattern after slash-normalization.
+        let flipped = if abs.contains('\\') {
+            abs.replace('\\', "/")
+        } else {
+            abs.replace('/', "\\")
+        };
+        let names = filename_search_blocking(
+            None,
+            &NameQuery {
+                path: root,
+                pattern: flipped,
+                regex: false,
+                gitignore: false,
+                include_hidden: false,
+                case_insensitive: false,
+                offset: 0,
+                limit: 20,
+            },
+        )
+        .unwrap();
+        let matches = names["matches"].as_array().unwrap();
+        assert!(
+            matches.iter().any(|m| m["path"].as_str() == Some(abs.as_str())),
+            "separator-flipped pattern must match, got {names}"
         );
     }
 }

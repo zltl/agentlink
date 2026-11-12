@@ -49,6 +49,16 @@ impl ConsentMode {
     }
 }
 
+/// Fail closed when the consent lock is poisoned. A torn Auto/Notify
+/// value must not let a viewer attach.
+pub fn read_consent_mode(
+    lock: &std::sync::RwLock<ConsentMode>,
+) -> std::result::Result<ConsentMode, String> {
+    lock.read()
+        .map(|guard| *guard)
+        .map_err(|_| "stream consent is unavailable".into())
+}
+
 pub fn approve(
     mode: ConsentMode,
     audit_path: &Path,
@@ -357,5 +367,23 @@ mod tests {
             assert!(!literal.contains('\u{2028}'));
             assert!(!literal.contains('\u{2029}'));
         }
+    }
+
+    #[test]
+    fn poisoned_consent_lock_is_fail_closed() {
+        use std::sync::{Arc, RwLock};
+        let lock = Arc::new(RwLock::new(ConsentMode::Auto));
+        assert_eq!(read_consent_mode(&lock).unwrap(), ConsentMode::Auto);
+        let poison = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.write().unwrap();
+            panic!("poison the consent lock");
+        })
+        .join();
+        let err = read_consent_mode(&lock).unwrap_err();
+        assert!(
+            err.contains("unavailable"),
+            "poisoned consent must not into_inner, got {err}"
+        );
     }
 }
