@@ -62,6 +62,7 @@ pub fn enter_debug(
         perf_log: debug.perf_log,
         debug_inbox: inbox,
         logical_size: (DEFAULT_W, DEFAULT_H),
+        preview_ui: false,
     });
     // Detach: eframe may never see a quit, and join would block on accept().
     drop(sock_thread);

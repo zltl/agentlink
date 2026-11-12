@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use agentlink_core::{NodePolicy, RelayTrust};
+use agentlink_core::{NodeInfo, NodePolicy, RelayTrust};
 
 pub const SCROLLBACK: usize = 1000;
 
@@ -154,6 +154,103 @@ pub struct CardButton {
     pub kind: CardButtonKind,
     pub enabled: bool,
     pub reason: &'static str,
+}
+
+/// One-line presence for a machine row (no node id or version).
+pub fn node_presence_label(online: bool, has_display: Option<bool>) -> &'static str {
+    match (online, has_display) {
+        (false, _) => "Offline",
+        (true, Some(false)) => "Online · Headless",
+        (true, Some(true)) => "Online",
+        (true, None) => "Online",
+    }
+}
+
+/// Short, copyable id for secondary details. Not a product wordmark.
+pub fn short_node_id(id: &str) -> String {
+    let id = id.trim();
+    if id.chars().count() <= 12 {
+        return id.to_string();
+    }
+    ellipsize_chars(id, 12)
+}
+
+/// Access phrase from the listed preset, falling back to the effective policy.
+pub fn access_summary(access: &str, policy: NodePolicy) -> String {
+    let access = access.trim();
+    if !access.is_empty() {
+        return access.to_string();
+    }
+    policy.preset_name().to_string()
+}
+
+fn preview_node(
+    id: &str,
+    name: &str,
+    hostname: &str,
+    online: bool,
+    has_display: Option<bool>,
+    policy: NodePolicy,
+    access: &str,
+) -> NodeInfo {
+    NodeInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        hostname: hostname.to_string(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        version: "preview-fixture".into(),
+        online,
+        policy,
+        effective: policy,
+        owner: String::new(),
+        relation: String::new(),
+        access: access.to_string(),
+        has_display,
+    }
+}
+
+/// Labeled fixture machines for `--preview-ui`. Names and ids start with
+/// `preview-fixture` so they cannot be mistaken for a live inventory.
+pub fn preview_fixture_nodes() -> Vec<NodeInfo> {
+    vec![
+        preview_node(
+            "preview-fixture-desktop",
+            "Fixture · desktop (sample)",
+            "preview-desktop",
+            true,
+            Some(true),
+            NodePolicy::full(),
+            "full",
+        ),
+        preview_node(
+            "preview-fixture-headless",
+            "Fixture · headless (sample)",
+            "preview-headless",
+            true,
+            Some(false),
+            NodePolicy::exec(),
+            "exec",
+        ),
+        preview_node(
+            "preview-fixture-view-only",
+            "Fixture · view-only (sample)",
+            "preview-view",
+            true,
+            Some(true),
+            NodePolicy::remote_view(),
+            "remote-view",
+        ),
+        preview_node(
+            "preview-fixture-offline",
+            "Fixture · offline (sample)",
+            "preview-offline",
+            false,
+            Some(true),
+            NodePolicy::full(),
+            "full",
+        ),
+    ]
 }
 
 /// Visible primary actions on a machines card. Labels are the real start
@@ -379,23 +476,19 @@ pub fn notice_refers_to_path(notice: &str, path: &str) -> bool {
     !path.is_empty() && notice.starts_with("Saved ") && notice.contains(path)
 }
 
-/// Width of the session machine rail, including its frame margin.
-pub const MACHINE_RAIL_WIDTH: f32 = 260.0;
-
-/// Comfortable main-column width beside the rail (terminal/files chrome).
+/// Width of the compact device nav (session and machines), including frame.
 ///
-/// Parent GUI at a restored ~1085 px window still showed the rail with the
-/// old 980 show-at. That was the threshold policy, not a viewport min-size
-/// pin (screenshot physical width ≈ 1085; Read preview 1280-wide made it
-/// look like ~725). Fold when the window cannot keep rail + this main.
-pub const SESSION_MAIN_COMFORT_WIDTH: f32 = 840.0;
+/// This is a name+status list, not a stack of four action buttons, so it
+/// can stay narrower than the old 260 pt action rail.
+pub const MACHINE_RAIL_WIDTH: f32 = 220.0;
 
-/// Hide the session rail below this window width; the session page still
-/// has an explicit Back to machines button.
+/// Hide the device nav below this window width. 1024 (acceptance) and
+/// 1280 keep a stable sidebar. 719 folds it and uses a stacked list so
+/// Terminal/Files keep a usable column. The session page still has Back.
 ///
-/// Intentional breakpoint: `MACHINE_RAIL_WIDTH + SESSION_MAIN_COMFORT_WIDTH`
-/// (1100). Distinct from the View-desktop rail clipping bug.
-pub const MACHINE_RAIL_SHOW_AT: f32 = MACHINE_RAIL_WIDTH + SESSION_MAIN_COMFORT_WIDTH;
+/// Earlier builds folded at 1100 because the rail held full "View desktop"
+/// labels. The compact nav no longer needs that leftover main width.
+pub const MACHINE_RAIL_SHOW_AT: f32 = 800.0;
 
 /// The Machines list is a single compact column.
 ///
@@ -756,20 +849,45 @@ mod tests {
         assert_eq!(wide, 1216.0);
         let narrow = machine_card_width(736.0, 1, 16.0);
         assert_eq!(narrow, 736.0);
-        // Intentional fold below rail + comfortable main (1100), so a restored
-        // ~1080 window hides the sidebar. 1280/1920 keep the rail.
-        assert_eq!(MACHINE_RAIL_SHOW_AT, 1100.0);
+        // Compact nav stays at the 1024 acceptance width and at a restored
+        // ~1080 window. It folds only on truly narrow frames (719 / 725).
+        assert_eq!(MACHINE_RAIL_SHOW_AT, 800.0);
+        assert!(machine_rail_visible(1024.0));
+        assert!(machine_rail_visible(1080.0));
+        assert!(machine_rail_visible(1085.0));
         assert!(machine_rail_visible(1280.0));
         assert!(machine_rail_visible(1920.0));
-        assert!(!machine_rail_visible(1080.0));
-        assert!(!machine_rail_visible(1085.0));
-        assert!(!machine_rail_visible(800.0));
+        assert!(machine_rail_visible(800.0));
+        assert!(!machine_rail_visible(799.0));
+        assert!(!machine_rail_visible(719.0));
         assert!(!machine_rail_visible(725.0));
         assert_eq!(
             ellipsize_chars("iZ7xv88es0zy9ogs1ny63Z", 12),
             "iZ7xv88es0z…"
         );
         assert_eq!(ellipsize_chars("short", 12), "short");
+        assert_eq!(node_presence_label(false, Some(true)), "Offline");
+        assert_eq!(
+            node_presence_label(true, Some(false)),
+            "Online · Headless"
+        );
+        assert_eq!(short_node_id("abcd"), "abcd");
+        assert_eq!(short_node_id("0123456789abcdef"), "0123456789a…");
+        let fixtures = preview_fixture_nodes();
+        assert!(fixtures.len() >= 4);
+        assert!(fixtures.iter().all(|n| n.id.starts_with("preview-fixture-")
+            && n.name.contains("Fixture")
+            && n.name.contains("sample")));
+        let headless = fixtures.iter().find(|n| n.id.ends_with("headless")).unwrap();
+        let buttons = card_buttons(headless.online, headless.has_display, headless.effective);
+        assert!(buttons.iter().all(|b| b.label != "View desktop" && b.label != "Control desktop"));
+        let view_only = fixtures.iter().find(|n| n.id.ends_with("view-only")).unwrap();
+        let buttons = card_buttons(view_only.online, view_only.has_display, view_only.effective);
+        let control = buttons.iter().find(|b| b.label == "Control desktop").unwrap();
+        assert!(!control.enabled);
+        assert!(
+            control.reason.contains("remote-control") || control.reason.contains("View desktop")
+        );
     }
 
     #[test]

@@ -45,6 +45,8 @@ pub struct EnterArgs {
     pub perf_log: Option<std::path::PathBuf>,
     /// Open this node's desktop once the machine list arrives.
     pub open_desktop: Option<String>,
+    /// Isolated layout fixture. Temporary dirs, no live account, no auto-start.
+    pub preview_ui: bool,
 }
 
 pub fn enter(
@@ -68,6 +70,7 @@ pub fn enter(
         max_fps: 30,
         perf_log: None,
         open_desktop: None,
+        preview_ui: false,
     })
 }
 
@@ -96,7 +99,8 @@ pub fn enter_args(args: EnterArgs) -> i32 {
             },
         };
         #[cfg(unix)]
-        if let Some(socket) = args.debug_socket {
+        if !args.preview_ui {
+            if let Some(socket) = args.debug_socket {
             return debug::enter_debug(
                 args.config_dir,
                 data_dir,
@@ -112,15 +116,36 @@ pub fn enter_args(args: EnterArgs) -> i32 {
                     perf_log: args.perf_log.clone(),
                 },
             );
+            }
         }
         #[cfg(not(unix))]
-        if args.debug_socket.is_some() || args.headless {
+        if !args.preview_ui && (args.debug_socket.is_some() || args.headless) {
             eprintln!("controller debug socket requires unix");
             return 1;
         }
-        if args.headless {
+        if args.headless && !args.preview_ui {
             eprintln!("controller --headless requires --debug-socket");
             return 1;
+        }
+        if args.preview_ui {
+            // Isolated fixture only. Never starts the production worker,
+            // tray, or auto-start, and never reads the caller's account.
+            return ui::enter_with_opts(ui::EnterOpts {
+                config_dir: args.config_dir,
+                data_dir,
+                tray: false,
+                background: false,
+                mock: true,
+                headless: false,
+                fail_connect: false,
+                connect_timeout_secs: args.connect_timeout_secs,
+                max_fps: args.max_fps,
+                perf_log: None,
+                debug_inbox: None,
+                logical_size: (1080.0, 760.0),
+                open_desktop: None,
+                preview_ui: true,
+            });
         }
         if args.mock {
             return ui::enter_with_opts(ui::EnterOpts {
@@ -137,6 +162,7 @@ pub fn enter_args(args: EnterArgs) -> i32 {
                 debug_inbox: None,
                 logical_size: (1440.0, 900.0),
                 open_desktop: args.open_desktop.clone(),
+                preview_ui: false,
             });
         }
         return ui::enter_with_opts(ui::EnterOpts {
@@ -153,6 +179,7 @@ pub fn enter_args(args: EnterArgs) -> i32 {
             debug_inbox: None,
             logical_size: (1080.0, 760.0),
             open_desktop: args.open_desktop.clone(),
+            preview_ui: false,
         });
     }
     #[cfg(target_env = "musl")]

@@ -734,6 +734,10 @@ enum Command {
         /// smoke tests possible without synthesising clicks.
         #[arg(long, value_name = "NODE")]
         open_desktop: Option<String>,
+        /// Isolated layout fixture. Temporary directories, labeled sample
+        /// machines, no live account, and no production auto-start.
+        #[arg(long)]
+        preview_ui: bool,
     },
     /// Notification-area icon and status window.
     ///
@@ -1145,6 +1149,7 @@ fn main() {
         max_fps,
         perf_log,
         open_desktop,
+        preview_ui,
     } = &cli.command
     {
         let config_dir = match config_dir(&cli) {
@@ -1168,6 +1173,7 @@ fn main() {
             max_fps: *max_fps,
             perf_log: perf_log.clone(),
             open_desktop: open_desktop.clone(),
+            preview_ui: *preview_ui,
         }));
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1436,6 +1442,7 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
             max_fps,
             perf_log,
             open_desktop,
+            preview_ui,
         } => Ok(controller::enter_args(controller::EnterArgs {
             config_dir: config_dir(cli)?,
             data_dir: data_dir.clone(),
@@ -1450,6 +1457,7 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
             max_fps: *max_fps,
             perf_log: perf_log.clone(),
             open_desktop: open_desktop.clone(),
+            preview_ui: *preview_ui,
         })),
         Command::Tray {
             data_dir,

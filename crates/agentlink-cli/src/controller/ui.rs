@@ -21,7 +21,8 @@ use super::chrome::{
     BAR_HEIGHT,
 };
 use super::model::{
-    self, card_buttons, connection_label, display_note, has_saved_session, Action, CardButtonKind,
+    self, access_summary, card_buttons, connection_label, display_note, has_saved_session,
+    node_presence_label, Action, CardButtonKind,
 };
 use super::term::Emulator;
 use super::theme;
@@ -119,6 +120,8 @@ pub struct EnterOpts {
     pub logical_size: (f32, f32),
     /// Open this node's desktop once the machine list arrives.
     pub open_desktop: Option<String>,
+    /// Isolated layout fixture. Never uses the caller's account or auto-start.
+    pub preview_ui: bool,
 }
 
 const PRESETS: &[&str] = &[
@@ -259,6 +262,12 @@ pub struct ControllerApp {
     open_desktop: Option<String>,
     /// Set once the auto-open ran so a refresh cannot yank the user back.
     auto_opened: bool,
+    /// Selected machine on the Machines page (and highlighted in the nav).
+    selected_id: Option<String>,
+    /// Settings / About panel (pairing, start-on-login, version).
+    settings_open: bool,
+    /// Isolated preview fixture; not a live account.
+    preview_ui: bool,
 }
 
 pub fn enter(
@@ -281,10 +290,26 @@ pub fn enter(
         debug_inbox: None,
         logical_size: (1080.0, 760.0),
         open_desktop: None,
+        preview_ui: false,
     })
 }
 
 pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
+    if opts.preview_ui {
+        // Force a throwaway directory. Never read or write the caller's
+        // production config, data dir, or start-on-login state.
+        let root = std::env::temp_dir().join(format!(
+            "agentlink-preview-ui-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(root.join("config"));
+        let _ = std::fs::create_dir_all(root.join("data"));
+        opts.config_dir = root.join("config");
+        opts.data_dir = root.join("data");
+        opts.tray = false;
+        opts.background = false;
+        opts.mock = true;
+    }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared::new());
     if !opts.mock {
@@ -327,6 +352,9 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
     app.perf_log = opts.perf_log;
     app.debug_inbox = opts.debug_inbox;
     app.open_desktop = opts.open_desktop;
+    if opts.preview_ui {
+        app.apply_preview_fixture();
+    }
     let (iw, ih) = opts.logical_size;
     // Min size stays below the intentional rail fold breakpoint and below the
     // 725-wide narrow layout parent uses in GUI. Not a root cause of the
@@ -474,6 +502,9 @@ impl ControllerApp {
             mock_frame_window_count: 0,
             open_desktop: None,
             auto_opened: false,
+            selected_id: None,
+            settings_open: false,
+            preview_ui: false,
         }
     }
 
@@ -525,6 +556,7 @@ impl ControllerApp {
                 }
                 UiEvent::Nodes(nodes) => {
                     self.nodes = nodes;
+                    self.ensure_selection();
                     self.maybe_auto_open_desktop();
                 }
                 UiEvent::Failed(message) => {
@@ -771,6 +803,7 @@ impl ControllerApp {
             rows: self.term_size.0,
             cols: self.term_size.1,
         });
+        self.selected_id = Some(node.id.clone());
         self.screen = Screen::Terminal {
             id: node.id.clone(),
             name: node.name.clone(),
@@ -787,6 +820,7 @@ impl ControllerApp {
             node: node.id.clone(),
             path: ".".into(),
         });
+        self.selected_id = Some(node.id.clone());
         self.screen = Screen::Files {
             id: node.id.clone(),
             name: node.name.clone(),
@@ -852,6 +886,7 @@ impl ControllerApp {
     }
 
     fn open_desktop(&mut self, node: &NodeInfo, control: bool) {
+        self.selected_id = Some(node.id.clone());
         self.control.insert(node.id.clone(), control);
         self.reset_desktop_session();
         self.error.clear();
@@ -1085,7 +1120,13 @@ impl ControllerApp {
             Screen::Terminal { name, .. } => format!("{name} — terminal — agentlink"),
             Screen::Files { name, .. } => format!("{name} — files — agentlink"),
             // Login / Restoring / Machines: no active session.
-            Screen::Login | Screen::Restoring | Screen::Machines => "agentlink controller".into(),
+            Screen::Login | Screen::Restoring | Screen::Machines => {
+                if self.preview_ui {
+                    "agentlink controller (preview)".into()
+                } else {
+                    "agentlink controller".into()
+                }
+            }
         }
     }
 
@@ -1177,94 +1218,100 @@ impl ControllerApp {
                     self.desktop(ui);
                 });
         } else {
-            let show_rail = matches!(self.screen, Screen::Terminal { .. } | Screen::Files { .. })
-                && model::machine_rail_visible(ctx.screen_rect().width());
+            let show_rail = matches!(
+                self.screen,
+                Screen::Machines | Screen::Terminal { .. } | Screen::Files { .. }
+            ) && model::machine_rail_visible(ctx.screen_rect().width());
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(theme::BG_PAGE))
                 .show(ctx, |ui| {
-                    if show_rail {
-                        // Full-height left-to-right split inside the central
-                        // panel. `ui.horizontal()` only seeds interact_size.y
-                        // height, which crushed Terminal/Files into a thin
-                        // strip and left the rest of the window as empty
-                        // BG_PAGE (black) at 1280×800. SidePanel also advanced
-                        // the main column from overflowing button rects.
-                        // Claim an exact rail slot, clip overflow, and keep
-                        // the main column at the remaining width.
-                        let avail = ui.available_size();
-                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                        ui.allocate_ui_with_layout(
-                            avail,
-                            egui::Layout::left_to_right(egui::Align::Min),
-                            |ui| {
-                                let rail_w = model::MACHINE_RAIL_WIDTH;
-                                let row_h = ui.max_rect().height().max(1.0);
-                                let (rail_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(rail_w, row_h),
-                                    egui::Sense::hover(),
+                    // Compact page margin (not SPACE_2XL). Header spans the
+                    // window; the device nav fills the remaining height.
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing =
+                                egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
+                            self.paint_chrome(ui);
+                            if show_rail {
+                                // Full remaining height, left-to-right split.
+                                let avail = ui.available_size();
+                                // Zero gap: tests require rail and main to abut
+                                // within 2 px. Main padding is inside main_rect.
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                ui.allocate_ui_with_layout(
+                                    avail,
+                                    egui::Layout::left_to_right(egui::Align::Min),
+                                    |ui| {
+                                        let rail_w = model::MACHINE_RAIL_WIDTH;
+                                        let row_h = ui.max_rect().height().max(1.0);
+                                        let (rail_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(rail_w, row_h),
+                                            egui::Sense::hover(),
+                                        );
+                                        {
+                                            let mut rail_ui = ui.new_child(
+                                                egui::UiBuilder::new()
+                                                    .id_salt("machine-rail")
+                                                    .max_rect(rail_rect)
+                                                    .layout(egui::Layout::top_down(
+                                                        egui::Align::Min,
+                                                    )),
+                                            );
+                                            rail_ui.set_clip_rect(rail_rect);
+                                            egui::Frame::NONE
+                                                .fill(theme::BG_SURFACE)
+                                                .inner_margin(egui::Margin::same(
+                                                    theme::SPACE_MD as i8,
+                                                ))
+                                                .stroke(theme::stroke_border_subtle())
+                                                .show(&mut rail_ui, |ui| {
+                                                    ui.set_min_size(ui.max_rect().size());
+                                                    ui.set_max_size(ui.max_rect().size());
+                                                    self.machine_rail(ui);
+                                                });
+                                        }
+                                        let main_w = ui.available_width().max(1.0);
+                                        let (main_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(main_w, row_h),
+                                            egui::Sense::hover(),
+                                        );
+                                        {
+                                            let mut main_ui = ui.new_child(
+                                                egui::UiBuilder::new()
+                                                    .id_salt("session-main")
+                                                    .max_rect(main_rect)
+                                                    .layout(egui::Layout::top_down(
+                                                        egui::Align::Min,
+                                                    )),
+                                            );
+                                            main_ui.set_clip_rect(main_rect);
+                                            egui::Frame::NONE
+                                                .inner_margin(egui::Margin::symmetric(
+                                                    theme::SPACE_MD as i8,
+                                                    0,
+                                                ))
+                                                .show(&mut main_ui, |ui| {
+                                                    self.paint_page(ui);
+                                                });
+                                        }
+                                        self.debug_layout.rail_rect = rect_xywh(rail_rect);
+                                        self.debug_layout.main_rect = rect_xywh(main_rect);
+                                    },
                                 );
-                                {
-                                    let mut rail_ui = ui.new_child(
-                                        egui::UiBuilder::new()
-                                            .id_salt("machine-rail")
-                                            .max_rect(rail_rect)
-                                            .layout(egui::Layout::top_down(egui::Align::Min)),
-                                    );
-                                    rail_ui.set_clip_rect(rail_rect);
-                                    egui::Frame::NONE
-                                        .fill(theme::BG_SURFACE)
-                                        .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
-                                        .stroke(theme::stroke_border_subtle())
-                                        .show(&mut rail_ui, |ui| {
-                                            ui.set_min_size(ui.max_rect().size());
-                                            ui.set_max_size(ui.max_rect().size());
-                                            self.machine_rail(ui);
-                                        });
-                                }
-                                let main_w = ui.available_width().max(1.0);
-                                let (main_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(main_w, row_h),
-                                    egui::Sense::hover(),
-                                );
-                                {
-                                    let mut main_ui = ui.new_child(
-                                        egui::UiBuilder::new()
-                                            .id_salt("session-main")
-                                            .max_rect(main_rect)
-                                            .layout(egui::Layout::top_down(egui::Align::Min)),
-                                    );
-                                    main_ui.set_clip_rect(main_rect);
-                                    egui::Frame::NONE
-                                        .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
-                                        .show(&mut main_ui, |ui| {
-                                            self.chrome_and_page(ui);
-                                        });
-                                }
-                                self.debug_layout.rail_rect = rect_xywh(rail_rect);
+                            } else {
+                                let main_rect = ui.available_rect_before_wrap();
                                 self.debug_layout.main_rect = rect_xywh(main_rect);
-                            },
-                        );
-                    } else {
-                        let margin = match self.screen {
-                            Screen::Machines => egui::Margin::symmetric(
-                                theme::SPACE_2XL as i8,
-                                theme::SPACE_LG as i8,
-                            ),
-                            _ => egui::Margin::same(theme::SPACE_LG as i8),
-                        };
-                        let main_rect = ui.available_rect_before_wrap();
-                        self.debug_layout.main_rect = rect_xywh(main_rect);
-                        egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
-                            self.chrome_and_page(ui);
+                                self.paint_page(ui);
+                            }
                         });
-                    }
                 });
         }
     }
 }
 
 impl ControllerApp {
-    fn chrome_and_page(&mut self, ui: &mut egui::Ui) {
+    fn paint_chrome(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
         self.header(ui);
         if !self.error.is_empty() {
@@ -1276,6 +1323,10 @@ impl ControllerApp {
         if !super::fonts::report().loaded {
             ui.label(theme::muted_text(super::fonts::missing_font_hint()));
         }
+    }
+
+    fn paint_page(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
         match self.screen {
             Screen::Login => self.login(ui),
             Screen::Restoring => self.restoring(ui),
@@ -1287,43 +1338,84 @@ impl ControllerApp {
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        let clip = ui.clip_rect();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_XS);
             ui.label(
-                egui::RichText::new("agentlink")
-                    .size(17.0)
+                egui::RichText::new("Agentlink")
+                    .size(16.0)
                     .color(theme::TEXT_PRIMARY)
                     .strong(),
             );
+            let link_label = if self.preview_ui {
+                "Isolated preview"
+            } else if self.link.is_empty() {
+                "Not connected"
+            } else {
+                self.link.as_str()
+            };
+            let pill = status_pill(ui, link_label, theme::TEXT_MUTED, None);
+            self.debug_layout
+                .note_visible("header_status", pill.rect, clip);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, 0.0);
-                if ui
+                ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_XS);
+                let quit = ui
                     .add(theme::secondary_button("Quit"))
-                    .on_hover_text("Exit the controller. The window close button also exits unless this was started with --background and a status icon is running.")
-                    .clicked()
-                {
+                    .on_hover_text("Exit the controller. The window close button also exits unless this was started with --background and a status icon is running.");
+                self.debug_layout.note_visible("header_quit", quit.rect, clip);
+                if quit.clicked() {
                     self.flags.quit.store(true, Ordering::Relaxed);
                     self.send(Cmd::PtyClose);
                     self.send(Cmd::LiveStop);
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if self.user.is_some() && !matches!(self.screen, Screen::Login | Screen::Restoring)
-                {
-                    if ui.add(theme::secondary_button("Log out")).clicked() {
-                        self.back_to_machines();
-                        self.send(Cmd::Logout);
-                    }
-                    if ui.add(theme::secondary_button("Refresh")).clicked() {
-                        self.send(Cmd::Refresh);
+                let can_account =
+                    self.user.is_some() && !matches!(self.screen, Screen::Login | Screen::Restoring);
+                if can_account {
+                    if !self.preview_ui {
+                        let logout = ui.add(theme::secondary_button("Log out"));
+                        self.debug_layout
+                            .note_visible("header_logout", logout.rect, clip);
+                        if logout.clicked() {
+                            self.back_to_machines();
+                            self.send(Cmd::Logout);
+                        }
+                        let refresh = ui.add(theme::secondary_button("Refresh"));
+                        self.debug_layout
+                            .note_visible("header_refresh", refresh.rect, clip);
+                        if refresh.clicked() {
+                            self.send(Cmd::Refresh);
+                        }
                     }
                     if let Some(user) = &self.user {
                         status_pill(ui, user, theme::TEXT_MUTED, None);
                     }
                 }
-                // Relay / link pill — always on the right edge of the wordmark row.
-                status_pill(ui, &self.link, theme::TEXT_MUTED, None);
+                let settings = ui.add(theme::secondary_button(if self.settings_open {
+                    "Close settings"
+                } else {
+                    "Settings"
+                }));
+                self.debug_layout
+                    .note_visible("header_settings", settings.rect, clip);
+                if settings.clicked() {
+                    self.settings_open = !self.settings_open;
+                }
             });
         });
-        ui.add_space(theme::SPACE_MD);
+        if self.preview_ui {
+            let banner = banner(
+                ui,
+                "Isolated preview — fixture machines, not a live account or production auto-start.",
+                false,
+            );
+            self.debug_layout
+                .note_visible("preview_banner", banner.rect, clip);
+        }
+        if self.settings_open {
+            self.settings_panel(ui);
+        }
+        ui.add_space(theme::SPACE_SM);
     }
 
     fn login(&mut self, ui: &mut egui::Ui) {
@@ -1423,25 +1515,27 @@ impl ControllerApp {
     }
 
     fn machines(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(theme::muted_text(&self.node_line));
-            ui.add_space(theme::SPACE_SM);
-            let label = if self.autostart {
-                "Start on login: on"
-            } else {
-                "Start on login: off"
-            };
-            if ui.add(theme::secondary_button(label)).clicked() {
-                self.toggle_autostart();
-            }
-        });
-        for pin in &self.pins {
+        self.ensure_selection();
+        egui::ScrollArea::vertical()
+            .id_salt("machines-page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.machines_inner(ui);
+            });
+    }
+
+    fn machines_inner(&mut self, ui: &mut egui::Ui) {
+        let pins = self.pins.clone();
+        for pin in &pins {
             banner(ui, pin, true);
         }
 
         let loading = self.nodes.is_empty()
             && self.user.is_some()
             && (link_is_connecting(&self.link) || self.link == "relay");
+        let rail = model::machine_rail_visible(self.logical_size.0);
+        let clip = ui.clip_rect();
         if self.nodes.is_empty() {
             let avail = ui.available_size();
             let empty = ui.allocate_ui_with_layout(
@@ -1460,36 +1554,279 @@ impl ControllerApp {
                 },
             );
             self.debug_layout
-                .set_page_visible(empty.response.rect, ui.clip_rect());
+                .set_page_visible(empty.response.rect, clip);
         } else {
-            let nodes = self.nodes.clone();
-            let list = egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.set_max_width(ui.available_width());
-                    for node in &nodes {
-                        self.node_card(ui, node);
-                        ui.add_space(theme::SPACE_SM);
-                    }
-                });
-            self.debug_layout
-                .set_page_visible(list.inner_rect, ui.clip_rect());
-        }
-        ui.add_space(theme::SPACE_MD);
-        if ui
-            .add(theme::secondary_button(if self.enroll_open {
-                "Hide pairing"
+            if !rail {
+                self.machine_list(ui, true);
+                ui.add_space(theme::SPACE_SM);
+            }
+            if let Some(node) = self.selected_node() {
+                let detail = egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.machine_detail(ui, &node);
+                    });
+                self.debug_layout
+                    .set_page_visible(detail.inner_rect, clip);
             } else {
-                "Pair a machine"
-            }))
-            .clicked()
-        {
-            self.enroll_open = !self.enroll_open;
+                let hint = ui.label(theme::muted_text("Select a machine."));
+                self.debug_layout.set_page_visible(hint.rect, clip);
+            }
         }
-        if self.enroll_open {
+        if !rail {
+            ui.add_space(theme::SPACE_SM);
+            self.pair_toggle(ui);
+        } else if self.enroll_open {
+            ui.add_space(theme::SPACE_SM);
             self.enroll(ui);
         }
+        if !rail && self.enroll_open {
+            self.enroll(ui);
+        }
+    }
+
+    fn pair_toggle(&mut self, ui: &mut egui::Ui) {
+        let resp = ui.add(theme::secondary_button(if self.enroll_open {
+            "Hide pairing"
+        } else {
+            "Pair a machine"
+        }));
+        self.debug_layout
+            .note_visible("pair_toggle", resp.rect, ui.clip_rect());
+        if resp.clicked() {
+            self.enroll_open = !self.enroll_open;
+        }
+    }
+
+    fn apply_preview_fixture(&mut self) {
+        self.preview_ui = true;
+        self.mock = true;
+        self.hide_on_close = false;
+        self.autostart = false;
+        self.user = Some("Preview (not signed in)".into());
+        self.nodes = model::preview_fixture_nodes();
+        self.selected_id = self.nodes.first().map(|n| n.id.clone());
+        self.screen = Screen::Machines;
+        self.link = "isolated preview".into();
+        self.window_title = "agentlink controller (preview)".into();
+        self.node_line = "This computer is not used in preview.".into();
+        self.error.clear();
+        self.notice.clear();
+    }
+
+    fn ensure_selection(&mut self) {
+        if let Some(id) = &self.selected_id {
+            if self.nodes.iter().any(|node| &node.id == id) {
+                return;
+            }
+        }
+        self.selected_id = self.nodes.first().map(|node| node.id.clone());
+    }
+
+    fn selected_node(&self) -> Option<NodeInfo> {
+        let id = self.selected_id.as_deref()?;
+        self.nodes.iter().find(|node| node.id == id).cloned()
+    }
+
+    fn machine_list(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let nodes = self.nodes.clone();
+        let max_h = if compact {
+            (ui.available_height() * 0.38).clamp(96.0, 220.0)
+        } else {
+            ui.available_height()
+        };
+        let list = egui::ScrollArea::vertical()
+            .id_salt("machine-list")
+            .auto_shrink([false, true])
+            .max_height(max_h)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_max_width(ui.available_width());
+                for node in &nodes {
+                    self.machine_row(ui, node);
+                    ui.add_space(theme::SPACE_XS);
+                }
+            });
+        self.debug_layout
+            .note_visible("machine_list", list.inner_rect, ui.clip_rect());
+    }
+
+    fn machine_row(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
+        let selected = self.selected_id.as_deref() == Some(node.id.as_str());
+        let session = match &self.screen {
+            Screen::Terminal { id, .. } | Screen::Files { id, .. } | Screen::Desktop { id, .. } => {
+                id.as_str() == node.id
+            }
+            _ => false,
+        };
+        let hover_id = ui.id().with("machine-row-hover").with(&node.id);
+        let hovered = ui.data(|d| d.get_temp::<bool>(hover_id).unwrap_or(false));
+        let fill = if selected || session {
+            theme::BG_HOVER
+        } else if hovered {
+            theme::BG_PANEL
+        } else {
+            theme::BG_SURFACE
+        };
+        let inner_w = ui.available_width();
+        let response = egui::Frame::new()
+            .fill(fill)
+            .stroke(if selected {
+                theme::stroke_border()
+            } else {
+                theme::stroke_border_subtle()
+            })
+            .inner_margin(egui::Margin::symmetric(
+                theme::SPACE_SM as i8,
+                theme::SPACE_XS as i8,
+            ))
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
+            .show(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.set_max_width(inner_w);
+                name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
+                ui.label(theme::muted_text(node_presence_label(
+                    node.online,
+                    node.has_display,
+                )));
+                if session {
+                    ui.label(theme::muted_text("This session"));
+                }
+            })
+            .response
+            .interact(egui::Sense::click());
+        self.debug_layout
+            .note_item(&format!("nav_row:{}", node.id), response.rect);
+        ui.data_mut(|d| d.insert_temp(hover_id, response.hovered()));
+        if response.has_focus() {
+            response.surrender_focus();
+        }
+        if response.clicked() {
+            self.selected_id = Some(node.id.clone());
+        }
+    }
+
+    fn machine_detail(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
+        let clip = ui.clip_rect();
+        name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
+        let host = [node.hostname.as_str(), node.os.as_str(), node.arch.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let presence = node_presence_label(node.online, node.has_display);
+        let subtitle = if host.is_empty() {
+            presence.to_string()
+        } else {
+            format!("{presence} · {host}")
+        };
+        ui.label(theme::muted_text(&subtitle));
+        if let Some(note) = display_note(node.has_display, node.effective) {
+            let resp = ui.add(egui::Label::new(theme::muted_text(note)).wrap());
+            self.debug_layout
+                .note_visible("display_note", resp.rect, clip);
+        }
+        ui.add_space(theme::SPACE_SM);
+        self.session_actions(ui, node);
+        ui.add_space(theme::SPACE_SM);
+        egui::CollapsingHeader::new("Details")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(theme::muted_text(format!(
+                    "Access: {}",
+                    access_summary(&node.access, node.effective)
+                )));
+                if !node.id.is_empty() {
+                    ui.label(theme::muted_text("Node id"));
+                    truncated_copy_line(ui, &node.id, &mut self.notice);
+                    self.debug_layout.note_item("detail_node_id", ui.min_rect());
+                }
+                if !node.version.is_empty() {
+                    ui.label(theme::muted_text(format!("Version: {}", node.version)));
+                }
+                if !node.owner.is_empty() {
+                    ui.label(theme::muted_text(format!("Owner: {}", node.owner)));
+                }
+            });
+    }
+
+    fn session_actions(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
+        let clip = ui.clip_rect();
+        let mut disabled = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
+            for button in card_buttons(node.online, node.has_display, node.effective) {
+                let action = Action {
+                    enabled: button.enabled,
+                    reason: button.reason,
+                };
+                let id = format!("action:{}:{}", node.id, button.label);
+                let response = action_button_response(ui, &id, button.label, &action);
+                self.debug_layout.note_button_raw_vis(
+                    &format!("action_btn:{}:{}", node.id, button.label),
+                    response.rect,
+                    clip,
+                );
+                if response.has_focus() {
+                    response.surrender_focus();
+                }
+                if !action.enabled {
+                    disabled.push((button.label, action.reason));
+                }
+                if response.clicked() {
+                    self.activate(node, &action, button.kind);
+                }
+            }
+        });
+        for (label, reason) in disabled {
+            let resp = ui.add(
+                egui::Label::new(theme::muted_text(format!("{label}: {reason}"))).wrap(),
+            );
+            self.debug_layout.note_visible(
+                &format!("action_reason:{}:{label}", node.id),
+                resp.rect,
+                clip,
+            );
+        }
+    }
+
+    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        let clip = ui.clip_rect();
+        let frame = theme::card_frame().show(ui, |ui| {
+            ui.label(theme::section_text("Settings"));
+            ui.label(theme::muted_text(&self.node_line));
+            if self.preview_ui {
+                ui.label(theme::muted_text(
+                    "Start on login is disabled in isolated preview.",
+                ));
+            } else {
+                let label = if self.autostart {
+                    "Start on login: on"
+                } else {
+                    "Start on login: off"
+                };
+                let resp = ui.add(theme::secondary_button(label));
+                self.debug_layout
+                    .note_visible("settings_autostart", resp.rect, clip);
+                if resp.clicked() {
+                    self.toggle_autostart();
+                }
+            }
+            ui.add_space(theme::SPACE_XS);
+            ui.label(theme::muted_text(format!(
+                "About · Agentlink controller {}",
+                env!("CARGO_PKG_VERSION")
+            )));
+            if self.preview_ui {
+                ui.label(theme::muted_text(
+                    "This window is an isolated layout fixture. It is not a live account.",
+                ));
+            }
+        });
+        self.debug_layout
+            .note_visible("settings_panel", frame.response.rect, clip);
     }
 
     fn toggle_autostart(&mut self) {
@@ -1533,74 +1870,6 @@ impl ControllerApp {
         }
     }
 
-    fn node_card(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
-        let hover_id = ui.id().with("node-card-hover").with(&node.id);
-        let hovered = ui.data(|d| d.get_temp::<bool>(hover_id).unwrap_or(false));
-        let response = egui::Frame::new()
-            .fill(if hovered {
-                theme::BG_HOVER
-            } else {
-                theme::BG_SURFACE
-            })
-            .stroke(theme::stroke_border_subtle())
-            .inner_margin(egui::Margin::same(theme::SPACE_MD as i8))
-            .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
-            .show(ui, |ui| {
-                // Cap to the list width. set_min_width(available_width())
-                // inside a Grid cell previously expanded the first column
-                // to the leftover panel width.
-                ui.set_width(ui.available_width());
-                ui.set_max_width(ui.available_width());
-                name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
-                let host = [node.os.as_str(), node.arch.as_str()]
-                    .into_iter()
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let mut meta = match (node.hostname.is_empty(), host.is_empty()) {
-                    (false, false) => format!("{} · {host}", node.hostname),
-                    (false, true) => node.hostname.clone(),
-                    (true, false) => host,
-                    (true, true) => String::new(),
-                };
-                if !node.version.is_empty() {
-                    if !meta.is_empty() {
-                        meta.push_str(" · ");
-                    }
-                    meta.push_str(&node.version);
-                }
-                if !node.id.is_empty() {
-                    if !meta.is_empty() {
-                        meta.push_str(" · ");
-                    }
-                    meta.push_str(&node.id);
-                }
-                if !meta.is_empty() {
-                    truncated_copy_line(ui, &meta, &mut self.notice);
-                }
-                if let Some(note) = display_note(node.has_display, node.effective) {
-                    ui.add(egui::Label::new(theme::muted_text(note)).wrap());
-                }
-                ui.add_space(theme::SPACE_SM);
-                ui.horizontal_wrapped(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_SM, theme::SPACE_SM);
-                    for button in card_buttons(node.online, node.has_display, node.effective) {
-                        let action = Action {
-                            enabled: button.enabled,
-                            reason: button.reason,
-                        };
-                        let id = format!("{}:{}", node.id, button.label);
-                        if action_button(ui, &id, button.label, &action) {
-                            self.activate(node, &action, button.kind);
-                        }
-                    }
-                });
-            })
-            .response;
-        ui.data_mut(|d| d.insert_temp(hover_id, response.hovered()));
-    }
-
     fn activate(&mut self, node: &NodeInfo, action: &Action, kind: CardButtonKind) {
         if !action.enabled {
             self.error = action.reason.to_string();
@@ -1635,86 +1904,47 @@ impl ControllerApp {
     }
 
     fn machine_rail(&mut self, ui: &mut egui::Ui) {
-        let back = ui.add(theme::secondary_button("Back to machines"));
-        self.debug_layout
-            .note_visible("rail_back", back.rect, ui.clip_rect());
-        if back.clicked() {
-            self.back_to_machines();
-            return;
-        }
-        ui.add_space(theme::SPACE_SM);
-        ui.label(theme::muted_text("Machines"));
-        ui.add_space(theme::SPACE_SM);
-        let current = match &self.screen {
-            Screen::Terminal { id, .. } | Screen::Files { id, .. } | Screen::Desktop { id, .. } => {
-                Some(id.clone())
+        self.ensure_selection();
+        let in_session = matches!(
+            self.screen,
+            Screen::Terminal { .. } | Screen::Files { .. } | Screen::Desktop { .. }
+        );
+        if in_session {
+            let back = ui.add(theme::secondary_button("Back to machines"));
+            self.debug_layout
+                .note_visible("rail_back", back.rect, ui.clip_rect());
+            if back.clicked() {
+                self.back_to_machines();
+                return;
             }
-            _ => None,
-        };
-        let nodes = self.nodes.clone();
-        // Fixed inner width from rail constants — do not trust ScrollArea
-        // max_rect (it expands past the 260pt clip, which kept View desktop
-        // on one row until the clip ate the last glyph).
-        let rail_clip = ui.clip_rect();
+            ui.add_space(theme::SPACE_SM);
+        }
+        ui.label(theme::muted_text("Machines"));
+        ui.add_space(theme::SPACE_XS);
         let rail_inner_w = (model::MACHINE_RAIL_WIDTH - theme::SPACE_MD * 2.0)
             .floor()
             .max(1.0);
-        let card_inner_w = (rail_inner_w - theme::SPACE_SM * 2.0).floor().max(1.0);
         ui.set_max_width(rail_inner_w);
+        let pair_reserve = if !in_session { 40.0 } else { 0.0 };
+        let list_h = (ui.available_height() - pair_reserve).max(48.0);
+        let nodes = self.nodes.clone();
         egui::ScrollArea::vertical()
+            .id_salt("machine-rail-list")
             .max_width(rail_inner_w)
+            .max_height(list_h)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_max_width(rail_inner_w);
+                ui.set_width(rail_inner_w);
                 for node in &nodes {
-                    let active = current.as_deref() == Some(node.id.as_str());
-                    let frame = egui::Frame::new()
-                        .fill(if active {
-                            theme::BG_HOVER
-                        } else {
-                            theme::BG_PANEL
-                        })
-                        .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
-                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD));
-                    frame.show(ui, |ui| {
-                        ui.set_max_width(card_inner_w);
-                        ui.set_width(card_inner_w);
-                        name_and_status(ui, &node.name, node.online, theme::TEXT_PRIMARY);
-                        if active {
-                            ui.label(theme::muted_text("This session"));
-                        }
-                        // Vertical stack keeps every full label inside the
-                        // 260pt rail clip; horizontal_wrapped could still
-                        // place View desktop past the clip when max_rect grew.
-                        ui.vertical(|ui| {
-                            ui.set_max_width(card_inner_w);
-                            ui.spacing_mut().item_spacing = egui::vec2(0.0, theme::SPACE_XS);
-                            for button in
-                                card_buttons(node.online, node.has_display, node.effective)
-                            {
-                                let action = Action {
-                                    enabled: button.enabled,
-                                    reason: button.reason,
-                                };
-                                let id = format!("rail:{}:{}", node.id, button.label);
-                                let response =
-                                    action_button_response(ui, &id, button.label, &action);
-                                self.debug_layout.note_button_raw_vis(
-                                    &format!("rail_btn:{}:{}", node.id, button.label),
-                                    response.rect,
-                                    rail_clip,
-                                );
-                                if response.has_focus() {
-                                    response.surrender_focus();
-                                }
-                                if response.clicked() {
-                                    self.activate(node, &action, button.kind);
-                                }
-                            }
-                        });
-                    });
-                    ui.add_space(theme::SPACE_SM);
+                    self.machine_row(ui, node);
+                    ui.add_space(theme::SPACE_XS);
                 }
             });
+        if !in_session {
+            ui.add_space(theme::SPACE_SM);
+            self.pair_toggle(ui);
+        }
     }
 
     fn enroll(&mut self, ui: &mut egui::Ui) {
@@ -1770,8 +2000,8 @@ impl ControllerApp {
     }
 
     fn session_back_row(&mut self, ui: &mut egui::Ui, title: String) {
-        ui.horizontal(|ui| {
-            // On a wide window the machine list stays in the left rail, but
+        ui.horizontal_wrapped(|ui| {
+            // On a wide window the machine list stays in the left nav, but
             // the back button remains so a narrow layout (or a resized
             // window) never strands the user in a session.
             let back = ui.add(theme::secondary_button("Back to machines"));
@@ -1782,7 +2012,21 @@ impl ControllerApp {
             }
             ui.label(theme::section_text(title));
         });
-        ui.label(theme::muted_text(format!("connection {}", self.link)));
+        let link = if self.preview_ui {
+            "Isolated preview — not a live connection".to_string()
+        } else {
+            format!("Connection: {}", self.link)
+        };
+        ui.label(theme::muted_text(link));
+        let id = match &self.screen {
+            Screen::Terminal { id, .. } | Screen::Files { id, .. } | Screen::Desktop { id, .. } => {
+                Some(id.clone())
+            }
+            _ => None,
+        };
+        if let Some(node) = id.and_then(|id| self.nodes.iter().find(|n| n.id == id).cloned()) {
+            self.session_actions(ui, &node);
+        }
     }
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
@@ -3839,7 +4083,7 @@ fn egui_key_name(key: egui::Key) -> Option<&'static str> {
     }
 }
 
-fn banner(ui: &mut egui::Ui, text: &str, alert: bool) {
+fn banner(ui: &mut egui::Ui, text: &str, alert: bool) -> egui::Response {
     let (fill, color, stroke) = if alert {
         (theme::DANGER_SOFT, theme::DANGER, theme::DANGER)
     } else {
@@ -3856,10 +4100,16 @@ fn banner(ui: &mut egui::Ui, text: &str, alert: bool) {
                     .size(theme::SECONDARY_SIZE)
                     .color(color),
             );
-        });
+        })
+        .response
 }
 
-fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, dot: Option<egui::Color32>) {
+fn status_pill(
+    ui: &mut egui::Ui,
+    text: &str,
+    color: egui::Color32,
+    dot: Option<egui::Color32>,
+) -> egui::Response {
     egui::Frame::new()
         .fill(theme::BG_SURFACE)
         .stroke(theme::stroke_border_subtle())
@@ -3884,7 +4134,8 @@ fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, dot: Option<
                         .color(color),
                 );
             });
-        });
+        })
+        .response
 }
 
 /// Name on the left, status pill on the right. The name is truncated so
@@ -4360,23 +4611,45 @@ mod geometry_tests {
         assert_back_clip_visible(layout, (w, h));
     }
 
-    fn assert_view_desktop_fully_in_clip(layout: &DebugLayout) {
-        let raw = item_rect(layout, "rail_btn:sufa:View desktop:raw")
-            .expect("sufa View desktop raw rect");
-        let vis = item_rect(layout, "rail_btn:sufa:View desktop:vis")
-            .expect("sufa View desktop vis rect");
+    fn assert_action_fully_visible(layout: &DebugLayout, key: &str, window_w: f32) {
+        let raw = item_rect(layout, &format!("{key}:raw")).unwrap_or_else(|| {
+            panic!(
+                "missing raw rect for {key}; have {:?}",
+                layout
+                    .toolbar_items
+                    .iter()
+                    .map(|(k, _)| k)
+                    .collect::<Vec<_>>()
+            )
+        });
+        let vis = item_rect(layout, &format!("{key}:vis")).expect("vis rect");
+        let min_w = if key.ends_with("View desktop") || key.ends_with("Control desktop") {
+            90.0
+        } else {
+            48.0
+        };
         assert!(
-            raw[2] >= 90.0,
-            "View desktop raw width too small (label incomplete?): {raw:?}"
+            raw[2] >= min_w,
+            "{key} raw width too small (label incomplete?): {raw:?}"
         );
         assert!(
             (vis[2] - raw[2]).abs() <= 1.0 && (vis[3] - raw[3]).abs() <= 1.0,
-            "View desktop clipped: raw={raw:?} vis={vis:?}"
+            "{key} clipped: raw={raw:?} vis={vis:?}"
         );
         assert!(
-            vis[0] >= 0.0 && vis[0] + vis[2] <= model::MACHINE_RAIL_WIDTH + 1.0,
-            "View desktop vis outside rail: {vis:?}"
+            vis[0] >= 0.0 && vis[0] + vis[2] <= window_w + 1.0,
+            "{key} vis outside window: {vis:?} w={window_w}"
         );
+    }
+
+    fn assert_view_desktop_fully_in_clip(layout: &DebugLayout) {
+        // Actions live in the detail / session toolbar, not the compact nav.
+        let w = if layout.main_rect[2] > 0.0 {
+            layout.main_rect[0] + layout.main_rect[2]
+        } else {
+            1920.0
+        };
+        assert_action_fully_visible(layout, "action_btn:sufa:View desktop", w);
     }
 
     #[test]
@@ -4406,11 +4679,15 @@ mod geometry_tests {
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, w, h, expect_rail);
-            if expect_rail {
-                assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
-            } else {
+            if !expect_rail {
                 assert_eq!(harn.app.debug_layout.rail_rect, [0.0; 4]);
             }
+            // quant67 is headless: toolbar has Terminal/Files, not a fake desktop.
+            assert_action_fully_visible(
+                &harn.app.debug_layout,
+                "action_btn:quant67:Terminal",
+                w,
+            );
 
             let node = harn.app.nodes[0].clone();
             harn.app.open_files(&node);
@@ -4443,31 +4720,47 @@ mod geometry_tests {
     #[test]
     fn rail_view_desktop_label_fully_visible_when_rail_shown() {
         let mut harn = Harness::new(1280.0, 800.0);
-        harn.open_quant_terminal();
+        harn.app.selected_id = Some("sufa".into());
+        harn.app.screen = Screen::Machines;
         harn.pass();
         harn.pass();
         assert!(model::machine_rail_visible(1280.0));
         assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
-        // Control desktop (4th action) must also stay inside the rail clip.
-        let raw = item_rect(&harn.app.debug_layout, "rail_btn:sufa:Control desktop:raw")
-            .expect("control raw");
-        let vis = item_rect(&harn.app.debug_layout, "rail_btn:sufa:Control desktop:vis")
-            .expect("control vis");
-        assert!(
-            (vis[2] - raw[2]).abs() <= 1.0,
-            "Control desktop clipped: raw={raw:?} vis={vis:?}"
+        assert_action_fully_visible(
+            &harn.app.debug_layout,
+            "action_btn:sufa:Control desktop",
+            1280.0,
+        );
+        let sufa = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "sufa")
+            .cloned()
+            .unwrap();
+        harn.app.open_terminal(&sufa);
+        harn.pass();
+        harn.pass();
+        assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
+        assert_action_fully_visible(
+            &harn.app.debug_layout,
+            "action_btn:sufa:Control desktop",
+            1280.0,
         );
     }
 
     #[test]
     fn restored_1080_and_true_725_fold_rail_1280_keeps_it() {
-        // Screenshot fact: restored window ≈1085 physical (preview looked like
-        // ~725). Old SHOW_AT=980 kept the rail — policy, not min-size pinning.
-        // Intentional SHOW_AT=1100 folds ≤1085; 1280/1920 keep the rail.
+        // Compact nav stays at 1024 / restored ~1080. Only truly narrow
+        // frames (719 / 725) fold it.
         for &(w, expect_rail) in &[
+            (719.0_f32, false),
             (725.0_f32, false),
-            (1080.0_f32, false),
-            (1085.0_f32, false),
+            (799.0_f32, false),
+            (800.0_f32, true),
+            (1024.0_f32, true),
+            (1080.0_f32, true),
+            (1085.0_f32, true),
             (1280.0_f32, true),
             (1920.0_f32, true),
         ] {
@@ -4503,13 +4796,14 @@ mod geometry_tests {
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, 1280.0, 800.0, true);
-            assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
+            assert_action_fully_visible(&harn.app.debug_layout, "action_btn:quant67:Terminal", 1280.0);
 
             // Restored-window size from screenshot (~1085), not the preview 725.
             harn.resize(1080.0, 800.0);
             harn.pass();
             harn.pass();
-            assert_session_clip_geometry(&harn.app.debug_layout, 1080.0, 800.0, false);
+            assert_session_clip_geometry(&harn.app.debug_layout, 1080.0, 800.0, true);
+            assert_action_fully_visible(&harn.app.debug_layout, "action_btn:quant67:Terminal", 1080.0);
 
             harn.resize(725.0, 800.0);
             harn.pass();
@@ -4527,7 +4821,7 @@ mod geometry_tests {
             harn.pass();
             harn.pass();
             assert_session_clip_geometry(&harn.app.debug_layout, 1920.0, 1200.0, true);
-            assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
+            assert_action_fully_visible(&harn.app.debug_layout, "action_btn:quant67:Terminal", 1920.0);
 
             harn.resize(1280.0, 800.0);
             harn.pass();
@@ -4730,5 +5024,262 @@ mod geometry_tests {
                 );
             }
         }
+    }
+
+    fn assert_no_overflow(layout: &DebugLayout, w: f32, h: f32) {
+        for (id, rect) in &layout.toolbar_items {
+            if id.ends_with(":raw")
+                || id.starts_with("nav_row:")
+                || id == "machine_list"
+                || id == "detail_node_id"
+                || id == "pair_toggle"
+                || id.starts_with("action_reason:")
+            {
+                continue;
+            }
+            if rect[2] <= 0.0 || rect[3] <= 0.0 {
+                continue;
+            }
+            assert!(
+                rect[0] + rect[2] <= w + 1.5,
+                "{id} overflows right: {rect:?} at {w}x{h}"
+            );
+            assert!(
+                rect[1] + rect[3] <= h + 1.5,
+                "{id} overflows bottom: {rect:?} at {w}x{h}"
+            );
+        }
+        let main = layout.main_rect;
+        assert!(
+            main[0] + main[2] <= w + 1.5,
+            "main overflows: {main:?} at {w}x{h}"
+        );
+    }
+
+    fn assert_machines_shell(harn: &Harness, w: f32, h: f32, expect_rail: bool) {
+        let layout = &harn.app.debug_layout;
+        let main = layout.main_rect;
+        assert!(
+            main[2] > w * 0.45,
+            "machines main width crushed: {main:?} at {w}x{h}"
+        );
+        assert!(
+            main[3] > h * 0.35,
+            "machines main height crushed: {main:?} at {w}x{h}"
+        );
+        if expect_rail {
+            let rail = layout.rail_rect;
+            assert!(
+                (rail[2] - model::MACHINE_RAIL_WIDTH).abs() < 1.0,
+                "rail width: {rail:?} at {w}"
+            );
+            assert!(
+                rail[3] >= min_page_visible_h(h) * 0.8,
+                "rail short: {rail:?}"
+            );
+        } else {
+            assert_eq!(layout.rail_rect, [0.0; 4], "rail should fold at {w}");
+        }
+        assert!(
+            item_rect(layout, "header_settings").is_some(),
+            "Settings missing at {w}x{h}"
+        );
+        assert!(
+            item_rect(layout, "header_quit").is_some(),
+            "Quit missing at {w}x{h}"
+        );
+        for node in &harn.app.nodes {
+            assert!(
+                item_rect(layout, &format!("nav_row:{}", node.id)).is_some(),
+                "nav row missing for {} at {w}x{h}",
+                node.id
+            );
+        }
+        let selected = harn.app.selected_id.clone().expect("selection");
+        for label in ["Terminal", "Files"] {
+            let key = format!("action_btn:{selected}:{label}");
+            assert_action_fully_visible(layout, &key, w);
+        }
+        assert_no_overflow(layout, w, h);
+    }
+
+    #[test]
+    fn machines_geometry_1024_719_1280() {
+        for &(w, h, expect_rail) in &[
+            (1024.0_f32, 756.0_f32, true),
+            (719.0_f32, 756.0_f32, false),
+            (1280.0_f32, 800.0_f32, true),
+        ] {
+            let mut harn = Harness::new(w, h);
+            harn.app.screen = Screen::Machines;
+            harn.pass();
+            harn.pass();
+            assert_eq!(model::machine_rail_visible(w), expect_rail);
+            assert_machines_shell(&harn, w, h, expect_rail);
+
+            let node = harn.app.nodes[0].clone();
+            harn.app.open_terminal(&node);
+            harn.pass();
+            harn.pass();
+            assert_session_clip_geometry(&harn.app.debug_layout, w, h, expect_rail);
+            assert!(
+                item_rect(&harn.app.debug_layout, "back").is_some()
+                    || item_rect(&harn.app.debug_layout, "rail_back").is_some(),
+                "Back missing in terminal at {w}x{h}"
+            );
+            assert_no_overflow(&harn.app.debug_layout, w, h);
+        }
+    }
+
+    #[test]
+    fn headless_hides_desktop_starts_and_shows_reason() {
+        let mut harn = Harness::new(1024.0, 756.0);
+        let mut node = harn.app.nodes[0].clone();
+        node.id = "headless-node".into();
+        node.name = "headless-box".into();
+        node.has_display = Some(false);
+        harn.app.nodes.insert(0, node.clone());
+        harn.app.selected_id = Some(node.id.clone());
+        harn.app.screen = Screen::Machines;
+        harn.pass();
+        harn.pass();
+        let layout = &harn.app.debug_layout;
+        assert!(
+            item_rect(layout, "action_btn:headless-node:View desktop:raw").is_none(),
+            "headless must not show View desktop: {:?}",
+            layout.toolbar_items
+        );
+        assert!(
+            item_rect(layout, "action_btn:headless-node:Control desktop:raw").is_none(),
+            "headless must not show Control desktop"
+        );
+        assert!(
+            item_rect(layout, "display_note").is_some(),
+            "headless needs an on-screen reason"
+        );
+        assert_action_fully_visible(layout, "action_btn:headless-node:Terminal", 1024.0);
+        assert_action_fully_visible(layout, "action_btn:headless-node:Files", 1024.0);
+    }
+
+    #[test]
+    fn view_only_disables_control_with_reason() {
+        let mut harn = Harness::new(1024.0, 756.0);
+        let mut node = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "sufa")
+            .cloned()
+            .expect("sufa");
+        node.effective = NodePolicy::remote_view();
+        node.policy = NodePolicy::remote_view();
+        node.access = "remote-view".into();
+        node.has_display = Some(true);
+        if let Some(existing) = harn.app.nodes.iter_mut().find(|n| n.id == "sufa") {
+            *existing = node;
+        }
+        harn.app.selected_id = Some("sufa".into());
+        harn.app.screen = Screen::Machines;
+        harn.pass();
+        harn.pass();
+        let layout = &harn.app.debug_layout;
+        assert_action_fully_visible(layout, "action_btn:sufa:View desktop", 1024.0);
+        let raw = item_rect(layout, "action_btn:sufa:Control desktop:raw")
+            .expect("Control desktop should stay visible (disabled, not hidden)");
+        let vis = item_rect(layout, "action_btn:sufa:Control desktop:vis").expect("control vis");
+        assert!(
+            (vis[2] - raw[2]).abs() <= 1.0,
+            "Control clipped: {raw:?} {vis:?}"
+        );
+        let reason = item_rect(layout, "action_reason:sufa:Control desktop");
+        assert!(reason.is_some(), "disabled Control needs an inline reason");
+    }
+
+    #[test]
+    fn preview_fixture_is_isolated_and_labeled() {
+        let mut harn = Harness::new(1024.0, 756.0);
+        harn.app.apply_preview_fixture();
+        harn.pass();
+        let out = harn.pass_output();
+        let titles = Harness::titles_from(&out);
+        assert!(
+            harn.app.window_title.contains("preview"),
+            "title cache: {}",
+            harn.app.window_title
+        );
+        assert!(
+            titles.iter().any(|t| t.contains("preview"))
+                || harn.app.window_title == "agentlink controller (preview)",
+            "preview title missing: {titles:?}"
+        );
+        assert!(harn.app.preview_ui && harn.app.mock);
+        assert!(!harn.app.hide_on_close);
+        assert!(!harn.app.autostart);
+        assert!(harn.app.nodes.iter().all(|n| n.id.starts_with("preview-fixture-")
+            && n.name.contains("Fixture")
+            && n.name.contains("sample")));
+        let layout = &harn.app.debug_layout;
+        assert!(
+            item_rect(layout, "preview_banner").is_some(),
+            "preview banner missing"
+        );
+        assert!(item_rect(layout, "header_logout").is_none());
+        assert!(item_rect(layout, "header_refresh").is_none());
+        assert_machines_shell(&harn, 1024.0, 756.0, true);
+        let headless = "preview-fixture-headless";
+        harn.app.selected_id = Some(headless.into());
+        harn.pass();
+        harn.pass();
+        assert!(
+            item_rect(
+                &harn.app.debug_layout,
+                &format!("action_btn:{headless}:View desktop:raw")
+            )
+            .is_none(),
+            "preview headless must not look like a usable desktop"
+        );
+        assert!(item_rect(&harn.app.debug_layout, "display_note").is_some());
+    }
+
+    #[test]
+    fn settings_and_logout_fit_on_narrow_header() {
+        for &(w, h) in &[
+            (719.0_f32, 756.0_f32),
+            (1024.0_f32, 756.0_f32),
+            (1280.0_f32, 800.0_f32),
+        ] {
+            let mut harn = Harness::new(w, h);
+            harn.app.screen = Screen::Machines;
+            harn.pass();
+            harn.pass();
+            assert!(item_rect(&harn.app.debug_layout, "header_settings").is_some());
+            assert!(item_rect(&harn.app.debug_layout, "header_logout").is_some());
+            assert!(item_rect(&harn.app.debug_layout, "header_quit").is_some());
+            harn.app.settings_open = true;
+            harn.pass();
+            harn.pass();
+            assert!(
+                item_rect(&harn.app.debug_layout, "settings_panel").is_some(),
+                "settings panel missing at {w}x{h}"
+            );
+            assert_no_overflow(&harn.app.debug_layout, w, h);
+        }
+    }
+
+    #[test]
+    fn hash_and_version_are_not_primary_machine_meta() {
+        let mut harn = Harness::new(1024.0, 756.0);
+        if let Some(node) = harn.app.nodes.iter_mut().find(|n| n.id == "sufa") {
+            node.version = "cd30c9ed52337645".into();
+        }
+        harn.app.selected_id = Some("sufa".into());
+        harn.app.screen = Screen::Machines;
+        harn.pass();
+        harn.pass();
+        assert!(item_rect(&harn.app.debug_layout, "nav_row:sufa").is_some());
+        assert!(
+            item_rect(&harn.app.debug_layout, "detail_node_id").is_none(),
+            "collapsed Details must not push the node id into the primary column"
+        );
     }
 }
