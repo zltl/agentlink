@@ -1,30 +1,30 @@
 # t456 branch matrix
 
-Recorded 2026-11-13 00:37 CST (Asia/Shanghai).
+Recorded 2026-11-13 13:54 CST (Asia/Shanghai).
 
 This integration starts from `feat/controller-p2p-observe-t449`
 (`ebfb6f22cef5509fce923e77c5494a44a5d7d9f4`). Live remote `main`
-(`602887281932d254d3d8ee1d57f8e3a305ab9bd6`) is a strict ancestor
+(`f4a336ee1dcae1d55fa47fbe1512d9aa66f9edf8`, re-verified this
+afternoon) is a strict ancestor; earlier sealed `main`
+(`602887281932d254d3d8ee1d57f8e3a305ab9bd6`) is also a strict ancestor
 (42 commits through `integrate/controller-android-t447` =
 `684e1adf3cd2b441a167c735be3f9d6937d3d4b7`, then 10 P2P commits,
 then the local t456/UI/reconnect/noflash line below).
 Original branches and frozen t452 artifacts were not moved or overwritten.
 
-Remote heads were re-verified read-only on 2026-11-13 00:31 CST
+Remote heads were re-verified read-only on 2026-11-13 13:54 CST
 (Asia/Shanghai) with `gh api repos/zltl/agentlink/git/ref/heads/main`,
 `repos/zltl/agentlink` (visibility), and `repos/zltl/agentlink/branches?per_page=100&page=1`
 plus `list_tags` page size 100. That is a live list of every remote
 head, not a leftover `refs/remotes/origin/main` or any other cached
-remote value treated as current. An HTTPS `git fetch` of all heads
-still needs credentials; this check did not use fetch, tokens, or
-internal APIs. The repository remains **private** (`visibility=private`).
-`pushed_at` on the GitHub API was `2026-11-12T00:40:25Z`
-(2026-11-12 08:40:25 Asia/Shanghai) at the earlier re-verify.
-Independent read-only review of product merge `6674388` (copy-retry
-safety and tests) completed 2026-11-13 (Asia/Shanghai) with **no new
-block**. This update is authorized as an ordinary fast-forward of
-private source `main` only — not Actions, not a visibility change,
-not a release, not a deploy, and not a production-machine upgrade.
+remote value treated as current. The repository remains **private**
+(`visibility=private`). `pushed_at` was still `2026-11-12T16:38:15Z`
+(2026-11-13 00:38:15 Asia/Shanghai) at this re-verify — the previous
+source-main push of `f4a336ee`. Independent review of SQLite
+candidate `ea69145` completed with **no source block**. User t461
+authorized an ordinary fast-forward of private source `main` onto
+this line — not Actions, not a visibility change, not a release,
+not a deploy, and not a production-machine upgrade.
 
 ## Live remote heads (GitHub API)
 
@@ -33,11 +33,11 @@ no tags (`list_tags` returned an empty page).
 
 | Ref | Tip | Notes |
 | --- | --- | --- |
-| `main` | `602887281932d254d3d8ee1d57f8e3a305ab9bd6` | Sealed integration baseline. |
+| `main` | `f4a336ee1dcae1d55fa47fbe1512d9aa66f9edf8` | Previous source main (re-verified 13:54 CST). Sealed `60288728` remains an ancestor. |
 | `integrate/controller-android-t447` | `684e1adf3cd2b441a167c735be3f9d6937d3d4b7` | Already an ancestor of the t449 baseline. |
 | `cursor/android-invite-crash-6d47` | `447fa55e96a1114e8e97ab7ef574a2f32a4a92f1` | Already an ancestor of t447 / t449. |
 
-## Current local candidate (667 review complete, no new block)
+## Current local candidate (SQLite `ea69145` reviewed, t461 authorized onto main)
 
 Local branch `integrate/security-main-t456` in
 `/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo` was
@@ -52,7 +52,9 @@ fast-forward keeps complete ancestry, including both merge parents:
 | `4fef74f763b6c208c8701e80f8378fafb7befb5e` | `fix: keep relay-drop session teardown and recover via a fresh grant` | Parent 1 of the merge. Reconnect/copy. |
 | `4e677c864719809f0cb1edb917ca46e2623bacc8` | `fix(process): route leftover Command::new through hidden or reviewed exceptions` | noflash product; parent of `79f3d63`. |
 | `79f3d63bc857d6eae16ceee5128c8ec9c4baf6c5` | `docs(grant_local): correct grant_ui_command notes on hidden()` | Parent 2 of the merge. noflash docs only. |
-| `6674388027224441327d771e1d3e3adab0ec42f8` | merge of the two children of `7142d936` | Current integrate tip. |
+| `6674388027224441327d771e1d3e3adab0ec42f8` | merge of the two children of `7142d936` | Product merge tip before the SQLite candidate. |
+| `f4a336ee1dcae1d55fa47fbe1512d9aa66f9edf8` | `docs(t456): record 6674388 independent review complete, no new block` | Previous live `main`. |
+| `ea6914525566f14e1a842fb301b32ac17adfc0e6` | `fix(relay): isolated candidate for RUSTSEC-2026-0459 via official sqlx#4502` | Current product tip (parent `f4a336ee`). |
 
 Earlier UI commits already on this line (also ancestors of `7142d936`):
 `156f49ba` (preview isolation), `5d13dfd9`, `fd033c7f`, `25eda068`.
@@ -69,7 +71,22 @@ parents (reconnect + noflash). This is not a sign-off of Windows
 visual noflash, different DPI, a full Tab-order walk, an Android
 full build or phone run, cross-network NAT P2P, or cargo-audit
 findings. Product workspace tests already recorded on `6674388`
-are unchanged; a later docs-only SHA is not a full product retest.
+(1548 / 0 / 2 ignored, 16 MiB) remain historical. After `f4a336ee`
+the integrate branch was fast-forwarded (`merge --ff-only`, after a
+normal fetch of the isolated candidate worktree) to
+`ea6914525566f14e1a842fb301b32ac17adfc0e6`. Independent review of
+that candidate found no source block (`AssertSqlSafe` only on
+literal `adapt()` and already-validated schema names; linked
+SQLite 3.54.1 and the official e5bf amalgamation fix verified;
+lock pins official sqlx git
+`10462fa4414c6c7f1ed1d39bb31678e3b726878c` and `libsqlite3-sys`
+0.39.1). Existing tests on `ea69145` are **1550 passed / 0 failed /
+2 ignored** under the same explicit 16 MiB workspace command.
+A later docs-only SHA is not a full product retest, and this is
+not a claim that real Postgres, Windows, Android, or the 12
+unmaintained cargo-audit warnings are done. crates.io sqlx 0.9.0
+still does not allow 0.39; this tip uses the unpublished official
+#4502 merge commit.
 
 ## Cached `origin/*` not on the live remote — do not merge
 
@@ -164,4 +181,13 @@ section for the reviewed scope). The preceding Post-40f551c /
 Post-8df / Post-8143 notes remain historical and are not the
 current tip. See the current-candidate section at the top and
 `docs/integrate-t456-security-status.md`.
+
+## Post-ea69145 docs snapshot
+
+`integrate/security-main-t456` was fast-forwarded from previous
+live `main` `f4a336ee` to product tip
+`ea6914525566f14e1a842fb301b32ac17adfc0e6` (RUSTSEC-2026-0459
+candidate). See the current-candidate section. User t461 authorized
+an ordinary private source-main fast-forward. Not Actions, not
+public, not a release, not a deploy, not a machine upgrade.
 

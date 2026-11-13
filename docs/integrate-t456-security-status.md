@@ -1,24 +1,26 @@
 # t456 security integration status
 
-Recorded 2026-11-13 00:37 CST (Asia/Shanghai). Independent read-only
-review of tip `6674388` (copy-retry safety and tests) completed
-2026-11-13 (Asia/Shanghai) with **no new block**. Authorized as an
-ordinary fast-forward of private source `main` only — not Actions,
-not a visibility change, not a release, not a deploy, and not a
-production-machine upgrade.
+Recorded 2026-11-13 13:54 CST (Asia/Shanghai). Independent review of
+SQLite candidate `ea69145` completed with **no source block**. User
+t461 authorized an ordinary fast-forward of private source `main`
+onto this line — not Actions, not a visibility change, not a
+release, not a deploy, and not a production-machine upgrade. This
+is not a full security or platform sign-off.
 
 - Current worktree: `/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo`
-- Branch: `integrate/security-main-t456` at `6674388027224441327d771e1d3e3adab0ec42f8`
-  (fast-forwarded from `7142d936`; merge parents `4fef74f7` and `79f3d63b`)
+- Branch: `integrate/security-main-t456` at `ea6914525566f14e1a842fb301b32ac17adfc0e6`
+  (fast-forwarded from previous live `main` `f4a336ee`; 667 merge
+  parents `4fef74f7` and `79f3d63b` remain ancestors)
 - Frozen 912 review tree (untouched): `/workspace/agentlink-integrate-t456` at `9122522b23846b2b6c31c640ef2928cb053dd994`
 - Historical continuation worktree (not the current tip): `/workspace/agentlink-integrate-t456-cont`
 - Baseline: `feat/controller-p2p-observe-t449` (`ebfb6f22cef5509fce923e77c5494a44a5d7d9f4`)
-- Live remote `main` re-verified 2026-11-13 00:31 CST (Asia/Shanghai) via
-  `gh api repos/zltl/agentlink/git/ref/heads/main`: still
-  `602887281932d254d3d8ee1d57f8e3a305ab9bd6`, a strict ancestor. A leftover
-  `refs/remotes/origin/main` was not used as the live value.
+- Live remote `main` re-verified 2026-11-13 13:54 CST (Asia/Shanghai) via
+  `gh api repos/zltl/agentlink/git/ref/heads/main`:
+  `f4a336ee1dcae1d55fa47fbe1512d9aa66f9edf8`, a strict parent of
+  `ea69145`. A leftover `refs/remotes/origin/main` was not used as
+  the live value. Earlier sealed `60288728` remains an ancestor.
 - Repo visibility re-verified the same minute: **private**. `pushed_at`
-  `2026-11-12T00:40:25Z` (2026-11-12 08:40:25 Asia/Shanghai).
+  was still `2026-11-12T16:38:15Z` (2026-11-13 00:38:15 Asia/Shanghai).
 - Frozen t452 controller bin left in place under `/workspace/agentlink-t427-recovery/20261112-1341-t452-controller-p2p/`
 - UI source repo and the 7142 Linux GUI freeze were not modified in this
   docs step; no new GUI binary was built.
@@ -29,10 +31,13 @@ Trust model is unchanged: a full current-user shell with a grant may read the sa
 
 This revision addresses the independent review of `9122522`. Confirmed-good direction (parameterized notifications, flag overwrite, desktop owner UUID, legacy default off, QR client DOM filtering, license/no Actions) was kept and not reverted.
 
-## Current tip `6674388` — what is and is not claimed
+## Current tip `ea69145` — what is and is not claimed
 
-This is a status snapshot of the fast-forwarded integrate tip. It does
-**not** declare security or platform work complete.
+This is a status snapshot of the fast-forwarded integrate tip
+(`ea6914525566f14e1a842fb301b32ac17adfc0e6`, parent `f4a336ee`).
+It does **not** declare security or platform work complete. The
+`6674388` / `f4a336ee` notes below remain historical except where
+this section updates them.
 
 **UI (product through `7142d936`, four real-window rounds).** The last
 two defects — Details focus rings and machine-row clip — passed on a
@@ -54,9 +59,16 @@ went to the user. Local evidence only (not an external URL):
 `/tmp/t460-ui-inspect/user-controller-screenshot.png` is an earlier
 `abf86f1` product shot, not the 7142 acceptance set.
 
-**Workspace regression at `6674388` (2026-11-13 00:24–00:29 Asia/Shanghai).**
+**Workspace regression at `ea69145` (already recorded, not re-run for a later docs SHA).**
+The same explicit 16 MiB command
 `RUST_MIN_STACK=16777216 cargo +1.99.1 test --locked --offline --workspace --no-fail-fast -- --test-threads=1`
-on an independent target: **1548 passed, 0 failed, 2 pre-existing ignored**
+on the isolated candidate: **1550 passed, 0 failed, 2 pre-existing ignored**
+(the 1548 recorded on `6674388` plus two new SQLite version / WAL /
+old-schema tests). This is **not** a default test-thread green and
+is **not** a full retest of a subsequent docs-only commit.
+
+**Historical workspace regression at `6674388` (2026-11-13 00:24–00:29 Asia/Shanghai).**
+The same command on an independent target: **1548 passed, 0 failed, 2 pre-existing ignored**
 (`bench_transfer`, `agentlink-desktop` doc-test `capture.rs:11`),
 `workspace_exit=0`. This is **not** a default test-thread green.
 The default rustc test-thread stack (~2 MiB) still overflows in
@@ -106,17 +118,28 @@ passing is not Windows evidence.
 
 **NAT P2P** has not been proven across a real NAT / public network.
 
-**SQLite `RUSTSEC-2026-0459` is not patched.** `libsqlite3-sys` 0.30.1
-remains in the lock and in the default compile tree; `sqlx` has no
-compatible path to a fixed `>=0.39` in this tree. `rsa` (`RUSTSEC-2023-0071`)
-remains in `Cargo.lock` via optional `sqlx-mysql` and is unreachable
-from the default feature tree; lock presence is not a fix.
-cargo-audit is still expected exit 1, including **12 unmaintained
-warnings**. Mitigations (default-tree unreachability, documenting the
-sqlite bind) are **not** a vulnerability fix.
+**SQLite `RUSTSEC-2026-0459` on this tip.** Product commit `ea69145`
+pins official unpublished `launchbadge/sqlx` at merge commit
+`10462fa4414c6c7f1ed1d39bb31678e3b726878c` (#4502) and crates.io
+`libsqlite3-sys` `=0.39.1` (bundled SQLite 3.54.1; not 0.40.0; SQLCipher
+not enabled). Independent review found no source block:
+`AssertSqlSafe` is used only after literal placeholder `adapt()` and
+after `validate_schema`. Isolated synthetic-db tests (not a production
+database) checked `sqlite_version() == 3.54.1` and the official
+e5bf1198 amalgamation `memset(pOut+sz, 0, nOut-sz)` in
+`sqlite3WalReadFrame`. A fresh cargo-audit (advisory-db
+`af7b3ec3`, 2026-11-12) exit 0 no longer lists `RUSTSEC-2026-0459`.
+This is **not** a claim that crates.io sqlx 0.9.0 already allows
+0.39 (it still does not). The tip depends on that unpublished official
+git rev. `rsa` / `RUSTSEC-2023-0071` is absent from this lock because
+sqlx 0.9 no longer pulls it via mysql — that is not a patch of a
+remaining `rsa` crate. cargo-audit still reports **12 unmaintained
+warnings** (not a full-green audit). Real Postgres, Windows, and
+Android were not tested. Mitigations of file mode are not the fix;
+the fix is the 3.54.1 amalgamation.
 
 Production machines were not upgraded. No Actions, no public repo, no
-release, no push of this branch.
+release, no deploy. A later docs-only SHA is not a product retest.
 
 Trust model is unchanged: a full current-user shell with a grant may
 read the same-UID issuer and countersign. The first request without a
@@ -157,7 +180,7 @@ Installed `cargo-audit 0.23.0` under `CARGO_HOME=/tmp/agentlink-audit-home`. Adv
 - `rustix` 1.1.5 → 1.1.6 (`RUSTSEC-2026-0486`, unsound zero-length xattr buffer). Compatible patch; crate fetched and `agentlink-core` lib tests re-run (271 passed). After this bump, cargo-audit reports 12 unmaintained warnings and no longer lists rustix.
 
 **Not upgraded (no compatible released patch in this tree):**
-- `libsqlite3-sys` 0.30.1 — `RUSTSEC-2026-0459` (bundled SQLite before 3.54.0; local, UI:P, CVSS 6.8). Patched crate versions are `>=0.39.0`. Workspace `sqlx` 0.8.6 (and current stable 0.9.0) still require `<0.38`. Unreleased sqlx main would allow 0.39 but was not used. The workspace also depends on `libsqlite3-sys` 0.30.1 with `bundled` directly, so this is a real default-build exposure. System SQLite was not substituted as a silent policy change. **This remains an open vulnerability in the lock and in the compile tree** (`cargo tree -i libsqlite3-sys` reaches `agentlink-relay`).
+- `libsqlite3-sys` 0.30.1 — `RUSTSEC-2026-0459` (bundled SQLite before 3.54.0; local, UI:P, CVSS 6.8). This was the state of the 912 / `f4a336ee` line. **Superseded on current tip `ea69145`** (official sqlx #4502 git rev + `libsqlite3-sys` 0.39.1 / SQLite 3.54.1). See the current-tip SQLite section. crates.io sqlx 0.9.0 still requires `<0.38` and was not the path used.
 - `rsa` 0.9.10 — `RUSTSEC-2023-0071` (Marvin). Patched in `>=0.10.0`. Present in `Cargo.lock` via optional `sqlx-mysql`. Workspace sqlx features do not enable mysql. `cargo tree -i rsa` prints nothing for the default tree and for `--all-features` (workspace crates do not enable `sqlx/mysql`). Lockfile presence is not “vulnerability fully solved”; cargo-audit on the full lock still fails because of it.
 
 Unmaintained warnings (not treated as vulns, no compatible forced rewrite): `basic-toml` (`RUSTSEC-2026-0374`), `paste` (`RUSTSEC-2024-0436`), `pin-utils` (`RUSTSEC-2026-0441`), `rustls-pemfile` (`RUSTSEC-2025-0134`), `serial` (`RUSTSEC-2017-0008`), `ttf-parser` (`RUSTSEC-2026-0192`), and zbus 3.x/4.x / zvariant / zvariant_derive unmaintained advisories (`RUSTSEC-2026-0370/0371/0372`). `paste` remains lock-only for the default tree.
@@ -287,26 +310,22 @@ This commit does not change production resize. On Windows the handshake write is
 
 ## Post-6674388 status snapshot
 
-The product merge tip remains `6674388027224441327d771e1d3e3adab0ec42f8`,
-not `40f551c`. Later docs-only commits on this branch record status;
-they are not a full product retest. The sections above stay as
-historical review notes. See **Current tip `6674388` — what is and
-is not claimed** for the live snapshot: 7142 GUI defects (focus /
-cards) closed on a real window with computerUse still partial;
-16 MiB workspace 1548 / 0 / 2 ignored; default test-thread CLI help
-still overflows; 8 MiB product help exits 0; reconnect keeps the
-drop-teardown gate and recovers via a grant-checked fresh session;
-noflash static review passed, Windows visual untested; official
-Kotlin regen and signature typecheck done, Android full build and
-phone untested; Windows AC resize still awaits an offline probe
-retest; NAT P2P unproven across networks; `RUSTSEC-2026-0459`
-unpatched; `rsa` lock-only and default-unreachable; 12 unmaintained
-warnings; mitigations are not a fix; production machines not
-upgraded; no Actions, not public, no release, no deploy.
-Independent read-only review of `6674388` completed 2026-11-13
-(Asia/Shanghai) with no new block (copy 60s / backoff, alive +
-fresh request id + authz, resume journal, drop teardown still in
-place, auth errors not retried, merge is the full union). That
-review is not a sign-off of the untested Windows / DPI / Tab /
-Android / NAT / audit items listed above.
+Historical. The product merge tip after UI / reconnect / noflash was
+`6674388`, then docs `f4a336ee` became live `main`. See **Current tip
+`ea69145`** for the live snapshot.
+
+## Post-ea69145 status snapshot
+
+The product tip is `ea6914525566f14e1a842fb301b32ac17adfc0e6` (parent
+`f4a336ee`). Later docs-only commits record status and are not a full
+product retest. Independent review found no source block. Existing
+16 MiB workspace tests on `ea69145` are 1550 / 0 / 2 ignored. GUI
+computerUse remains partial; Windows visual noflash, Windows AC
+resize, Android full build and phone, cross-network NAT P2P, and a
+real Postgres run were not tested. cargo-audit on this lock is exit 0
+for `RUSTSEC-2026-0459` but still has 12 unmaintained warnings; rsa
+is absent from this lock (not a residual-rsa patch). Production
+machines were not upgraded; no Actions, not public, no release, no
+deploy. User t461 authorized an ordinary private source-main
+fast-forward only.
 
