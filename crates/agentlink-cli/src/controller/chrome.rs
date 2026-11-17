@@ -329,7 +329,7 @@ pub fn estimate_bar_width_with(
                 + item
                 + btn_w(advance("Shot", theme::BAR_SIZE, false))
                 + if m.has_cad {
-                    item + btn_w(advance("CAD", theme::BAR_SIZE, false))
+                    item + btn_w(advance("Send", theme::BAR_SIZE, false))
                 } else {
                     0.0
                 }
@@ -362,7 +362,7 @@ pub fn estimate_bar_width_with(
                 + item
                 + btn_w(advance("Sc", theme::BAR_SIZE, false))
                 + if m.has_cad {
-                    item + btn_w(advance("CAD", theme::BAR_SIZE, false))
+                    item + btn_w(advance("Send", theme::BAR_SIZE, false))
                 } else {
                     0.0
                 }
@@ -420,7 +420,7 @@ pub fn estimate_right_width_with(
                 + item
                 + btn_w(advance("Shot", theme::BAR_SIZE, false))
                 + if m.has_cad {
-                    item + btn_w(advance("CAD", theme::BAR_SIZE, false))
+                    item + btn_w(advance("Send", theme::BAR_SIZE, false))
                 } else {
                     0.0
                 }
@@ -442,7 +442,7 @@ pub fn estimate_right_width_with(
                 + item
                 + btn_w(advance("Shot", theme::BAR_SIZE, false))
                 + if m.has_cad {
-                    item + btn_w(advance("CAD", theme::BAR_SIZE, false))
+                    item + btn_w(advance("Send", theme::BAR_SIZE, false))
                 } else {
                     0.0
                 }
@@ -464,7 +464,7 @@ pub fn estimate_right_width_with(
                 + item
                 + btn_w(advance("Sc", theme::BAR_SIZE, false))
                 + if m.has_cad {
-                    item + btn_w(advance("CAD", theme::BAR_SIZE, false))
+                    item + btn_w(advance("Send", theme::BAR_SIZE, false))
                 } else {
                     0.0
                 }

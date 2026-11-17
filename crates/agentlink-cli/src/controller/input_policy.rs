@@ -58,6 +58,8 @@ pub enum RawEvent {
     Key {
         name: String,
         pressed: bool,
+        /// Remote typematic. A repeat is another key-down while the key stays held.
+        repeat: bool,
     },
     /// Non-ASCII text; barrier (never delayed past later clicks/keys).
     Text {
@@ -81,6 +83,7 @@ pub enum OutEvent {
     Key {
         name: String,
         pressed: bool,
+        repeat: bool,
     },
     Text {
         text: String,
@@ -193,11 +196,16 @@ pub fn reduce(state: &mut ReducerState, events: &[RawEvent]) -> Vec<OutEvent> {
                     });
                 }
             }
-            RawEvent::Key { name, pressed } => {
+            RawEvent::Key {
+                name,
+                pressed,
+                repeat,
+            } => {
                 flush_move(&mut pending_move, state, &mut out);
                 out.push(OutEvent::Key {
                     name: name.clone(),
                     pressed: *pressed,
+                    repeat: *repeat,
                 });
             }
             RawEvent::Text { text } => {
@@ -386,11 +394,13 @@ mod tests {
                 RawEvent::Key {
                     name: "shift".into(),
                     pressed: true,
+                    repeat: false,
                 },
                 btn(Button::Right, true, 0.5, 0.5, true),
                 RawEvent::Key {
                     name: "shift".into(),
                     pressed: false,
+                    repeat: false,
                 },
                 btn(Button::Right, false, 0.5, 0.5, true),
             ],
@@ -401,6 +411,7 @@ mod tests {
                 OutEvent::Key {
                     name: "shift".into(),
                     pressed: true,
+                    repeat: false,
                 },
                 OutEvent::Mouse {
                     action: "down",
@@ -413,6 +424,7 @@ mod tests {
                 OutEvent::Key {
                     name: "shift".into(),
                     pressed: false,
+                    repeat: false,
                 },
                 OutEvent::Mouse {
                     action: "up",
@@ -539,6 +551,7 @@ mod tests {
                 RawEvent::Key {
                     name: "a".into(),
                     pressed: true,
+                    repeat: false,
                 },
                 RawEvent::Text {
                     text: "中".into(),

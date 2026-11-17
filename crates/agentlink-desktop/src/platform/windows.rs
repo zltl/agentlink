@@ -1205,12 +1205,26 @@ impl CaptureBackend for WindowsDesktop {
     }
 }
 
+fn secure_attention(action: &InputAction) -> bool {
+    match action {
+        InputAction::Key { keys } | InputAction::KeyEdge { keys, .. } => {
+            crate::keys::is_secure_attention_sequence(keys)
+        }
+        _ => false,
+    }
+}
+
 impl HidBackend for WindowsDesktop {
     fn backend_name(&self) -> &str {
         "sendinput"
     }
 
     fn inject(&self, action: &InputAction) -> Result<()> {
+        if secure_attention(action) {
+            return Err(msg(
+                "Ctrl+Alt+Del is the Windows secure attention sequence. Ordinary SendInput cannot open the security screen.",
+            ));
+        }
         let action = action.clone();
         self.worker.call(move |state| perform(state, &action))
     }

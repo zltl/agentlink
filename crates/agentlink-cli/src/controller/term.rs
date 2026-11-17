@@ -456,84 +456,13 @@ impl Emulator {
         events: &[GuiEvent],
         modifiers: egui::Modifiers,
     ) -> (Vec<u8>, Option<String>, Option<String>, bool) {
-        let app_cursor = self.app_cursor();
-        let mut writes: Vec<u8> = Vec::new();
-        let mut copy_text: Option<String> = None;
-        let mut paste_text: Option<String> = None;
-        let mut want_paste = false;
-        let mut ime_commits: Vec<String> = Vec::new();
-        let mut preedit_active = false;
-        let mut control_key_sent = false;
-        let mut preedit = None;
-        for event in events {
-            match event {
-                GuiEvent::Copy | GuiEvent::Cut => {
-                    copy_text = self.term.selection_to_string();
-                }
-                GuiEvent::Paste(text) => {
-                    paste_text = Some(text.clone());
-                }
-                GuiEvent::Ime(ImeEvent::Enabled) => {}
-                GuiEvent::Ime(ImeEvent::Preedit(text)) => {
-                    if !text.is_empty() {
-                        preedit_active = true;
-                    }
-                    preedit = Some(text.clone());
-                }
-                GuiEvent::Ime(ImeEvent::Commit(text)) => {
-                    ime_commits.push(text.clone());
-                    writes.extend(Self::encode_text(text, false));
-                    preedit = Some(String::new());
-                }
-                GuiEvent::Ime(ImeEvent::Disabled) => {
-                    preedit = Some(String::new());
-                }
-                GuiEvent::Key {
-                    key,
-                    pressed,
-                    modifiers,
-                    ..
-                } if *pressed => {
-                    let name = key_name(*key);
-                    match clipboard_shortcut(*key, *modifiers, self.term.selection_to_string()) {
-                        TermClipboardShortcut::Copy(text) => {
-                            copy_text = Some(text);
-                            continue;
-                        }
-                        TermClipboardShortcut::Paste => {
-                            want_paste = true;
-                            continue;
-                        }
-                        TermClipboardShortcut::None => {}
-                    }
-                    if matches!(key, Key::Enter | Key::Tab) && !modifiers.ctrl {
-                        control_key_sent = true;
-                    }
-                    if let Some(bytes) = Self::encode_key(
-                        name,
-                        modifiers.ctrl,
-                        modifiers.alt,
-                        modifiers.shift,
-                        app_cursor,
-                    ) {
-                        writes.extend(bytes);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for event in events {
-            let GuiEvent::Text(text) = event else {
-                continue;
-            };
-            if modifiers.ctrl || modifiers.command {
-                continue;
-            }
-            if Self::skip_duplicate_text(text, &ime_commits, preedit_active, control_key_sent) {
-                continue;
-            }
-            writes.extend(Self::encode_text(text, modifiers.alt));
-        }
+        let selection = self.term.selection_to_string();
+        let (writes, copy_text, paste_text, want_paste, preedit) = plan_terminal_events(
+            events,
+            selection.as_deref(),
+            self.app_cursor(),
+            modifiers,
+        );
         if let Some(text) = preedit {
             self.ime_preedit = text;
         }
@@ -735,6 +664,13 @@ impl Emulator {
         } else if response.drag_stopped() {
             self.selecting = false;
         }
+        if primary_click_clears_selection(
+            response.clicked_by(PointerButton::Primary),
+            response.dragged_by(PointerButton::Primary),
+            response.double_clicked_by(PointerButton::Primary),
+        ) {
+            self.term.selection = None;
+        }
         if response.double_clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let point = to_point(pos);
@@ -777,6 +713,159 @@ impl Emulator {
 
         out
     }
+}
+
+/// A plain click (not a drag, not a double-click) clears the terminal selection
+/// so the next Ctrl+C can interrupt instead of copying a stale range.
+pub(crate) fn primary_click_clears_selection(
+    clicked: bool,
+    dragged: bool,
+    double_clicked: bool,
+) -> bool {
+    clicked && !dragged && !double_clicked
+}
+
+fn plain_ctrl(modifiers: egui::Modifiers) -> bool {
+    (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt
+}
+
+/// Turn a frame of native egui events into PTY bytes.
+///
+/// Windows egui can emit [`GuiEvent::Copy`] for Ctrl+C without [`GuiEvent::Key`]
+/// `C`. An empty selection then has to interrupt (`^C`). A non-empty selection
+/// still copies. Copy plus Key(C) in the same frame produces one interrupt,
+/// not two. Paste text goes to the PTY, not the remote-desktop clipboard.
+pub(crate) fn plan_terminal_events(
+    events: &[GuiEvent],
+    selection: Option<&str>,
+    app_cursor: bool,
+    frame_modifiers: egui::Modifiers,
+) -> (Vec<u8>, Option<String>, Option<String>, bool, Option<String>) {
+    let selected = selection.filter(|text| !text.is_empty());
+    let mut saw_copy = false;
+    let mut saw_cut = false;
+    let mut saw_paste = false;
+    for event in events {
+        match event {
+            GuiEvent::Copy => saw_copy = true,
+            GuiEvent::Cut => saw_cut = true,
+            GuiEvent::Paste(_) => saw_paste = true,
+            _ => {}
+        }
+    }
+
+    let mut writes: Vec<u8> = Vec::new();
+    let mut copy_text: Option<String> = None;
+    let mut paste_text: Option<String> = None;
+    let mut want_paste = false;
+    let mut interrupt_from_copy = false;
+    let mut cut_from_event = false;
+    if saw_copy {
+        if let Some(text) = selected {
+            copy_text = Some(text.to_string());
+        } else if let Some(bytes) = Emulator::encode_key("c", true, false, false, app_cursor) {
+            writes.extend(bytes);
+            interrupt_from_copy = true;
+        }
+    }
+    if saw_cut {
+        if let Some(text) = selected {
+            copy_text = Some(text.to_string());
+        } else if let Some(bytes) = Emulator::encode_key("x", true, false, false, app_cursor) {
+            writes.extend(bytes);
+            cut_from_event = true;
+        }
+    }
+
+    let mut ime_commits: Vec<String> = Vec::new();
+    let mut preedit_active = false;
+    let mut control_key_sent = false;
+    let mut preedit = None;
+    for event in events {
+        match event {
+            GuiEvent::Copy | GuiEvent::Cut => {}
+            GuiEvent::Paste(text) => {
+                paste_text = Some(text.clone());
+            }
+            GuiEvent::Ime(ImeEvent::Enabled) => {}
+            GuiEvent::Ime(ImeEvent::Preedit(text)) => {
+                if !text.is_empty() {
+                    preedit_active = true;
+                }
+                preedit = Some(text.clone());
+            }
+            GuiEvent::Ime(ImeEvent::Commit(text)) => {
+                ime_commits.push(text.clone());
+                writes.extend(Emulator::encode_text(text, false));
+                preedit = Some(String::new());
+            }
+            GuiEvent::Ime(ImeEvent::Disabled) => {
+                preedit = Some(String::new());
+            }
+            GuiEvent::Key {
+                key,
+                pressed,
+                modifiers,
+                ..
+            } if *pressed => {
+                if interrupt_from_copy && plain_ctrl(*modifiers) && matches!(key, Key::C) {
+                    continue;
+                }
+                if cut_from_event && plain_ctrl(*modifiers) && matches!(key, Key::X) {
+                    continue;
+                }
+                if saw_paste && plain_ctrl(*modifiers) && matches!(key, Key::V) {
+                    continue;
+                }
+                if saw_copy && selected.is_some() && plain_ctrl(*modifiers) && matches!(key, Key::C)
+                {
+                    continue;
+                }
+                if saw_cut && selected.is_some() && plain_ctrl(*modifiers) && matches!(key, Key::X)
+                {
+                    continue;
+                }
+                let name = key_name(*key);
+                match clipboard_shortcut(*key, *modifiers, selection.map(str::to_string)) {
+                    TermClipboardShortcut::Copy(text) => {
+                        copy_text = Some(text);
+                        continue;
+                    }
+                    TermClipboardShortcut::Paste => {
+                        want_paste = true;
+                        continue;
+                    }
+                    TermClipboardShortcut::None => {}
+                }
+                if matches!(key, Key::Enter | Key::Tab) && !modifiers.ctrl {
+                    control_key_sent = true;
+                }
+                if let Some(bytes) = Emulator::encode_key(
+                    name,
+                    modifiers.ctrl,
+                    modifiers.alt,
+                    modifiers.shift,
+                    app_cursor,
+                ) {
+                    writes.extend(bytes);
+                }
+            }
+            _ => {}
+        }
+    }
+    for event in events {
+        let GuiEvent::Text(text) = event else {
+            continue;
+        };
+        if frame_modifiers.ctrl || frame_modifiers.command {
+            continue;
+        }
+        if Emulator::skip_duplicate_text(text, &ime_commits, preedit_active, control_key_sent) {
+            continue;
+        }
+        writes.extend(Emulator::encode_text(text, frame_modifiers.alt));
+    }
+    (writes, copy_text, paste_text, want_paste, preedit)
 }
 
 /// Keyboard shortcuts that should copy or paste instead of sending a control
@@ -1245,5 +1334,132 @@ mod tests {
             pressed: true,
             modifiers: egui::Modifiers::NONE,
         }));
+    }
+
+    fn key_c(mods: egui::Modifiers) -> GuiEvent {
+        GuiEvent::Key {
+            key: Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        }
+    }
+
+    fn ctrl_mods() -> egui::Modifiers {
+        egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        }
+    }
+
+    #[test]
+    fn copy_event_without_selection_interrupts_once() {
+        let (bytes, copy, paste, want_paste, _) =
+            plan_terminal_events(&[GuiEvent::Copy], None, false, egui::Modifiers::NONE);
+        assert_eq!(bytes, vec![0x03], "native Copy with no selection must be ^C");
+        assert!(copy.is_none());
+        assert!(paste.is_none());
+        assert!(!want_paste);
+    }
+
+    #[test]
+    fn copy_event_with_selection_copies_and_does_not_interrupt() {
+        let (bytes, copy, _, _, _) =
+            plan_terminal_events(&[GuiEvent::Copy], Some("_COPY_OK"), false, egui::Modifiers::NONE);
+        assert!(bytes.is_empty());
+        assert_eq!(copy.as_deref(), Some("_COPY_OK"));
+    }
+
+    #[test]
+    fn copy_event_plus_key_c_interrupts_only_once() {
+        let events = [GuiEvent::Copy, key_c(ctrl_mods())];
+        let (bytes, copy, _, _, _) =
+            plan_terminal_events(&events, None, false, ctrl_mods());
+        assert_eq!(bytes, vec![0x03]);
+        assert!(copy.is_none());
+    }
+
+    #[test]
+    fn key_c_without_copy_event_still_interrupts_when_empty() {
+        let (bytes, copy, _, _, _) =
+            plan_terminal_events(&[key_c(ctrl_mods())], Some(""), false, ctrl_mods());
+        assert_eq!(bytes, vec![0x03]);
+        assert!(copy.is_none());
+    }
+
+    #[test]
+    fn key_c_with_selection_copies_instead_of_interrupting() {
+        let (bytes, copy, _, _, _) =
+            plan_terminal_events(&[key_c(ctrl_mods())], Some("sel"), false, ctrl_mods());
+        assert!(bytes.is_empty());
+        assert_eq!(copy.as_deref(), Some("sel"));
+    }
+
+    #[test]
+    fn cut_event_without_selection_sends_ctrl_x_once() {
+        let key_x = GuiEvent::Key {
+            key: Key::X,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: ctrl_mods(),
+        };
+        let (alone, _, _, _, _) =
+            plan_terminal_events(&[GuiEvent::Cut], None, false, egui::Modifiers::NONE);
+        assert_eq!(alone, vec![0x18]);
+        let (both, _, _, _, _) =
+            plan_terminal_events(&[GuiEvent::Cut, key_x], None, false, ctrl_mods());
+        assert_eq!(both, vec![0x18]);
+    }
+
+    #[test]
+    fn paste_event_is_pty_text_and_does_not_request_a_second_paste() {
+        let key_v = GuiEvent::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: ctrl_mods(),
+        };
+        let (bytes, copy, paste, want_paste, _) = plan_terminal_events(
+            &[GuiEvent::Paste("echo ok".into()), key_v],
+            None,
+            false,
+            ctrl_mods(),
+        );
+        assert!(bytes.is_empty(), "paste must not also inject key bytes: {bytes:?}");
+        assert!(copy.is_none());
+        assert_eq!(paste.as_deref(), Some("echo ok"));
+        assert!(!want_paste, "Paste event already carries the text");
+    }
+
+    #[test]
+    fn ctrl_shift_c_still_copies_without_a_copy_event() {
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        let event = GuiEvent::Key {
+            key: Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        };
+        let (bytes, copy, _, want_paste, _) =
+            plan_terminal_events(&[event], Some("sel"), false, mods);
+        assert!(bytes.is_empty());
+        assert_eq!(copy.as_deref(), Some("sel"));
+        assert!(!want_paste);
+    }
+
+    #[test]
+    fn plain_click_clears_selection_and_a_drag_does_not() {
+        assert!(primary_click_clears_selection(true, false, false));
+        assert!(!primary_click_clears_selection(true, true, false));
+        assert!(!primary_click_clears_selection(true, false, true));
+        assert!(!primary_click_clears_selection(false, false, false));
     }
 }

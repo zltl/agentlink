@@ -132,6 +132,24 @@ pub fn parse_combo(spec: &str) -> Result<Vec<String>> {
     parts.into_iter().map(canonical).collect()
 }
 
+/// Windows Ctrl+Alt+Del is the secure attention sequence. `SendInput` and
+/// the portal key path cannot open the security screen. A chord matches only
+/// when ctrl, alt, and delete are all present.
+pub fn is_secure_attention_sequence<S: AsRef<str>>(keys: &[S]) -> bool {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut delete = false;
+    for key in keys {
+        match key.as_ref() {
+            "ctrl" | "lctrl" | "rctrl" | "control" => ctrl = true,
+            "alt" | "lalt" | "ralt" | "option" | "opt" => alt = true,
+            "delete" | "del" => delete = true,
+            _ => {}
+        }
+    }
+    ctrl && alt && delete
+}
+
 pub fn key_info(name: &str) -> Option<KeyInfo> {
     if let Some(info) = NAMED.iter().find(|item| item.name == name).copied() {
         return Some(info);
@@ -939,5 +957,20 @@ mod tests {
             // mac field is always present (0 for keys without a CGKeyCode).
             let _ = info.mac;
         }
+    }
+
+    #[test]
+    fn secure_attention_is_only_ctrl_alt_delete() {
+        assert!(is_secure_attention_sequence(&["ctrl", "alt", "delete"]));
+        assert!(is_secure_attention_sequence(&[
+            "lctrl".to_string(),
+            "ralt".into(),
+            "del".into()
+        ]));
+        assert!(!is_secure_attention_sequence(&["ctrl", "c"]));
+        assert!(!is_secure_attention_sequence(&["delete"]));
+        assert!(!is_secure_attention_sequence(&["ctrl", "alt", "tab"]));
+        assert!(!is_secure_attention_sequence(&["alt", "f4"]));
+        assert!(!is_secure_attention_sequence::<&str>(&[]));
     }
 }

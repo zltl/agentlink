@@ -315,6 +315,10 @@ pub struct ControllerApp {
     desk_fullscreen: bool,
     desk_capture_keys: bool,
     desk_held_keys: HashSet<String>,
+    /// Grant/policy rejected further injection until the session restarts.
+    desk_input_blocked: bool,
+    /// Toolbar menu of chords the local OS may swallow.
+    desk_send_menu: bool,
     desk_sticky: HashSet<&'static str>,
     desk_last_move: Instant,
     desk_last_frame: Option<Instant>,
@@ -588,6 +592,8 @@ impl ControllerApp {
             desk_fullscreen: false,
             desk_capture_keys: false,
             desk_held_keys: HashSet::new(),
+            desk_input_blocked: false,
+            desk_send_menu: false,
             desk_sticky: HashSet::new(),
             desk_last_move: Instant::now() - Duration::from_secs(1),
             desk_last_frame: None,
@@ -685,6 +691,14 @@ impl ControllerApp {
                 }
                 UiEvent::Failed(message) => {
                     self.files_loading = false;
+                    if matches!(self.screen, Screen::Desktop { .. })
+                        && super::desk_keys::failure_revokes_input(&message)
+                    {
+                        // Release while injection is still allowed, then block.
+                        self.desk_capture_keys = false;
+                        self.release_remote_input();
+                        self.desk_input_blocked = true;
+                    }
                     if matches!(self.screen, Screen::Restoring) {
                         self.screen = Screen::Login;
                         self.error = message;
@@ -1106,6 +1120,8 @@ impl ControllerApp {
         self.desk_pan = egui::Vec2::ZERO;
         self.desk_fit = true;
         self.desk_capture_keys = false;
+        self.desk_input_blocked = false;
+        self.desk_send_menu = false;
         self.desk_last_frame = None;
         self.desk_hud = LiveHud::default();
         self.desk_await_paste = false;
@@ -1151,6 +1167,8 @@ impl ControllerApp {
         self.desk_disconnect_reason.clear();
         self.desk_connect_failed = false;
         self.desk_stats_open = false;
+        self.desk_input_blocked = false;
+        self.desk_send_menu = false;
         self.error.clear();
         let control = self.control.get(node).copied().unwrap_or(false);
         self.link = if control {
@@ -1192,6 +1210,8 @@ impl ControllerApp {
         self.seen_seq = 0;
         self.desk_last_frame = None;
         self.desk_capture_keys = false;
+        self.desk_input_blocked = false;
+        self.desk_send_menu = false;
         self.desk_user_stopped = true;
         self.desk_connect_failed = false;
         self.desk_connect_started = None;
@@ -1208,6 +1228,8 @@ impl ControllerApp {
         self.seen_seq = 0;
         self.desk_last_frame = None;
         self.desk_capture_keys = false;
+        self.desk_input_blocked = false;
+        self.desk_send_menu = false;
         self.desk_user_stopped = true;
         self.desk_connect_failed = true;
         self.desk_connect_started = None;
@@ -1321,6 +1343,8 @@ impl eframe::App for ControllerApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flags.quit.store(true, Ordering::Relaxed);
+        self.desk_capture_keys = false;
+        self.release_remote_input();
         self.send(Cmd::PtyClose);
         self.send(Cmd::LiveStop);
     }
@@ -1342,6 +1366,7 @@ impl ControllerApp {
         self.debug_layout.clear();
         self.sync_window_size(ctx);
         self.pump(ctx);
+        self.release_keyboard_if_ungated(ctx);
         if matches!(self.screen, Screen::Terminal { .. }) && self.terminal.focused {
             self.terminal.consume_focused_keys(ctx);
         }
@@ -2547,11 +2572,6 @@ impl ControllerApp {
             _ => return,
         };
         let control = self.control.get(&id).copied().unwrap_or(false);
-        let is_windows = self
-            .nodes
-            .iter()
-            .find(|node| node.id == id)
-            .is_some_and(|node| node.os.to_ascii_lowercase().contains("windows"));
 
         // Track pointer motion for fullscreen connection-bar auto-hide.
         let (pointer_y, pointer_moved) = ui.ctx().input(|input| {
@@ -2569,42 +2589,31 @@ impl ControllerApp {
             }
         }
 
-        // F11 toggles fullscreen; Esc releases keyboard capture / sticky keys.
+        // F11 toggles local fullscreen only while the keyboard is not captured.
+        // A captured F11 is forwarded to the remote. Esc is also forwarded;
+        // capture ends on the Keys button, focus loss, disconnect, grant
+        // revoke, or exit.
         let mut toggle_fs = false;
-        let mut release_keys = false;
-        ui.ctx().input(|input| {
-            for event in &input.events {
-                if let egui::Event::Key {
-                    key: egui::Key::F11,
-                    pressed: true,
-                    repeat: false,
-                    ..
-                } = event
-                {
-                    toggle_fs = true;
-                }
-                if let egui::Event::Key {
-                    key: egui::Key::Escape,
-                    pressed: true,
-                    repeat: false,
-                    ..
-                } = event
-                {
-                    if self.desk_capture_keys || !self.desk_held_keys.is_empty() {
-                        release_keys = true;
+        if !self.desk_capture_keys {
+            ui.ctx().input(|input| {
+                for event in &input.events {
+                    if let egui::Event::Key {
+                        key: egui::Key::F11,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } = event
+                    {
+                        toggle_fs = true;
                     }
                 }
-            }
-        });
+            });
+        }
         if toggle_fs {
             self.desk_fullscreen = !self.desk_fullscreen;
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.desk_fullscreen));
             self.desk_ui_pointer = Instant::now();
-        }
-        if release_keys {
-            self.desk_capture_keys = false;
-            self.release_remote_input_on(&id);
         }
 
         let phase = self.desktop_phase();
@@ -2628,7 +2637,7 @@ impl ControllerApp {
                     ui.set_opacity(bar_fade);
                     ui.set_min_height(BAR_HEIGHT);
                     ui.set_max_height(BAR_HEIGHT);
-                    self.desktop_connection_bar(ui, &id, &name, control, is_windows, phase);
+                    self.desktop_connection_bar(ui, &id, &name, control, phase);
                 });
             // Hairline under the bar (RDP-style), not a full card border.
             let edge = bar_resp.response.rect;
@@ -2668,7 +2677,7 @@ impl ControllerApp {
                     self.desktop_connecting_overlay(ui, &name, pane_rect);
                 }
                 SessionPhase::Live | SessionPhase::Stale => {
-                    self.desktop_canvas(ui, &id, control, is_windows, pane_rect);
+                    self.desktop_canvas(ui, &id, control, pane_rect);
                     if phase == SessionPhase::Stale {
                         self.desktop_stale_toast(ui, pane_rect);
                     }
@@ -2679,6 +2688,45 @@ impl ControllerApp {
             }
             self.desktop_draw_toast(ui, pane_rect);
         });
+        if self.desk_send_menu {
+            self.remote_send_popup(ui.ctx(), &id, control);
+        }
+    }
+
+    fn remote_send_popup(&mut self, ctx: &egui::Context, id: &str, control: bool) {
+        let mut open = self.desk_send_menu;
+        let mut close = false;
+        egui::Window::new("Send to remote")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(280.0);
+                if !control || self.desk_input_blocked {
+                    ui.label(theme::muted_text(
+                        "View only — keyboard shortcuts stay on this computer.",
+                    ));
+                } else {
+                    ui.label(theme::muted_text(
+                        "These chords are injected on the remote machine. The local OS may swallow the physical keys.",
+                    ));
+                    for chord in super::desk_keys::explicit_remote_chords() {
+                        if ui.button(chord.label).clicked() {
+                            self.inject_keys_tap(id, chord.keys);
+                            self.desk_toast = Some((chord.limit.to_string(), Instant::now()));
+                            close = true;
+                        }
+                        ui.label(theme::muted_text(chord.limit));
+                    }
+                }
+                ui.add_space(theme::SPACE_SM);
+                ui.label(
+                    egui::RichText::new(super::desk_keys::SECURE_ATTENTION_NOTE)
+                        .size(theme::SECONDARY_SIZE)
+                        .color(theme::TEXT_MUTED),
+                );
+            });
+        self.desk_send_menu = open && !close;
     }
 
     fn desktop_connection_bar(
@@ -2687,7 +2735,6 @@ impl ControllerApp {
         id: &str,
         name: &str,
         control: bool,
-        is_windows: bool,
         phase: SessionPhase,
     ) {
         let mut restart = false;
@@ -2740,7 +2787,7 @@ impl ControllerApp {
             stats: stats.as_deref(),
             zoom_label: &zoom_label,
             fullscreen_label: fs_label,
-            has_cad: is_windows,
+            has_cad: true,
             control,
         };
         let avail = ui.available_width().max(1.0);
@@ -2926,12 +2973,15 @@ impl ControllerApp {
                     }
                     ui.add_space(theme::SPACE_XS);
                     chrome_vsep(ui);
-                    if is_windows {
-                        let cad_btn = chrome_bar_button(ui, "CAD", "Send Ctrl+Alt+Del", false);
-                        self.debug_layout.note_item("ctrl_alt_del", cad_btn.rect);
-                        if cad_btn.clicked() {
-                            cad = true;
-                        }
+                    let send_btn = chrome_bar_button(
+                        ui,
+                        "Send",
+                        "Send a chord the local OS may swallow. Ctrl+Alt+Del cannot be injected.",
+                        self.desk_send_menu,
+                    );
+                    self.debug_layout.note_item("send_remote", send_btn.rect);
+                    if send_btn.clicked() {
+                        cad = true;
                     }
                     let (shot_l, clip_l, key_l) = match density {
                         BarDensity::Icons => ("Sc", "Cb", "Kb"),
@@ -3097,7 +3147,7 @@ impl ControllerApp {
             });
         }
         if cad {
-            self.inject_keys_tap(id, &["ctrl", "alt", "delete"]);
+            self.desk_send_menu = !self.desk_send_menu;
         }
         if restart {
             self.restart_live(id);
@@ -3109,7 +3159,6 @@ impl ControllerApp {
         ui: &mut egui::Ui,
         id: &str,
         control: bool,
-        is_windows: bool,
         pane_rect: egui::Rect,
     ) {
         let Some(texture) = self.texture.clone() else {
@@ -3207,10 +3256,19 @@ impl ControllerApp {
                         .min_size(egui::vec2(ui.available_width(), theme::BTN_TOOLBAR_H)),
                     )
                 };
-                if is_windows && item(ui, "Send Ctrl+Alt+Del").clicked() {
-                    action = Some(DeskMenuAction::Cad);
-                    ui.close_menu();
+                if control {
+                    for chord in super::desk_keys::explicit_remote_chords() {
+                        if item(ui, chord.label).clicked() {
+                            action = Some(DeskMenuAction::SendChord(chord.keys));
+                            ui.close_menu();
+                        }
+                    }
                 }
+                ui.add(egui::Label::new(
+                    egui::RichText::new(super::desk_keys::SECURE_ATTENTION_NOTE)
+                        .size(theme::SECONDARY_SIZE)
+                        .color(theme::TEXT_MUTED),
+                ).wrap());
                 if item(
                     ui,
                     if self.desk_fullscreen {
@@ -3246,7 +3304,7 @@ impl ControllerApp {
             }
         }
 
-        if control {
+        if control && !self.desk_input_blocked {
             // Ordered mouse (+ keys when captured) via STD input_policy reducer.
             // Plain / Shift / Ctrl right-click over the image all go remote;
             // toolbar / letterbox keep the local menu above.
@@ -3254,6 +3312,10 @@ impl ControllerApp {
             self.apply_negotiated_cursor(ui, over_image);
             if !self.desk_capture_keys && response.clicked() {
                 self.desk_capture_keys = true;
+            }
+        } else if control {
+            if over_image {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
             }
         } else {
             // View-only: leave the platform cursor alone (no overlay).
@@ -3265,10 +3327,10 @@ impl ControllerApp {
         // View-only: quiet centered pill. Control without capture: click hint pill.
         if !control || !self.desk_capture_keys {
             let painter = ui.painter_at(pane_rect);
-            let label = if !control {
+            let label = if !control || self.desk_input_blocked {
                 "View only — keyboard and mouse stay local"
             } else {
-                "Click to capture keyboard · Esc releases"
+                "Click to capture keyboard · Keys or unfocus releases"
             };
             let galley = painter.layout_no_wrap(
                 label.to_string(),
@@ -3369,7 +3431,19 @@ impl ControllerApp {
         pane_rect: egui::Rect,
     ) {
         match action {
-            DeskMenuAction::Cad => self.inject_keys_tap(id, &["ctrl", "alt", "delete"]),
+            DeskMenuAction::SendChord(keys) => {
+                if self.local_input_allowed(id)
+                    && !agentlink_desktop::is_secure_attention_sequence(keys)
+                {
+                    self.inject_keys_tap(id, keys);
+                    if let Some(chord) = super::desk_keys::explicit_remote_chords()
+                        .iter()
+                        .find(|chord| chord.keys == keys)
+                    {
+                        self.desk_toast = Some((chord.limit.to_string(), Instant::now()));
+                    }
+                }
+            }
             DeskMenuAction::Fullscreen => {
                 self.desk_fullscreen = !self.desk_fullscreen;
                 ui.ctx()
@@ -3659,6 +3733,7 @@ impl ControllerApp {
         response: &egui::Response,
         content: egui::Rect,
     ) {
+        use super::desk_keys::{self, Slot};
         use super::input_adapter::{
             adapt_frame, is_barrier_out, ContentGeom, FrameEvent, ModSnapshot, WheelUnit,
         };
@@ -3688,12 +3763,15 @@ impl ControllerApp {
             command: m.command || m.mac_cmd,
         };
 
-        let (events, final_mods) = ui.ctx().input(|input| {
-            let mut events: Vec<FrameEvent> = Vec::new();
+        let (slots, final_mods) = ui.ctx().input(|input| {
+            let mut slots: Vec<Slot> = Vec::new();
             for event in &input.events {
                 match event {
                     egui::Event::PointerMoved(pos) => {
-                        events.push(FrameEvent::PointerMoved { x: pos.x, y: pos.y });
+                        slots.push(Slot::Pointer(FrameEvent::PointerMoved {
+                            x: pos.x,
+                            y: pos.y,
+                        }));
                     }
                     egui::Event::PointerButton {
                         pos,
@@ -3707,13 +3785,13 @@ impl ControllerApp {
                             egui::PointerButton::Middle => Button::Middle,
                             _ => continue,
                         };
-                        events.push(FrameEvent::PointerButton {
+                        slots.push(Slot::Pointer(FrameEvent::PointerButton {
                             x: pos.x,
                             y: pos.y,
                             button,
                             pressed: *pressed,
                             mods: snap(*modifiers),
-                        });
+                        }));
                     }
                     egui::Event::MouseWheel {
                         unit,
@@ -3729,41 +3807,36 @@ impl ControllerApp {
                         // uses the evolving pointer from earlier Move events
                         // (seeded from the previous frame). Passing hover
                         // would map Move A, wheel, Move B → wheel at B.
-                        events.push(FrameEvent::MouseWheel {
+                        slots.push(Slot::Pointer(FrameEvent::MouseWheel {
                             x: None,
                             y: None,
                             delta_x: delta.x,
                             delta_y: delta.y,
                             unit,
                             mods: snap(*modifiers),
-                        });
+                        }));
                     }
                     egui::Event::PointerGone => {
-                        events.push(FrameEvent::PointerGone);
+                        slots.push(Slot::Pointer(FrameEvent::PointerGone));
                     }
-                    egui::Event::Key {
-                        key,
-                        pressed,
-                        repeat,
-                        modifiers,
-                        ..
-                    } if capture_keys && !*repeat => {
-                        if let Some(name) = egui_key_name(*key) {
-                            events.push(FrameEvent::Key {
-                                name: name.to_string(),
-                                pressed: *pressed,
-                                mods: snap(*modifiers),
-                            });
+                    other if capture_keys => {
+                        if let Some(host) = host_key_from_egui(other, snap) {
+                            slots.push(Slot::Key(host));
                         }
-                    }
-                    egui::Event::Text(text) if capture_keys && !text.is_ascii() => {
-                        events.push(FrameEvent::Text { text: text.clone() });
                     }
                     _ => {}
                 }
             }
-            (events, snap(input.modifiers))
+            (slots, snap(input.modifiers))
         });
+        if capture_keys {
+            // Keys belong to the remote session. Leave pointer events so the
+            // picture and local chrome still see the mouse.
+            ui.ctx().input_mut(|input| {
+                input.events.retain(|event| !egui_event_is_keyboard(event));
+            });
+        }
+        let events = desk_keys::interleave(true, capture_keys, &slots);
 
         let out = adapt_frame(
             &mut self.desk_adapter,
@@ -3792,9 +3865,14 @@ impl ControllerApp {
                     event.dy = dy;
                     self.inject_mouse(node, event, barrier);
                 }
-                OutEvent::Key { name, pressed } => {
+                OutEvent::Key {
+                    name,
+                    pressed,
+                    repeat,
+                } => {
                     if pressed {
-                        if self.desk_held_keys.insert(name.clone()) {
+                        let fresh = self.desk_held_keys.insert(name.clone());
+                        if fresh || repeat {
                             self.inject_key_edge(node, &name, true);
                         }
                     } else if self.desk_held_keys.remove(&name) {
@@ -3810,6 +3888,34 @@ impl ControllerApp {
             egui::vec2(0.0, 0.0),
             egui::Sense::focusable_noninteractive(),
         );
+    }
+
+    fn release_keyboard_if_ungated(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        let exiting = self.flags.quit.load(Ordering::Relaxed) || self.debug_quit;
+        let (on_desktop, control) = match &self.screen {
+            Screen::Desktop { id, .. } => (
+                true,
+                self.control.get(id).copied().unwrap_or(false) && !self.desk_input_blocked,
+            ),
+            _ => (false, false),
+        };
+        let gate = super::desk_keys::HoldGate {
+            on_desktop,
+            control_granted: control,
+            viewport_focused: focused,
+            exiting,
+        };
+        if (self.desk_capture_keys || !self.desk_held_keys.is_empty())
+            && !super::desk_keys::hold_keyboard(&gate)
+        {
+            self.desk_capture_keys = false;
+            self.release_remote_input();
+        }
+    }
+
+    fn local_input_allowed(&self, node: &str) -> bool {
+        self.control.get(node).copied().unwrap_or(false) && !self.desk_input_blocked
     }
 
     fn release_remote_input(&mut self) {
@@ -3843,6 +3949,10 @@ impl ControllerApp {
     }
 
     fn inject_mouse(&self, node: &str, event: MouseEvent<'_>, barrier: bool) {
+        // Button releases still go out after a grant rejection so buttons do not stick.
+        if event.action != "up" && !self.local_input_allowed(node) {
+            return;
+        }
         let mut live = serde_json::json!({
             "type": "mouse",
             "action": event.action,
@@ -3889,6 +3999,9 @@ impl ControllerApp {
     }
 
     fn inject_text(&self, node: &str, text: &str) {
+        if !self.local_input_allowed(node) {
+            return;
+        }
         let live = serde_json::json!({"type": "type", "text": text}).to_string();
         let inject = serde_json::json!({"action": "type", "text": text}).to_string();
         self.send(Cmd::Input {
@@ -3900,6 +4013,10 @@ impl ControllerApp {
     }
 
     fn inject_key_edge(&self, node: &str, key: &str, down: bool) {
+        // Key-up is allowed after a grant rejection so a held modifier cannot stick.
+        if down && !self.local_input_allowed(node) {
+            return;
+        }
         let live = serde_json::json!({"type": "key", "keys": [key], "down": down}).to_string();
         let inject = serde_json::json!({"action": "key", "keys": key, "down": down}).to_string();
         self.send(Cmd::Input {
@@ -3911,6 +4028,10 @@ impl ControllerApp {
     }
 
     fn inject_keys_tap(&self, node: &str, keys: &[&str]) {
+        if !self.local_input_allowed(node) || agentlink_desktop::is_secure_attention_sequence(keys)
+        {
+            return;
+        }
         let live = serde_json::json!({"type": "key", "keys": keys}).to_string();
         let inject = serde_json::json!({"action": "key", "keys": keys.join("+")}).to_string();
         self.send(Cmd::Input {
@@ -4354,7 +4475,7 @@ fn chrono_now_secs() -> u64 {
 }
 
 enum DeskMenuAction {
-    Cad,
+    SendChord(&'static [&'static str]),
     Fullscreen,
     Fit,
     OneToOne,
@@ -4452,6 +4573,52 @@ fn default_shot_path() -> String {
     name
 }
 
+fn egui_event_is_keyboard(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Paste(_)
+            | egui::Event::Ime(_)
+    )
+}
+
+fn host_key_from_egui(
+    event: &egui::Event,
+    snap: impl Fn(egui::Modifiers) -> super::input_adapter::ModSnapshot,
+) -> Option<super::desk_keys::HostKey> {
+    use super::desk_keys::HostKey;
+    match event {
+        egui::Event::Key {
+            key,
+            pressed,
+            repeat,
+            modifiers,
+            ..
+        } => {
+            let name = egui_key_name(*key)?;
+            Some(HostKey::Key {
+                name: name.to_string(),
+                pressed: *pressed,
+                repeat: *repeat,
+                mods: snap(*modifiers),
+            })
+        }
+        egui::Event::Text(text) => Some(HostKey::Text(text.clone())),
+        egui::Event::Copy => Some(HostKey::Copy),
+        egui::Event::Cut => Some(HostKey::Cut),
+        // Clipboard bytes stay on the desktop clipboard channel. A captured
+        // paste is the remote Ctrl+V chord, not a second typed payload.
+        egui::Event::Paste(_) => Some(HostKey::Paste),
+        egui::Event::Ime(egui::ImeEvent::Preedit(text)) => Some(HostKey::ImePreedit(text.clone())),
+        egui::Event::Ime(egui::ImeEvent::Commit(text)) => Some(HostKey::ImeCommit(text.clone())),
+        egui::Event::Ime(_) => None,
+        _ => None,
+    }
+}
+
 fn egui_key_name(key: egui::Key) -> Option<&'static str> {
     match key {
         egui::Key::Enter => Some("enter"),
@@ -4459,6 +4626,7 @@ fn egui_key_name(key: egui::Key) -> Option<&'static str> {
         egui::Key::Tab => Some("tab"),
         egui::Key::Backspace => Some("backspace"),
         egui::Key::Delete => Some("delete"),
+        egui::Key::Insert => Some("insert"),
         egui::Key::ArrowLeft => Some("left"),
         egui::Key::ArrowRight => Some("right"),
         egui::Key::ArrowUp => Some("up"),
@@ -4468,8 +4636,30 @@ fn egui_key_name(key: egui::Key) -> Option<&'static str> {
         egui::Key::Home => Some("home"),
         egui::Key::End => Some("end"),
         egui::Key::Space => Some("space"),
-        egui::Key::Minus => Some("minus"),
-        egui::Key::Equals => Some("equal"),
+        egui::Key::Minus => Some("-"),
+        egui::Key::Plus => Some("+"),
+        egui::Key::Equals => Some("="),
+        egui::Key::Comma => Some(","),
+        egui::Key::Period => Some("."),
+        egui::Key::Slash => Some("/"),
+        egui::Key::Backslash => Some("\\"),
+        egui::Key::Semicolon => Some(";"),
+        egui::Key::Quote => Some("'"),
+        egui::Key::OpenBracket => Some("["),
+        egui::Key::CloseBracket => Some("]"),
+        egui::Key::Backtick => Some("`"),
+        egui::Key::F1 => Some("f1"),
+        egui::Key::F2 => Some("f2"),
+        egui::Key::F3 => Some("f3"),
+        egui::Key::F4 => Some("f4"),
+        egui::Key::F5 => Some("f5"),
+        egui::Key::F6 => Some("f6"),
+        egui::Key::F7 => Some("f7"),
+        egui::Key::F8 => Some("f8"),
+        egui::Key::F9 => Some("f9"),
+        egui::Key::F10 => Some("f10"),
+        egui::Key::F11 => Some("f11"),
+        egui::Key::F12 => Some("f12"),
         egui::Key::A => Some("a"),
         egui::Key::B => Some("b"),
         egui::Key::C => Some("c"),

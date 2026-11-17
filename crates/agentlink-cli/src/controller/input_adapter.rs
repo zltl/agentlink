@@ -63,6 +63,8 @@ pub enum FrameEvent {
     Key {
         name: String,
         pressed: bool,
+        /// Local typematic repeat. Forwarded as another key-down, not a second press.
+        repeat: bool,
         mods: ModSnapshot,
     },
     /// Non-ASCII typed text (IME / compose). Barrier in the same stream.
@@ -174,6 +176,7 @@ fn emit_mod_delta(state: &mut AdapterState, next: ModSnapshot, raw: &mut Vec<Raw
             raw.push(RawEvent::Key {
                 name: name.to_string(),
                 pressed: now,
+                repeat: false,
             });
         }
     }
@@ -278,18 +281,19 @@ pub fn adapt_frame(
             FrameEvent::Key {
                 name,
                 pressed,
+                repeat,
                 mods,
             } => {
                 if !capture_keys {
                     continue;
                 }
-                if name == "escape" && *pressed {
-                    continue;
-                }
+                // Escape is a remote key. Capture is released by the toolbar,
+                // focus loss, disconnect, grant revoke, or exit — not by Esc.
                 emit_mod_delta(state, *mods, &mut raw);
                 raw.push(RawEvent::Key {
                     name: name.clone(),
                     pressed: *pressed,
+                    repeat: *repeat,
                 });
             }
             FrameEvent::Text { text } => {
@@ -364,7 +368,7 @@ mod tests {
         let names: Vec<_> = out
             .iter()
             .map(|e| match e {
-                OutEvent::Key { name, pressed } => {
+                OutEvent::Key { name, pressed, .. } => {
                     format!("{}:{}", name, if *pressed { "down" } else { "up" })
                 }
                 OutEvent::Mouse { action, button, .. } => format!("{action}:{button}"),
@@ -449,6 +453,7 @@ mod tests {
                 FrameEvent::Key {
                     name: "a".into(),
                     pressed: true,
+                    repeat: false,
                     mods: ModSnapshot::default(),
                 },
                 FrameEvent::Text {
@@ -521,6 +526,7 @@ mod tests {
             &[FrameEvent::Key {
                 name: "shift".into(),
                 pressed: true,
+                repeat: false,
                 mods: ModSnapshot {
                     shift: true,
                     ..ModSnapshot::default()

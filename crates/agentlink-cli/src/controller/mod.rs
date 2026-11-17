@@ -27,6 +27,8 @@ mod theme;
 #[cfg(not(target_env = "musl"))]
 mod field_pad;
 #[cfg(not(target_env = "musl"))]
+mod desk_keys;
+#[cfg(not(target_env = "musl"))]
 mod input_adapter;
 #[cfg(not(target_env = "musl"))]
 mod ordered_send;

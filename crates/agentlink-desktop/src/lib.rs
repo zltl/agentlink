@@ -57,6 +57,7 @@ pub use clipboard::{
 };
 pub use control_indicator::{note_control_session, note_inject_input};
 pub use error::{DesktopError, Result};
+pub use keys::is_secure_attention_sequence;
 pub use input::{HidBackend as InputInjector, InputAction, MouseButton};
 pub use mock::MockDesktop;
 pub use session::{display_from_signals, has_display, DisplaySignals};
