@@ -16,7 +16,30 @@ use super::encode::{EncodedAccessUnit, VideoEncoder};
 use super::tap::{self, StreamTapEvent};
 
 /// Still-desktop heartbeat so clients do not treat a quiet encode path as a stall.
+///
+/// Heartbeat still *encodes* a quiet frame; it must not force an IDR. On VAAPI,
+/// `force_keyframe` respawns the ffmpeg child (rawvideo pipe has no mid-stream
+/// IDR API). Initial IDR is `frames_sent == 0` / start `keyframe` flag; client
+/// PLI/FIR/loss recovery sets `PumpControl::keyframe`.
 const HEARTBEAT: Duration = Duration::from_secs(2);
+
+/// Encode / IDR policy for one pump tick (pure; no I/O).
+///
+/// Returns `None` to skip the encode, or `Some(force_keyframe)`.
+/// Idle heartbeat encodes without forcing IDR.
+pub(crate) fn encode_force_policy(
+    frame_unchanged: bool,
+    dirty_empty: bool,
+    client_keyframe: bool,
+    need_heartbeat: bool,
+    frames_sent: u64,
+) -> Option<bool> {
+    let force_keyframe = client_keyframe || frames_sent == 0;
+    if !force_keyframe && !need_heartbeat && (frame_unchanged || dirty_empty) {
+        return None;
+    }
+    Some(force_keyframe)
+}
 
 pub struct Pump {
     source: Box<dyn FrameSource>,
@@ -255,10 +278,12 @@ impl Pump {
             }
         }
         let sent = self.frames_sent.load(Ordering::Relaxed);
-        let mut force = self.keyframe.load(Ordering::Acquire);
+        let client_force = self.keyframe.load(Ordering::Acquire);
         let need_heartbeat = self.last_encoded_at.elapsed() >= HEARTBEAT;
+        // First picture / explicit ask force IDR; idle heartbeat does not.
+        let force_idr = client_force || sent == 0;
 
-        if frame.unchanged && !force && !need_heartbeat {
+        if frame.unchanged && !force_idr && !need_heartbeat {
             return Ok(None);
         }
 
@@ -282,12 +307,15 @@ impl Pump {
         let convert_us = scale_us + convert_started.elapsed().as_micros() as u64;
         update_encode_ema(&self.convert_us_ema, convert_us);
 
-        if dirty.is_empty() && !force && !need_heartbeat {
+        let Some(force) = encode_force_policy(
+            frame.unchanged,
+            dirty.is_empty(),
+            client_force,
+            need_heartbeat,
+            sent,
+        ) else {
             return Ok(None);
-        }
-        if need_heartbeat && dirty.is_empty() && !force {
-            force = true;
-        }
+        };
 
         // Still / low-change frames: raise QP (lower bitrate) so VAAPI CQP stays cheap.
         let base_bitrate = self.bitrate.load(Ordering::Relaxed);
@@ -297,7 +325,7 @@ impl Pump {
         }
 
         let encode_started = Instant::now();
-        let packet = match self.encoder.encode(&frame, force || sent == 0) {
+        let packet = match self.encoder.encode(&frame, force) {
             Ok(packet) if !packet.bytes.is_empty() => packet,
             Ok(_) => {
                 self.dropped_frames.fetch_add(1, Ordering::Relaxed);
@@ -341,6 +369,13 @@ impl Pump {
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = err.to_string();
         }
+    }
+
+    /// Test-only: pretend the last successful encode was `ago` in the past so
+    /// the next quiet frame hits the heartbeat path without sleeping.
+    #[cfg(test)]
+    fn backdate_last_encoded_for_test(&mut self, ago: Duration) {
+        self.last_encoded_at = Instant::now() - ago;
     }
 }
 
@@ -557,5 +592,159 @@ mod tests {
         assert!(snap.get("encode_ms").is_some());
         assert!(snap.get("queue_ms").is_some());
         assert!(snap.get("frames_sent").is_some());
+    }
+
+    /// Records every `force_keyframe` argument the pump passes into encode.
+    struct Recording {
+        forces: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl crate::stream::encode::VideoEncoder for Recording {
+        fn info(&self) -> crate::stream::encode::EncoderInfo {
+            crate::stream::encode::EncoderInfo {
+                name: "recording".into(),
+                codec: Codec::H264,
+                hardware: false,
+            }
+        }
+        fn encode(
+            &mut self,
+            frame: &Frame,
+            force_keyframe: bool,
+        ) -> Result<crate::stream::encode::EncodedAccessUnit> {
+            self.forces.lock().unwrap().push(force_keyframe);
+            Ok(crate::stream::encode::EncodedAccessUnit {
+                codec: Codec::H264,
+                bytes: vec![0, 0, 0, 1, if force_keyframe { 0x65 } else { 0x41 }],
+                keyframe: force_keyframe,
+                width: frame.width,
+                height: frame.height,
+                captured_unix_ms: frame.captured_unix_ms,
+            })
+        }
+        fn set_bitrate(&mut self, _: u32) {}
+    }
+
+    fn solid_color(byte: u8) -> Frame {
+        Frame::from_bgra(16, 16, 64, &vec![byte; 16 * 16 * 4], "test").unwrap()
+    }
+
+    #[test]
+    fn encode_force_policy_idle_heartbeat_does_not_force_idr() {
+        // Quiet desktop past HEARTBEAT: encode, but not as IDR.
+        assert_eq!(
+            encode_force_policy(true, true, false, true, 3),
+            Some(false)
+        );
+        // Within HEARTBEAT and quiet: skip entirely.
+        assert_eq!(encode_force_policy(true, true, false, false, 3), None);
+        assert_eq!(encode_force_policy(false, true, false, false, 3), None);
+    }
+
+    #[test]
+    fn encode_force_policy_first_frame_and_explicit_request_force_idr() {
+        assert_eq!(
+            encode_force_policy(false, false, false, false, 0),
+            Some(true),
+            "first frame forces IDR"
+        );
+        assert_eq!(
+            encode_force_policy(true, true, true, false, 5),
+            Some(true),
+            "explicit client PLI/FIR/keyframe forces IDR even on unchanged"
+        );
+        assert_eq!(
+            encode_force_policy(true, true, true, true, 5),
+            Some(true),
+            "explicit ask wins over idle heartbeat"
+        );
+    }
+
+    #[test]
+    fn encode_force_policy_dirty_frame_unchanged_idr_rules() {
+        assert_eq!(
+            encode_force_policy(false, false, false, false, 4),
+            Some(false),
+            "real dirty frame encodes without forced IDR"
+        );
+        assert_eq!(
+            encode_force_policy(false, false, false, true, 4),
+            Some(false),
+            "dirty + heartbeat still does not force IDR"
+        );
+    }
+
+    #[test]
+    fn pump_idle_heartbeat_encodes_without_forcing_idr() {
+        let forces = Arc::new(Mutex::new(Vec::new()));
+        let mut quiet = solid();
+        quiet.mark_unchanged();
+        let (mut pump, control) = Pump::start(
+            Box::new(Seq {
+                frames: vec![solid(), quiet.clone(), quiet],
+            }),
+            Box::new(Recording {
+                forces: forces.clone(),
+            }),
+            "s".into(),
+            200_000,
+        );
+        let first = pump.next(Duration::from_millis(1)).unwrap().unwrap();
+        assert!(first.keyframe, "first picture is an IDR");
+        assert_eq!(forces.lock().unwrap().as_slice(), &[true]);
+        assert!(!control.keyframe.load(Ordering::Relaxed));
+
+        // Quiet tick inside HEARTBEAT: no encode.
+        assert!(pump.next(Duration::from_millis(1)).unwrap().is_none());
+        assert_eq!(forces.lock().unwrap().len(), 1);
+
+        // Backdate past HEARTBEAT: encode a non-IDR keepalive.
+        pump.backdate_last_encoded_for_test(HEARTBEAT + Duration::from_millis(1));
+        let beat = pump.next(Duration::from_millis(1)).unwrap().unwrap();
+        assert!(!beat.keyframe, "idle heartbeat must not force IDR");
+        assert_eq!(forces.lock().unwrap().as_slice(), &[true, false]);
+        assert_eq!(control.frames_sent.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn pump_explicit_keyframe_request_forces_idr_on_quiet_desktop() {
+        let forces = Arc::new(Mutex::new(Vec::new()));
+        let mut quiet = solid();
+        quiet.mark_unchanged();
+        let (mut pump, control) = Pump::start(
+            Box::new(Seq {
+                frames: vec![solid(), quiet.clone(), quiet],
+            }),
+            Box::new(Recording {
+                forces: forces.clone(),
+            }),
+            "s".into(),
+            200_000,
+        );
+        assert!(pump.next(Duration::from_millis(1)).unwrap().unwrap().keyframe);
+        assert!(pump.next(Duration::from_millis(1)).unwrap().is_none());
+        control.keyframe.store(true, Ordering::Relaxed);
+        let again = pump.next(Duration::from_millis(1)).unwrap().unwrap();
+        assert!(again.keyframe);
+        assert_eq!(forces.lock().unwrap().as_slice(), &[true, true]);
+    }
+
+    #[test]
+    fn pump_dirty_frame_encodes_without_forced_idr() {
+        let forces = Arc::new(Mutex::new(Vec::new()));
+        let (mut pump, _) = Pump::start(
+            Box::new(Seq {
+                frames: vec![solid_color(1), solid_color(200)],
+            }),
+            Box::new(Recording {
+                forces: forces.clone(),
+            }),
+            "s".into(),
+            200_000,
+        );
+        assert!(pump.next(Duration::from_millis(1)).unwrap().unwrap().keyframe);
+        let dirty = pump.next(Duration::from_millis(1)).unwrap().unwrap();
+        assert!(!dirty.keyframe, "content change is a delta, not a forced IDR");
+        assert_eq!(forces.lock().unwrap().as_slice(), &[true, false]);
     }
 }

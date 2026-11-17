@@ -86,6 +86,8 @@ pub(crate) struct ClientInner {
     pub(crate) grant_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
     resend: Notify,
     fast: AtomicBool,
+    /// Sticky first transport end cause (sanitized categories only).
+    pub(crate) transport: crate::transport_status::TransportObserver,
     /// Test hook: PTY writes skip E2E and land here. Production stays None.
     write_hook: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
@@ -483,6 +485,7 @@ impl PtySession {
             grant_dir: std::sync::Arc::new(Mutex::new(None)),
             resend: Notify::new(),
             fast: AtomicBool::new(false),
+            transport: crate::transport_status::TransportObserver::new(),
             write_hook: Mutex::new(Some(hook_tx)),
         });
         let session_id = "pty-test".to_string();
@@ -611,8 +614,26 @@ impl Client {
         identity: crate::identity::Identity,
         use_token: bool,
     ) -> Result<Self> {
+        Self::connect_identity_observed(settings, identity, use_token)
+            .await
+            .map_err(|err| err.error)
+    }
+
+    /// Like [`Self::connect_identity`], but preserves the sticky typed transport
+    /// status when the first dial / Hello fails before a usable `Client` handle
+    /// would otherwise be returned (observer would be dropped with the inner).
+    pub async fn connect_identity_observed(
+        settings: &ClientSettings,
+        identity: crate::identity::Identity,
+        use_token: bool,
+    ) -> std::result::Result<Self, ObservedConnectError> {
         let client_id = identity.public_hex().to_string();
-        let relay = crate::relay_url::parse_relay_url(&settings.relay)?;
+        let relay = crate::relay_url::parse_relay_url(&settings.relay).map_err(|error| {
+            ObservedConnectError {
+                error,
+                status: crate::transport_status::TransportStatus::default(),
+            }
+        })?;
         let relay_addr = (relay.host.as_str(), relay.port)
             .to_socket_addrs()
             .ok()
@@ -644,6 +665,7 @@ impl Client {
             grant_dir: Arc::new(Mutex::new(None)),
             resend: Notify::new(),
             fast: AtomicBool::new(false),
+            transport: crate::transport_status::TransportObserver::new(),
             write_hook: Mutex::new(None),
         });
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -667,8 +689,22 @@ impl Client {
                 pin_dir: Mutex::new(None),
                 pin_warnings: Mutex::new(Vec::new()),
             }),
-            Ok(Err(err)) => Err(err),
-            Err(_) => Err(Error::Message("connection closed".into())),
+            Ok(Err(error)) => {
+                let status = inner.transport.snapshot();
+                Err(ObservedConnectError { error, status })
+            }
+            Err(_) => {
+                use crate::transport_status::ClosureCategory;
+                if inner.transport.snapshot().is_empty() {
+                    let _ = inner
+                        .transport
+                        .note_first(ClosureCategory::ReadyDropped, None);
+                }
+                Err(ObservedConnectError {
+                    error: Error::Message("connection closed".into()),
+                    status: inner.transport.snapshot(),
+                })
+            }
         }
     }
 
@@ -678,6 +714,17 @@ impl Client {
 
     pub fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::SeqCst) && !self.inner.shutdown.is_cancelled()
+    }
+
+    /// First recorded transport end cause for this Client (sticky).
+    pub fn transport_status(&self) -> crate::transport_status::TransportStatus {
+        self.inner.transport.snapshot()
+    }
+
+    /// Persist first-closure events as they happen (sink runs outside the
+    /// observer mutex). Replaces any previous sink.
+    pub fn set_transport_sink(&self, sink: Option<crate::transport_status::ClosureSink>) {
+        self.inner.transport.set_sink(sink);
     }
 
     /// Pin node name → ed25519 id under `dir` (usually the config directory).
@@ -1324,7 +1371,6 @@ impl Client {
         })
     }
 
-
     /// Server-issued PTY id from the open ack. The client's `request_id` is
     /// only the stream route for later chunks; it is never the session key.
     fn pty_open_session_id(body: Option<&Value>) -> Result<String> {
@@ -1334,9 +1380,8 @@ impl Client {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::Protocol("pty open missing session_id".into()))?;
-        uuid::Uuid::parse_str(id).map_err(|_| {
-            Error::Protocol("pty open session_id is not a uuid".into())
-        })?;
+        uuid::Uuid::parse_str(id)
+            .map_err(|_| Error::Protocol("pty open session_id is not a uuid".into()))?;
         Ok(id.to_string())
     }
 
@@ -2563,10 +2608,7 @@ mod tests {
     fn pty_open_uses_the_server_uuid_and_rejects_a_request_id_standin() {
         let server = uuid::Uuid::new_v4().to_string();
         let body = serde_json::json!({"session_id": server, "rows": 24, "cols": 80});
-        assert_eq!(
-            Client::pty_open_session_id(Some(&body)).unwrap(),
-            server
-        );
+        assert_eq!(Client::pty_open_session_id(Some(&body)).unwrap(), server);
         assert!(Client::pty_open_session_id(None).is_err());
         assert!(Client::pty_open_session_id(Some(&serde_json::json!({}))).is_err());
         assert!(Client::pty_open_session_id(Some(&serde_json::json!({"session_id": ""}))).is_err());
@@ -2585,7 +2627,6 @@ mod tests {
         .is_err());
     }
 
-
     #[tokio::test]
     async fn drop_without_close_does_not_panic_inside_the_runtime() {
         let io = PtySession::test_io();
@@ -2593,22 +2634,44 @@ mod tests {
     }
 }
 
-async fn next_env<S>(stream: &mut S) -> Result<Envelope>
+async fn next_env<S>(
+    stream: &mut S,
+    transport: &crate::transport_status::TransportObserver,
+) -> Result<Envelope>
 where
     S: Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
+    use crate::transport_status::ClosureCategory;
     loop {
-        let msg = stream
-            .next()
-            .await
-            .ok_or_else(|| Error::Ws("connection closed during handshake".into()))?
-            .map_err(|e| Error::Ws(e.to_string()))?;
+        let msg = match stream.next().await {
+            None => {
+                let _ = transport.note_first(ClosureCategory::WsStreamEnd, None);
+                return Err(Error::Ws("connection closed during handshake".into()));
+            }
+            Some(Err(_)) => {
+                let _ = transport.note_first(ClosureCategory::WsStreamError, None);
+                return Err(Error::Ws("connection closed during handshake".into()));
+            }
+            Some(Ok(msg)) => msg,
+        };
         match ws::parse_incoming(msg)? {
             Incoming::Env(env) => return Ok(env),
             Incoming::Ping(_) | Incoming::Ignore | Incoming::Binary(_) => continue,
-            Incoming::Closed => return Err(Error::Ws("connection closed during handshake".into())),
+            Incoming::Closed { code } => {
+                let _ = transport.note_first(ClosureCategory::WsClose, code);
+                return Err(Error::Ws("connection closed during handshake".into()));
+            }
         }
     }
+}
+
+/// Connect failure that keeps the sticky typed transport status that lived on
+/// the discarded inner Client (so bootstrap diagnostics can persist categories
+/// without logging raw server strings).
+#[derive(Debug)]
+pub struct ObservedConnectError {
+    pub error: Error,
+    pub status: crate::transport_status::TransportStatus,
 }
 
 type ClientSocket = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -2627,25 +2690,38 @@ async fn supervise(
     use_token: bool,
     mut ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
 ) {
+    use crate::transport_status::ClosureCategory;
     let mut backoff = crate::resume::Backoff::new();
     let mut connected_once = false;
     let mut down_since: Option<Instant> = None;
     let mut heartbeat = false;
     loop {
         if inner.shutdown.is_cancelled() {
+            let _ = inner.transport.bump_attempt();
+            inner.transport.note_first(ClosureCategory::Shutdown, None);
             if let Some(tx) = ready.take() {
                 let _ = tx.send(Err(Error::Message("connection closed".into())));
             }
             fail_waiters(&inner);
             break;
         }
-        match dial_client(&settings, &identity, use_token).await {
+        let _ = inner.transport.bump_attempt();
+        match dial_client(&settings, &identity, use_token, &inner.transport).await {
             Err(err) => {
                 if !connected_once {
                     // A first-dial TLS/IO flap should not fail a CLI command
                     // outright. Retry briefly; trust and auth failures still
                     // surface immediately.
                     if !err.is_retryable() {
+                        if matches!(err, Error::Auth(_)) {
+                            inner
+                                .transport
+                                .note_first(ClosureCategory::AuthRejected, None);
+                        } else {
+                            inner
+                                .transport
+                                .note_first(ClosureCategory::InitialDialGiveUp, None);
+                        }
                         if let Some(tx) = ready.take() {
                             let _ = tx.send(Err(err));
                         }
@@ -2654,6 +2730,9 @@ async fn supervise(
                     }
                     let since = *down_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= INITIAL_CONNECT_GIVE_UP {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::InitialDialGiveUp, None);
                         if let Some(tx) = ready.take() {
                             let _ = tx.send(Err(err));
                         }
@@ -2664,6 +2743,9 @@ async fn supervise(
                     let delay = next_reconnect_delay(&inner, &mut backoff);
                     tokio::select! {
                         _ = inner.shutdown.cancelled() => {
+                            inner
+                                .transport
+                                .note_first(ClosureCategory::Shutdown, None);
                             if let Some(tx) = ready.take() {
                                 let _ = tx.send(Err(Error::Message("connection closed".into())));
                             }
@@ -2678,18 +2760,27 @@ async fn supervise(
                 // Surface it to in-flight calls instead of retrying for a minute.
                 if let Error::Auth(message) = &err {
                     tracing::warn!(error = %message, "relay rejected the session; not retrying");
+                    inner
+                        .transport
+                        .note_first(ClosureCategory::AuthRejected, None);
                     fail_waiters_with(&inner, Some(message));
                     break;
                 }
                 let since = *down_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= crate::resume::RECONNECT_GIVE_UP {
                     tracing::warn!("relay stayed down; giving up on the session");
+                    inner
+                        .transport
+                        .note_first(ClosureCategory::DialGiveUp, None);
                     fail_waiters(&inner);
                     break;
                 }
                 let delay = next_reconnect_delay(&inner, &mut backoff);
                 tokio::select! {
                     _ = inner.shutdown.cancelled() => {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::Shutdown, None);
                         fail_waiters(&inner);
                         break;
                     }
@@ -2726,6 +2817,7 @@ async fn supervise(
                 let end = run_socket(&inner, ws, &mut app_rx).await;
                 fail_transfers(&inner);
                 if matches!(end, SocketEnd::Shutdown) || inner.shutdown.is_cancelled() {
+                    inner.transport.note_first(ClosureCategory::Shutdown, None);
                     fail_waiters(&inner);
                     break;
                 }
@@ -2734,11 +2826,15 @@ async fn supervise(
                     backoff.reset();
                 }
                 if matches!(end, SocketEnd::GoingAway) {
+                    inner.transport.note_first(ClosureCategory::GoingAway, None);
                     inner.fast.store(true, Ordering::SeqCst);
                 }
                 let delay = next_reconnect_delay(&inner, &mut backoff);
                 tokio::select! {
                     _ = inner.shutdown.cancelled() => {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::Shutdown, None);
                         fail_waiters(&inner);
                         break;
                     }
@@ -2746,6 +2842,11 @@ async fn supervise(
                 }
             }
         }
+    }
+    if ready.is_some() {
+        inner
+            .transport
+            .note_first(ClosureCategory::ReadyDropped, None);
     }
 }
 
@@ -2762,7 +2863,9 @@ async fn dial_client(
     settings: &ClientSettings,
     identity: &crate::identity::Identity,
     use_token: bool,
+    transport: &crate::transport_status::TransportObserver,
 ) -> Result<ClientSocket> {
+    use crate::transport_status::ClosureCategory;
     let relay = crate::relay_url::parse_relay_url(&settings.relay)?;
     let trust = tls::RelayTrust::parse(&settings.fingerprint, settings.trust.as_deref())?;
     let addr = relay.dial_label();
@@ -2815,7 +2918,7 @@ async fn dial_client(
     ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await
         .map_err(|e| Error::Ws(e.to_string()))?;
-    match next_env(&mut ws).await? {
+    match next_env(&mut ws, transport).await? {
         Envelope::HelloOk { .. } => Ok(ws),
         Envelope::Challenge { nonce } => {
             let signature = identity.sign_nonce(&nonce);
@@ -2824,16 +2927,23 @@ async fn dial_client(
             ))
             .await
             .map_err(|e| Error::Ws(e.to_string()))?;
-            match next_env(&mut ws).await? {
+            match next_env(&mut ws, transport).await? {
                 Envelope::HelloOk { .. } => Ok(ws),
-                Envelope::HelloErr { message, .. } => Err(Error::Auth(message)),
+                Envelope::HelloErr { message, .. } => {
+                    // Typed category only for diagnostics; UI may still see `message`.
+                    let _ = transport.note_first(ClosureCategory::AuthRejected, None);
+                    Err(Error::Auth(message))
+                }
                 other => Err(Error::Protocol(format!(
                     "expected hello_ok, got {}",
                     kind(&other)
                 ))),
             }
         }
-        Envelope::HelloErr { message, .. } => Err(Error::Auth(message)),
+        Envelope::HelloErr { message, .. } => {
+            let _ = transport.note_first(ClosureCategory::AuthRejected, None);
+            Err(Error::Auth(message))
+        }
         other => Err(Error::Protocol(format!(
             "expected hello_ok, got {}",
             kind(&other)
@@ -2846,6 +2956,7 @@ async fn run_socket(
     ws: ClientSocket,
     app_rx: &mut mpsc::Receiver<Outbound>,
 ) -> SocketEnd {
+    use crate::transport_status::ClosureCategory;
     let (sink, mut stream) = ws.split();
     let (sock_tx, sock_rx) = mpsc::channel(64);
     let writer_shutdown = inner.shutdown.clone();
@@ -2858,6 +2969,9 @@ async fn run_socket(
     for env in session_frames(inner) {
         let Ok(out) = ws::encode(&env) else { continue };
         if sock_tx.send(out).await.is_err() {
+            inner
+                .transport
+                .note_first(ClosureCategory::WsStreamEnd, None);
             return SocketEnd::Gone;
         }
     }
@@ -2877,12 +2991,26 @@ async fn run_socket(
             outgoing = app_rx.recv() => {
                 let Some(outgoing) = outgoing else { return SocketEnd::Shutdown };
                 if sock_tx.send(outgoing).await.is_err() {
+                    inner
+                        .transport
+                        .note_first(ClosureCategory::WsStreamEnd, None);
                     return SocketEnd::Gone;
                 }
             }
             msg = stream.next() => {
                 match msg {
-                    None | Some(Err(_)) => return SocketEnd::Gone,
+                    None => {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::WsStreamEnd, None);
+                        return SocketEnd::Gone;
+                    }
+                    Some(Err(_)) => {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::WsStreamError, None);
+                        return SocketEnd::Gone;
+                    }
                     Some(Ok(msg)) => match ws::parse_incoming(msg) {
                         Ok(Incoming::Env(Envelope::GoingAway { .. })) => {
                             tracing::info!("relay is going away; reconnecting");
@@ -2933,7 +3061,12 @@ async fn run_socket(
                         Ok(Incoming::Ping(payload)) => {
                             let _ = sock_tx.try_send(Outbound::Pong(payload));
                         }
-                        Ok(Incoming::Closed) => return SocketEnd::Gone,
+                        Ok(Incoming::Closed { code }) => {
+                            inner
+                                .transport
+                                .note_first(ClosureCategory::WsClose, code);
+                            return SocketEnd::Gone;
+                        }
                         Ok(Incoming::Ignore) => {}
                         Err(err) => tracing::warn!(error = %err, "ignoring malformed frame"),
                     },
@@ -3328,8 +3461,11 @@ async fn finish_login(
     identity: &crate::identity::Identity,
     request_id: &str,
 ) -> Result<UserSession> {
+    // Hermetic observer: account login helpers are not Client sessions, but
+    // next_env requires a TransportObserver after sticky first-cause wiring.
+    let transport = crate::transport_status::TransportObserver::new();
     loop {
-        match next_env(ws).await? {
+        match next_env(ws, &transport).await? {
             Envelope::Challenge { nonce } => {
                 send_ws(
                     ws,

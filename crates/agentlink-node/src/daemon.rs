@@ -664,7 +664,7 @@ async fn connect_once(
                 Ok(Incoming::Ping(payload)) => {
                     let _ = tx.try_send(Outbound::Pong(payload));
                 }
-                Ok(Incoming::Closed) => break SessionEnd::Closed,
+                Ok(Incoming::Closed { .. }) => break SessionEnd::Closed,
                 Ok(Incoming::Ignore) => {}
             },
         }
@@ -1302,7 +1302,7 @@ where
                 .map_err(|e| Error::Ws(e.to_string()))?;
             match ws::parse_incoming(msg)? {
                 Incoming::Env(env) => return Ok(env),
-                Incoming::Closed => return Err(Error::Ws("connection closed".into())),
+                Incoming::Closed { .. } => return Err(Error::Ws("connection closed".into())),
                 Incoming::Ping(_) | Incoming::Ignore | Incoming::Binary(_) => continue,
             }
         }

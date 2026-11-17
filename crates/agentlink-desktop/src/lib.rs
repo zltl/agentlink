@@ -17,6 +17,8 @@ mod a11y;
 mod capture;
 mod clipboard;
 mod control_indicator;
+mod cursor_meta_policy;
+mod cursor_negotiate;
 mod cursor_shape;
 mod encode;
 mod error;
@@ -33,6 +35,12 @@ use std::sync::Arc;
 
 use agentlink_core::NodeExtension;
 
+pub use crate::cursor_meta_policy::{exclude_cap_allowed, CursorAlpha, MUTTER_CURSOR_ALPHA};
+pub use crate::cursor_negotiate::{
+    bitmap_within_bound, content_fraction_with_pad, encode_pad_content_size,
+    negotiate_presentation, scale_hotspot, CursorCaps, CursorPresentation, MAX_CURSOR_BITMAP_EDGE,
+};
+
 use crate::a11y::A11yBackend;
 use crate::capture::CaptureBackend;
 use crate::handlers::{InjectHandler, ScreenshotHandler};
@@ -40,8 +48,12 @@ use crate::input::HidBackend;
 
 pub use a11y::{A11yBackend as Accessibility, ElementOp, UiNode};
 pub use capture::{
-    drive_frames, CaptureBackend as ScreenCapture, CaptureRequest, CaptureTarget, Frame,
-    FrameSource, MonitorInfo, PixelFormat, Rect, StreamMode,
+    drive_frames, CaptureBackend as ScreenCapture, CaptureRequest, CaptureTarget,
+    CursorCaptureMode, Frame, FrameSource, MonitorInfo, PixelFormat, Rect, StreamMode,
+};
+pub use clipboard::{
+    parse_set_message, set_payload, share_allowed, write_clipboard, ClipboardText,
+    ClipboardWatchState, CLIPBOARD_POLL_INTERVAL,
 };
 pub use control_indicator::{note_control_session, note_inject_input};
 pub use error::{DesktopError, Result};
@@ -49,9 +61,9 @@ pub use input::{HidBackend as InputInjector, InputAction, MouseButton};
 pub use mock::MockDesktop;
 pub use session::{display_from_signals, has_display, DisplaySignals};
 pub use stream::{
-    close_all_streams, close_expired_streams, close_inactive_streams, close_streams_for_jti, configure_stream, register_frame_tap, unregister_frame_tap,
-    update_stream_policy, ConsentMode, GrantActiveHook, StreamAudit, StreamHandler,
-    StreamSettings, StreamTapEvent, TapId,
+    close_all_streams, close_expired_streams, close_inactive_streams, close_streams_for_jti,
+    configure_stream, register_frame_tap, unregister_frame_tap, update_stream_policy, ConsentMode,
+    GrantActiveHook, StreamAudit, StreamHandler, StreamSettings, StreamTapEvent, TapId,
 };
 
 /// Capture, input, and accessibility bound to one backend.

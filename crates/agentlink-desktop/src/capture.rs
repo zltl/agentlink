@@ -15,6 +15,7 @@
 //!     scale: 0.5,
 //!     max_fps: 2.0,
 //!     max_width: 0,
+//!     cursor_mode: CursorCaptureMode::Embedded,
 //! })?;
 //! while let Some(frame) = session.next_frame(Duration::from_secs(2))? {
 //!     recorder.on_frame(&frame);
@@ -204,12 +205,29 @@ pub enum CaptureTarget {
 /// `max_width` is a capture-side width cap for PipeWire/Mutter (0 = full
 /// ScreenCast resolution). Streaming sets this to the encode width so ffmpeg
 /// does not CPU-scale a 20 MB BGRA frame; screenshots leave it at 0.
+/// How this capture session should present the OS cursor in the video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorCaptureMode {
+    /// Burn / embed the cursor into video frames (Mutter mode 1). Default for
+    /// legacy viewers and multi-client compatibility.
+    #[default]
+    Embedded,
+    /// Exclude the OS cursor from video; deliver position/shape/bitmap via
+    /// PipeWire `SPA_META_Cursor` (Mutter mode 2). Only safe when the session
+    /// actually opens a metadata stream.
+    Metadata,
+}
+
 #[derive(Debug, Clone)]
 pub struct CaptureRequest {
     pub target: CaptureTarget,
     pub scale: f32,
     pub max_fps: f32,
     pub max_width: u32,
+    /// Per-session cursor presentation request. Backends that cannot honor
+    /// [`CursorCaptureMode::Metadata`] keep embedded video and report that in
+    /// [`StreamMode`].
+    pub cursor_mode: CursorCaptureMode,
 }
 
 impl Default for CaptureRequest {
@@ -219,6 +237,7 @@ impl Default for CaptureRequest {
             scale: 1.0,
             max_fps: 2.0,
             max_width: 0,
+            cursor_mode: CursorCaptureMode::Embedded,
         }
     }
 }
@@ -248,7 +267,13 @@ pub enum StreamMode {
     PortalSampled { pipewire_node: Option<u32> },
     /// PipeWire ScreenCast. `dma_buf` is true when the latest buffer was a dma-buf
     /// that PipeWire mapped for us. The encoder still receives a BGRA copy.
-    PipeWire { node: u32, dma_buf: bool },
+    /// `cursor_excluded` is true only when this session's Record* stream used
+    /// Mutter metadata cursor-mode (no embedded pointer in video).
+    PipeWire {
+        node: u32,
+        dma_buf: bool,
+        cursor_excluded: bool,
+    },
     /// macOS ScreenCaptureKit. One-shot screenshots stay on CoreGraphics.
     ScreenCaptureKit,
 }
@@ -256,15 +281,33 @@ pub enum StreamMode {
 /// Pointer position for the cursor overlay channel. The video itself does not
 /// burn the cursor in.
 ///
-/// Wire shape is `{x,y,shape?,visible?}`. `visible` is attached by the stream
-/// layer (see [`CaptureBackend::cursor_visible`]) so older backend constructors
-/// that only fill `x`/`y`/`shape` keep compiling. Clients that do not know
-/// `shape`/`visible` still work from coordinates alone.
+/// Wire shape is `{x,y,shape?,visible?,hotspot_x?,hotspot_y?}`. `visible` is
+/// attached by the stream layer (see [`CaptureBackend::cursor_visible`]) so
+/// older backend constructors that only fill `x`/`y`/`shape` keep compiling.
+/// Clients that do not know `shape`/`visible`/`hotspot_*` still work from
+/// coordinates alone. Unknown Linux shapes must not be faked as `"arrow"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorSample {
     pub x: i32,
     pub y: i32,
     pub shape: String,
+    #[serde(default)]
+    pub hotspot_x: u16,
+    #[serde(default)]
+    pub hotspot_y: u16,
+    /// Optional tightly packed RGBA8 custom sprite (host byte order as RGBA).
+    /// Omitted when only a stock shape id is known. Bounded by
+    /// [`crate::MAX_CURSOR_BITMAP_EDGE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitmap_rgba: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub bitmap_w: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub bitmap_h: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Whether the desktop is currently capturable (for example not on a Windows
@@ -315,6 +358,12 @@ pub trait CaptureBackend: Send + Sync {
     /// Whether the OS cursor is currently drawn. Defaults to visible.
     fn cursor_visible(&self) -> bool {
         true
+    }
+
+    /// Whether this backend can exclude the embedded cursor for a negotiated
+    /// metadata presentation. Default false (legacy / embedded only).
+    fn cursor_exclude_supported(&self) -> bool {
+        false
     }
 
     /// Whether the screen can be captured right now (secure desktop, etc.).

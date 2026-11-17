@@ -1155,6 +1155,13 @@ impl CaptureBackend for WindowsDesktop {
             x: point.x,
             y: point.y,
             shape: current_cursor_shape(),
+            // Stock IDC shapes use the conventional top-left hot spot; custom
+            // icon hotspots are not yet extracted on this path.
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bitmap_rgba: None,
+            bitmap_w: 0,
+            bitmap_h: 0,
         })
     }
 

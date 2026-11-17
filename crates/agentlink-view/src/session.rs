@@ -20,9 +20,13 @@ use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
     RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, RTCStatsReport,
-    RTCStatsReportEntry, Registry, StatsSelector,
+    RTCStatsReportEntry, Registry, SettingEngineBuilder, StatsSelector,
 };
 use webrtc::runtime::default_runtime;
+
+use agentlink_core::{
+    prefer_on_link_hosts_in_candidate, prefer_on_link_hosts_in_sdp, HOST_ACCEPTANCE_MIN_WAIT,
+};
 
 use crate::h264::{
     addr_scope, classify_media_path, classify_selected_path, describe_ice_candidates,
@@ -45,6 +49,9 @@ pub struct LiveOptions {
     pub control: bool,
     /// Capture downscale before encode (`1.0` = native). Clamped on the node.
     pub scale: f32,
+    /// Requested cursor presentation (`"metadata"` for RDP-style local sprite
+    /// when the node can exclude the embedded pointer; `"legacy"` otherwise).
+    pub cursor_mode: String,
     /// Test-only ICE fault. Production always leaves this as [`IceFault::None`].
     /// It is never read from the environment and never forbids direct by default.
     pub ice_fault: IceFault,
@@ -62,6 +69,7 @@ impl std::fmt::Debug for LiveOptions {
             .field("ice_servers", &self.ice_servers)
             .field("control", &self.control)
             .field("scale", &self.scale)
+            .field("cursor_mode", &self.cursor_mode)
             .field("ice_fault", &self.ice_fault)
             .field("on_stage", &self.on_stage.is_some())
             .finish()
@@ -92,6 +100,8 @@ impl Default for LiveOptions {
             ice_servers: Vec::new(),
             control: true,
             scale: 1.0,
+            // Desktop Controller asks for metadata; nodes without exclude stay legacy.
+            cursor_mode: "metadata".into(),
             ice_fault: IceFault::None,
             on_stage: None,
         }
@@ -115,6 +125,15 @@ fn strip_sdp_ice_candidates(sdp: &str) -> String {
     }
 }
 
+/// Raise on-link physical LAN host priority on a remote ICE candidate string.
+/// Overlay/`100.x`/srflx/relay stay present — preference only, never a filter.
+fn prefer_remote_ice(mut init: RTCIceCandidateInit) -> RTCIceCandidateInit {
+    if !init.candidate.is_empty() {
+        init.candidate = prefer_on_link_hosts_in_candidate(&init.candidate);
+    }
+    init
+}
+
 fn report_stage(opts: &LiveOptions, msg: &str) {
     eprintln!("agentlink live-webrtc: {msg}");
     if let Some(cb) = &opts.on_stage {
@@ -130,6 +149,9 @@ pub struct LiveInfo {
     pub hardware: bool,
     pub width: u32,
     pub height: u32,
+    /// True content size before encode macroblock pad (0 ⇒ treat as width/height).
+    pub src_width: u32,
+    pub src_height: u32,
     pub control: bool,
     /// Confirmed media path: `host`, `stun`, `turn`, `tailscale`,
     /// `connecting`, `unknown`, or `relay` (legacy). Set from the selected
@@ -137,6 +159,9 @@ pub struct LiveInfo {
     pub path: String,
     /// `classify_media_path` of the answer SDP. Log-only; never the HUD path.
     pub sdp_inventory: String,
+    /// Negotiated cursor presentation: `"legacy"` (default) or `"metadata"`.
+    /// Missing on old nodes ⇒ legacy. Never paint a second local sprite in legacy.
+    pub cursor_presentation: String,
 }
 
 /// Selected ICE pair as observed on the viewer's peer connection.
@@ -166,6 +191,21 @@ pub struct LiveCursor {
     pub x: i32,
     pub y: i32,
     pub shape: String,
+    /// Remote OS pointer visibility — distinct from capture exclusion.
+    pub visible: bool,
+    pub hotspot_x: u16,
+    pub hotspot_y: u16,
+    pub bitmap_w: u32,
+    pub bitmap_h: u32,
+    /// Tightly packed RGBA8 when the node sent a custom sprite.
+    pub bitmap_rgba: Option<Vec<u8>>,
+}
+
+/// Unicode clipboard text received on the `input` data channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveClipboard {
+    pub text: String,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -194,6 +234,7 @@ pub struct Viewer {
     info: Arc<Mutex<LiveInfo>>,
     transport: Arc<Mutex<Option<TransportSnapshot>>>,
     cursor: Arc<Mutex<Option<LiveCursor>>>,
+    clipboard: Arc<Mutex<Option<LiveClipboard>>>,
     stats: Arc<Mutex<LiveStats>>,
     /// Safe ICE check snapshot (typ, raddr, proto, pair state, send/recv counts).
     /// No ICE ufrag/pwd, certificates, or packet payloads.
@@ -222,6 +263,7 @@ impl Viewer {
             info: built.info,
             transport: built.transport,
             cursor: built.cursor,
+            clipboard: built.clipboard,
             stats: built.stats,
             ice_checks: built.ice_checks,
             input_open: built.input_open,
@@ -304,6 +346,23 @@ impl Viewer {
             .clone()
     }
 
+    /// Take the latest remote clipboard payload, if any. Consumed once so a
+    /// session cannot replay an old copy after the user has moved on.
+    pub fn poll_clipboard(&self) -> Option<LiveClipboard> {
+        self.clipboard
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()
+    }
+
+    /// True after [`Self::close`] or a peer failure. Clipboard share tasks
+    /// use this so they exit instead of leaving a residual watcher.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+            || self.stop.load(Ordering::Relaxed)
+            || self.stopped.load(Ordering::Relaxed)
+    }
+
     pub fn stats(&self) -> LiveStats {
         self.stats
             .lock()
@@ -312,10 +371,34 @@ impl Viewer {
     }
 
     pub fn send_control(&self, json: &str) -> bool {
+        self.send_control_move(json)
+    }
+
+    /// Coalescable move path — try_send only; OK to drop under saturation.
+    pub fn send_control_move(&self, json: &str) -> bool {
         if !self.input_open.load(Ordering::Relaxed) {
             return false;
         }
         self.cmd.try_send(Cmd::Control(json.to_string())).is_ok()
+    }
+
+    /// Barrier path — await queue space so later clicks cannot leapfrog a
+    /// queued RTC down via Extension fallback. Returns false if the channel
+    /// is closed or input is down (caller must **not** switch routes).
+    pub async fn send_control_barrier(&self, json: &str) -> bool {
+        if !self.input_open.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let send = self.cmd.send(Cmd::Control(json.to_string()));
+        match tokio::time::timeout(Duration::from_secs(2), send).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                // Timed out waiting for capacity while still open — still no
+                // alternate route; drop rather than reorder.
+                false
+            }
+        }
     }
 
     pub fn request_keyframe(&self) {
@@ -386,6 +469,7 @@ struct Built {
     info: Arc<Mutex<LiveInfo>>,
     transport: Arc<Mutex<Option<TransportSnapshot>>>,
     cursor: Arc<Mutex<Option<LiveCursor>>>,
+    clipboard: Arc<Mutex<Option<LiveClipboard>>>,
     stats: Arc<Mutex<LiveStats>>,
     ice_checks: Arc<Mutex<String>>,
     input_open: Arc<AtomicBool>,
@@ -424,6 +508,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let loss = Arc::new(Mutex::new(LossWindow::default()));
     let stats = Arc::new(Mutex::new(LiveStats::default()));
     let cursor = Arc::new(Mutex::new(None));
+    let clipboard = Arc::new(Mutex::new(None));
     let failed = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
@@ -463,8 +548,12 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
                 rtc::peer_connection::configuration::RTCIceTransportPolicy::Relay,
             );
     }
+    let setting_engine = SettingEngineBuilder::new()
+        .with_host_acceptance_min_wait(Some(HOST_ACCEPTANCE_MIN_WAIT))
+        .build();
     let pc = PeerConnectionBuilder::new()
         .with_configuration(cfg.build())
+        .with_setting_engine(setting_engine)
         .with_media_engine(media)
         .with_interceptor_registry(registry)
         .with_handler(handler.clone() as Arc<dyn PeerConnectionEventHandler>)
@@ -484,7 +573,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         .await
         .map_err(|err| err.to_string())?;
     *input_slot.lock().unwrap_or_else(|err| err.into_inner()) = Some(input.clone());
-    watch_input(input, input_open.clone(), stop.clone());
+    watch_input(input, input_open.clone(), clipboard.clone(), stop.clone());
     watch_cursor(cursor_ch, cursor.clone(), stop.clone());
     watch_meta(meta_ch, captured.clone(), stats.clone(), stop.clone());
 
@@ -569,6 +658,12 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             "ice_servers": ice_servers,
             "gather_ms": 4000,
             "_allow_control": opts.control,
+            // Additive: old nodes ignore. New nodes open Mutter metadata when able.
+            "cursor_mode": if opts.cursor_mode.eq_ignore_ascii_case("legacy") {
+                "legacy"
+            } else {
+                "metadata"
+            },
         }),
     )
     .await?;
@@ -648,12 +743,35 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
             .unwrap_or(false),
         width: json_u32(&answer, "width"),
         height: json_u32(&answer, "height"),
+        src_width: {
+            let src = json_u32(&answer, "src_width");
+            if src > 0 {
+                src
+            } else {
+                json_u32(&answer, "width")
+            }
+        },
+        src_height: {
+            let src = json_u32(&answer, "src_height");
+            if src > 0 {
+                src
+            } else {
+                json_u32(&answer, "height")
+            }
+        },
         control: answer
             .get("control")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
         path: "connecting".into(),
         sdp_inventory: classify_media_path(&sdp).to_string(),
+        // Empty when the node omitted the field (pre-negotiation) — Controller
+        // must not hide the OS cursor as if embedding were known.
+        cursor_presentation: answer
+            .get("cursor_presentation")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
     };
     let info = Arc::new(Mutex::new(info));
     let transport = Arc::new(Mutex::new(None));
@@ -661,6 +779,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
 
     report_stage(&opts, "applying remote answer, ICE in progress");
     let pull_ufrag_early = sdp_ice_ufrag(&sdp);
+    let sdp = prefer_on_link_hosts_in_sdp(&sdp);
     let remote = RTCSessionDescription::answer(sdp).map_err(|err| err.to_string())?;
     PeerConnection::set_remote_description(&pc, remote)
         .await
@@ -669,7 +788,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         if let Some(candidates) = answer.get("candidates").and_then(|value| value.as_array()) {
             for candidate in candidates {
                 if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate.clone()) {
-                    let _ = PeerConnection::add_ice_candidate(&pc, init).await;
+                    let _ = PeerConnection::add_ice_candidate(&pc, prefer_remote_ice(init)).await;
                 }
             }
         }
@@ -798,6 +917,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         info,
         transport,
         cursor,
+        clipboard,
         stats,
         ice_checks,
         input_open,
@@ -976,7 +1096,7 @@ async fn ice_restart(
     if let Some(candidates) = answer.get("candidates").and_then(Value::as_array) {
         for candidate in candidates {
             if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate.clone()) {
-                let _ = peer.add_ice_candidate(init).await;
+                let _ = peer.add_ice_candidate(prefer_remote_ice(init)).await;
             }
         }
     }
@@ -1012,7 +1132,34 @@ async fn send_text(
     channel.send_text(text).await.is_ok()
 }
 
-fn watch_input(channel: Arc<dyn DataChannel>, open: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+/// Soft cap matching the node clipboard contract. The viewer must not
+/// materialize an uncapped payload even if a peer sends one.
+const CLIPBOARD_MAX_CHARS: usize = 1_048_576;
+
+fn parse_clipboard_set(value: &Value) -> Option<LiveClipboard> {
+    if value.get("type").and_then(Value::as_str) != Some("clipboard") {
+        return None;
+    }
+    let text = value.get("text").and_then(Value::as_str)?;
+    let truncated_flag = value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut text = text.to_string();
+    let mut truncated = truncated_flag;
+    if text.chars().count() > CLIPBOARD_MAX_CHARS {
+        text = text.chars().take(CLIPBOARD_MAX_CHARS).collect();
+        truncated = true;
+    }
+    Some(LiveClipboard { text, truncated })
+}
+
+fn watch_input(
+    channel: Arc<dyn DataChannel>,
+    open: Arc<AtomicBool>,
+    clipboard: Arc<Mutex<Option<LiveClipboard>>>,
+    stop: Arc<AtomicBool>,
+) {
     tokio::spawn(async move {
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -1020,6 +1167,13 @@ fn watch_input(channel: Arc<dyn DataChannel>, open: Arc<AtomicBool>, stop: Arc<A
             }
             match channel.poll().await {
                 Some(DataChannelEvent::OnOpen) => open.store(true, Ordering::Relaxed),
+                Some(DataChannelEvent::OnMessage(message)) => {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&message.data) {
+                        if let Some(clip) = parse_clipboard_set(&value) {
+                            *clipboard.lock().unwrap_or_else(|err| err.into_inner()) = Some(clip);
+                        }
+                    }
+                }
                 Some(DataChannelEvent::OnClose) | None => {
                     open.store(false, Ordering::Relaxed);
                     break;
@@ -1043,14 +1197,53 @@ fn watch_cursor(
             match channel.poll().await {
                 Some(DataChannelEvent::OnMessage(message)) => {
                     if let Ok(value) = serde_json::from_slice::<Value>(&message.data) {
+                        let bitmap_w = value
+                            .get("bitmap_w")
+                            .and_then(|item| item.as_u64())
+                            .unwrap_or(0) as u32;
+                        let bitmap_h = value
+                            .get("bitmap_h")
+                            .and_then(|item| item.as_u64())
+                            .unwrap_or(0) as u32;
+                        let bitmap_rgba = value
+                            .get("bitmap_rgba_b64")
+                            .and_then(|item| item.as_str())
+                            .and_then(|b64| {
+                                use base64::Engine;
+                                let bytes =
+                                    base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+                                let need = (bitmap_w as usize)
+                                    .checked_mul(bitmap_h as usize)?
+                                    .checked_mul(4)?;
+                                if bitmap_w == 0 || bitmap_h == 0 || bytes.len() < need {
+                                    return None;
+                                }
+                                Some(bytes[..need].to_vec())
+                            });
                         let cursor = LiveCursor {
                             x: json_i32(&value, "x"),
                             y: json_i32(&value, "y"),
                             shape: value
                                 .get("shape")
                                 .and_then(|item| item.as_str())
-                                .unwrap_or("arrow")
+                                .unwrap_or("unknown")
                                 .to_string(),
+                            // Missing visible ⇒ assume shown (old nodes).
+                            visible: value
+                                .get("visible")
+                                .and_then(|item| item.as_bool())
+                                .unwrap_or(true),
+                            hotspot_x: value
+                                .get("hotspot_x")
+                                .and_then(|item| item.as_u64())
+                                .unwrap_or(0) as u16,
+                            hotspot_y: value
+                                .get("hotspot_y")
+                                .and_then(|item| item.as_u64())
+                                .unwrap_or(0) as u16,
+                            bitmap_w,
+                            bitmap_h,
+                            bitmap_rgba,
                         };
                         *slot.lock().unwrap_or_else(|err| err.into_inner()) = Some(cursor);
                     }
@@ -1238,15 +1431,15 @@ where
     }
 
     async fn apply_remote_answer(&self, sdp: &str) -> Result<(), String> {
-        let remote =
-            RTCSessionDescription::answer(sdp.to_string()).map_err(|err| err.to_string())?;
+        let sdp = prefer_on_link_hosts_in_sdp(sdp);
+        let remote = RTCSessionDescription::answer(sdp).map_err(|err| err.to_string())?;
         PeerConnection::set_remote_description(&self.inner, remote)
             .await
             .map_err(|err| err.to_string())
     }
 
     async fn add_ice_candidate(&self, candidate: RTCIceCandidateInit) -> Result<(), String> {
-        PeerConnection::add_ice_candidate(&self.inner, candidate)
+        PeerConnection::add_ice_candidate(&self.inner, prefer_remote_ice(candidate))
             .await
             .map_err(|err| err.to_string())
     }
@@ -1889,12 +2082,16 @@ mod tests {
                 hardware: false,
                 width: 1,
                 height: 1,
+                src_width: 1,
+                src_height: 1,
                 control: false,
                 path: "relay".into(),
                 sdp_inventory: String::new(),
+                cursor_presentation: "legacy".into(),
             })),
             transport: Arc::new(Mutex::new(None)),
             cursor: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
             stats: Arc::new(Mutex::new(LiveStats::default())),
             ice_checks: Arc::new(Mutex::new(String::new())),
             input_open: Arc::new(AtomicBool::new(false)),
@@ -1906,6 +2103,35 @@ mod tests {
             runtime: Mutex::new(Some(runtime)),
         };
         (viewer, rx)
+    }
+
+    #[test]
+    fn parse_clipboard_set_requires_type_and_text() {
+        assert!(parse_clipboard_set(&serde_json::json!({"type": "error", "text": "x"})).is_none());
+        assert!(parse_clipboard_set(&serde_json::json!({"type": "clipboard"})).is_none());
+        let clip = parse_clipboard_set(&serde_json::json!({
+            "type": "clipboard",
+            "text": "hello",
+            "chars": 5
+        }))
+        .expect("set");
+        assert_eq!(clip.text, "hello");
+        assert!(!clip.truncated);
+    }
+
+    #[test]
+    fn poll_clipboard_is_consumed_once() {
+        let (viewer, _rx) = test_viewer(1);
+        assert!(viewer.poll_clipboard().is_none());
+        *viewer.clipboard.lock().expect("clipboard") = Some(LiveClipboard {
+            text: "from-node".into(),
+            truncated: false,
+        });
+        let first = viewer.poll_clipboard().expect("payload");
+        assert_eq!(first.text, "from-node");
+        assert!(viewer.poll_clipboard().is_none());
+        viewer.close();
+        assert!(viewer.is_closed());
     }
 
     /// 0111/0133: `Viewer::close` used `blocking_send` at session.rs:214

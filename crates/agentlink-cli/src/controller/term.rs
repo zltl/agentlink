@@ -495,13 +495,16 @@ impl Emulator {
                     ..
                 } if *pressed => {
                     let name = key_name(*key);
-                    if modifiers.ctrl && modifiers.shift && matches!(key, Key::C) {
-                        copy_text = self.term.selection_to_string();
-                        continue;
-                    }
-                    if modifiers.ctrl && modifiers.shift && matches!(key, Key::V) {
-                        want_paste = true;
-                        continue;
+                    match clipboard_shortcut(*key, *modifiers, self.term.selection_to_string()) {
+                        TermClipboardShortcut::Copy(text) => {
+                            copy_text = Some(text);
+                            continue;
+                        }
+                        TermClipboardShortcut::Paste => {
+                            want_paste = true;
+                            continue;
+                        }
+                        TermClipboardShortcut::None => {}
                     }
                     if matches!(key, Key::Enter | Key::Tab) && !modifiers.ctrl {
                         control_key_sent = true;
@@ -774,6 +777,50 @@ impl Emulator {
 
         out
     }
+}
+
+/// Keyboard shortcuts that should copy or paste instead of sending a control
+/// character. Ctrl+Shift+C/V always copy/paste (classic terminal). Ctrl+C
+/// copies when there is a selection, otherwise it falls through as interrupt
+/// (`^C`). Ctrl+V always pastes. Command modifiers follow the same rules on
+/// macOS when egui does not already emit Copy/Paste events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TermClipboardShortcut {
+    Copy(String),
+    Paste,
+    None,
+}
+
+pub(crate) fn clipboard_shortcut(
+    key: Key,
+    modifiers: egui::Modifiers,
+    selection: Option<String>,
+) -> TermClipboardShortcut {
+    let chord = modifiers.ctrl || modifiers.command;
+    if !chord || modifiers.alt {
+        return TermClipboardShortcut::None;
+    }
+    if modifiers.shift && matches!(key, Key::C) {
+        return TermClipboardShortcut::Copy(selection.unwrap_or_default());
+    }
+    if modifiers.shift && matches!(key, Key::V) {
+        return TermClipboardShortcut::Paste;
+    }
+    if modifiers.shift {
+        return TermClipboardShortcut::None;
+    }
+    if matches!(key, Key::C) {
+        if let Some(text) = selection {
+            if !text.is_empty() {
+                return TermClipboardShortcut::Copy(text);
+            }
+        }
+        return TermClipboardShortcut::None;
+    }
+    if matches!(key, Key::V) {
+        return TermClipboardShortcut::Paste;
+    }
+    TermClipboardShortcut::None
 }
 
 fn ctrl_byte(key: &str) -> Option<u8> {
@@ -1131,6 +1178,47 @@ mod tests {
             term.viewport_text().contains("TAIL"),
             "{}",
             term.viewport_text()
+        );
+    }
+
+    #[test]
+    fn ctrl_c_copies_selection_but_interrupts_when_empty() {
+        let mods = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            clipboard_shortcut(Key::C, mods, Some("copied".into())),
+            TermClipboardShortcut::Copy("copied".into())
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::C, mods, Some(String::new())),
+            TermClipboardShortcut::None
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::C, mods, None),
+            TermClipboardShortcut::None
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::V, mods, None),
+            TermClipboardShortcut::Paste
+        );
+        let shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            clipboard_shortcut(Key::C, shift, Some("sel".into())),
+            TermClipboardShortcut::Copy("sel".into())
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::V, shift, None),
+            TermClipboardShortcut::Paste
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::C, egui::Modifiers::NONE, Some("sel".into())),
+            TermClipboardShortcut::None
         );
     }
 

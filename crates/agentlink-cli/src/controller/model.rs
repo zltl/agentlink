@@ -351,6 +351,22 @@ pub fn webrtc_connect_is_hard_reject(err: &str) -> bool {
         || lower.contains("offline")
 }
 
+/// Relay/session transport death on a long-lived Controller `Client`.
+///
+/// Local grants are re-read from disk per invoke; they are not the sticky
+/// failure. A dead websocket / drained waiter surfaces as `connection closed`
+/// and must recreate `Client` (same path as Bootstrap `saved_client`). Grant
+/// denials stay on [`webrtc_connect_is_hard_reject`] and must not match here.
+pub fn session_needs_rebootstrap(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    if webrtc_connect_is_hard_reject(&lower) {
+        return false;
+    }
+    lower.contains("connection closed")
+        || lower.contains("connection closed during handshake")
+        || lower == "client runtime stopped"
+}
+
 /// A lost ICE/DTLS session should keep (or resume) JPEG stills over the
 /// relay, including after H.264 had already taken over.
 pub fn webrtc_loss_keeps_jpeg(_saw_h264_frame: bool) -> bool {
@@ -875,6 +891,17 @@ mod tests {
         assert!(!webrtc_connect_is_hard_reject("ICE failed to gather"));
         assert!(webrtc_loss_keeps_jpeg(false));
         assert!(webrtc_loss_keeps_jpeg(true));
+        assert!(session_needs_rebootstrap("connection closed"));
+        assert!(session_needs_rebootstrap("  Connection Closed\n"));
+        assert!(session_needs_rebootstrap(
+            "connection closed during handshake"
+        ));
+        assert!(
+            !session_needs_rebootstrap("not allowed: missing grant"),
+            "grant deny must stay hard-fatal, not a silent Client recreate"
+        );
+        assert!(!session_needs_rebootstrap("node offline"));
+        assert!(!session_needs_rebootstrap("ICE failed to gather"));
     }
 
     #[test]

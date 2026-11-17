@@ -743,6 +743,7 @@ pub fn spawn_recorder(service: Arc<AuditService>, backend: Option<Arc<dyn Screen
                     scale: 1.0,
                     max_fps: fps,
                     max_width: 0,
+                    cursor_mode: agentlink_desktop::CursorCaptureMode::Embedded,
                 };
                 match backend.open_session(&request) {
                     Ok(opened) => session = Some(opened),
@@ -813,6 +814,7 @@ mod tests {
                 scale: 1.0,
                 max_fps: 8.0,
                 max_width: 0,
+                cursor_mode: agentlink_desktop::CursorCaptureMode::Embedded,
             })
             .expect("open_session");
         let frame = session

@@ -2,8 +2,10 @@
 //!
 //! The picture is shown with object-fit: contain (letterboxed), then zoom and
 //! pan. Pointer fractions must use the content rectangle, not the full pane.
+//! Encode macroblock padding (e.g. 853→864) is cropped via
+//! [`content_rect_excluding_pad`] so fractions stay on real pixels.
 
-use eframe::egui::{Pos2, Rect, Vec2};
+use eframe::egui::{pos2, Pos2, Rect, Vec2};
 
 /// Size of `image` fitted inside `available` while keeping aspect ratio.
 pub fn contain_size(image: Vec2, available: Vec2) -> Vec2 {
@@ -38,6 +40,44 @@ pub fn point_to_fraction(content: Rect, pos: Pos2) -> (f64, f64) {
     let x = ((pos.x - content.min.x) / width).clamp(0.0, 1.0) as f64;
     let y = ((pos.y - content.min.y) / height).clamp(0.0, 1.0) as f64;
     (x, y)
+}
+
+/// Shrink a letterboxed encode-texture rect to the unpadded picture.
+///
+/// `encode_*` is the texture / answer size; `src_*` is the true content size
+/// before macroblock pad. When they match (or src is 0), `full` is returned.
+pub fn content_rect_excluding_pad(
+    full: Rect,
+    src_w: u32,
+    src_h: u32,
+    encode_w: u32,
+    encode_h: u32,
+) -> Rect {
+    if src_w == 0 || src_h == 0 || encode_w == 0 || encode_h == 0 {
+        return full;
+    }
+    if src_w >= encode_w && src_h >= encode_h {
+        return full;
+    }
+    let (w, h) = agentlink_desktop::encode_pad_content_size(
+        full.width(),
+        full.height(),
+        src_w,
+        src_h,
+        encode_w,
+        encode_h,
+    );
+    Rect::from_min_size(full.min, Vec2::new(w, h))
+}
+
+/// UV rect (0..1) covering the unpadded region of an encode texture.
+pub fn content_uv_excluding_pad(src_w: u32, src_h: u32, encode_w: u32, encode_h: u32) -> Rect {
+    if src_w == 0 || src_h == 0 || encode_w == 0 || encode_h == 0 {
+        return Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    }
+    let u = (src_w as f32 / encode_w as f32).clamp(0.0, 1.0);
+    let v = (src_h as f32 / encode_h as f32).clamp(0.0, 1.0);
+    Rect::from_min_max(pos2(0.0, 0.0), pos2(u, v))
 }
 
 /// True when `pos` is inside the drawn content (not the letterbox).
@@ -154,5 +194,16 @@ mod tests {
     fn native_zoom_is_one_when_pane_matches_image() {
         let zoom = native_zoom(vec2(800.0, 600.0), vec2(800.0, 600.0));
         assert!((zoom - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn encode_pad_crops_interactive_content() {
+        let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 864.0));
+        let cropped = content_rect_excluding_pad(full, 1280, 853, 1280, 864);
+        assert!((cropped.width() - 1280.0).abs() < 0.01);
+        assert!((cropped.height() - 853.0).abs() < 0.01);
+        assert_eq!(cropped.min, full.min);
+        let uv = content_uv_excluding_pad(1280, 853, 1280, 864);
+        approx(uv.max.y as f64, 853.0 / 864.0);
     }
 }

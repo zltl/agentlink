@@ -199,6 +199,7 @@ pub fn parse_capture(payload: &Value) -> Result<CaptureRequest> {
         max_fps: 2.0,
         // Screenshots stay full-resolution; stream sessions set max_width.
         max_width: 0,
+        cursor_mode: crate::capture::CursorCaptureMode::Embedded,
     })
 }
 

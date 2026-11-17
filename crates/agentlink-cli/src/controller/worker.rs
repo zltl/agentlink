@@ -18,7 +18,71 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::decode::{decode_image, H264Decoder};
+use super::diagnostics::{self, DiagEvent};
 use super::model::enroll_command;
+
+fn identity_fp_for(config_dir: &std::path::Path) -> Option<String> {
+    Identity::load(&config_dir.join("identity.json"))
+        .ok()
+        .map(|id| diagnostics::identity_fingerprint(id.public_hex()))
+}
+
+fn diag_client(
+    config_dir: &std::path::Path,
+    stage: &'static str,
+    cmd: Option<&'static str>,
+    client: Option<&Client>,
+    rebootstrap: Option<bool>,
+) {
+    diag_with_closure(
+        config_dir,
+        stage,
+        cmd,
+        client,
+        client.map(Client::transport_status),
+        rebootstrap,
+    );
+}
+
+fn diag_with_closure(
+    config_dir: &std::path::Path,
+    stage: &'static str,
+    cmd: Option<&'static str>,
+    client: Option<&Client>,
+    closure: Option<agentlink_core::TransportStatus>,
+    rebootstrap: Option<bool>,
+) {
+    diagnostics::emit_lossy(DiagEvent {
+        stage,
+        cmd,
+        config_dir: config_dir.to_path_buf(),
+        identity_fp: identity_fp_for(config_dir),
+        client_alive: client.map(Client::is_alive),
+        closure,
+        rebootstrap,
+    });
+}
+
+/// Persist first transport closure as it happens (idle GUI / crash before next
+/// Cmd). Sink must not run under the core observer mutex (core guarantees that).
+fn attach_closure_sink(client: &Client, config_dir: &std::path::Path) {
+    let config_dir = config_dir.to_path_buf();
+    let identity_fp = identity_fp_for(&config_dir);
+    client.set_transport_sink(Some(std::sync::Arc::new(move |status| {
+        if status.category == agentlink_core::ClosureCategory::None {
+            return;
+        }
+        diagnostics::emit_lossy(DiagEvent {
+            stage: "first_closure",
+            cmd: None,
+            config_dir: config_dir.clone(),
+            identity_fp: identity_fp.clone(),
+            client_alive: Some(false),
+            closure: Some(status),
+            rebootstrap: None,
+        });
+    })));
+}
 
 #[derive(Clone, Debug)]
 pub struct Picture {
@@ -58,6 +122,23 @@ pub struct LiveHud {
     pub path_note: String,
     /// WebRTC handshake / negotiation stage. Independent of the painted media path.
     pub handshake: String,
+    /// Negotiated cursor presentation (`legacy` default / `metadata`).
+    pub cursor_presentation: String,
+    /// True content height before encode pad (0 ⇒ use `height`).
+    pub src_width: u32,
+    pub src_height: u32,
+}
+
+/// Latest remote cursor sprite metadata from the `cursor` data channel.
+#[derive(Clone, Debug, Default)]
+pub struct DeskCursor {
+    pub shape: String,
+    pub visible: bool,
+    pub hotspot_x: u16,
+    pub hotspot_y: u16,
+    pub bitmap_w: u32,
+    pub bitmap_h: u32,
+    pub bitmap_rgba: Option<Vec<u8>>,
 }
 
 /// Sliding client-side timing samples (microseconds / counts) for `--perf-log` and debug `state`.
@@ -211,15 +292,22 @@ pub enum Cmd {
         scale: f32,
         /// When non-zero, overrides the quality-derived fps cap.
         max_fps: u32,
+        /// True when sent from desktop Retry (vs first View open).
+        retry: bool,
     },
     LiveStop,
     Input {
         node: String,
         live: String,
         inject: String,
+        /// Barrier events must stay on one ordered live route (no Extension
+        /// fallback on saturation). Moves may drop/coalesce.
+        barrier: bool,
     },
     Monitors {
         node: String,
+        /// True when sent from desktop Retry (vs first View open).
+        retry: bool,
     },
     Clipboard {
         node: String,
@@ -245,6 +333,7 @@ enum PtyCmd {
 pub struct Shared {
     events: Mutex<Vec<UiEvent>>,
     picture: Mutex<Option<Picture>>,
+    cursor: Mutex<DeskCursor>,
     seq: AtomicU64,
     /// Once a terminal handshake is published, progress/cleanup stages
     /// must not overwrite it until the next live attempt.
@@ -257,6 +346,7 @@ impl Shared {
         Self {
             events: Mutex::new(Vec::new()),
             picture: Mutex::new(None),
+            cursor: Mutex::new(DeskCursor::default()),
             seq: AtomicU64::new(0),
             terminal_handshake: AtomicBool::new(false),
             perf: ClientPerf::default(),
@@ -299,6 +389,19 @@ impl Shared {
 
     pub fn set_hud(&self, hud: LiveHud) {
         self.push(UiEvent::Hud(hud));
+    }
+
+    pub fn set_cursor(&self, cursor: DeskCursor) {
+        if let Ok(mut slot) = self.cursor.lock() {
+            *slot = cursor;
+        }
+    }
+
+    pub fn latest_cursor(&self) -> DeskCursor {
+        self.cursor
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
     }
 
     /// Start a new live attempt: later progress stages may update the HUD again.
@@ -543,18 +646,44 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 break;
             };
             match cmd {
-                Cmd::Bootstrap => match saved_client(&config_dir).await {
-                    Ok(Some((next, user))) => {
-                        client = Some(next);
-                        shared.push(UiEvent::Ready { user: Some(user) });
-                        refresh(client.as_ref(), &shared).await;
+                Cmd::Bootstrap => {
+                    diag_client(
+                        &config_dir,
+                        "bootstrap_begin",
+                        Some("Bootstrap"),
+                        None,
+                        None,
+                    );
+                    match saved_client(&config_dir).await {
+                        Ok(Some((next, user))) => {
+                            diag_client(
+                                &config_dir,
+                                "bootstrap_ok",
+                                Some("Bootstrap"),
+                                Some(next.as_ref()),
+                                None,
+                            );
+                            client = Some(next);
+                            shared.push(UiEvent::Ready { user: Some(user) });
+                            refresh(client.as_ref(), &shared).await;
+                        }
+                        Ok(None) => {
+                            diag_client(
+                                &config_dir,
+                                "bootstrap_none",
+                                Some("Bootstrap"),
+                                None,
+                                None,
+                            );
+                            shared.push(UiEvent::Ready { user: None });
+                        }
+                        Err(err) => {
+                            // Typed connect failures already emitted inside `saved_client`.
+                            shared.push(UiEvent::Ready { user: None });
+                            shared.push(UiEvent::Failed(err));
+                        }
                     }
-                    Ok(None) => shared.push(UiEvent::Ready { user: None }),
-                    Err(err) => {
-                        shared.push(UiEvent::Ready { user: None });
-                        shared.push(UiEvent::Failed(err));
-                    }
-                },
+                }
                 Cmd::Login {
                     username,
                     password,
@@ -599,7 +728,13 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     shared.push(UiEvent::Ready { user: None });
                     shared.push(UiEvent::Notice("Signed out".into()));
                 }
-                Cmd::Refresh => refresh(client.as_ref(), &shared).await,
+                Cmd::Refresh => {
+                    if let Err(err) = ensure_worker_client(&mut client, &config_dir, false).await {
+                        shared.push(UiEvent::Failed(err));
+                    } else {
+                        refresh(client.as_ref(), &shared).await;
+                    }
+                }
                 Cmd::PtyOpen { node, rows, cols } => {
                     close_pty(&mut pty).await;
                     match client.as_ref() {
@@ -696,12 +831,32 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     quality,
                     scale,
                     max_fps,
+                    retry,
                 } => {
                     stop_live(&mut live, &mut shots);
-                    let Some(current) = client.clone() else {
-                        shared.push(UiEvent::Failed("Sign in first.".into()));
-                        continue;
+                    diag_client(
+                        &config_dir,
+                        if retry { "retry" } else { "cmd" },
+                        Some("Live"),
+                        client.as_ref().map(|c| c.as_ref()),
+                        None,
+                    );
+                    let current = match ensure_worker_client(&mut client, &config_dir, false).await
+                    {
+                        Ok(current) => current,
+                        Err(err) => {
+                            diag_client(&config_dir, "live_ensure_err", Some("Live"), None, None);
+                            shared.push(UiEvent::Failed(err));
+                            continue;
+                        }
                     };
+                    diag_client(
+                        &config_dir,
+                        "live_ensure_ok",
+                        Some("Live"),
+                        Some(current.as_ref()),
+                        None,
+                    );
                     shared.push(UiEvent::Link(if control {
                         "connecting · control".into()
                     } else {
@@ -729,44 +884,102 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     node,
                     live: body,
                     inject,
+                    barrier,
                 } => {
-                    let sent = live
+                    // One ordered live route: never switch to Extension while a
+                    // viewer exists (saturation would reorder barriers ahead of
+                    // queued RTC downs). Extension only when there is no live
+                    // session (stills / pre-connect).
+                    let viewer = live
                         .as_ref()
                         .and_then(|session| session.viewer.lock().ok())
-                        .and_then(|slot| slot.clone())
-                        .is_some_and(|viewer| viewer.send_control(&body));
-                    if !sent {
-                        if let Some(current) = &client {
-                            let payload = serde_json::from_str(&inject).unwrap_or(json!({}));
-                            if let Err(err) = current
-                                .call_op(
-                                    &node,
-                                    Op::Extension {
-                                        name: PHASE2_INJECT_INPUT.to_string(),
-                                        payload,
-                                    },
-                                )
-                                .await
-                            {
-                                shared.push(UiEvent::Failed(err.to_string()));
-                            }
+                        .and_then(|slot| slot.clone());
+                    if let Some(viewer) = viewer {
+                        let _sent = if barrier {
+                            viewer.send_control_barrier(&body).await
+                        } else {
+                            viewer.send_control_move(&body)
+                        };
+                        // Closed/saturated barrier: do not Extension-bypass.
+                    } else if let Some(current) = &client {
+                        let payload = serde_json::from_str(&inject).unwrap_or(json!({}));
+                        if let Err(err) = current
+                            .call_op(
+                                &node,
+                                Op::Extension {
+                                    name: PHASE2_INJECT_INPUT.to_string(),
+                                    payload,
+                                },
+                            )
+                            .await
+                        {
+                            shared.push(UiEvent::Failed(err.to_string()));
                         }
                     }
                 }
-                Cmd::Monitors { node } => match client.as_ref() {
-                    Some(current) => match list_monitors(current, &node).await {
-                        Ok(monitors) => shared.push(UiEvent::Monitors(monitors)),
-                        Err(err) => shared.push(UiEvent::Failed(err)),
-                    },
-                    None => shared.push(UiEvent::Failed("Sign in first.".into())),
-                },
+                Cmd::Monitors { node, retry } => {
+                    diag_client(
+                        &config_dir,
+                        if retry { "retry" } else { "cmd" },
+                        Some("Monitors"),
+                        client.as_ref().map(|c| c.as_ref()),
+                        None,
+                    );
+                    match list_monitors_with_once_rebootstrap(
+                        &mut client,
+                        &node,
+                        |slot, force| {
+                            let config_dir = config_dir.clone();
+                            Box::pin(
+                                async move { ensure_worker_client(slot, &config_dir, force).await },
+                            )
+                        },
+                        |current, node| {
+                            Box::pin(async move { list_monitors(&current, &node).await })
+                        },
+                    )
+                    .await
+                    {
+                        Ok(MonitorsOutcome {
+                            monitors,
+                            reconnected,
+                        }) => {
+                            diag_client(
+                                &config_dir,
+                                "monitors_ok",
+                                Some("Monitors"),
+                                client.as_ref().map(|c| c.as_ref()),
+                                Some(reconnected),
+                            );
+                            if reconnected {
+                                shared.push(UiEvent::Notice(
+                                    "Reconnected after a closed relay session.".into(),
+                                ));
+                            }
+                            shared.push(UiEvent::Monitors(monitors));
+                        }
+                        Err(err) => {
+                            diag_client(
+                                &config_dir,
+                                "monitors_err",
+                                Some("Monitors"),
+                                client.as_ref().map(|c| c.as_ref()),
+                                None,
+                            );
+                            shared.push(UiEvent::Failed(err));
+                        }
+                    }
+                }
                 Cmd::Clipboard { node, text } => {
                     let body = json!({"type": "clipboard", "text": text}).to_string();
-                    let sent = live
+                    let viewer = live
                         .as_ref()
                         .and_then(|session| session.viewer.lock().ok())
-                        .and_then(|slot| slot.clone())
-                        .is_some_and(|viewer| viewer.send_control(&body));
+                        .and_then(|slot| slot.clone());
+                    let sent = match viewer {
+                        Some(viewer) => viewer.send_control_barrier(&body).await,
+                        None => false,
+                    };
                     if !sent {
                         shared.push(UiEvent::Failed(
                             "Clipboard needs a live session. Reconnect desktop first.".into(),
@@ -1050,6 +1263,9 @@ fn start_live_from(
                     *slot = Some(Arc::clone(&viewer));
                 }
                 let info = viewer.info();
+                if agentlink_desktop::share_allowed(control, info.control) {
+                    spawn_session_clipboard(Arc::clone(&viewer), Arc::clone(&thread_stop));
+                }
                 // Handshake is independent of the painted media path. JPEG stills
                 // may still be on screen until the first decoded H.264 frame.
                 // Never publish kind=h264 / path=connecting here — that would
@@ -1201,6 +1417,17 @@ fn start_live_from(
                         thread_shared.perf.frames.fetch_add(1, Ordering::Relaxed);
                         let (path_label, path_note) = live_path_for_hud(&viewer);
                         thread_shared.set_picture(rgba, width, height, "h264", &path_label);
+                        if let Some(cursor) = viewer.poll_cursor() {
+                            thread_shared.set_cursor(DeskCursor {
+                                shape: cursor.shape,
+                                visible: cursor.visible,
+                                hotspot_x: cursor.hotspot_x,
+                                hotspot_y: cursor.hotspot_y,
+                                bitmap_w: cursor.bitmap_w,
+                                bitmap_h: cursor.bitmap_h,
+                                bitmap_rgba: cursor.bitmap_rgba,
+                            });
+                        }
                         window_frames += 1;
                         let elapsed = window_start.elapsed();
                         if elapsed >= Duration::from_millis(500) || first_h264 {
@@ -1223,6 +1450,9 @@ fn start_live_from(
                                 frames_dropped: stats.frames_dropped,
                                 path_note,
                                 handshake: "webrtc: receiving video".into(),
+                                cursor_presentation: info.cursor_presentation.clone(),
+                                src_width: info.src_width,
+                                src_height: info.src_height,
                             });
                             window_start = Instant::now();
                             window_frames = 0;
@@ -1474,6 +1704,42 @@ async fn save_screenshot(client: &Client, node: &str, path: &str) -> Result<Stri
     Ok(path.to_string())
 }
 
+fn spawn_session_clipboard(viewer: Arc<Viewer>, stop: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new()
+        .name("agentlink-clipboard-share".into())
+        .spawn(move || {
+            let mut state = agentlink_desktop::ClipboardWatchState::new();
+            while !stop.load(Ordering::Relaxed) && !viewer.is_closed() {
+                std::thread::sleep(agentlink_desktop::CLIPBOARD_POLL_INTERVAL);
+                if stop.load(Ordering::Relaxed) || viewer.is_closed() {
+                    break;
+                }
+                if let Some(incoming) = viewer.poll_clipboard() {
+                    if agentlink_desktop::write_clipboard(&incoming.text).is_ok() {
+                        state.note_applied(&incoming.text);
+                    }
+                }
+                if let Some(clip) = state.poll_outgoing() {
+                    let body = agentlink_desktop::set_payload(&clip).to_string();
+                    let mut sent = false;
+                    for _ in 0..20 {
+                        if stop.load(Ordering::Relaxed) || viewer.is_closed() {
+                            break;
+                        }
+                        if viewer.send_control(&body) {
+                            sent = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    if !sent {
+                        state.send_failed();
+                    }
+                }
+            }
+        });
+}
+
 fn stop_live(live: &mut Option<Live>, shots: &mut Option<tokio::task::JoinHandle<()>>) {
     if let Some(session) = live.take() {
         session.stop.store(true, Ordering::Relaxed);
@@ -1581,22 +1847,161 @@ async fn refresh(client: Option<&Arc<Client>>, shared: &Shared) {
     }
 }
 
+/// Result of `Cmd::Monitors` after at most one transport rebootstrap.
+#[derive(Debug)]
+struct MonitorsOutcome {
+    monitors: Vec<MonitorEntry>,
+    reconnected: bool,
+}
+
+/// Reuse a worker handle when it is still alive; otherwise clear the slot so
+/// the caller can rebuild. `force` drops a still-held handle after transport
+/// `connection closed` so Retry cannot stick on a drained session.
+fn replace_worker_client_slot<C>(
+    client: &mut Option<Arc<C>>,
+    force: bool,
+    is_alive: impl FnOnce(&C) -> bool,
+) -> Option<Arc<C>> {
+    if !force {
+        if let Some(current) = client.as_ref() {
+            if is_alive(current) {
+                return Some(Arc::clone(current));
+            }
+        }
+    }
+    *client = None;
+    None
+}
+
+/// Monitors with one forced Client recreate on transport death.
+///
+/// Grant / owner / revoke denials stay immediate failures via
+/// [`super::model::session_needs_rebootstrap`]. The bootstrap closure runs at
+/// most twice (initial ensure + one force), never in a loop.
+async fn list_monitors_with_once_rebootstrap<C, Ensure, List>(
+    client: &mut Option<Arc<C>>,
+    node: &str,
+    mut ensure: Ensure,
+    mut list: List,
+) -> Result<MonitorsOutcome, String>
+where
+    C: 'static,
+    Ensure: for<'a> FnMut(
+        &'a mut Option<Arc<C>>,
+        bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<C>, String>> + 'a>,
+    >,
+    List: FnMut(
+        Arc<C>,
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<MonitorEntry>, String>>>,
+    >,
+{
+    let current = ensure(client, false).await?;
+    match list(Arc::clone(&current), node.to_string()).await {
+        Ok(monitors) => Ok(MonitorsOutcome {
+            monitors,
+            reconnected: false,
+        }),
+        Err(err) if super::model::session_needs_rebootstrap(&err) => {
+            // Dead/drained Client: recreate once (grants still load from disk
+            // on the next call_op).
+            let current = ensure(client, true).await?;
+            let monitors = list(current, node.to_string()).await?;
+            Ok(MonitorsOutcome {
+                monitors,
+                reconnected: true,
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Reuse the worker `Client` when it is still alive; otherwise rebuild it the
+/// same way Bootstrap does (`maintain_session` + `connect_identity` +
+/// `remember_grants`). `force` drops a still-held handle after a transport
+/// `connection closed` so Retry cannot stick on a drained session.
+async fn ensure_worker_client(
+    client: &mut Option<Arc<Client>>,
+    config_dir: &std::path::Path,
+    force: bool,
+) -> Result<Arc<Client>, String> {
+    if let Some(current) = replace_worker_client_slot(client, force, Client::is_alive) {
+        diag_client(
+            config_dir,
+            if force {
+                "ensure_reuse_forced_alive"
+            } else {
+                "ensure_reuse_alive"
+            },
+            None,
+            Some(current.as_ref()),
+            Some(force),
+        );
+        return Ok(current);
+    }
+    diag_client(
+        config_dir,
+        if force {
+            "ensure_rebootstrap"
+        } else {
+            "ensure_bootstrap"
+        },
+        None,
+        None,
+        Some(force),
+    );
+    match saved_client(config_dir).await {
+        Ok(Some((next, _user))) => {
+            diag_client(
+                config_dir,
+                "ensure_ok",
+                None,
+                Some(next.as_ref()),
+                Some(force),
+            );
+            *client = Some(Arc::clone(&next));
+            Ok(next)
+        }
+        Ok(None) => Err("Sign in first.".into()),
+        Err(err) => Err(err),
+    }
+}
+
 async fn saved_client(
     config_dir: &std::path::Path,
 ) -> Result<Option<(Arc<Client>, String)>, String> {
-    let identity = Identity::load_or_create(&config_dir.join("identity.json"))
-        .map_err(|err| err.to_string())?;
-    let _ = maintain_session(config_dir, &identity)
-        .await
-        .map_err(|err| err.to_string())?;
+    let identity = Identity::load_or_create(&config_dir.join("identity.json")).map_err(|err| {
+        diag_client(config_dir, "bootstrap_err", Some("Bootstrap"), None, None);
+        err.to_string()
+    })?;
+    if let Err(err) = maintain_session(config_dir, &identity).await {
+        diag_client(config_dir, "bootstrap_err", Some("Bootstrap"), None, None);
+        return Err(err.to_string());
+    }
     let file = agentlink_core::config::load_file(config_dir).unwrap_or_default();
     let Some(settings) = settings_of(&file) else {
         return Ok(None);
     };
     let user = file.user.clone().filter(|user| !user.is_empty());
-    let client = Client::connect_identity(&settings, identity, true)
-        .await
-        .map_err(|err| err.to_string())?;
+    let client = match Client::connect_identity_observed(&settings, identity, true).await {
+        Ok(client) => client,
+        Err(obs) => {
+            // Typed category survives even when no Client handle is returned.
+            diag_with_closure(
+                config_dir,
+                "bootstrap_err",
+                Some("Bootstrap"),
+                None,
+                Some(obs.status),
+                None,
+            );
+            return Err(obs.error.to_string());
+        }
+    };
+    attach_closure_sink(&client, config_dir);
     client.remember_node_pins(config_dir);
     client.remember_grants(config_dir);
     Ok(Some((
@@ -1662,9 +2067,21 @@ async fn sign_in(
         session.access_expires_unix,
     )
     .map_err(|err| err.to_string())?;
-    let client = Client::connect_identity(&settings, identity, true)
-        .await
-        .map_err(|err| err.to_string())?;
+    let client = match Client::connect_identity_observed(&settings, identity, true).await {
+        Ok(client) => client,
+        Err(obs) => {
+            diag_with_closure(
+                config_dir,
+                "bootstrap_err",
+                Some("Bootstrap"),
+                None,
+                Some(obs.status),
+                None,
+            );
+            return Err(obs.error.to_string());
+        }
+    };
+    attach_closure_sink(&client, config_dir);
     client.remember_node_pins(config_dir);
     client.remember_grants(config_dir);
     Ok((Arc::new(client), session.user))
@@ -1749,7 +2166,7 @@ mod live_pipeline_tests {
             audit_path: std::env::temp_dir().join("agentlink-t449-live-harness.log"),
             consent: ConsentMode::Auto,
             on_audit: None,
-        
+
             grant_active: None,
         });
         handler
@@ -2746,5 +3163,180 @@ mod handshake_retention_tests {
             })
             .collect();
         assert_eq!(stages.last().map(String::as_str), Some("webrtc: starting"));
+    }
+}
+
+#[cfg(test)]
+mod worker_client_recovery_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
+
+    struct FakeClient {
+        id: u32,
+        alive: AtomicBool,
+        lists: Mutex<Vec<Result<Vec<MonitorEntry>, String>>>,
+    }
+
+    impl FakeClient {
+        fn alive(id: u32, lists: Vec<Result<Vec<MonitorEntry>, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                id,
+                alive: AtomicBool::new(true),
+                lists: Mutex::new(lists),
+            })
+        }
+
+        fn dead(id: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id,
+                alive: AtomicBool::new(false),
+                lists: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn is_alive(&self) -> bool {
+            self.alive.load(Ordering::SeqCst)
+        }
+
+        fn list_monitors(&self) -> Result<Vec<MonitorEntry>, String> {
+            let mut q = self.lists.lock().expect("lists");
+            if q.is_empty() {
+                return Err("connection closed".into());
+            }
+            q.remove(0)
+        }
+    }
+
+    fn sample_monitor() -> MonitorEntry {
+        MonitorEntry {
+            index: 0,
+            name: "Display".into(),
+            width: 1280,
+            height: 720,
+            primary: true,
+            capturable: Some(true),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn replace_slot_keeps_alive_unless_forced() {
+        let mut slot = Some(FakeClient::alive(1, Vec::new()));
+        let kept = replace_worker_client_slot(&mut slot, false, FakeClient::is_alive)
+            .expect("alive client");
+        assert_eq!(kept.id, 1);
+        assert!(slot.is_some());
+
+        let forced = replace_worker_client_slot(&mut slot, true, FakeClient::is_alive);
+        assert!(forced.is_none());
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn replace_slot_clears_dead_client() {
+        let mut slot = Some(FakeClient::dead(7));
+        assert!(replace_worker_client_slot(&mut slot, false, FakeClient::is_alive).is_none());
+        assert!(slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_client_rebootstrap_retries_list_once() {
+        let connects = Arc::new(AtomicU32::new(0));
+        let mut slot: Option<Arc<FakeClient>> =
+            Some(FakeClient::alive(1, vec![Err("connection closed".into())]));
+        let connects_ensure = Arc::clone(&connects);
+        let out = list_monitors_with_once_rebootstrap(
+            &mut slot,
+            "sufa",
+            |slot, force| {
+                let connects = Arc::clone(&connects_ensure);
+                Box::pin(async move {
+                    if let Some(current) =
+                        replace_worker_client_slot(slot, force, FakeClient::is_alive)
+                    {
+                        return Ok(current);
+                    }
+                    let n = connects.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    let next = FakeClient::alive(n + 1, vec![Ok(vec![sample_monitor()])]);
+                    *slot = Some(Arc::clone(&next));
+                    Ok(next)
+                })
+            },
+            |current, _node| Box::pin(async move { current.list_monitors() }),
+        )
+        .await
+        .expect("recovered");
+        assert!(out.reconnected);
+        assert_eq!(out.monitors.len(), 1);
+        assert_eq!(connects.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(slot.as_ref().map(|c| c.id), Some(2));
+    }
+
+    #[tokio::test]
+    async fn grant_deny_does_not_spend_rebootstrap() {
+        let connects = Arc::new(AtomicU32::new(0));
+        let mut slot: Option<Arc<FakeClient>> = Some(FakeClient::alive(
+            1,
+            vec![Err("not allowed: missing grant".into())],
+        ));
+        let connects_ensure = Arc::clone(&connects);
+        let err = list_monitors_with_once_rebootstrap(
+            &mut slot,
+            "sufa",
+            |slot, force| {
+                let connects = Arc::clone(&connects_ensure);
+                Box::pin(async move {
+                    if let Some(current) =
+                        replace_worker_client_slot(slot, force, FakeClient::is_alive)
+                    {
+                        return Ok(current);
+                    }
+                    connects.fetch_add(1, AtomicOrdering::SeqCst);
+                    Err("should not reconnect on grant deny".into())
+                })
+            },
+            |current, _node| Box::pin(async move { current.list_monitors() }),
+        )
+        .await
+        .expect_err("grant deny stays fatal");
+        assert!(err.contains("not allowed"), "{err}");
+        assert_eq!(connects.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(slot.as_ref().map(|c| c.id), Some(1));
+    }
+
+    #[tokio::test]
+    async fn second_closed_list_fails_without_another_bootstrap() {
+        let connects = Arc::new(AtomicU32::new(0));
+        let mut slot: Option<Arc<FakeClient>> =
+            Some(FakeClient::alive(1, vec![Err("connection closed".into())]));
+        let connects_ensure = Arc::clone(&connects);
+        let err = list_monitors_with_once_rebootstrap(
+            &mut slot,
+            "sufa",
+            |slot, force| {
+                let connects = Arc::clone(&connects_ensure);
+                Box::pin(async move {
+                    if let Some(current) =
+                        replace_worker_client_slot(slot, force, FakeClient::is_alive)
+                    {
+                        return Ok(current);
+                    }
+                    let n = connects.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    let next = FakeClient::alive(n + 1, vec![Err("connection closed".into())]);
+                    *slot = Some(Arc::clone(&next));
+                    Ok(next)
+                })
+            },
+            |current, _node| Box::pin(async move { current.list_monitors() }),
+        )
+        .await
+        .expect_err("bounded once");
+        assert_eq!(err, "connection closed");
+        assert_eq!(
+            connects.load(AtomicOrdering::SeqCst),
+            1,
+            "must not loop saved_client forever"
+        );
     }
 }

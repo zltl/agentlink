@@ -8,6 +8,7 @@
 //! uses for congestion feedback.
 
 mod h264;
+mod probe_bounds;
 mod queue;
 mod session;
 
@@ -16,7 +17,8 @@ pub use h264::{
     classify_selected_path_with, describe_ice_candidates, detect_tailscale_reason, feedback_ratio,
     is_screenshot_fallback, is_tailscale_ula_prefix, media_path_hint, AddrScope,
 };
+pub use probe_bounds::{parse_bounded_u64, parse_max_decoded};
 pub use session::{
-    IceFault, LiveCursor, LiveFrame, LiveInfo, LiveOptions, LiveStats, Signal, TransportSnapshot,
-    Viewer,
+    IceFault, LiveClipboard, LiveCursor, LiveFrame, LiveInfo, LiveOptions, LiveStats, Signal,
+    TransportSnapshot, Viewer,
 };

@@ -26,7 +26,10 @@ use super::model::{
 };
 use super::term::Emulator;
 use super::theme;
-use super::viewport::{hit_content, native_zoom, point_to_fraction, viewport_rect};
+use super::viewport::{
+    content_rect_excluding_pad, content_uv_excluding_pad, hit_content, native_zoom,
+    point_to_fraction, viewport_rect,
+};
 use super::worker::{Cmd, LiveHud, MonitorEntry, Picture, Shared, UiEvent};
 
 use std::collections::HashSet;
@@ -312,14 +315,13 @@ pub struct ControllerApp {
     desk_fullscreen: bool,
     desk_capture_keys: bool,
     desk_held_keys: HashSet<String>,
-    desk_held_buttons: HashSet<&'static str>,
     desk_sticky: HashSet<&'static str>,
     desk_last_move: Instant,
     desk_last_frame: Option<Instant>,
     desk_hud: LiveHud,
     desk_await_paste: bool,
-    desk_last_frac: (f64, f64),
-    desk_mods: (bool, bool, bool, bool),
+    /// Ordered input adapter (mods / pointer / wheel / held) — STD core.
+    desk_adapter: super::input_adapter::AdapterState,
     /// User hit Disconnect (or a fatal connect error); stay on the session page.
     desk_user_stopped: bool,
     desk_disconnect_reason: String,
@@ -586,14 +588,12 @@ impl ControllerApp {
             desk_fullscreen: false,
             desk_capture_keys: false,
             desk_held_keys: HashSet::new(),
-            desk_held_buttons: HashSet::new(),
             desk_sticky: HashSet::new(),
             desk_last_move: Instant::now() - Duration::from_secs(1),
             desk_last_frame: None,
             desk_hud: LiveHud::default(),
             desk_await_paste: false,
-            desk_last_frac: (0.5, 0.5),
-            desk_mods: (false, false, false, false),
+            desk_adapter: super::input_adapter::AdapterState::default(),
             desk_user_stopped: false,
             desk_disconnect_reason: String::new(),
             desk_connect_failed: false,
@@ -1031,6 +1031,10 @@ impl ControllerApp {
                 frames_dropped: 0,
                 path_note: String::new(),
                 handshake: String::new(),
+                // Mock keeps legacy presentation — no second local sprite.
+                cursor_presentation: "legacy".into(),
+                src_width: 960,
+                src_height: 480,
             };
             self.screen = Screen::Desktop {
                 id: node.id.clone(),
@@ -1059,6 +1063,7 @@ impl ControllerApp {
         };
         self.send(Cmd::Monitors {
             node: node.id.clone(),
+            retry: false,
         });
         self.send(Cmd::Live {
             node: node.id.clone(),
@@ -1067,6 +1072,7 @@ impl ControllerApp {
             quality: self.desk_quality,
             scale: self.live_scale_for_monitor(),
             max_fps: self.max_fps,
+            retry: false,
         });
         self.screen = Screen::Desktop {
             id: node.id.clone(),
@@ -1161,6 +1167,12 @@ impl ControllerApp {
             self.desk_connect_started = None;
             return;
         }
+        // Same prelude as `open_desktop`: Monitors runs on the worker before
+        // Live and can rebootstrap a dead Client after `connection closed`.
+        self.send(Cmd::Monitors {
+            node: node.to_string(),
+            retry: true,
+        });
         self.send(Cmd::Live {
             node: node.to_string(),
             control,
@@ -1168,6 +1180,7 @@ impl ControllerApp {
             quality: self.desk_quality,
             scale: self.live_scale_for_monitor(),
             max_fps: self.max_fps,
+            retry: true,
         });
     }
 
@@ -1576,11 +1589,18 @@ impl ControllerApp {
                 ui.spacing_mut().item_spacing.x = theme::SPACE_SM;
                 ui.set_height(theme::BTN_PRIMARY_H);
                 let btn_w = 72.0;
+                let ppp = ui.ctx().pixels_per_point();
+                let vpad = super::field_pad::text_edit_v_margin(
+                    theme::BTN_PRIMARY_H,
+                    theme::BODY_SIZE,
+                    ppp,
+                );
+                let v = vpad.round().clamp(0.0, 40.0) as i8;
                 let edit = egui::TextEdit::singleline(&mut self.password)
                     .password(!self.show_password)
                     .desired_width((ui.available_width() - btn_w - theme::SPACE_SM).max(80.0))
                     .min_size(egui::vec2(0.0, theme::BTN_PRIMARY_H))
-                    .margin(egui::Margin::symmetric(theme::BTN_PAD_X as i8, 0));
+                    .margin(egui::Margin::symmetric(theme::BTN_PAD_X as i8, v));
                 style_text_edit(ui, edit);
                 if ui
                     .add_sized(
@@ -2922,8 +2942,16 @@ impl ControllerApp {
                     if shot_btn.clicked() {
                         shot = true;
                     }
-                    let clip_btn =
-                        chrome_bar_button(ui, clip_l, "Send local clipboard to the node", false);
+                    let clip_tip = if control {
+                        "Clipboard is shared automatically in a control session. Click to send the current local text now."
+                    } else {
+                        "Clipboard sharing needs a control session, not view-only."
+                    };
+                    let clip_btn = ui.add_enabled(
+                        control,
+                        theme::icon_button(clip_l, false),
+                    );
+                    let clip_btn = clip_btn.on_hover_text(clip_tip);
                     self.debug_layout.note_item("clipboard", clip_btn.rect);
                     if clip_btn.clicked() {
                         paste = true;
@@ -3092,10 +3120,27 @@ impl ControllerApp {
             self.desk_zoom = 1.0;
             self.desk_pan = egui::Vec2::ZERO;
         }
-        let content = viewport_rect(image_size, pane_rect, self.desk_zoom, self.desk_pan);
+        let full = viewport_rect(image_size, pane_rect, self.desk_zoom, self.desk_pan);
+        let encode_w = image_size.x.round().max(1.0) as u32;
+        let encode_h = image_size.y.round().max(1.0) as u32;
+        let src_w = if self.desk_hud.src_width > 0 {
+            self.desk_hud.src_width
+        } else {
+            encode_w
+        };
+        let src_h = if self.desk_hud.src_height > 0 {
+            self.desk_hud.src_height
+        } else {
+            encode_h
+        };
+        // Crop macroblock encode pad (e.g. 11 rows under 853→864) out of both
+        // the painted UV and the interactive content rect.
+        let content = content_rect_excluding_pad(full, src_w, src_h, encode_w, encode_h);
+        let uv = content_uv_excluding_pad(src_w, src_h, encode_w, encode_h);
         self.debug_layout.content_rect = rect_xywh(content);
         let response = ui.allocate_rect(pane_rect, egui::Sense::click_and_drag());
         egui::Image::new(&texture)
+            .uv(uv)
             .fit_to_exact_size(content.size())
             .paint_at(ui, content);
 
@@ -3127,10 +3172,21 @@ impl ControllerApp {
             }
         }
 
-        // Local RDP-style menu on right-click; Shift+right goes to the node.
-        let shift_right = ui.ctx().input(|i| i.modifiers.shift);
-        let menu_open = response.context_menu_opened();
-        if !shift_right || menu_open {
+        // Local session menu: toolbar always; letterbox / view-only pane OK.
+        // Controllable image must NOT steal right-click — plain and Shift both
+        // go remote so the node's context menu opens (t483). Hit-test the
+        // visible clipped content (content ∩ pane ∩ ui clip), not the full
+        // letterboxed rect that can extend under the toolbar when zoomed.
+        let clip = ui.clip_rect();
+        let visible = content.intersect(response.rect).intersect(clip);
+        let over_image = ui.ctx().input(|i| {
+            i.pointer
+                .interact_pos()
+                .or(i.pointer.hover_pos())
+                .is_some_and(|pos| hit_content(visible, pos))
+        });
+        let allow_local_menu = !control || !over_image || response.context_menu_opened();
+        if allow_local_menu {
             let mut action: Option<DeskMenuAction> = None;
             response.context_menu(|ui| {
                 ui.set_min_width(180.0);
@@ -3191,12 +3247,18 @@ impl ControllerApp {
         }
 
         if control {
-            // Plain right-click is local menu; Shift+right is forwarded.
-            self.desktop_pointer(&id, ui, &response, content, true);
-            if self.desk_capture_keys {
-                self.desktop_keys(&id, ui);
-            } else if response.clicked() {
+            // Ordered mouse (+ keys when captured) via STD input_policy reducer.
+            // Plain / Shift / Ctrl right-click over the image all go remote;
+            // toolbar / letterbox keep the local menu above.
+            self.desktop_input(&id, ui, &response, content);
+            self.apply_negotiated_cursor(ui, over_image);
+            if !self.desk_capture_keys && response.clicked() {
                 self.desk_capture_keys = true;
+            }
+        } else {
+            // View-only: leave the platform cursor alone (no overlay).
+            if over_image {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
             }
         }
 
@@ -3524,169 +3586,224 @@ impl ControllerApp {
         painter.galley(rect.min + egui::vec2(10.0, 6.0), galley, theme::TEXT_BODY);
     }
 
-    fn desktop_pointer(
+    /// Apply the negotiated cursor presentation over the remote image.
+    ///
+    /// - `metadata`: local sprite (stock egui icon or custom RGBA bitmap).
+    /// - `legacy`: hide the OS cursor only when the node explicitly negotiated
+    ///   legacy (embedded capture known). Missing/unknown presentation keeps
+    ///   the pre-b7 OS cursor so the user cannot lose the only pointer.
+    /// - custom/unknown stock without a bitmap falls back to Default — never
+    ///   CursorIcon::None as a "success" for an unknown shape.
+    fn apply_negotiated_cursor(&self, ui: &mut egui::Ui, over_image: bool) {
+        if !over_image {
+            return;
+        }
+        let presentation = self.desk_hud.cursor_presentation.to_ascii_lowercase();
+        if presentation != "metadata" {
+            if presentation == "legacy" {
+                // Negotiated embedded capture — avoid a second local arrow.
+                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            }
+            // else: unknown/empty (old node) — preserve OS cursor.
+            return;
+        }
+        let remote = self.shared.latest_cursor();
+        if !remote.visible {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            return;
+        }
+        if let (Some(rgba), w, h) = (
+            remote.bitmap_rgba.as_ref(),
+            remote.bitmap_w,
+            remote.bitmap_h,
+        ) {
+            if w > 0 && h > 0 && rgba.len() >= (w as usize) * (h as usize) * 4 {
+                // Paint a local sprite at the pointer with the remote hotspot.
+                // egui has no arbitrary-bitmap CursorIcon; overlay + hide OS.
+                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                    let origin = egui::pos2(
+                        pos.x - remote.hotspot_x as f32,
+                        pos.y - remote.hotspot_y as f32,
+                    );
+                    // Wire RGBA is straight (C bridge un-premultiplies Mutter
+                    // premul BGRA). Match with from_rgba_unmultiplied.
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba[..(w as usize) * (h as usize) * 4],
+                    );
+                    let tex = ui.ctx().load_texture(
+                        "agentlink-remote-cursor",
+                        color_image,
+                        egui::TextureOptions::NEAREST,
+                    );
+                    ui.painter().image(
+                        tex.id(),
+                        egui::Rect::from_min_size(origin, egui::vec2(w as f32, h as f32)),
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                return;
+            }
+        }
+        ui.ctx().set_cursor_icon(stock_cursor_icon(&remote.shape));
+    }
+
+    /// Collect ordered egui raw events via the STD adapter, then inject.
+    /// Mouse always runs in control mode; keys join when keyboard capture is on.
+    fn desktop_input(
         &mut self,
         node: &str,
         ui: &mut egui::Ui,
         response: &egui::Response,
         content: egui::Rect,
-        // When true, right-click belongs to the local context menu (unless Shift).
-        local_right_menu: bool,
     ) {
-        let pointer = ui.ctx().input(|input| {
-            let pos = input.pointer.interact_pos().or(input.pointer.hover_pos());
-            let primary = input.pointer.button_pressed(egui::PointerButton::Primary);
-            let primary_up = input.pointer.button_released(egui::PointerButton::Primary);
-            let secondary = input.pointer.button_pressed(egui::PointerButton::Secondary);
-            let secondary_up = input
-                .pointer
-                .button_released(egui::PointerButton::Secondary);
-            let middle = input.pointer.button_pressed(egui::PointerButton::Middle);
-            let middle_up = input.pointer.button_released(egui::PointerButton::Middle);
-            let double = input
-                .pointer
-                .button_double_clicked(egui::PointerButton::Primary);
-            let moved = input.pointer.is_moving();
-            let scroll = input.raw_scroll_delta;
-            let ctrl = input.modifiers.ctrl || input.modifiers.command;
-            let shift = input.modifiers.shift;
-            (
-                pos,
-                primary,
-                primary_up,
-                secondary,
-                secondary_up,
-                middle,
-                middle_up,
-                double,
-                moved,
-                scroll,
-                ctrl,
-                shift,
-            )
-        });
-        let (
-            Some(pos),
-            primary,
-            primary_up,
-            secondary,
-            secondary_up,
-            middle,
-            middle_up,
-            double,
-            moved,
-            scroll,
-            ctrl,
-            shift,
-        ) = pointer
-        else {
-            return;
+        use super::input_adapter::{
+            adapt_frame, is_barrier_out, ContentGeom, FrameEvent, ModSnapshot, WheelUnit,
         };
-        if !response.rect.contains(pos) {
-            return;
-        }
-        let (x, y) = point_to_fraction(content, pos);
-        self.desk_last_frac = (x, y);
+        use super::input_policy::{Button, OutEvent};
 
-        if primary {
-            self.desk_held_buttons.insert("left");
-            self.inject_mouse(node, MouseEvent::new("down", x, y, "left"));
-        }
-        if primary_up && self.desk_held_buttons.remove("left") {
-            self.inject_mouse(node, MouseEvent::new("up", x, y, "left"));
-        }
-        // RDP: plain right-click opens the local menu; Shift+right goes remote.
-        let send_right = secondary && !ctrl && (!local_right_menu || shift);
-        if send_right {
-            self.desk_held_buttons.insert("right");
-            self.inject_mouse(node, MouseEvent::new("down", x, y, "right"));
-        }
-        if secondary_up && self.desk_held_buttons.remove("right") {
-            self.inject_mouse(node, MouseEvent::new("up", x, y, "right"));
-        }
-        if middle {
-            self.desk_held_buttons.insert("middle");
-            self.inject_mouse(node, MouseEvent::new("down", x, y, "middle"));
-        }
-        if middle_up && self.desk_held_buttons.remove("middle") {
-            self.inject_mouse(node, MouseEvent::new("up", x, y, "middle"));
-        }
-        if double {
-            let mut event = MouseEvent::new("click", x, y, "left");
-            event.count = 2;
-            self.inject_mouse(node, event);
+        if self.desk_capture_keys {
+            ui.memory_mut(|mem| mem.request_focus(egui::Id::new("desk-key-capture")));
         }
 
-        // Coalesce moves to the last position in this UI frame — no time throttle.
-        let holding = !self.desk_held_buttons.is_empty();
-        if (moved || holding) && hit_content(content, pos) {
-            self.desk_last_move = Instant::now();
-            self.inject_mouse(node, MouseEvent::new("move", x, y, "left"));
-        }
-        if response.hovered() && !ctrl && (scroll.x.abs() > 0.5 || scroll.y.abs() > 0.5) {
-            let mut event = MouseEvent::new("scroll", x, y, "left");
-            // Protocol unit is notches (WHEEL_DELTA=120). egui gives pixels.
-            event.dx = pixel_delta_to_notches(scroll.x.round() as i32);
-            event.dy = pixel_delta_to_notches((-scroll.y).round() as i32);
-            self.inject_mouse(node, event);
-        }
-    }
+        let capture_keys = self.desk_capture_keys;
+        let clip = ui.clip_rect();
+        let geom = ContentGeom::intersect3(
+            (content.min.x, content.min.y, content.max.x, content.max.y),
+            (
+                response.rect.min.x,
+                response.rect.min.y,
+                response.rect.max.x,
+                response.rect.max.y,
+            ),
+            (clip.min.x, clip.min.y, clip.max.x, clip.max.y),
+        );
 
-    fn desktop_keys(&mut self, node: &str, ui: &mut egui::Ui) {
-        // Steal focus so TextEdit widgets do not eat keystrokes.
-        ui.memory_mut(|mem| mem.request_focus(egui::Id::new("desk-key-capture")));
-        let mut edges: Vec<(String, bool)> = Vec::new();
-        let mut texts: Vec<String> = Vec::new();
-        let mods = ui.ctx().input(|input| {
+        let snap = |m: egui::Modifiers| ModSnapshot {
+            ctrl: m.ctrl,
+            alt: m.alt,
+            shift: m.shift,
+            command: m.command || m.mac_cmd,
+        };
+
+        let (events, final_mods) = ui.ctx().input(|input| {
+            let mut events: Vec<FrameEvent> = Vec::new();
             for event in &input.events {
                 match event {
+                    egui::Event::PointerMoved(pos) => {
+                        events.push(FrameEvent::PointerMoved { x: pos.x, y: pos.y });
+                    }
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        modifiers,
+                    } => {
+                        let button = match button {
+                            egui::PointerButton::Primary => Button::Left,
+                            egui::PointerButton::Secondary => Button::Right,
+                            egui::PointerButton::Middle => Button::Middle,
+                            _ => continue,
+                        };
+                        events.push(FrameEvent::PointerButton {
+                            x: pos.x,
+                            y: pos.y,
+                            button,
+                            pressed: *pressed,
+                            mods: snap(*modifiers),
+                        });
+                    }
+                    egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                    } => {
+                        let unit = match unit {
+                            egui::MouseWheelUnit::Point => WheelUnit::Point,
+                            egui::MouseWheelUnit::Line => WheelUnit::Line,
+                            egui::MouseWheelUnit::Page => WheelUnit::Page,
+                        };
+                        // Never attach final-frame hover here — the adapter
+                        // uses the evolving pointer from earlier Move events
+                        // (seeded from the previous frame). Passing hover
+                        // would map Move A, wheel, Move B → wheel at B.
+                        events.push(FrameEvent::MouseWheel {
+                            x: None,
+                            y: None,
+                            delta_x: delta.x,
+                            delta_y: delta.y,
+                            unit,
+                            mods: snap(*modifiers),
+                        });
+                    }
+                    egui::Event::PointerGone => {
+                        events.push(FrameEvent::PointerGone);
+                    }
                     egui::Event::Key {
                         key,
                         pressed,
                         repeat,
+                        modifiers,
                         ..
-                    } if !*repeat => {
+                    } if capture_keys && !*repeat => {
                         if let Some(name) = egui_key_name(*key) {
-                            if name == "escape" && *pressed {
-                                continue;
-                            }
-                            edges.push((name.to_string(), *pressed));
+                            events.push(FrameEvent::Key {
+                                name: name.to_string(),
+                                pressed: *pressed,
+                                mods: snap(*modifiers),
+                            });
                         }
                     }
-                    egui::Event::Text(text) if !text.is_ascii() => texts.push(text.clone()),
+                    egui::Event::Text(text) if capture_keys && !text.is_ascii() => {
+                        events.push(FrameEvent::Text { text: text.clone() });
+                    }
                     _ => {}
                 }
             }
-            (
-                input.modifiers.ctrl,
-                input.modifiers.alt,
-                input.modifiers.shift,
-                input.modifiers.command || input.modifiers.mac_cmd,
-            )
+            (events, snap(input.modifiers))
         });
-        // Modifier keys rarely arrive as Key events; mirror egui modifier state.
-        let prev = self.desk_mods;
-        self.desk_mods = mods;
-        for (name, was, now) in [
-            ("ctrl", prev.0, mods.0),
-            ("alt", prev.1, mods.1),
-            ("shift", prev.2, mods.2),
-            ("meta", prev.3, mods.3),
-        ] {
-            if was != now {
-                edges.push((name.to_string(), now));
-            }
-        }
-        for text in texts {
-            self.inject_text(node, &text);
-        }
-        for (name, down) in edges {
-            if down {
-                if self.desk_held_keys.insert(name.clone()) {
-                    self.inject_key_edge(node, &name, true);
+
+        let out = adapt_frame(
+            &mut self.desk_adapter,
+            geom,
+            &events,
+            Some(final_mods),
+            capture_keys,
+        );
+
+        for ev in out {
+            let barrier = is_barrier_out(&ev);
+            match ev {
+                OutEvent::Mouse {
+                    action,
+                    button,
+                    x,
+                    y,
+                    dx,
+                    dy,
+                } => {
+                    if action == "move" {
+                        self.desk_last_move = Instant::now();
+                    }
+                    let mut event = MouseEvent::new(action, x, y, button);
+                    event.dx = dx;
+                    event.dy = dy;
+                    self.inject_mouse(node, event, barrier);
                 }
-            } else if self.desk_held_keys.remove(&name) {
-                self.inject_key_edge(node, &name, false);
+                OutEvent::Key { name, pressed } => {
+                    if pressed {
+                        if self.desk_held_keys.insert(name.clone()) {
+                            self.inject_key_edge(node, &name, true);
+                        }
+                    } else if self.desk_held_keys.remove(&name) {
+                        self.inject_key_edge(node, &name, false);
+                    }
+                }
+                OutEvent::Text { text } => {
+                    self.inject_text(node, &text);
+                }
             }
         }
         ui.allocate_exact_size(
@@ -3701,7 +3818,7 @@ impl ControllerApp {
             self.release_remote_input_on(&id);
         } else {
             self.desk_held_keys.clear();
-            self.desk_held_buttons.clear();
+            self.desk_adapter = super::input_adapter::AdapterState::default();
             self.desk_sticky.clear();
         }
     }
@@ -3711,16 +3828,21 @@ impl ControllerApp {
         for key in keys {
             self.inject_key_edge(node, &key, false);
         }
-        let buttons: Vec<&'static str> = self.desk_held_buttons.drain().collect();
-        let (x, y) = self.desk_last_frac;
+        let buttons: Vec<&'static str> = self.desk_adapter.reducer.held.iter().copied().collect();
+        self.desk_adapter.reducer.held.clear();
+        let (x, y) = (
+            self.desk_adapter.reducer.last_x,
+            self.desk_adapter.reducer.last_y,
+        );
         for button in buttons {
-            self.inject_mouse(node, MouseEvent::new("up", x, y, button));
+            self.inject_mouse(node, MouseEvent::new("up", x, y, button), true);
         }
         self.desk_sticky.clear();
-        self.desk_mods = (false, false, false, false);
+        self.desk_adapter.mods = super::input_adapter::ModSnapshot::default();
+        self.desk_adapter.pointer = None;
     }
 
-    fn inject_mouse(&self, node: &str, event: MouseEvent<'_>) {
+    fn inject_mouse(&self, node: &str, event: MouseEvent<'_>, barrier: bool) {
         let mut live = serde_json::json!({
             "type": "mouse",
             "action": event.action,
@@ -3762,6 +3884,7 @@ impl ControllerApp {
             node: node.to_string(),
             live: live.to_string(),
             inject: inject.to_string(),
+            barrier,
         });
     }
 
@@ -3772,6 +3895,7 @@ impl ControllerApp {
             node: node.to_string(),
             live,
             inject,
+            barrier: true,
         });
     }
 
@@ -3782,6 +3906,7 @@ impl ControllerApp {
             node: node.to_string(),
             live,
             inject,
+            barrier: true,
         });
     }
 
@@ -3792,6 +3917,7 @@ impl ControllerApp {
             node: node.to_string(),
             live,
             inject,
+            barrier: true,
         });
     }
 
@@ -4542,12 +4668,28 @@ fn action_card(
 
 fn labeled(ui: &mut egui::Ui, name: &str, text: &mut String, secret: bool) {
     ui.label(theme::muted_text(name));
-    let edit = egui::TextEdit::singleline(text)
+    let edit = centered_singleline(ui, text, secret);
+    style_text_edit(ui, edit);
+}
+
+/// Shared TextEdit for Username / Password / Relay / Certificate pin / Trust /
+/// authenticator — vertical margin from font metrics so glyphs and password
+/// bullets stay centered in the tall field (t484). Never logs `text`.
+fn centered_singleline<'a>(
+    ui: &egui::Ui,
+    text: &'a mut String,
+    secret: bool,
+) -> egui::TextEdit<'a> {
+    let ppp = ui.ctx().pixels_per_point();
+    let font_size = theme::BODY_SIZE;
+    let vpad = super::field_pad::text_edit_v_margin(theme::BTN_PRIMARY_H, font_size, ppp);
+    // egui Margin uses i8; clamp to a sane range for extreme DPI.
+    let v = vpad.round().clamp(0.0, 40.0) as i8;
+    egui::TextEdit::singleline(text)
         .password(secret)
         .desired_width(f32::INFINITY)
         .min_size(egui::vec2(0.0, theme::BTN_PRIMARY_H))
-        .margin(egui::Margin::symmetric(theme::BTN_PAD_X as i8, 0));
-    style_text_edit(ui, edit);
+        .margin(egui::Margin::symmetric(theme::BTN_PAD_X as i8, v))
 }
 
 fn style_text_edit(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> egui::Response {
@@ -4653,6 +4795,29 @@ fn trust_is_custom(trust: &str) -> bool {
 }
 
 /// Convert egui pixel wheel deltas to protocol notches (WHEEL_DELTA = 120).
+/// Map a negotiated stock shape id to an egui cursor.
+///
+/// `"unknown"` / `"custom"` without a bitmap must **not** become
+/// [`CursorIcon::None`] — that removes the only pointer. Fall back to Default
+/// so the user keeps a visible caret; the custom RGBA path paints when present.
+fn stock_cursor_icon(shape: &str) -> egui::CursorIcon {
+    match shape {
+        "arrow" => egui::CursorIcon::Default,
+        "ibeam" => egui::CursorIcon::Text,
+        "hand" => egui::CursorIcon::PointingHand,
+        "sizeall" => egui::CursorIcon::AllScroll,
+        "sizens" => egui::CursorIcon::ResizeVertical,
+        "sizewe" => egui::CursorIcon::ResizeHorizontal,
+        "sizenwse" => egui::CursorIcon::ResizeNwSe,
+        "sizenesw" => egui::CursorIcon::ResizeNeSw,
+        "cross" => egui::CursorIcon::Crosshair,
+        "wait" => egui::CursorIcon::Progress,
+        "no" => egui::CursorIcon::NotAllowed,
+        "help" => egui::CursorIcon::Help,
+        _ => egui::CursorIcon::Default,
+    }
+}
+
 fn pixel_delta_to_notches(delta: i32) -> i32 {
     if delta == 0 {
         return 0;
@@ -4708,7 +4873,9 @@ mod geometry_tests {
 
     impl Harness {
         fn new(w: f32, h: f32) -> Self {
-            Self::new_with(w, h, false, super::super::LiveHooks::production())
+            // Inert hooks: geometry tests must not read/write production
+            // autostart (HKCU Run) or resolve the real user data-dir.
+            Self::new_with(w, h, false, super::super::LiveHooks::inert_for_tests())
         }
 
         /// `w`/`h` are physical pixels. `pixels_per_point` is the platform scale.
@@ -6491,5 +6658,180 @@ mod geometry_tests {
             let _ = scroll_item_fully_into_view(&mut harn, &row_id);
             assert_painted_focus_outer_inside_clip(&harn.app.debug_layout, &row_id);
         }
+    }
+
+    fn drain_mouse_inputs(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    ) -> Vec<(String, String, f64, f64)> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            let Cmd::Input { inject, .. } = cmd else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&inject) else {
+                continue;
+            };
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_string();
+            let button = v
+                .get("button")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_string();
+            let x = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let y = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.0);
+            out.push((action, button, x, y));
+        }
+        out
+    }
+
+    fn content_center(layout: &DebugLayout) -> egui::Pos2 {
+        let r = layout.content_rect;
+        assert!(
+            r[2] > 8.0 && r[3] > 8.0,
+            "content_rect missing/small: {r:?}"
+        );
+        egui::pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5)
+    }
+
+    fn right_click_at(harn: &mut Harness, pos: egui::Pos2, shift: bool) {
+        let mut modifiers = egui::Modifiers::default();
+        modifiers.shift = shift;
+        secondary_click_at(harn, pos, modifiers);
+    }
+
+    fn secondary_click_at(harn: &mut Harness, pos: egui::Pos2, modifiers: egui::Modifiers) {
+        harn.pending_events.push(egui::Event::PointerMoved(pos));
+        harn.pass();
+        let _ = drain_mouse_inputs(&mut harn.cmd_rx);
+        harn.pending_events.push(egui::Event::PointerMoved(pos));
+        harn.pending_events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers,
+        });
+        harn.pass();
+        harn.pending_events.push(egui::Event::PointerMoved(pos));
+        harn.pending_events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers,
+        });
+        harn.pass();
+    }
+
+    #[test]
+    fn controllable_image_plain_and_shift_right_click_go_remote() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let desk = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "sufa")
+            .cloned()
+            .expect("sufa");
+        harn.app.open_desktop(&desk, true);
+        harn.pass();
+        harn.pass();
+        assert!(
+            harn.app.texture.is_some(),
+            "mock desktop texture required for pointer tests"
+        );
+        let pos = content_center(&harn.app.debug_layout);
+        let _ = drain_mouse_inputs(&mut harn.cmd_rx);
+
+        right_click_at(&mut harn, pos, false);
+        let plain = drain_mouse_inputs(&mut harn.cmd_rx);
+        assert!(
+            plain.iter().any(|(a, b, _, _)| a == "down" && b == "right"),
+            "plain right-click must inject secondary down: {plain:?}"
+        );
+        assert!(
+            plain.iter().any(|(a, b, _, _)| a == "up" && b == "right"),
+            "plain right-click must inject secondary up: {plain:?}"
+        );
+        let down_idx = plain
+            .iter()
+            .position(|(a, b, _, _)| a == "down" && b == "right")
+            .expect("down");
+        assert!(
+            plain[..down_idx].iter().any(|(a, _, _, _)| a == "move"),
+            "move-before-click ordering missing before secondary down: {plain:?}"
+        );
+
+        right_click_at(&mut harn, pos, true);
+        let shifted = drain_mouse_inputs(&mut harn.cmd_rx);
+        assert!(
+            shifted
+                .iter()
+                .any(|(a, b, _, _)| a == "down" && b == "right"),
+            "Shift+right must also inject secondary down: {shifted:?}"
+        );
+        assert!(
+            shifted.iter().any(|(a, b, _, _)| a == "up" && b == "right"),
+            "Shift+right must also inject secondary up: {shifted:?}"
+        );
+    }
+
+    #[test]
+    fn controllable_image_ctrl_right_click_goes_remote() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let desk = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "sufa")
+            .cloned()
+            .expect("sufa");
+        harn.app.open_desktop(&desk, true);
+        harn.pass();
+        harn.pass();
+        let pos = content_center(&harn.app.debug_layout);
+        let _ = drain_mouse_inputs(&mut harn.cmd_rx);
+        let mut modifiers = egui::Modifiers::default();
+        modifiers.ctrl = true;
+        secondary_click_at(&mut harn, pos, modifiers);
+        let events = drain_mouse_inputs(&mut harn.cmd_rx);
+        assert!(
+            events
+                .iter()
+                .any(|(a, b, _, _)| a == "down" && b == "right"),
+            "Ctrl+right must inject secondary down inside image: {events:?}"
+        );
+        assert!(
+            events.iter().any(|(a, b, _, _)| a == "up" && b == "right"),
+            "Ctrl+right must inject secondary up inside image: {events:?}"
+        );
+    }
+
+    #[test]
+    fn view_only_desktop_does_not_inject_right_click() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let desk = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "sufa")
+            .cloned()
+            .expect("sufa");
+        harn.app.open_desktop(&desk, false);
+        harn.pass();
+        harn.pass();
+        assert!(harn.app.texture.is_some());
+        let pos = content_center(&harn.app.debug_layout);
+        let _ = drain_mouse_inputs(&mut harn.cmd_rx);
+        right_click_at(&mut harn, pos, false);
+        let events = drain_mouse_inputs(&mut harn.cmd_rx);
+        assert!(
+            events
+                .iter()
+                .all(|(a, b, _, _)| !(b == "right" && (a == "down" || a == "up"))),
+            "view-only must never inject remote right button: {events:?}"
+        );
     }
 }

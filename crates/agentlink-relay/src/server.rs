@@ -1955,7 +1955,7 @@ async fn client_loop(
                     tracing::debug!(%peer, error = %err, "binary forward failed");
                 }
             }
-            Incoming::Closed => break,
+            Incoming::Closed { .. } => break,
             Incoming::Ignore => {}
         }
     }
@@ -2785,7 +2785,7 @@ async fn node_loop(ws: RelaySocket, hub: Arc<Hub>, node_id: String) -> Result<()
                         mark_seen(&hub, &node_id).await;
                         let _ = tx.try_send(Outbound::Pong(payload));
                     }
-                    Incoming::Closed => break,
+                    Incoming::Closed { .. } => break,
                     Incoming::Ignore => {}
                 }
             }
@@ -3921,7 +3921,7 @@ where
             .map_err(|e| Error::Ws(e.to_string()))?;
         match ws::parse_incoming(msg)? {
             Incoming::Env(env) => return Ok(env),
-            Incoming::Closed => return Err(Error::Ws("connection closed".into())),
+            Incoming::Closed { .. } => return Err(Error::Ws("connection closed".into())),
             Incoming::Ping(_) | Incoming::Ignore | Incoming::Binary(_) => continue,
         }
     }

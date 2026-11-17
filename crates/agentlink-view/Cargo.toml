@@ -10,6 +10,7 @@ description = "WebRTC viewer that turns the desktop stream into H.264 Annex-B"
 [dependencies]
 agentlink-core.workspace = true
 async-trait = "0.1"
+base64.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 webrtc = { version = "0.21.1", default-features = false, features = ["runtime-tokio", "crypto-ring"] }
@@ -17,3 +18,5 @@ rtc = { version = "0.21.1", default-features = false, features = ["crypto-ring"]
 
 [dev-dependencies]
 agentlink-desktop = { workspace = true }
+# Example-only: t449_sufa_stage dimension probe (same crate as Controller H264Decoder).
+openh264 = "0.8"

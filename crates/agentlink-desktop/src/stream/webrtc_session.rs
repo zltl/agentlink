@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use agentlink_core::NodePolicy;
+use agentlink_core::{
+    prefer_on_link_hosts_in_candidate, prefer_on_link_hosts_in_sdp, NodePolicy,
+    HOST_ACCEPTANCE_MIN_WAIT,
+};
 use bytes::Bytes;
 use rtc::media::Sample;
 use rtc::rtp_transceiver::rtp_sender::{
@@ -25,15 +28,16 @@ use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
     RTCIceTransportPolicy, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
-    RTCSessionDescription, Registry,
+    RTCSessionDescription, Registry, SettingEngineBuilder,
 };
 use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::default_runtime;
 
-use crate::capture::{CaptureRequest, CaptureTarget};
+use crate::capture::{CaptureRequest, CaptureTarget, CursorCaptureMode, StreamMode};
 use crate::control_indicator;
 use crate::error::{msg, Result};
 use crate::input::{InputAction, MouseButton};
+use crate::CursorPresentation;
 use crate::Desktop;
 
 use super::audio::{ulaw, AudioCapture};
@@ -116,7 +120,7 @@ where
         &self,
         candidate: rtc::peer_connection::transport::RTCIceCandidateInit,
     ) -> std::result::Result<(), String> {
-        PeerConnection::add_ice_candidate(&self.inner, candidate)
+        PeerConnection::add_ice_candidate(&self.inner, prefer_remote_ice(candidate))
             .await
             .map_err(|err| err.to_string())
     }
@@ -129,8 +133,8 @@ where
         if let Ok(mut candidates) = self.candidates.lock() {
             candidates.clear();
         }
-        let offer =
-            RTCSessionDescription::offer(offer_sdp.to_string()).map_err(|err| err.to_string())?;
+        let offer_sdp = prefer_on_link_hosts_in_sdp(offer_sdp);
+        let offer = RTCSessionDescription::offer(offer_sdp).map_err(|err| err.to_string())?;
         PeerConnection::set_remote_description(&self.inner, offer)
             .await
             .map_err(|err| err.to_string())?;
@@ -188,6 +192,8 @@ where
 struct ChannelSet {
     cursor: Option<Arc<dyn DataChannel>>,
     meta: Option<Arc<dyn DataChannel>>,
+    input: Option<Arc<dyn DataChannel>>,
+    clipboard: Arc<Mutex<crate::clipboard::ClipboardWatchState>>,
 }
 
 /// AIMD bitrate adaptation state shared with the input data-channel handler.
@@ -284,6 +290,7 @@ struct Handler {
     /// often encoded while SRTP is still empty and the stack discards it.
     wait_idr: Arc<AtomicBool>,
     aimd: AimdState,
+    clipboard: Arc<Mutex<crate::clipboard::ClipboardWatchState>>,
 }
 
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -366,9 +373,7 @@ impl SessionManager {
         };
         let n = ids.len();
         for id in ids {
-            let _ = self
-                .close_owned(&json!({"session_id": id}), None)
-                .await;
+            let _ = self.close_owned(&json!({"session_id": id}), None).await;
         }
         n
     }
@@ -379,19 +384,13 @@ impl SessionManager {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             sessions
                 .iter()
-                .filter(|session| {
-                    session
-                        .grant_exp_unix
-                        .is_some_and(|exp| now >= exp)
-                })
+                .filter(|session| session.grant_exp_unix.is_some_and(|exp| now >= exp))
                 .map(|session| session.id.clone())
                 .collect()
         };
         let n = ids.len();
         for id in ids {
-            let _ = self
-                .close_owned(&json!({"session_id": id}), None)
-                .await;
+            let _ = self.close_owned(&json!({"session_id": id}), None).await;
         }
         n
     }
@@ -411,9 +410,7 @@ impl SessionManager {
         };
         let n = ids.len();
         for id in ids {
-            let _ = self
-                .close_owned(&json!({"session_id": id}), None)
-                .await;
+            let _ = self.close_owned(&json!({"session_id": id}), None).await;
         }
         n
     }
@@ -427,9 +424,7 @@ impl SessionManager {
         };
         let n = ids.len();
         for id in ids {
-            let _ = self
-                .close_owned(&json!({"session_id": id}), None)
-                .await;
+            let _ = self.close_owned(&json!({"session_id": id}), None).await;
         }
         n
     }
@@ -550,10 +545,13 @@ impl SessionManager {
         );
         spawn_capturable(
             self.desktop.clone(),
-            built.channels,
+            built.channels.clone(),
             built.stop.clone(),
             built.control.clone(),
         );
+        if built.allow_control {
+            spawn_clipboard(built.channels, built.stop.clone());
+        }
         let control_held = Arc::new(AtomicBool::new(false));
         if built.allow_control {
             control_held.store(true, Ordering::SeqCst);
@@ -1053,6 +1051,12 @@ async fn build_answer(
         0
     };
     let capture_max_width = stream_capture_max_width(want_encode_w);
+    let viewer_wants_metadata = payload
+        .get("cursor_mode")
+        .and_then(Value::as_str)
+        .map(|m| m.eq_ignore_ascii_case("metadata"))
+        .unwrap_or(false);
+    let exclude_capable = desktop.capture.cursor_exclude_supported();
     let capture_request = CaptureRequest {
         target: if payload.get("monitor").is_some() {
             CaptureTarget::Monitor(monitor)
@@ -1062,8 +1066,18 @@ async fn build_answer(
         scale: 1.0,
         max_fps: fps as f32,
         max_width: capture_max_width,
+        // Open a per-session Mutter metadata stream only when the viewer asks
+        // and the backend can exclude. Failure falls back to embedded below.
+        cursor_mode: if viewer_wants_metadata && exclude_capable {
+            CursorCaptureMode::Metadata
+        } else {
+            CursorCaptureMode::Embedded
+        },
     };
-    let probe = desktop.capture.capture(&capture_request)?;
+    let probe = desktop.capture.capture(&CaptureRequest {
+        cursor_mode: CursorCaptureMode::Embedded,
+        ..capture_request.clone()
+    })?;
     let capture_w = probe.width;
     let capture_h = probe.height;
     let (encode_w, encode_h, src_w, src_h) = if capture_max_width > 0 {
@@ -1101,12 +1115,15 @@ async fn build_answer(
         bitrate,
     })?;
     let info = encoder.info();
-    let (mut pump, control) = Pump::start(
-        desktop.capture.open_session(&capture_request)?,
-        encoder,
-        session_id.clone(),
-        bitrate,
+    let frame_source = desktop.capture.open_session(&capture_request)?;
+    let session_cursor_excluded = matches!(
+        frame_source.mode(),
+        StreamMode::PipeWire {
+            cursor_excluded: true,
+            ..
+        }
     );
+    let (mut pump, control) = Pump::start(frame_source, encoder, session_id.clone(), bitrate);
     control.capture_w.store(capture_w, Ordering::Relaxed);
     control.capture_h.store(capture_h, Ordering::Relaxed);
     control.encode_w.store(encode_w, Ordering::Relaxed);
@@ -1117,9 +1134,12 @@ async fn build_answer(
 
     let runtime = default_runtime().ok_or_else(|| msg("tokio runtime is required for WebRTC"))?;
     let stop = Arc::new(AtomicBool::new(false));
+    let clipboard = Arc::new(Mutex::new(crate::clipboard::ClipboardWatchState::new()));
     let channels = Arc::new(Mutex::new(ChannelSet {
         cursor: None,
         meta: None,
+        input: None,
+        clipboard: clipboard.clone(),
     }));
     let policy_now = *shared
         .policy
@@ -1142,6 +1162,7 @@ async fn build_answer(
         media_ready: Arc::new(AtomicBool::new(false)),
         wait_idr: Arc::new(AtomicBool::new(true)),
         aimd: AimdState::new(),
+        clipboard: clipboard.clone(),
     });
     let mut media = MediaEngine::default();
     media
@@ -1159,6 +1180,9 @@ async fn build_answer(
     let policy = ice_transport_policy(payload);
     let gather_for = gather_budget(payload, policy);
     let want = wanted_typ(payload).map(str::to_string);
+    let setting_engine = SettingEngineBuilder::new()
+        .with_host_acceptance_min_wait(Some(HOST_ACCEPTANCE_MIN_WAIT))
+        .build();
     let pc = PeerConnectionBuilder::new()
         .with_configuration(
             RTCConfigurationBuilder::new()
@@ -1166,6 +1190,7 @@ async fn build_answer(
                 .with_ice_transport_policy(policy)
                 .build(),
         )
+        .with_setting_engine(setting_engine)
         .with_media_engine(media)
         .with_interceptor_registry(registry)
         .with_handler(handler.clone() as Arc<dyn PeerConnectionEventHandler>)
@@ -1269,6 +1294,7 @@ async fn build_answer(
         }
     }
 
+    let sdp = prefer_on_link_hosts_in_sdp(&sdp);
     let offer = RTCSessionDescription::offer(sdp).map_err(|err| msg(err.to_string()))?;
     pc.set_remote_description(offer)
         .await
@@ -1443,6 +1469,26 @@ async fn build_answer(
         stop_loop.store(true, Ordering::Relaxed);
     });
 
+    // Cursor presentation: default legacy. Metadata only when the viewer asked
+    // AND this session actually opened an exclude/metadata capture stream —
+    // never advertise Metadata on a warn-only double-cursor path.
+    // Caps.exclude reflects backend capability (Mutter can open mode 2);
+    // presentation reflects the live session outcome.
+    let cursor_caps = crate::CursorCaps {
+        shape: true,
+        visible: true,
+        hotspot: true,
+        exclude: exclude_capable,
+    };
+    // Reality gate: Metadata only after an exclude stream is live for *this*
+    // session. caps.exclude may still be true (Mutter can open mode 2) so the
+    // next offer can retry; presentation must not lie about the current peer.
+    let cursor_presentation = if viewer_wants_metadata && session_cursor_excluded {
+        CursorPresentation::Metadata
+    } else {
+        CursorPresentation::Legacy
+    };
+
     Ok(Built {
         answer: json!({
             "session_id": session_id,
@@ -1453,6 +1499,9 @@ async fn build_answer(
             "hardware": info.hardware,
             "width": width,
             "height": height,
+            // True content size before macroblock pad (viewer hotspot / fraction).
+            "src_width": src_w,
+            "src_height": src_h,
             "scale": scale,
             "encoded_frames": 0,
             "dropped_frames": 0,
@@ -1463,6 +1512,8 @@ async fn build_answer(
             // Viewer may bounded-pull candidates gathered after this answer.
             // Absent on older nodes; a new viewer must not retry-storm then.
             "ice_pull": true,
+            "cursor_caps": cursor_caps,
+            "cursor_presentation": cursor_presentation,
         }),
         peer: Arc::new(OwnedPeer {
             inner: pc,
@@ -1488,13 +1539,28 @@ fn spawn_cursor(desktop: Arc<Desktop>, channels: Arc<Mutex<ChannelSet>>, stop: A
             let cursor = desktop.capture.cursor();
             let Some(cursor) = cursor else { continue };
             let visible = desktop.capture.cursor_visible();
-            let text = json!({
+            // Additive fields only — old viewers that read x/y(/shape) keep working.
+            let mut payload = json!({
                 "x": cursor.x,
                 "y": cursor.y,
                 "shape": cursor.shape,
                 "visible": visible,
-            })
-            .to_string();
+                "hotspot_x": cursor.hotspot_x,
+                "hotspot_y": cursor.hotspot_y,
+            });
+            if let Some(rgba) = cursor.bitmap_rgba.as_ref() {
+                if cursor.bitmap_w > 0
+                    && cursor.bitmap_h > 0
+                    && crate::bitmap_within_bound(cursor.bitmap_w, cursor.bitmap_h)
+                {
+                    use base64::Engine;
+                    payload["bitmap_w"] = json!(cursor.bitmap_w);
+                    payload["bitmap_h"] = json!(cursor.bitmap_h);
+                    payload["bitmap_rgba_b64"] =
+                        json!(base64::engine::general_purpose::STANDARD.encode(rgba));
+                }
+            }
+            let text = payload.to_string();
             if text == last {
                 continue;
             }
@@ -1548,6 +1614,36 @@ fn spawn_capturable(
                     let _ = meta.send_text(&cap_text).await;
                 }
             }
+        }
+    });
+}
+
+fn spawn_clipboard(channels: Arc<Mutex<ChannelSet>>, stop: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        while !stop.load(Ordering::Relaxed) {
+            tokio::time::sleep(crate::clipboard::CLIPBOARD_POLL_INTERVAL).await;
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let (clip_state, input) = {
+                let set = channels.lock().unwrap_or_else(|err| err.into_inner());
+                (set.clipboard.clone(), set.input.clone())
+            };
+            let Some(input) = input else {
+                continue;
+            };
+            let outgoing = tokio::task::spawn_blocking(move || {
+                let mut state = clip_state.lock().unwrap_or_else(|err| err.into_inner());
+                state.poll_outgoing()
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(clip) = outgoing else {
+                continue;
+            };
+            let body = crate::clipboard::set_payload(&clip).to_string();
+            let _ = input.send_text(&body).await;
         }
     });
 }
@@ -1794,6 +1890,17 @@ fn parse_trickle_candidate(
         .map_err(|err| format!("ice candidate is not a valid RTCIceCandidateInit ({err})"))
 }
 
+/// Raise on-link physical LAN host priority on a remote ICE candidate string.
+/// Overlay/`100.x`/srflx/relay stay present — preference only, never a filter.
+fn prefer_remote_ice(
+    mut init: rtc::peer_connection::transport::RTCIceCandidateInit,
+) -> rtc::peer_connection::transport::RTCIceCandidateInit {
+    if !init.candidate.is_empty() {
+        init.candidate = prefer_on_link_hosts_in_candidate(&init.candidate);
+    }
+    init
+}
+
 /// typ only, for logs and tests. The candidate attribute does not carry a
 /// ufrag; still do not print the address line.
 /// ICE ufrag from an SDP. Compared to trickle `usernameFragment`; never logged.
@@ -1993,7 +2100,20 @@ impl PeerConnectionEventHandler for Handler {
                 self.channels.lock().unwrap_or_else(|e| e.into_inner()).meta =
                     Some(channel.clone());
             }
-            _ => {}
+            "input" => {
+                self.channels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .input = Some(channel.clone());
+            }
+            _ => {
+                if label.is_empty() {
+                    self.channels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .input = Some(channel.clone());
+                }
+            }
         }
         let policy = self.policy.clone();
         let desktop = self.desktop.clone();
@@ -2006,6 +2126,7 @@ impl PeerConnectionEventHandler for Handler {
         let grant_exp_unix = self.grant_exp_unix;
         let aimd = self.aimd.clone();
         let stop = self.stop.clone();
+        let clipboard = self.clipboard.clone();
         let input = label == "input" || label.is_empty();
         tokio::spawn(async move {
             loop {
@@ -2032,6 +2153,7 @@ impl PeerConnectionEventHandler for Handler {
                             grant_exp_unix,
                             &aimd,
                             &stop,
+                            &clipboard,
                         )
                         .await;
                     }
@@ -2057,6 +2179,7 @@ async fn handle_input(
     grant_exp_unix: Option<i64>,
     aimd: &AimdState,
     stop: &AtomicBool,
+    clipboard: &std::sync::Arc<std::sync::Mutex<crate::clipboard::ClipboardWatchState>>,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
@@ -2160,8 +2283,15 @@ async fn handle_input(
             match value.get("text").and_then(Value::as_str) {
                 Some(text) => {
                     let text = text.to_string();
+                    let clipboard = clipboard.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        crate::clipboard::write_clipboard(&text)
+                        let result = crate::clipboard::write_clipboard(&text);
+                        if result.is_ok() {
+                            if let Ok(mut state) = clipboard.lock() {
+                                state.note_applied(&text);
+                            }
+                        }
+                        result
                     })
                     .await;
                 }
@@ -2235,7 +2365,11 @@ fn payload_grant_exp(payload: &Value) -> Option<i64> {
     payload.get("_grant_exp").and_then(Value::as_i64)
 }
 
-fn session_grant_error(shared: &super::StreamShared, session: &LiveSession, peer: &str) -> Option<String> {
+fn session_grant_error(
+    shared: &super::StreamShared,
+    session: &LiveSession,
+    peer: &str,
+) -> Option<String> {
     if session.peer_id != peer {
         return Some("unknown stream session".into());
     }
@@ -2676,6 +2810,7 @@ mod tests {
         let control = NodePolicy::remote_control();
         assert!(input_allowed(&control, "mouse"));
         assert!(input_allowed(&control, "key"));
+        assert!(input_allowed(&control, "clipboard"));
     }
 
     #[test]
@@ -2988,16 +3123,17 @@ mod tests {
     fn handler_rejects_forged_client_id_even_when_the_session_uuid_is_known() {
         let mgr = test_manager();
         let session_id = super::new_stream_session_id();
-        mgr.sessions.lock().unwrap().push(dummy_session(
-            &session_id,
-            "bob",
-            "jti-bob",
-            None,
-        ));
+        mgr.sessions
+            .lock()
+            .unwrap()
+            .push(dummy_session(&session_id, "bob", "jti-bob", None));
         // Alice knows Bob's session UUID and presents Bob's client_id as the
         // caller. The handler peer is the seal identity, not that field.
         let err = mgr
-            .keyframe("alice", &json!({"session_id": session_id, "client_id": "bob"}))
+            .keyframe(
+                "alice",
+                &json!({"session_id": session_id, "client_id": "bob"}),
+            )
             .unwrap_err();
         assert!(err.contains("unknown stream session"), "{err}");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3005,7 +3141,10 @@ mod tests {
             .build()
             .unwrap();
         let err = runtime
-            .block_on(mgr.close("alice", &json!({"session_id": session_id, "client_id": "bob"})))
+            .block_on(mgr.close(
+                "alice",
+                &json!({"session_id": session_id, "client_id": "bob"}),
+            ))
             .unwrap_err();
         assert!(err.contains("unknown stream session"), "{err}");
         let sessions = mgr.sessions.lock().unwrap();

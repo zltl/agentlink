@@ -1,25 +1,38 @@
 //! Cursor shape names for the remote overlay channel.
 //!
-//! The wire format is `{x,y,shape?,visible?}`. Unknown shapes fall back to
-//! `"arrow"` on the node; old clients that only read `x`/`y` keep working.
+//! The wire format is `{x,y,shape?,visible?,hotspot_x?,hotspot_y?}`. Stock
+//! aliases map to canonical ids. Unrecognized names stay `"unknown"` via
+//! [`classify_shape`] — do not pretend they are `"arrow"`. [`normalize_shape`]
+//! keeps the older Windows stock fallback to `"arrow"` for IDC misses.
 
-/// Canonical shape id sent on the cursor data channel.
+/// Canonical shape id when the name is a known stock alias; `"unknown"` otherwise.
+pub fn classify_shape(name: &str) -> &'static str {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "arrow" | "default" | "pointer" | "left_ptr" => "arrow",
+        "ibeam" | "text" | "beam" | "xterm" => "ibeam",
+        "hand" | "pointinghand" | "link" | "hand2" => "hand",
+        "sizeall" | "move" | "all-scroll" | "grabbing" | "fleur" => "sizeall",
+        "sizens" | "ns-resize" | "row-resize" | "n-resize" | "s-resize"
+        | "sb_v_double_arrow" => "sizens",
+        "sizewe" | "ew-resize" | "col-resize" | "e-resize" | "w-resize"
+        | "sb_h_double_arrow" => "sizewe",
+        "sizenwse" | "nwse-resize" | "bd_double_arrow" => "sizenwse",
+        "sizenesw" | "nesw-resize" | "fd_double_arrow" => "sizenesw",
+        "cross" | "crosshair" | "cross_reverse" => "cross",
+        "wait" | "progress" | "busy" | "watch" | "left_ptr_watch" => "wait",
+        "no" | "not-allowed" | "forbidden" | "crossed_circle" => "no",
+        "help" | "question_arrow" => "help",
+        "" => "unknown",
+        _ => "unknown",
+    }
+}
+
+/// Canonical shape id for Windows stock mapping. Unknown → `"arrow"`.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn normalize_shape(name: &str) -> &'static str {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "arrow" | "default" | "pointer" => "arrow",
-        "ibeam" | "text" | "beam" => "ibeam",
-        "hand" | "pointinghand" | "link" => "hand",
-        "sizeall" | "move" | "all-scroll" | "grabbing" => "sizeall",
-        "sizens" | "ns-resize" | "row-resize" | "n-resize" | "s-resize" => "sizens",
-        "sizewe" | "ew-resize" | "col-resize" | "e-resize" | "w-resize" => "sizewe",
-        "sizenwse" | "nwse-resize" => "sizenwse",
-        "sizenesw" | "nesw-resize" => "sizenesw",
-        "cross" | "crosshair" => "cross",
-        "wait" | "progress" | "busy" => "wait",
-        "no" | "not-allowed" | "forbidden" => "no",
-        "help" => "help",
-        _ => "arrow",
+    match classify_shape(name) {
+        "unknown" => "arrow",
+        other => other,
     }
 }
 
@@ -60,6 +73,9 @@ mod tests {
         assert_eq!(normalize_shape("pointingHand"), "hand");
         assert_eq!(normalize_shape("ns-resize"), "sizens");
         assert_eq!(normalize_shape("unknown-xyz"), "arrow");
+        assert_eq!(classify_shape("xterm"), "ibeam");
+        assert_eq!(classify_shape("unknown-xyz"), "unknown");
+        assert_eq!(classify_shape("left_ptr"), "arrow");
     }
 
     #[test]

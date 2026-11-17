@@ -1,7 +1,21 @@
 //! Read-only diagnostic: send webrtc list_monitors / offer to an existing
 //! node (default: sufa) with the already-authorized client identity.
 //! Does not create an identity or grant, does not print tokens, and closes
-//! the session after a short wait for a selected ICE pair or first frame.
+//! the session after a timed wait for a selected ICE pair and decoded frames.
+//!
+//! Portability: pure Viewer + Identity::load; no GUI, no input, no Unix debug
+//! socket (unlike `controller --headless`, which requires unix). Safe on
+//! Windows with the probe config dir.
+//!
+//! Annex-B access units from `poll_frame` are **not** decoded frames. This
+//! probe also runs the same openh264 `Decoder` path as Controller
+//! `H264Decoder`, but only keeps width×height (drops YUV; no RGBA, no pixels
+//! saved, no paint). Do not claim GUI presentation from this tool alone.
+//!
+//! Sustained stats (after Viewer::connect): wall duration, received bytes,
+//! decoded_fps (openh264 pictures / wall — not GUI presented fps), avg/max
+//! decode_us, decode_errors, stalled receive intervals. Does **not** call
+//! `drain_keep_latest` (that drops dependency frames and would skew decode).
 
 use std::env;
 use std::sync::Arc;
@@ -10,8 +24,58 @@ use std::time::{Duration, Instant};
 use agentlink_core::client::maintain_session;
 use agentlink_core::config::{self, ClientSettings};
 use agentlink_core::{apply_relay_defaults, Client, Identity, Op, PHASE3_WEBRTC_SIGNAL};
-use agentlink_view::{is_screenshot_fallback, LiveOptions, Signal, Viewer};
+use agentlink_view::{
+    is_screenshot_fallback, parse_bounded_u64, parse_max_decoded, LiveOptions, Signal, Viewer,
+};
+use openh264::decoder::Decoder;
+use openh264::formats::YUVSource;
+use openh264::nal_units;
 use serde_json::{json, Value};
+
+/// Dimension-only mirror of Controller `H264Decoder` (openh264 Decoder +
+/// `nal_units`). Skips the RGBA conversion that paint uses.
+struct ProbeH264 {
+    inner: Option<Decoder>,
+}
+
+impl ProbeH264 {
+    fn new() -> Self {
+        Self {
+            inner: Decoder::new().ok(),
+        }
+    }
+
+    fn available(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// Last decoded picture dims in this access unit, plus openh264 errors.
+    fn decode_dims(&mut self, annex_b: &[u8]) -> (Option<(usize, usize)>, u32) {
+        let Some(decoder) = self.inner.as_mut() else {
+            return (None, 0);
+        };
+        let mut last = None;
+        let mut errors = 0u32;
+        for nal in nal_units(annex_b) {
+            match decoder.decode(nal) {
+                Ok(Some(yuv)) => {
+                    let (width, height) = yuv.dimensions();
+                    if width == 0 || height == 0 {
+                        continue;
+                    }
+                    // Drop YUV immediately — counters/dims only.
+                    last = Some((width, height));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    errors += 1;
+                    break;
+                }
+            }
+        }
+        (last, errors)
+    }
+}
 
 struct ClientSignal {
     client: Arc<Client>,
@@ -74,16 +138,44 @@ fn summarize(value: &Value) -> String {
     )
 }
 
+fn probe_seconds() -> u64 {
+    // Default 15s; clamp so a typo cannot run for hours.
+    parse_bounded_u64(
+        env::var("AGENTLINK_PROBE_SECONDS").ok().as_deref(),
+        15,
+        1,
+        120,
+    )
+}
+
+/// Cap decoded pictures so a long probe stays CPU-friendly.
+/// Default `0` = no early stop (full window) — needed for ~30s sustained stats.
+fn probe_max_decoded() -> u32 {
+    parse_max_decoded(
+        env::var("AGENTLINK_PROBE_MAX_DECODED").ok().as_deref(),
+        0,
+        10_000,
+    )
+}
+
+fn log_unit(n: u32) -> bool {
+    n <= 3 || n % 30 == 0
+}
+
 #[tokio::main]
 async fn main() {
     let node = env::args().nth(1).unwrap_or_else(|| "sufa".to_string());
     let config_dir = env::var("AGENTLINK_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| config::default_config_dir().expect("config dir"));
+    let wait_secs = probe_seconds();
+    let max_decoded = probe_max_decoded();
     eprintln!(
-        "t449-probe: config_dir={} node={} (Identity::load only, no new grant)",
+        "t449-probe: config_dir={} node={} wait={}s max_decoded={} (0=full window; Identity::load only, no new grant; annex-b≠decoded; no drain_keep_latest)",
         config_dir.display(),
-        node
+        node,
+        wait_secs,
+        max_decoded
     );
 
     let identity = match Identity::load(&config_dir.join("identity.json")) {
@@ -221,7 +313,9 @@ async fn main() {
         on_stage: Some(on_stage),
         ..LiveOptions::default()
     };
-    eprintln!("t449-probe: stage=Viewer::connect starting (60s deadline, view-only, then close)");
+    eprintln!(
+        "t449-probe: stage=Viewer::connect starting (60s deadline, view-only, then close; no input)"
+    );
     let connect_started = Instant::now();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let thread_signal = Arc::clone(&signal);
@@ -238,7 +332,7 @@ async fn main() {
         Ok(Ok(viewer)) => {
             let info = viewer.info();
             eprintln!(
-                "t449-probe: Viewer::connect ok {}ms encoder={} hardware={} path={} {}x{} codec={}",
+                "t449-probe: Viewer::connect ok {}ms encoder={} hardware={} path={} offer_meta={}x{} codec={}",
                 connect_started.elapsed().as_millis(),
                 info.encoder,
                 info.hardware,
@@ -247,14 +341,29 @@ async fn main() {
                 info.height,
                 info.codec
             );
-            // 15s covers the Controller's 12s no-pair / no-first-frame
-            // deadline plus a little slack for logging the pair.
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let mut frames = 0u32;
+            let mut decoder = ProbeH264::new();
+            eprintln!(
+                "t449-probe: openh264 decoder available={} (same path as Controller H264Decoder; dims only; no pixels saved)",
+                decoder.available()
+            );
+            let media_started = Instant::now();
+            let deadline = media_started + Duration::from_secs(wait_secs);
+            let mut annex_b_units = 0u32;
+            let mut decoded_frames = 0u32;
+            let mut received_bytes = 0u64;
+            let mut decode_errors = 0u32;
+            let mut decode_attempts = 0u32;
+            let mut stalled_intervals = 0u32;
+            let mut decode_us_total = 0u64;
+            let mut decode_us_max = 0u64;
+            let mut last_decoded_w = 0usize;
+            let mut last_decoded_h = 0usize;
             let mut logged_pair = false;
+            let mut saw_annex = false;
+            let mut last_annex_at = Instant::now();
             while Instant::now() < deadline {
                 if viewer.failed() {
-                    eprintln!("t449-probe: viewer.failed() before first frame");
+                    eprintln!("t449-probe: viewer.failed() during probe window");
                     break;
                 }
                 if !logged_pair {
@@ -272,29 +381,72 @@ async fn main() {
                         );
                     }
                 }
-                if let Some(frame) = viewer.poll_frame(Duration::from_millis(200)) {
-                    frames += 1;
+                let Some(frame) = viewer.poll_frame(Duration::from_millis(200)) else {
+                    // Match controller stall heuristic: gap after media started.
+                    if saw_annex && last_annex_at.elapsed() > Duration::from_millis(200) {
+                        stalled_intervals += 1;
+                        last_annex_at = Instant::now();
+                    }
+                    continue;
+                };
+                if saw_annex && last_annex_at.elapsed() > Duration::from_millis(500) {
+                    stalled_intervals += 1;
+                }
+                saw_annex = true;
+                last_annex_at = Instant::now();
+                annex_b_units += 1;
+                received_bytes += frame.annex_b.len() as u64;
+                if log_unit(annex_b_units) {
                     eprintln!(
-                        "t449-probe: h264 frame #{} key={} {}x{} bytes={}",
-                        frames,
+                        "t449-probe: annex-b unit #{} key={} offer_meta={}x{} bytes={} (not yet decoded)",
+                        annex_b_units,
                         frame.keyframe,
                         frame.width,
                         frame.height,
                         frame.annex_b.len()
                     );
-                    if frames >= 2 {
+                }
+                if !decoder.available() {
+                    continue;
+                }
+                decode_attempts += 1;
+                let decode_started = Instant::now();
+                let (dims, errs) = decoder.decode_dims(&frame.annex_b);
+                let decode_us = decode_started.elapsed().as_micros() as u64;
+                decode_us_total += decode_us;
+                if decode_us > decode_us_max {
+                    decode_us_max = decode_us;
+                }
+                decode_errors += errs;
+                if let Some((w, h)) = dims {
+                    decoded_frames += 1;
+                    last_decoded_w = w;
+                    last_decoded_h = h;
+                    if log_unit(decoded_frames) {
+                        eprintln!(
+                            "t449-probe: decoded frame #{decoded_frames} {w}x{h} decode_us={decode_us} (YUV dropped; no pixels saved)"
+                        );
+                    }
+                    if max_decoded > 0 && decoded_frames >= max_decoded {
+                        eprintln!("t449-probe: reached max_decoded={max_decoded}; stopping early");
                         break;
                     }
+                } else if log_unit(annex_b_units) {
+                    eprintln!(
+                        "t449-probe: annex-b unit #{annex_b_units} produced no decoded picture yet (SPS/PPS, incomplete AU, or decode_error={errs})"
+                    );
                 }
             }
+            let media_secs = media_started.elapsed().as_secs_f64().max(0.001);
+            let decoded_fps = decoded_frames as f64 / media_secs;
+            let avg_decode_us = if decode_attempts > 0 {
+                decode_us_total / u64::from(decode_attempts)
+            } else {
+                0
+            };
             if !logged_pair {
                 eprintln!(
-                    "t449-probe: no selected ICE pair within 15s after connect (failed={})",
-                    viewer.failed()
-                );
-            } else if frames == 0 {
-                eprintln!(
-                    "t449-probe: no H.264 frame within 15s after a selected ICE pair (failed={})",
+                    "t449-probe: no selected ICE pair within {wait_secs}s after connect (failed={})",
                     viewer.failed()
                 );
             }
@@ -304,8 +456,20 @@ async fn main() {
             } else {
                 eprintln!("t449-probe: ice checks {checks}");
             }
+            eprintln!(
+                "t449-probe: summary duration_s={media_secs:.3} annex_b_units={annex_b_units} received_bytes={received_bytes} decoded_frames={decoded_frames} decoded_fps={decoded_fps:.2} avg_decode_us={avg_decode_us} max_decode_us={decode_us_max} decode_errors={decode_errors} stalled_intervals={stalled_intervals} last_decoded={}x{} pair={} failed={} (decoded_fps≠GUI presented_fps; no pixels saved)",
+                last_decoded_w,
+                last_decoded_h,
+                logged_pair,
+                viewer.failed()
+            );
+            if annex_b_units > 0 && decoded_frames == 0 {
+                eprintln!(
+                    "t449-probe: WARNING annex-b arrived but openh264 yielded 0 pictures — do not treat NAL receipt as decode success"
+                );
+            }
             viewer.close();
-            eprintln!("t449-probe: viewer closed");
+            eprintln!("t449-probe: viewer closed (no GUI paint claimed)");
         }
         Ok(Err(err)) => {
             eprintln!(
