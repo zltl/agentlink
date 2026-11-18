@@ -2141,6 +2141,22 @@ impl ControllerApp {
                 if resp.clicked() {
                     self.toggle_autostart();
                 }
+                ui.add_space(theme::SPACE_XS);
+                let osc_label = if self.terminal.allows_osc52() {
+                    "Terminal OSC 52 clipboard: on (≤64 KiB)"
+                } else {
+                    "Terminal OSC 52 clipboard: off"
+                };
+                let osc_resp = ui
+                    .add(theme::secondary_button(osc_label))
+                    .on_hover_text("Allow remote terminal programs to copy up to 64 KiB to the local clipboard via OSC 52. Off by default.");
+                self.debug_layout
+                    .note_visible("settings_osc52", osc_resp.rect, clip);
+                self.debug_layout
+                    .note_focus("settings_osc52", &osc_resp, clip);
+                if osc_resp.clicked() {
+                    self.terminal.set_allow_osc52(!self.terminal.allows_osc52());
+                }
             }
             ui.add_space(theme::SPACE_XS);
             ui.label(theme::muted_text(format!(
@@ -2412,6 +2428,9 @@ impl ControllerApp {
         if let Some((rows, cols)) = output.resized {
             self.term_size = (rows, cols);
             self.send(Cmd::PtyResize { rows, cols });
+        }
+        if let Some(chars) = output.osc52_copied_chars {
+            self.notice = format!("Terminal copied {chars} chars to clipboard (OSC 52).");
         }
         if !output.writes.is_empty() {
             self.send(Cmd::PtyWrite {

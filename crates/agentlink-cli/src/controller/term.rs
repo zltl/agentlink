@@ -6,6 +6,7 @@
 //! session. The egui view is our own (the `egui_term` crate talks to a
 //! local PTY backend we cannot use here).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -19,11 +20,15 @@ use eframe::egui::{
     self, Color32, Event as GuiEvent, ImeEvent, Key, PointerButton, Pos2, Rect, Vec2,
 };
 
+/// Maximum decoded UTF-8 byte length accepted from OSC 52 when explicitly enabled.
+pub const OSC52_MAX_BYTES: usize = 64 * 1024;
+
 /// Bytes the UI should write to the remote PTY after one frame.
 #[derive(Debug, Default)]
 pub struct TermOutput {
     pub writes: Vec<u8>,
     pub resized: Option<(u16, u16)>,
+    pub osc52_copied_chars: Option<usize>,
 }
 
 struct TermDims {
@@ -48,6 +53,8 @@ struct TermHost {
     pending: Arc<Mutex<Vec<u8>>>,
     title: Arc<Mutex<String>>,
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Default `false`: remote PTY output cannot silently overwrite the host clipboard.
+    allow_osc52: Arc<AtomicBool>,
 }
 
 impl EventListener for TermHost {
@@ -61,7 +68,13 @@ impl EventListener for TermHost {
             Event::Title(title) => *self.title.lock().expect("term host") = title,
             Event::ResetTitle => self.title.lock().expect("term host").clear(),
             Event::ClipboardStore(_, text) => {
-                *self.clipboard.lock().expect("term host") = Some(text);
+                if self.allow_osc52.load(Ordering::Relaxed)
+                    && !text.is_empty()
+                    && text.len() <= OSC52_MAX_BYTES
+                    && !text.contains('\0')
+                {
+                    *self.clipboard.lock().expect("term host") = Some(text);
+                }
             }
             _ => {}
         }
@@ -129,7 +142,22 @@ impl Emulator {
     }
 
     pub fn take_osc52_copy(&self) -> Option<String> {
+        if !self.allows_osc52() {
+            let _ = self.host.clipboard.lock().expect("term host").take();
+            return None;
+        }
         self.host.clipboard.lock().expect("term host").take()
+    }
+
+    pub fn allows_osc52(&self) -> bool {
+        self.host.allow_osc52.load(Ordering::Relaxed)
+    }
+
+    pub fn set_allow_osc52(&self, allow: bool) {
+        self.host.allow_osc52.store(allow, Ordering::Relaxed);
+        if !allow {
+            let _ = self.host.clipboard.lock().expect("term host").take();
+        }
     }
 
     pub fn title(&self) -> String {
@@ -474,6 +502,7 @@ impl Emulator {
         let mut out = TermOutput {
             writes: self.take_writes(),
             resized: None,
+            osc52_copied_chars: None,
         };
         let font = egui::FontId::monospace(13.0);
         let (cell_w, cell_h) = ui.fonts(|fonts| {
@@ -575,7 +604,7 @@ impl Emulator {
                     let y = cell_rect.max.y - 2.0;
                     painter.line_segment(
                         [Pos2::new(cell_rect.min.x, y), Pos2::new(cell_rect.max.x, y)],
-                        egui::Stroke::new(1.0, fg),
+                        egui::Stroke::new(1.0_f32, fg),
                     );
                 }
             }
@@ -708,7 +737,9 @@ impl Emulator {
         self.keys_taken = false;
 
         if let Some(osc) = self.take_osc52_copy() {
+            let chars = osc.chars().count();
             ui.ctx().copy_text(osc);
+            out.osc52_copied_chars = Some(chars);
         }
 
         out
@@ -1461,5 +1492,39 @@ mod tests {
         assert!(!primary_click_clears_selection(true, true, false));
         assert!(!primary_click_clears_selection(true, false, true));
         assert!(!primary_click_clears_selection(false, false, false));
+    }
+
+    #[test]
+    fn osc52_clipboard_is_denied_by_default_and_bounded_when_opted_in() {
+        let mut term = Emulator::new(24, 80);
+        assert!(!term.allows_osc52(), "OSC 52 must be disabled by default");
+        // Base64("secret-clip") = "c2VjcmV0LWNsaXA="
+        term.feed(b"\x1b]52;c;c2VjcmV0LWNsaXA=\x07");
+        assert_eq!(
+            term.take_osc52_copy(),
+            None,
+            "default-deny must drop remote OSC 52 clipboard writes"
+        );
+
+        term.set_allow_osc52(true);
+        term.feed(b"\x1b]52;c;c2VjcmV0LWNsaXA=\x07");
+        assert_eq!(term.take_osc52_copy().as_deref(), Some("secret-clip"));
+
+        // Oversized OSC 52 (> 64 KiB decoded) must be rejected even when opted in.
+        let huge = vec![b'A'; OSC52_MAX_BYTES + 16];
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&huge);
+        let seq = format!("\x1b]52;c;{b64}\x07");
+        term.feed(seq.as_bytes());
+        assert_eq!(
+            term.take_osc52_copy(),
+            None,
+            "OSC 52 payload exceeding OSC52_MAX_BYTES must be dropped"
+        );
+
+        // Turning opt-in back off clears any queued value.
+        term.feed(b"\x1b]52;c;c2VjcmV0LWNsaXA=\x07");
+        term.set_allow_osc52(false);
+        assert_eq!(term.take_osc52_copy(), None);
     }
 }
