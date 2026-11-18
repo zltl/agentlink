@@ -626,14 +626,27 @@ async fn handle_env(
             )
         }
         Envelope::AuditPolicyPush { toml } => {
-            match agentlink_core::audit::AuditPolicy::parse(&toml) {
-                Ok(next) => {
-                    if let Err(err) = std::fs::write(config.data_dir.join("audit.toml"), &toml) {
-                        tracing::warn!(error = %err, "could not save pushed audit policy");
-                    }
-                    audit_hub.replace_policy(next);
+            let current = audit_hub.policy();
+            match current.apply_untrusted_relay_push(&toml) {
+                Ok(None) => {
+                    tracing::info!("ignoring relay audit policy because lock_local is set");
                 }
-                Err(err) => tracing::warn!(error = %err, "pushed audit policy is invalid"),
+                Ok(Some(sanitized)) => {
+                    match sanitized.to_toml() {
+                        Ok(clean_toml) => {
+                            if let Err(err) =
+                                std::fs::write(config.data_dir.join("audit.toml"), clean_toml)
+                            {
+                                tracing::warn!(error = %err, "could not save pushed audit policy");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "could not serialize pushed audit policy");
+                        }
+                    }
+                    audit_hub.replace_policy(sanitized);
+                }
+                Err(err) => tracing::warn!(error = %err, "rejected relay audit policy push"),
             }
             return;
         }

