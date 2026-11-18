@@ -559,6 +559,26 @@ async fn open_screencast_inner(
         .call("CreateSession", &(options,))
         .await
         .map_err(|err| msg(format!("ScreenCast.CreateSession: {err}")))?;
+    let sc_path_str = screencast_path.to_string();
+    match attach_screencast_stream(conn, connector, &remote_session, &screencast_path).await {
+        Ok(out) => Ok(out),
+        Err(err) => {
+            if let Some(path) =
+                super::mutter_session::screencast_path_to_stop_on_error(Some(&sc_path_str))
+            {
+                let _ = stop_screencast_session(conn, path).await;
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn attach_screencast_stream(
+    conn: &Connection,
+    connector: &str,
+    remote_session: &Proxy<'_>,
+    screencast_path: &OwnedObjectPath,
+) -> Result<(String, u32)> {
     let screencast_session =
         Proxy::new(conn, MUTTER_SC, screencast_path.as_str(), SC_SESSION_IFACE)
             .await

@@ -35,6 +35,14 @@ pub(crate) fn capture_needs_reconnect(message: &str) -> bool {
         || message.contains("closed the ScreenCast stream")
 }
 
+/// Non-empty ScreenCast object path created before a later setup step failed.
+/// Both the ScreenCast session and the outer RemoteDesktop session must be
+/// stopped so a partial failure does not leave an unstarted ScreenCast object
+/// on the GNOME session bus.
+pub(crate) fn screencast_path_to_stop_on_error(created_path: Option<&str>) -> Option<&str> {
+    created_path.map(str::trim).filter(|path| !path.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -72,5 +80,17 @@ mod tests {
             "Mutter did not add a PipeWire stream within 10s"
         ));
         assert!(!capture_needs_reconnect("session bus: disconnected"));
+    }
+
+    #[test]
+    fn partial_screencast_error_identifies_created_session_for_stop() {
+        assert_eq!(
+            super::screencast_path_to_stop_on_error(Some(
+                "/org/gnome/Mutter/ScreenCast/Session/u1"
+            )),
+            Some("/org/gnome/Mutter/ScreenCast/Session/u1")
+        );
+        assert_eq!(super::screencast_path_to_stop_on_error(Some("  ")), None);
+        assert_eq!(super::screencast_path_to_stop_on_error(None), None);
     }
 }
