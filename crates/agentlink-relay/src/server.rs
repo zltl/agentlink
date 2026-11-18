@@ -271,6 +271,17 @@ impl RelayHandle {
             }
         }
     }
+
+    #[doc(hidden)]
+    pub fn testing_backdate_routes_and_run_periodic_reap(&self, age: Duration) {
+        if let Ok(mut routes) = lock_routes(&self.hub) {
+            let past = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+            for route in routes.values_mut() {
+                route.last_activity = past;
+            }
+        }
+        reap_stale_nodes(&self.hub);
+    }
 }
 
 impl Drop for RelayHandle {
@@ -3033,9 +3044,17 @@ async fn route_e2e(
     let node = match resolved {
         Ok(node) => node,
         Err(err) => {
+            if from_node.is_some() {
+                return Ok(());
+            }
             return send_out(from_tx, &Envelope::result_err(request_id, err.to_string())).await;
         }
     };
+    if from_node == Some(node.id.as_str()) {
+        // Orphan node->client E2E reply after the client route already closed:
+        // never create a node->self loop route.
+        return Ok(());
+    }
     let allowed = if principal.map(|p| p.admin).unwrap_or(false) {
         node.effective()
     } else if let Some(from_id) = from_node {
@@ -3442,6 +3461,24 @@ async fn open_or_forward(
         };
         return forward_existing(hub, from_node, &request_id, env, terminal).await;
     }
+    let can_initiate = matches!(
+        msg,
+        TransferMsg::Push { .. }
+            | TransferMsg::PushDir { .. }
+            | TransferMsg::PushStream { .. }
+            | TransferMsg::Pull { .. }
+            | TransferMsg::PullDir { .. }
+            | TransferMsg::PullStream { .. }
+            | TransferMsg::PeerCopy { .. }
+            | TransferMsg::TunnelDial { .. }
+            | TransferMsg::TunnelBind { .. }
+    );
+    if !can_initiate {
+        if from_node.is_some() {
+            return Ok(());
+        }
+        return fail_transfer(from_tx, request_id, node_id, "request route missing".into()).await;
+    }
     let resolved = hub.db.resolve_node(&node_id).await;
     let node = match resolved {
         Ok(node) => node,
@@ -3449,6 +3486,9 @@ async fn open_or_forward(
             return fail_transfer(from_tx, request_id, node_id, err.to_string()).await;
         }
     };
+    if from_node == Some(node.id.as_str()) {
+        return Ok(());
+    }
     if let Err(why) = transfer_allowed(hub, &node, from_node, &msg).await {
         return fail_transfer(from_tx, request_id, node.name, why).await;
     }
@@ -3602,6 +3642,11 @@ async fn open_direct(
         Err(err) => return Err(err),
     };
     if let Some(from_id) = from_node {
+        if from_id == node.id {
+            return Err(Error::PermissionDenied(
+                "node cannot direct-offer itself".into(),
+            ));
+        }
         let from = hub.db.resolve_node(from_id).await?;
         if !peer_nodes_allowed(&from, &node) {
             return Err(Error::PermissionDenied("node peer access denied".into()));
@@ -3788,13 +3833,9 @@ const MAX_PUNCH_ENTRIES: usize = 4_096;
 const PUNCH_TTL: Duration = Duration::from_secs(300);
 const MAX_RATE_WINDOWS: usize = 16_384;
 
-fn reap_stale_routes(hub: &Hub, idle_ttl: Duration) {
+fn reap_closed_routes(hub: &Hub) {
     if let Ok(mut routes) = lock_routes(hub) {
-        routes.retain(|_, r| {
-            !r.origin_tx.is_closed()
-                && !r.target_tx.is_closed()
-                && r.last_activity.elapsed() < idle_ttl
-        });
+        routes.retain(|_, r| !r.origin_tx.is_closed() && !r.target_tx.is_closed());
     }
 }
 
@@ -3809,19 +3850,27 @@ fn try_insert_route(hub: &Hub, request_id: String, route: Route) -> Result<()> {
         .filter(|r| r.origin_tx.same_channel(&route.origin_tx))
         .count();
     if origin_count >= MAX_ROUTES_PER_ORIGIN || routes.len() >= MAX_TOTAL_ROUTES {
-        routes.retain(|_, r| {
-            !r.origin_tx.is_closed()
-                && !r.target_tx.is_closed()
-                && r.last_activity.elapsed() < ROUTE_IDLE_TTL
-        });
-        let origin_after = routes
+        routes.retain(|_, r| !r.origin_tx.is_closed() && !r.target_tx.is_closed());
+        let origin_after_closed = routes
             .values()
             .filter(|r| r.origin_tx.same_channel(&route.origin_tx))
             .count();
-        if origin_after >= MAX_ROUTES_PER_ORIGIN {
-            return Err(Error::Message(format!(
-                "too many concurrent in-flight requests on this connection (limit {MAX_ROUTES_PER_ORIGIN})"
-            )));
+        if origin_after_closed >= MAX_ROUTES_PER_ORIGIN {
+            // Reclaim stale leaked routes ONLY on this saturated origin — never
+            // touch another client's long-lived idle PTY/TunnelBind routes.
+            routes.retain(|_, r| {
+                !r.origin_tx.same_channel(&route.origin_tx)
+                    || r.last_activity.elapsed() < ROUTE_IDLE_TTL
+            });
+            let origin_after_ttl = routes
+                .values()
+                .filter(|r| r.origin_tx.same_channel(&route.origin_tx))
+                .count();
+            if origin_after_ttl >= MAX_ROUTES_PER_ORIGIN {
+                return Err(Error::Message(format!(
+                    "too many concurrent in-flight requests on this connection (limit {MAX_ROUTES_PER_ORIGIN})"
+                )));
+            }
         }
         if routes.len() >= MAX_TOTAL_ROUTES {
             return Err(Error::Message(
@@ -3962,7 +4011,7 @@ fn enrolled_to_info(node: &EnrolledNode, live: Option<&Online>) -> NodeInfo {
 }
 
 fn reap_stale_nodes(hub: &Hub) {
-    reap_stale_routes(hub, ROUTE_IDLE_TTL);
+    reap_closed_routes(hub);
     let stale_after = stale_after();
     let Ok(online) = lock_online(hub) else {
         return;
@@ -5776,18 +5825,102 @@ mod route_rebind_tests {
             "full unexpired rate-limit table must fail closed"
         );
 
-        // 3. Stale open-socket routes past idle TTL are reaped and free per-origin slots.
+        // 3. Healthy below-quota open-socket routes MUST survive periodic `reap_stale_nodes`
+        // even after >1h idle; only same-origin quota saturation (>256) reclaims that origin's
+        // own stale routes, and orphan node->self frames MUST NEVER create self-loop routes!
         {
             let mut routes = lock_routes(hub).unwrap();
-            for r in routes.values_mut() {
-                r.last_activity = Instant::now() - Duration::from_secs(3700);
-            }
+            routes.clear();
         }
-        reap_stale_routes(hub, ROUTE_IDLE_TTL);
+        let (node_self_tx, mut node_self_rx) = mpsc::channel(1024);
+        lock_online(hub).unwrap().insert(
+            alice_node.id.clone(),
+            Online {
+                generation: 2,
+                tx: node_self_tx.clone(),
+                last_seen: Instant::now(),
+                cancel: CancellationToken::new(),
+            },
+        );
+        // Orphan E2e reply sent by node after client route already closed:
+        route_e2e(
+            hub,
+            Some(&alice_node.id),
+            &node_self_tx,
+            None,
+            e2e("orphan-req-1", &alice_node.id),
+        )
+        .await
+        .unwrap();
+        // Orphan non-initiating Transfer reply sent by node:
+        open_or_forward(
+            hub,
+            Some(&alice_node.id),
+            &node_self_tx,
+            "orphan-xfer-1".into(),
+            alice_node.id.clone(),
+            String::new(),
+            TransferMsg::TunnelIncoming {
+                token: "tok".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             lock_routes(hub).unwrap().len(),
             0,
-            "stale open-socket routes must be reaped after ROUTE_IDLE_TTL"
+            "orphan node frames must never insert self-loop routes!"
         );
+        assert!(
+            node_self_rx.try_recv().is_err(),
+            "orphan node frame looped back to the node itself!"
+        );
+
+        // Verify same-origin quota pressure reclaims ONLY the saturated origin's own stale
+        // routes while preserving an innocent second client's >1h-idle route!
+        let (innocent_tx, _innocent_rx) = mpsc::channel(8);
+        route_e2e(
+            hub,
+            None,
+            &innocent_tx,
+            Some(&p),
+            e2e("innocent-pty-open", &alice_node.id),
+        )
+        .await
+        .unwrap();
+        for idx in 0..MAX_ROUTES_PER_ORIGIN {
+            route_e2e(
+                hub,
+                None,
+                &origin_tx,
+                Some(&p),
+                e2e(&format!("sat-{idx}"), &alice_node.id),
+            )
+            .await
+            .unwrap();
+        }
+        relay.testing_backdate_routes_and_run_periodic_reap(Duration::from_secs(7200));
+        assert!(
+            lock_routes(hub).unwrap().contains_key("innocent-pty-open"),
+            "periodic reap must not delete healthy below-quota open-socket routes"
+        );
+        // Saturated `origin_tx` sends a 257th request -> reclaims `origin_tx`'s stale routes
+        // WITHOUT evicting `innocent_tx`'s 2h-idle route!
+        route_e2e(
+            hub,
+            None,
+            &origin_tx,
+            Some(&p),
+            e2e("sat-after-ttl", &alice_node.id),
+        )
+        .await
+        .unwrap();
+        let guard = lock_routes(hub).unwrap();
+        assert!(
+            guard.contains_key("innocent-pty-open"),
+            "cross-origin pressure unfairly evicted innocent client's idle route!"
+        );
+        assert!(guard.contains_key("sat-after-ttl"));
     }
 }

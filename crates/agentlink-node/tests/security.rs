@@ -668,6 +668,190 @@ async fn live_node_handler_rejects_wire_replayed_e2e_frames_and_hello_flood() {
     let _ = tokio::time::timeout(Duration::from_secs(5), node_task).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn long_idle_pty_and_tunnel_bind_survive_periodic_reap_and_cross_origin_pressure() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let relay = RelayHandle::spawn(RelayConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        data_dir: dir.path().join("relay"),
+        capture: None,
+        database_url: None,
+        allow_signup: false,
+        bootstrap_admin: false,
+        db_schema: None,
+        trust_proxy: Vec::new(),
+        print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
+    })
+    .await
+    .expect("relay");
+    let relay_url = format!("wss://{}/v1/connect", relay.local_addr);
+    let admin = Arc::new(
+        Client::connect(&ClientSettings {
+            relay: relay_url.clone(),
+            token: relay.admin_token.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        })
+        .await
+        .expect("admin"),
+    );
+
+    let tok = admin
+        .create_pairing_token("idle-box", NodePolicy::full(), 600)
+        .await
+        .expect("pair");
+    let node_dir = dir.path().join("idle-box");
+    std::fs::create_dir_all(&node_dir).expect("mkdir");
+    let stop = CancellationToken::new();
+    let node_task = tokio::spawn(run(
+        NodeConfig {
+            relay_url: relay_url.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+            data_dir: node_dir.clone(),
+            name: "idle-box".into(),
+            pairing_token: Some(tok.token),
+            root: None,
+            max_policy: NodePolicy::full(),
+            version: "test".into(),
+            extensions: Vec::new(),
+            policy_hook: None,
+            capture: None,
+        },
+        stop.clone(),
+    ));
+    wait_online(&admin, "idle-box").await;
+    let ident = std::fs::read_to_string(node_dir.join("identity.json")).expect("ident");
+    let box_id = serde_json::from_str::<serde_json::Value>(&ident)
+        .expect("json")["public_hex"]
+        .as_str()
+        .expect("hex")
+        .to_string();
+    admin
+        .install_local_grant(&node_dir, &box_id)
+        .expect("grant");
+
+    // 1. Open a real interactive PTY session on `idle-box`.
+    let mut pty = admin
+        .open_pty("idle-box", None, None, 24, 80)
+        .await
+        .expect("open_pty");
+    pty.write(b"echo BEFORE_LONG_IDLE\n")
+        .await
+        .expect("pty write 1");
+    let mut initial_out = String::new();
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while !initial_out.contains("BEFORE_LONG_IDLE") {
+        let chunk = pty
+            .read_available(Duration::from_millis(250), 65536)
+            .await
+            .expect("pty read 1");
+        initial_out.push_str(&String::from_utf8_lossy(&chunk.data));
+        assert!(std::time::Instant::now() < until);
+    }
+
+    // 2. Open a real TunnelBind (`port_reverse`) forwarding remote_port -> local echo listener.
+    let local_echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local echo");
+    let local_port = local_echo.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = local_echo.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let mut reply = b"ECHO:".to_vec();
+                    reply.extend_from_slice(&buf[..n]);
+                    let _ = sock.write_all(&reply).await;
+                }
+            });
+        }
+    });
+    let probe_bind = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+    let remote_port = probe_bind.local_addr().expect("addr").port();
+    drop(probe_bind);
+    let admin_rev = Arc::clone(&admin);
+    let rev_task = tokio::spawn(async move {
+        let _ = admin_rev
+            .port_reverse("idle-box", remote_port, "127.0.0.1", local_port)
+            .await;
+    });
+    // Wait until node's reverse listener accepts TCP on `remote_port`.
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", remote_port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "TunnelBind never came up");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 3. Simulate 2 hours (7,200s) of complete silence AND run periodic relay reap!
+    relay.testing_backdate_routes_and_run_periodic_reap(Duration::from_secs(7200));
+
+    // 4. Also open a second independent client connection that hits its own route quota,
+    // proving cross-origin pressure does NOT evict `admin`'s 2h-idle PTY / TunnelBind routes!
+    let other_client = Client::connect(&ClientSettings {
+        relay: relay_url.clone(),
+        token: relay.admin_token.clone(),
+        fingerprint: relay.fingerprint.clone(),
+        trust: None,
+    })
+    .await
+    .expect("other client");
+    let _ = other_client.list_nodes().await.expect("other list");
+
+    // 5. Verify real PTY command STILL receives Chunk AND End { exit_code: Some(0) }!
+    pty.write(b"echo AFTER_2H_SILENCE && exit\n")
+        .await
+        .expect("pty write after 2h idle");
+    let mut after_out = String::new();
+    let mut saw_exit_zero = false;
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while !(after_out.contains("AFTER_2H_SILENCE") && saw_exit_zero) {
+        let chunk = pty
+            .read_available(Duration::from_millis(250), 65536)
+            .await
+            .expect("pty read 2");
+        assert!(
+            chunk.error.is_none(),
+            "unexpected pty error: {:?}",
+            chunk.error
+        );
+        after_out.push_str(&String::from_utf8_lossy(&chunk.data));
+        if let Some(code) = chunk.exit_code {
+            assert_eq!(code, 0);
+            saw_exit_zero = true;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "PTY went deaf after >1h idle route reap! got={after_out:?} exit={saw_exit_zero}"
+        );
+    }
+
+    // 6. Verify real TunnelBind STILL forwards a new incoming TCP connection end-to-end!
+    let mut remote_conn = tokio::net::TcpStream::connect(("127.0.0.1", remote_port))
+        .await
+        .expect("connect TunnelBind after 2h idle");
+    remote_conn.write_all(b"PING_2H").await.expect("write tunnel");
+    let mut echo_buf = [0u8; 32];
+    let n = tokio::time::timeout(Duration::from_secs(5), remote_conn.read(&mut echo_buf))
+        .await
+        .expect("TunnelBind went deaf after >1h idle route reap!")
+        .expect("read tunnel");
+    assert_eq!(&echo_buf[..n], b"ECHO:PING_2H");
+
+    rev_task.abort();
+    stop.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), node_task).await;
+}
+
 async fn wait_online(admin: &Client, name: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
