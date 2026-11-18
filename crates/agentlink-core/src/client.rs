@@ -1831,7 +1831,14 @@ impl Client {
         if let Some(id) = env.request_id() {
             self.inner.note_route(id, &node_id);
         }
-        crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env)
+        match crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env) {
+            Err(Error::Protocol(msg)) if msg.contains("counter exhausted") => {
+                self.inner.e2e.forget(&node_id);
+                self.ensure_e2e(&node_id).await?;
+                crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env)
+            }
+            other => other,
+        }
     }
 
     pub(crate) async fn ensure_e2e(&self, node_id: &str) -> Result<()> {

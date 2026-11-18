@@ -607,6 +607,10 @@ async fn handle_env(
                 Ok(triple) => triple,
                 Err(err) => {
                     tracing::warn!(error = %err, "e2e open failed");
+                    let reset = Envelope::result_err(request_id, "e2e session reset");
+                    if let Ok(out) = ws::encode(&reset) {
+                        let _ = tx.send(out).await;
+                    }
                     return;
                 }
             };

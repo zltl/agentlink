@@ -11,9 +11,10 @@
 //! to prevent that. The relay cannot forge a signature for a key it does not
 //! hold, so it cannot sit in the middle of a session bound to a known node id.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -27,21 +28,129 @@ use crate::identity::{self, Identity};
 use crate::protocol::{Envelope, Op, TransferMsg};
 
 const INFO: &[u8] = b"agentlink-e2e-v1";
-const REPLAY_WINDOW: usize = 4096;
+const REPLAY_WINDOW_BITS: u64 = 4096;
+const REPLAY_WORDS: usize = (REPLAY_WINDOW_BITS as usize) / 64;
+const MAX_SESSION_COUNTER: u64 = u64::MAX - 1;
+
+struct ReplayWindow {
+    max_seen: Option<u64>,
+    /// Bit `d` (`0 <= d < 4096`) is set iff counter `(max_seen - d)` was accepted.
+    bitmap: [u64; REPLAY_WORDS],
+}
+
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        Self {
+            max_seen: None,
+            bitmap: [0u64; REPLAY_WORDS],
+        }
+    }
+}
+
+impl ReplayWindow {
+    fn accept(&mut self, n: u64) -> Result<()> {
+        if n > MAX_SESSION_COUNTER {
+            return Err(Error::Protocol("invalid e2e frame counter".into()));
+        }
+        let Some(max) = self.max_seen else {
+            self.max_seen = Some(n);
+            self.bitmap[0] = 1;
+            return Ok(());
+        };
+        if n > max {
+            let shift = n - max;
+            if shift >= REPLAY_WINDOW_BITS {
+                self.bitmap = [0u64; REPLAY_WORDS];
+            } else {
+                let word_shift = (shift / 64) as usize;
+                let bit_shift = (shift % 64) as u32;
+                for i in (0..REPLAY_WORDS).rev() {
+                    if i < word_shift {
+                        self.bitmap[i] = 0;
+                    } else if bit_shift == 0 {
+                        self.bitmap[i] = self.bitmap[i - word_shift];
+                    } else {
+                        let hi = self.bitmap[i - word_shift] << bit_shift;
+                        let lo = if i > word_shift {
+                            self.bitmap[i - word_shift - 1] >> (64 - bit_shift)
+                        } else {
+                            0
+                        };
+                        self.bitmap[i] = hi | lo;
+                    }
+                }
+            }
+            self.bitmap[0] |= 1;
+            self.max_seen = Some(n);
+            return Ok(());
+        }
+        let delta = max - n;
+        if delta >= REPLAY_WINDOW_BITS {
+            return Err(Error::Protocol("replayed or expired e2e frame".into()));
+        }
+        let word = (delta / 64) as usize;
+        let mask = 1u64 << ((delta % 64) as u32);
+        if (self.bitmap[word] & mask) != 0 {
+            return Err(Error::Protocol("replayed e2e frame".into()));
+        }
+        self.bitmap[word] |= mask;
+        Ok(())
+    }
+}
 
 /// Keys for one direction pair after a finished handshake.
 pub struct Direction {
     encrypt: [u8; 32],
     decrypt: [u8; 32],
     send_n: AtomicU64,
-    seen: Mutex<VecDeque<u64>>,
+    seen: Mutex<ReplayWindow>,
+    epoch: Instant,
+    last_active_ms: AtomicU64,
+    received_any: AtomicBool,
+    client_eph: Option<[u8; 32]>,
+    cached_welcome: Option<Vec<u8>>,
 }
 
 impl Direction {
+    fn new(
+        encrypt: [u8; 32],
+        decrypt: [u8; 32],
+        epoch: Instant,
+        now_ms: u64,
+        client_eph: Option<[u8; 32]>,
+        cached_welcome: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            encrypt,
+            decrypt,
+            send_n: AtomicU64::new(1),
+            seen: Mutex::new(ReplayWindow::default()),
+            epoch,
+            last_active_ms: AtomicU64::new(now_ms),
+            received_any: AtomicBool::new(false),
+            client_eph,
+            cached_welcome,
+        }
+    }
+
+    fn touch(&self) {
+        let ms = self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.last_active_ms.store(ms, Ordering::Relaxed);
+    }
+
     /// Seal a plaintext with this session's send counter.
     pub fn seal(&self, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
-        let n = self.send_n.fetch_add(1, Ordering::Relaxed);
-        aead_seal(&self.encrypt, n, aad, plain)
+        let n = self
+            .send_n
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                (cur <= MAX_SESSION_COUNTER).then_some(cur + 1)
+            })
+            .map_err(|_| {
+                Error::Protocol("e2e session counter exhausted; re-handshake required".into())
+            })?;
+        let out = aead_seal(&self.encrypt, n, aad, plain)?;
+        self.touch();
+        Ok(out)
     }
 
     fn open_one(&self, aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
@@ -50,13 +159,10 @@ impl Direction {
             .seen
             .lock()
             .map_err(|_| Error::Message("e2e replay lock poisoned".into()))?;
-        if seen.contains(&n) {
-            return Err(Error::Protocol("replayed e2e frame".into()));
-        }
-        seen.push_back(n);
-        if seen.len() > REPLAY_WINDOW {
-            seen.pop_front();
-        }
+        seen.accept(n)?;
+        drop(seen);
+        self.received_any.store(true, Ordering::Release);
+        self.touch();
         Ok(plain)
     }
 
@@ -82,6 +188,68 @@ pub struct PendingHello {
 /// own e2e handshake. Replacing the only session made an in-flight `cp` fail
 /// to decrypt replies after another command shook hands.
 const MAX_SESSIONS_PER_PEER: usize = 8;
+pub const MAX_TRACKED_PEERS: usize = 1024;
+pub const IDLE_PEER_TTL_MS: u64 = 15 * 60 * 1000;
+const MAX_RETIRED_HELLOS: usize = 8192;
+
+struct EndpointState {
+    peers: HashMap<String, VecDeque<Arc<Direction>>>,
+    retired_order: VecDeque<[u8; 32]>,
+    retired_set: HashSet<[u8; 32]>,
+}
+
+impl Default for EndpointState {
+    fn default() -> Self {
+        Self {
+            peers: HashMap::new(),
+            retired_order: VecDeque::new(),
+            retired_set: HashSet::new(),
+        }
+    }
+}
+
+impl EndpointState {
+    fn retire_eph(&mut self, eph: [u8; 32]) {
+        if self.retired_set.insert(eph) {
+            self.retired_order.push_back(eph);
+            while self.retired_order.len() > MAX_RETIRED_HELLOS {
+                if let Some(oldest) = self.retired_order.pop_front() {
+                    self.retired_set.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    fn retire_sessions<'a>(&mut self, sessions: impl IntoIterator<Item = &'a Arc<Direction>>) {
+        let ephs: Vec<[u8; 32]> = sessions
+            .into_iter()
+            .filter_map(|dir| dir.client_eph)
+            .collect();
+        for eph in ephs {
+            self.retire_eph(eph);
+        }
+    }
+
+    fn prune_idle_peers(&mut self, now_ms: u64, idle_ttl_ms: u64) {
+        let stale_keys: Vec<String> = self
+            .peers
+            .iter()
+            .filter_map(|(peer, sessions)| {
+                let newest = sessions
+                    .iter()
+                    .map(|dir| dir.last_active_ms.load(Ordering::Relaxed))
+                    .max()
+                    .unwrap_or(0);
+                (now_ms.saturating_sub(newest) >= idle_ttl_ms).then(|| peer.clone())
+            })
+            .collect();
+        for key in stale_keys {
+            if let Some(removed) = self.peers.remove(&key) {
+                self.retire_sessions(removed.iter());
+            }
+        }
+    }
+}
 
 /// Sessions this process has completed, keyed by the peer's ed25519 id.
 ///
@@ -89,15 +257,21 @@ const MAX_SESSIONS_PER_PEER: usize = 8;
 #[derive(Clone)]
 pub struct Endpoint {
     identity: Arc<Identity>,
-    peers: Arc<Mutex<HashMap<String, VecDeque<Arc<Direction>>>>>,
+    epoch: Instant,
+    state: Arc<Mutex<EndpointState>>,
 }
 
 impl Endpoint {
     pub fn new(identity: Identity) -> Self {
         Self {
             identity: Arc::new(identity),
-            peers: Arc::new(Mutex::new(HashMap::new())),
+            epoch: Instant::now(),
+            state: Arc::new(Mutex::new(EndpointState::default())),
         }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
 
     pub fn identity(&self) -> &Identity {
@@ -109,16 +283,18 @@ impl Endpoint {
     }
 
     pub fn has(&self, peer: &str) -> bool {
-        self.peers
+        self.state
             .lock()
-            .map(|map| map.contains_key(peer))
+            .map(|state| state.peers.contains_key(peer))
             .unwrap_or(false)
     }
 
     /// Drop a session so the next payload starts a fresh handshake.
     pub fn forget(&self, peer: &str) {
-        if let Ok(mut map) = self.peers.lock() {
-            map.remove(peer);
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(removed) = state.peers.remove(peer) {
+                state.retire_sessions(removed.iter());
+            }
         }
     }
 
@@ -157,24 +333,51 @@ impl Endpoint {
         let signed = transcript("client", &client_eph, self.identity.public_hex());
         identity::verify_message(&client_id, signed.as_bytes(), &hex::encode(sig))?;
 
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Message("e2e session lock poisoned".into()))?;
+            if state.retired_set.contains(&client_eph) {
+                return Err(Error::Protocol("replayed e2e hello".into()));
+            }
+            if let Some(existing) = state.peers.get(&client_id).and_then(|list| {
+                list.iter()
+                    .find(|dir| dir.client_eph == Some(client_eph))
+                    .cloned()
+            }) {
+                if !existing.received_any.load(Ordering::Acquire) {
+                    if let Some(welcome) = &existing.cached_welcome {
+                        existing.touch();
+                        return Ok((client_id, welcome.clone()));
+                    }
+                }
+                return Err(Error::Protocol("replayed e2e hello".into()));
+            }
+        }
+
         let secret = EphemeralSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         let node_eph = public.to_bytes();
         let shared = secret.diffie_hellman(&PublicKey::from(client_eph));
         let (c2n, n2c) = derive(shared.as_bytes(), &client_eph, &node_eph);
-        self.insert(
-            &client_id,
-            Direction {
-                encrypt: n2c,
-                decrypt: c2n,
-                send_n: AtomicU64::new(1),
-                seen: Mutex::new(VecDeque::new()),
-            },
-        )?;
         let message = sign_raw("node", &client_eph, &node_eph, &client_id, &self.identity)?;
         let mut welcome = Vec::with_capacity(32 + 64);
         welcome.extend_from_slice(&node_eph);
         welcome.extend_from_slice(&message);
+        let now_ms = self.now_ms();
+        self.insert_with_now(
+            &client_id,
+            Direction::new(
+                n2c,
+                c2n,
+                self.epoch,
+                now_ms,
+                Some(client_eph),
+                Some(welcome.clone()),
+            ),
+            now_ms,
+        )?;
         Ok((client_id, welcome))
     }
 
@@ -190,14 +393,11 @@ impl Endpoint {
         identity::verify_message(&pending.node_id, signed.as_bytes(), &hex::encode(sig))?;
         let shared = pending.secret.diffie_hellman(&PublicKey::from(node_eph));
         let (c2n, n2c) = derive(shared.as_bytes(), &client_eph, &node_eph);
-        self.insert(
+        let now_ms = self.now_ms();
+        self.insert_with_now(
             &pending.node_id,
-            Direction {
-                encrypt: c2n,
-                decrypt: n2c,
-                send_n: AtomicU64::new(1),
-                seen: Mutex::new(VecDeque::new()),
-            },
+            Direction::new(c2n, n2c, self.epoch, now_ms, Some(client_eph), None),
+            now_ms,
         )?;
         Ok(())
     }
@@ -276,15 +476,33 @@ impl Endpoint {
         crate::frame::replace_payload(frame, &plain, false)
     }
 
-    fn insert(&self, peer: &str, direction: Direction) -> Result<()> {
-        let mut map = self
-            .peers
+    fn insert_with_now(&self, peer: &str, direction: Direction, now_ms: u64) -> Result<()> {
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| Error::Message("e2e session lock poisoned".into()))?;
-        let entry = map.entry(peer.to_string()).or_default();
-        entry.push_back(Arc::new(direction));
-        while entry.len() > MAX_SESSIONS_PER_PEER {
-            entry.pop_front();
+        if !state.peers.contains_key(peer) && state.peers.len() >= MAX_TRACKED_PEERS {
+            state.prune_idle_peers(now_ms, IDLE_PEER_TTL_MS);
+            if state.peers.len() >= MAX_TRACKED_PEERS {
+                return Err(Error::Protocol(format!(
+                    "e2e peer table at capacity ({MAX_TRACKED_PEERS} active peers)"
+                )));
+            }
+        }
+        let mut evicted_eph = Vec::new();
+        {
+            let entry = state.peers.entry(peer.to_string()).or_default();
+            entry.push_back(Arc::new(direction));
+            while entry.len() > MAX_SESSIONS_PER_PEER {
+                if let Some(oldest) = entry.pop_front() {
+                    if let Some(eph) = oldest.client_eph {
+                        evicted_eph.push(eph);
+                    }
+                }
+            }
+        }
+        for eph in evicted_eph {
+            state.retire_eph(eph);
         }
         Ok(())
     }
@@ -299,18 +517,19 @@ impl Endpoint {
     }
 
     fn sessions_for(&self, peer: &str) -> Result<VecDeque<Arc<Direction>>> {
-        self.peers
+        self.state
             .lock()
             .map_err(|_| Error::Message("e2e session lock poisoned".into()))?
+            .peers
             .get(peer)
             .cloned()
             .ok_or_else(|| Error::Protocol(format!("no e2e session for {peer}")))
     }
 
     pub fn peer_ids(&self) -> Vec<String> {
-        self.peers
+        self.state
             .lock()
-            .map(|map| map.keys().cloned().collect())
+            .map(|state| state.peers.keys().cloned().collect())
             .unwrap_or_default()
     }
 }
@@ -756,5 +975,173 @@ mod tests {
         assert_eq!(peer, b.peer_id());
         let opened: Envelope = serde_json::from_slice(&plain).unwrap();
         assert!(matches!(opened, Envelope::Transfer { .. }));
+    }
+
+    #[test]
+    fn old_frame_beyond_4096_window_stays_permanently_rejected_and_out_of_order_works() {
+        let client = Endpoint::new(Identity::generate());
+        let node = Endpoint::new(Identity::generate());
+        let pending = client.client_hello(node.peer_id()).unwrap();
+        let (_, welcome) = node.accept(Endpoint::hello_bytes(&pending)).unwrap();
+        client.complete(pending, &welcome).unwrap();
+
+        let first = client.seal(node.peer_id(), b"req", b"m1").unwrap();
+        assert_eq!(node.open(client.peer_id(), b"req", &first).unwrap(), b"m1");
+
+        // Advance past the 4096-frame sliding window.
+        let mut hold_recent = Vec::new();
+        for idx in 0..4105u32 {
+            let ct = client
+                .seal(node.peer_id(), b"req", &idx.to_le_bytes())
+                .unwrap();
+            if idx == 4100 || idx == 4101 {
+                // Hold two in-window packets to deliver out-of-order after 4104.
+                hold_recent.push((idx, ct));
+            } else {
+                assert_eq!(
+                    node.open(client.peer_id(), b"req", &ct).unwrap(),
+                    idx.to_le_bytes()
+                );
+            }
+        }
+
+        // Replaying the very first ciphertext after >4096 packets MUST still fail!
+        assert!(
+            node.open(client.peer_id(), b"req", &first).is_err(),
+            "frame older than 4096-packet window was accepted again on replay!"
+        );
+
+        // Out-of-order frames inside the 4096-bit window open once and reject second time.
+        for (idx, ct) in hold_recent.into_iter().rev() {
+            assert_eq!(
+                node.open(client.peer_id(), b"req", &ct).unwrap(),
+                idx.to_le_bytes()
+            );
+            assert!(node.open(client.peer_id(), b"req", &ct).is_err());
+        }
+    }
+
+    #[test]
+    fn replayed_hello_cannot_evict_active_peer_sessions() {
+        let shared_id = Identity::generate();
+        let active_client = Endpoint::new(shared_id.clone());
+        let replay_source = Endpoint::new(shared_id);
+        let node = Endpoint::new(Identity::generate());
+
+        let p_active = active_client.client_hello(node.peer_id()).unwrap();
+        let (_, w_active) = node.accept(Endpoint::hello_bytes(&p_active)).unwrap();
+        active_client.complete(p_active, &w_active).unwrap();
+        let ct0 = active_client
+            .seal(node.peer_id(), b"r0", b"alive-0")
+            .unwrap();
+        assert_eq!(
+            node.open(active_client.peer_id(), b"r0", &ct0).unwrap(),
+            b"alive-0"
+        );
+
+        // Relay captures one valid hello and replays it 16 times trying to churn MAX_SESSIONS_PER_PEER.
+        let p_captured = replay_source.client_hello(node.peer_id()).unwrap();
+        let captured_hello = Endpoint::hello_bytes(&p_captured).to_vec();
+        let (_, w_first) = node.accept(&captured_hello).unwrap();
+        // Before first ciphertext: idempotent welcome (reconnect safety), no extra slot churn.
+        for _ in 0..12 {
+            let _ = node.accept(&captured_hello);
+        }
+        // Active session MUST still be alive and decrypting!
+        let ct1 = active_client
+            .seal(node.peer_id(), b"r1", b"alive-1")
+            .unwrap();
+        assert_eq!(
+            node.open(active_client.peer_id(), b"r1", &ct1).unwrap(),
+            b"alive-1"
+        );
+
+        // Once the second session sends traffic, replaying its E2eHello is hard-rejected.
+        replay_source.complete(p_captured, &w_first).unwrap();
+        let ct_b = replay_source.seal(node.peer_id(), b"rb", b"used").unwrap();
+        assert_eq!(
+            node.open(replay_source.peer_id(), b"rb", &ct_b).unwrap(),
+            b"used"
+        );
+        assert!(
+            node.accept(&captured_hello).is_err(),
+            "replayed E2eHello for an already-used session must be rejected"
+        );
+    }
+
+    #[test]
+    fn counter_exhaustion_fails_closed_without_nonce_wrap() {
+        let client = Endpoint::new(Identity::generate());
+        let node = Endpoint::new(Identity::generate());
+        let pending = client.client_hello(node.peer_id()).unwrap();
+        let (_, welcome) = node.accept(Endpoint::hello_bytes(&pending)).unwrap();
+        client.complete(pending, &welcome).unwrap();
+
+        let dir = client.direction(node.peer_id()).unwrap();
+        dir.send_n.store(MAX_SESSION_COUNTER, Ordering::SeqCst);
+        let last_ok = client.seal(node.peer_id(), b"aad", b"penultimate").unwrap();
+        assert_eq!(
+            node.open(client.peer_id(), b"aad", &last_ok).unwrap(),
+            b"penultimate"
+        );
+        let exhausted = client.seal(node.peer_id(), b"aad", b"overflow");
+        assert!(exhausted.is_err(), "counter must fail closed at u64::MAX");
+        assert_eq!(dir.send_n.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn peer_table_cap_prunes_only_idle_peers_and_never_evicts_active_sessions() {
+        let node = Endpoint::new(Identity::generate());
+        let active = Endpoint::new(Identity::generate());
+        let p0 = active.client_hello(node.peer_id()).unwrap();
+        let (_, w0) = node.accept(Endpoint::hello_bytes(&p0)).unwrap();
+        active.complete(p0, &w0).unwrap();
+
+        // Fill remaining MAX_TRACKED_PEERS - 1 slots with synthetic peers.
+        {
+            let mut state = node.state.lock().unwrap();
+            for i in 1..MAX_TRACKED_PEERS {
+                let mut dq = VecDeque::new();
+                dq.push_back(Arc::new(Direction::new(
+                    [1u8; 32],
+                    [2u8; 32],
+                    node.epoch,
+                    1_000_000,
+                    Some([i as u8; 32]),
+                    None,
+                )));
+                state.peers.insert(format!("peer-{i}"), dq);
+            }
+            // Mark active peer fresh too.
+            for dir in state.peers.get(active.peer_id()).unwrap() {
+                dir.last_active_ms.store(1_000_000, Ordering::SeqCst);
+            }
+        }
+
+        // When all 1024 peers are active within IDLE_PEER_TTL_MS, a 1025th peer is refused
+        // rather than evicting any active session.
+        let newcomer = Endpoint::new(Identity::generate());
+        let p_new = newcomer.client_hello(node.peer_id()).unwrap();
+        assert!(node.accept(Endpoint::hello_bytes(&p_new)).is_err());
+
+        // Active peer still decrypts cleanly.
+        let ct = active.seal(node.peer_id(), b"r", b"still-live").unwrap();
+        assert_eq!(
+            node.open(active.peer_id(), b"r", &ct).unwrap(),
+            b"still-live"
+        );
+
+        // Once one synthetic peer exceeds IDLE_PEER_TTL_MS, pruning frees its slot while
+        // retiring its hello and keeping active peers intact.
+        {
+            let mut state = node.state.lock().unwrap();
+            state.peers.get("peer-1").unwrap()[0]
+                .last_active_ms
+                .store(0, Ordering::SeqCst);
+            state.prune_idle_peers(IDLE_PEER_TTL_MS + 10, IDLE_PEER_TTL_MS);
+            assert!(!state.peers.contains_key("peer-1"));
+            assert!(state.retired_set.contains(&[1u8; 32]));
+        }
+        assert!(node.accept(Endpoint::hello_bytes(&p_new)).is_ok());
     }
 }

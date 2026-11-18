@@ -446,6 +446,193 @@ detail = "off"
     let _ = tokio::time::timeout(Duration::from_secs(5), legacy_task).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_node_handler_rejects_wire_replayed_e2e_frames_and_hello_flood() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let capture = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let relay = RelayHandle::spawn(RelayConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        data_dir: dir.path().join("relay"),
+        capture: Some(capture.clone()),
+        database_url: None,
+        allow_signup: false,
+        bootstrap_admin: false,
+        db_schema: None,
+        trust_proxy: Vec::new(),
+        print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
+    })
+    .await
+    .expect("relay");
+    let relay_url = format!("wss://{}/v1/connect", relay.local_addr);
+    let admin = Client::connect(&ClientSettings {
+        relay: relay_url.clone(),
+        token: relay.admin_token.clone(),
+        fingerprint: relay.fingerprint.clone(),
+        trust: None,
+    })
+    .await
+    .expect("admin");
+
+    let tok = admin
+        .create_pairing_token("replay-box", NodePolicy::exec(), 600)
+        .await
+        .expect("pair");
+    let node_dir = dir.path().join("replay-box");
+    std::fs::create_dir_all(&node_dir).expect("mkdir");
+    let stop = CancellationToken::new();
+    let node_task = tokio::spawn(run(
+        NodeConfig {
+            relay_url: relay_url.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+            data_dir: node_dir.clone(),
+            name: "replay-box".into(),
+            pairing_token: Some(tok.token),
+            root: None,
+            max_policy: NodePolicy::phase1_ceiling(),
+            version: "test".into(),
+            extensions: Vec::new(),
+            policy_hook: None,
+            capture: None,
+        },
+        stop.clone(),
+    ));
+    wait_online(&admin, "replay-box").await;
+    let ident = std::fs::read_to_string(node_dir.join("identity.json")).expect("ident");
+    let box_id = serde_json::from_str::<serde_json::Value>(&ident)
+        .expect("json")["public_hex"]
+        .as_str()
+        .expect("hex")
+        .to_string();
+    admin
+        .install_local_grant(&node_dir, &box_id)
+        .expect("install grant");
+
+    let marker_file = dir.path().join("once.txt");
+    let marker_s = marker_file.to_string_lossy().to_string();
+    let out = admin
+        .exec_collect(
+            "replay-box",
+            ExecRequest::shell(
+                &format!("printf x >> '{marker_s}'"),
+                Some(Duration::from_secs(10)),
+            ),
+            None,
+        )
+        .await
+        .expect("initial exec");
+    assert_eq!(out.exit_code, Some(0));
+    assert_eq!(std::fs::read_to_string(&marker_file).expect("read"), "x");
+
+    // Extract the captured E2eHello and E2e exec frames from the wire capture.
+    let (captured_hello, captured_e2e) = {
+        let frames = capture.lock().expect("lock");
+        let mut hello = None;
+        let mut e2e = None;
+        for raw in frames.iter() {
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(raw) else {
+                continue;
+            };
+            match val.get("type").and_then(|t| t.as_str()) {
+                Some("e2e_hello") if hello.is_none() => hello = Some(val),
+                Some("e2e")
+                    if e2e.is_none()
+                        && val.get("class").and_then(|c| c.as_str()) == Some("exec") =>
+                {
+                    e2e = Some(val);
+                }
+                _ => {}
+            }
+        }
+        (hello.expect("captured hello"), e2e.expect("captured e2e"))
+    };
+
+    // Open a raw authenticated client WebSocket and replay the captured E2eHello 16x + E2e exec.
+    let trust = agentlink_core::tls::RelayTrust::parse(&relay.fingerprint, None).expect("trust");
+    let tcp = tokio::net::TcpStream::connect(relay.local_addr)
+        .await
+        .expect("tcp");
+    let tls_cfg = agentlink_core::tls::client_config_for(&trust).expect("tls cfg");
+    let connector = tokio_rustls::TlsConnector::from(tls_cfg);
+    let sni = agentlink_core::tls::server_name("127.0.0.1", &trust).expect("sni");
+    let tls = connector.connect(sni, tcp).await.expect("tls");
+    let (mut ws, _) = tokio_tungstenite::client_async(
+        format!("ws://{}/v1/connect", relay.local_addr),
+        tls,
+    )
+    .await
+    .expect("ws");
+    let raw_id = Identity::generate();
+    let hello_env = serde_json::json!({
+        "type": "hello",
+        "role": "client",
+        "protocol": agentlink_core::PROTOCOL_VERSION,
+        "token": relay.admin_token,
+        "public_key": raw_id.public_hex(),
+        "name": "admin",
+    });
+    ws.send(Message::Text(hello_env.to_string().into()))
+        .await
+        .expect("send hello");
+    loop {
+        let msg = ws.next().await.expect("msg").expect("ok");
+        if let Message::Text(txt) = msg {
+            let v: serde_json::Value = serde_json::from_str(&txt).expect("json");
+            if v["type"] == "challenge" {
+                let sig = raw_id.sign_nonce(v["nonce"].as_str().expect("nonce"));
+                ws.send(Message::Text(
+                    serde_json::json!({"type": "authenticate", "signature": sig})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("auth");
+            } else if v["type"] == "hello_ok" {
+                break;
+            }
+        }
+    }
+
+    // Replay the captured E2eHello 16 times to try to churn the active session ring,
+    // and replay the captured E2e exec frame.
+    for idx in 0..16 {
+        let mut h = captured_hello.clone();
+        h["request_id"] = serde_json::Value::String(format!("replay-h-{idx}"));
+        ws.send(Message::Text(h.to_string().into()))
+            .await
+            .expect("send replayed hello");
+    }
+    ws.send(Message::Text(captured_e2e.to_string().into()))
+        .await
+        .expect("send replayed e2e");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // 1. Replayed E2e exec MUST NOT have executed a second time!
+    assert_eq!(
+        std::fs::read_to_string(&marker_file).expect("read"),
+        "x",
+        "replayed E2e exec frame executed twice!"
+    );
+    // 2. Original active `admin` session MUST still execute without E2E reset!
+    let out2 = admin
+        .exec_collect(
+            "replay-box",
+            ExecRequest::shell("echo still-ok", Some(Duration::from_secs(10))),
+            None,
+        )
+        .await
+        .expect("active session after hello replay flood");
+    assert_eq!(out2.exit_code, Some(0));
+    assert!(String::from_utf8_lossy(&out2.stdout).contains("still-ok"));
+
+    stop.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), node_task).await;
+}
+
 async fn wait_online(admin: &Client, name: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
