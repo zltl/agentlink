@@ -1018,6 +1018,9 @@ pub fn is_public_webhook_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_public_webhook_ipv4(v4),
         std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
             if let Some(mapped) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
                 return is_public_webhook_ipv4(mapped);
             }
@@ -1026,23 +1029,20 @@ pub fn is_public_webhook_ip(ip: std::net::IpAddr) -> bool {
             let is_unique_local = (seg0 & 0xfe00) == 0xfc00;
             let is_link_local = (seg0 & 0xffc0) == 0xfe80;
             let is_doc = seg0 == 0x2001 && seg1 == 0x0db8;
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || is_unique_local
-                || is_link_local
-                || is_doc)
+            !(is_unique_local || is_link_local || is_doc)
         }
     }
 }
 
 fn is_public_webhook_ipv4(v4: std::net::Ipv4Addr) -> bool {
     let oct = v4.octets();
+    let is_this_net = oct[0] == 0;
     let is_cgnat = oct[0] == 100 && (64..=127).contains(&oct[1]);
     let is_benchmark = oct[0] == 198 && (oct[1] == 18 || oct[1] == 19);
     let is_ietf_special = oct[0] == 192 && oct[1] == 0 && oct[2] == 0;
     let is_reserved = oct[0] >= 240;
-    !(v4.is_loopback()
+    !(is_this_net
+        || v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_unspecified()
