@@ -43,7 +43,7 @@ int al_pw_validate_frame_copy(
     uint64_t min_valid64;
     uint64_t copy64;
 
-    if (width <= 0 || height <= 0 || width > AL_PW_MAX_DIM || height > AL_PW_MAX_DIM) {
+    if (width <= 0 || height <= 0 || width > AL_PW_MAX_DIM || height > AL_PW_MAX_DIM || chunk_stride < 0) {
         return 0;
     }
     min_row = (uint64_t)(uint32_t)width * 4ULL;
