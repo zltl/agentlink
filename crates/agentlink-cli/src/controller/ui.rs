@@ -27,8 +27,7 @@ use super::model::{
 use super::term::Emulator;
 use super::theme;
 use super::viewport::{
-    content_rect_excluding_pad, content_uv_excluding_pad, hit_content, native_zoom,
-    point_to_fraction, viewport_rect,
+    content_rect_excluding_pad, content_uv_excluding_pad, hit_content, native_zoom, viewport_rect,
 };
 use super::worker::{Cmd, LiveHud, MonitorEntry, Picture, Shared, UiEvent};
 

@@ -754,6 +754,13 @@ fn html_response(body: String) -> ErrorResponse {
     Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
+        .header("x-content-type-options", "nosniff")
+        .header("x-frame-options", "DENY")
+        .header("referrer-policy", "no-referrer")
+        .header(
+            "content-security-policy",
+            "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+        )
         .body(Some(body))
         .expect("static response")
 }

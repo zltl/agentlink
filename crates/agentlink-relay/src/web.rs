@@ -37,7 +37,7 @@ impl HttpReply {
     pub fn encode_for_method(&self, method: &str) -> Vec<u8> {
         let length = self.content_length.unwrap_or_else(|| self.body.len());
         let mut header = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: frame-ancestors 'none'; base-uri 'self'; object-src 'none'\r\nConnection: close\r\n",
             self.status,
             self.reason,
             self.content_type,
@@ -1388,5 +1388,17 @@ mod tests {
             "a forwarded header must not override a matching Host"
         );
         assert!(allow(&[json, ("host", "relay.example.com")]));
+    }
+
+    #[test]
+    fn http_reply_includes_anti_framing_and_nosniff_security_headers() {
+        let raw = String::from_utf8(dashboard_page().encode_for_method("HEAD")).unwrap();
+        let lower = raw.to_ascii_lowercase();
+        assert!(lower.contains("x-frame-options: deny\r\n"), "{raw}");
+        assert!(lower.contains("x-content-type-options: nosniff\r\n"), "{raw}");
+        assert!(
+            lower.contains("content-security-policy:") && lower.contains("frame-ancestors 'none'"),
+            "{raw}"
+        );
     }
 }
