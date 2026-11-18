@@ -535,15 +535,95 @@ impl Emulator {
             self.focused = true;
         }
 
+        // Scrollback and pointer selection run BEFORE `renderable_content()` so
+        // drags, double-clicks, and click-clears paint in the very same frame.
+        if response.hovered() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll > 0.5 {
+                self.term
+                    .scroll_display(Scroll::Delta(scroll as i32 / 20 + 1));
+            } else if scroll < -0.5 {
+                self.term
+                    .scroll_display(Scroll::Delta(scroll as i32 / 20 - 1));
+            }
+        }
+
+        let grid_display_offset = self.term.grid().display_offset();
+        let to_point = |pos: Pos2| -> Point {
+            let col = ((pos.x - rect.min.x) / cell_w)
+                .floor()
+                .clamp(0.0, (cols - 1) as f32) as usize;
+            let row = ((pos.y - rect.min.y) / cell_h)
+                .floor()
+                .clamp(0.0, (rows - 1) as f32) as i32;
+            let line = Line(row - grid_display_offset as i32);
+            Point::new(line, Column(col))
+        };
+
+        let drag_started = response.drag_started_by(PointerButton::Primary);
+        let dragged = response.dragged_by(PointerButton::Primary);
+        let drag_stopped = response.drag_stopped();
+
+        if drag_started {
+            let origin = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if let Some(start_pos) = origin {
+                let mut sel =
+                    Selection::new(SelectionType::Simple, to_point(start_pos), Side::Left);
+                if let Some(cur_pos) = response.interact_pointer_pos() {
+                    sel.update(to_point(cur_pos), Side::Right);
+                }
+                sel.include_all();
+                self.term.selection = Some(sel);
+                self.selecting = true;
+                ui.ctx().request_repaint();
+            }
+        } else if self.selecting && dragged {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(sel) = self.term.selection.as_mut() {
+                    sel.update(to_point(pos), Side::Right);
+                    sel.include_all();
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        if drag_stopped && self.selecting {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(sel) = self.term.selection.as_mut() {
+                    sel.update(to_point(pos), Side::Right);
+                    sel.include_all();
+                }
+            }
+            self.selecting = false;
+            ui.ctx().request_repaint();
+        }
+        if primary_click_clears_selection(
+            response.clicked_by(PointerButton::Primary),
+            dragged || drag_started || drag_stopped,
+            response.double_clicked_by(PointerButton::Primary),
+        ) {
+            if self.term.selection.take().is_some() {
+                ui.ctx().request_repaint();
+            }
+        }
+        if response.double_clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let point = to_point(pos);
+                self.term.selection =
+                    Some(Selection::new(SelectionType::Semantic, point, Side::Left));
+                ui.ctx().request_repaint();
+            }
+        }
+
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, palette_bg());
 
-        let display_offset;
         let cursor_point;
         let cursor_hidden;
         {
             let content = self.term.renderable_content();
-            display_offset = content.display_offset;
+            let display_offset = content.display_offset;
             cursor_point = content.cursor.point;
             cursor_hidden = matches!(
                 content.cursor.shape,
@@ -572,12 +652,19 @@ impl Emulator {
                 );
                 let mut fg = resolve_color(indexed.cell.fg, true);
                 let mut bg = resolve_color(indexed.cell.bg, false);
-                let inverse = indexed.cell.flags.contains(Flags::INVERSE)
-                    || selection.is_some_and(|s| s.contains(indexed.point));
-                if inverse {
+                let selected = selection.is_some_and(|s| {
+                    s.contains(indexed.point)
+                        || (wide
+                            && s.contains(Point::new(indexed.point.line, indexed.point.column + 1)))
+                });
+                if indexed.cell.flags.contains(Flags::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
-                if indexed.cell.flags.contains(Flags::DIM) {
+                if selected {
+                    bg = selection_bg();
+                    fg = Color32::WHITE;
+                }
+                if indexed.cell.flags.contains(Flags::DIM) && !selected {
                     fg = Color32::from_rgb(
                         (fg.r() as u16 * 2 / 3) as u8,
                         (fg.g() as u16 * 2 / 3) as u8,
@@ -652,60 +739,6 @@ impl Emulator {
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput { rect, cursor_rect });
             });
-        }
-
-        // Scrollback
-        if response.hovered() {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll > 0.5 {
-                self.term
-                    .scroll_display(Scroll::Delta(scroll as i32 / 20 + 1));
-            } else if scroll < -0.5 {
-                self.term
-                    .scroll_display(Scroll::Delta(scroll as i32 / 20 - 1));
-            }
-        }
-
-        let to_point = |pos: Pos2| -> Point {
-            let col = ((pos.x - rect.min.x) / cell_w)
-                .floor()
-                .clamp(0.0, (cols - 1) as f32) as usize;
-            let row = ((pos.y - rect.min.y) / cell_h)
-                .floor()
-                .clamp(0.0, (rows - 1) as f32) as i32;
-            let line = Line(row - display_offset as i32);
-            Point::new(line, Column(col))
-        };
-
-        if response.drag_started_by(PointerButton::Primary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let point = to_point(pos);
-                self.term.selection =
-                    Some(Selection::new(SelectionType::Simple, point, Side::Left));
-                self.selecting = true;
-            }
-        } else if self.selecting && response.dragged_by(PointerButton::Primary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if let Some(sel) = self.term.selection.as_mut() {
-                    sel.update(to_point(pos), Side::Right);
-                }
-            }
-        } else if response.drag_stopped() {
-            self.selecting = false;
-        }
-        if primary_click_clears_selection(
-            response.clicked_by(PointerButton::Primary),
-            response.dragged_by(PointerButton::Primary),
-            response.double_clicked_by(PointerButton::Primary),
-        ) {
-            self.term.selection = None;
-        }
-        if response.double_clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let point = to_point(pos);
-                self.term.selection =
-                    Some(Selection::new(SelectionType::Semantic, point, Side::Left));
-            }
         }
 
         if (response.has_focus() || self.focused) && !self.keys_taken {
@@ -1068,6 +1101,10 @@ fn key_name(key: Key) -> &'static str {
 
 fn palette_bg() -> Color32 {
     Color32::from_rgb(0x0D, 0x0D, 0x12)
+}
+
+fn selection_bg() -> Color32 {
+    Color32::from_rgb(0x2F, 0x65, 0xB8)
 }
 
 fn palette_fg() -> Color32 {
@@ -1526,5 +1563,160 @@ mod tests {
         term.feed(b"\x1b]52;c;c2VjcmV0LWNsaXA=\x07");
         term.set_allow_osc52(false);
         assert_eq!(term.take_osc52_copy(), None);
+    }
+
+    fn count_selection_rects(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(shape: &egui::epaint::Shape) -> usize {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == selection_bg() => 1,
+                egui::epaint::Shape::Vec(items) => items.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
+    #[test]
+    fn real_egui_three_frame_drag_highlights_copies_and_plain_click_clears() {
+        let ctx = egui::Context::default();
+        let mut term = Emulator::new(24, 80);
+        term.focused = true;
+        term.feed(b"echo COPY_OK_99 done\r\n");
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 480.0));
+        let mut time = 0.0_f64;
+        let mut step = |term: &mut Emulator, events: Vec<GuiEvent>| -> (TermOutput, egui::FullOutput) {
+            let mut out = TermOutput::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                predicted_dt: 1.0 / 60.0,
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            time += 0.1;
+            let full = ctx.run(raw, |ctx| {
+                term.consume_focused_keys(ctx);
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        out = term.show(ui);
+                    });
+            });
+            (out, full)
+        };
+
+        // Warm-up frame so fonts and cell metrics settle.
+        let _ = step(&mut term, Vec::new());
+        let font = egui::FontId::monospace(13.0);
+        let (cell_w, cell_h) = ctx.fonts(|fonts| {
+            let galley = fonts.layout_no_wrap("W".to_owned(), font.clone(), Color32::WHITE);
+            (galley.size().x.max(7.0), galley.size().y.max(font.size * 1.25))
+        });
+        let cell_center = |col: usize, row: usize| -> Pos2 {
+            Pos2::new((col as f32 + 0.5) * cell_w, (row as f32 + 0.5) * cell_h)
+        };
+
+        // Columns 5..=14 on row 0 are "COPY_OK_99".
+        // Reproduce the exact 3-frame VNC/GUI drag: Down(5,0) -> Move(14,0) -> Up(14,0).
+        let start = cell_center(5, 0);
+        let end = cell_center(14, 0);
+        let _ = step(
+            &mut term,
+            vec![
+                GuiEvent::PointerMoved(start),
+                GuiEvent::PointerButton {
+                    pos: start,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, move_frame) = step(&mut term, vec![GuiEvent::PointerMoved(end)]);
+        assert_eq!(
+            count_selection_rects(&move_frame.shapes),
+            10,
+            "same-frame drag must paint 10 highlighted selection cells"
+        );
+        let (_, up_frame) = step(
+            &mut term,
+            vec![GuiEvent::PointerButton {
+                pos: end,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(term.selection_text().as_deref(), Some("COPY_OK_99"));
+        assert_eq!(count_selection_rects(&up_frame.shapes), 10);
+
+        // Native Copy (`Ctrl+C`) copies the selection and does NOT send `^C`.
+        let (copy_out, copy_full) = step(&mut term, vec![GuiEvent::Copy]);
+        assert!(copy_out.writes.is_empty(), "selected Ctrl+C must not send ^C");
+        let copied = copy_full
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            });
+        assert_eq!(copied.as_deref(), Some("COPY_OK_99"));
+
+        // Plain primary click clears selection, and the next Copy sends `^C` (`0x03`).
+        let click_pt = cell_center(1, 0);
+        let _ = step(
+            &mut term,
+            vec![
+                GuiEvent::PointerMoved(click_pt),
+                GuiEvent::PointerButton {
+                    pos: click_pt,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, clear_frame) = step(
+            &mut term,
+            vec![GuiEvent::PointerButton {
+                pos: click_pt,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(term.selection_text(), None);
+        assert_eq!(count_selection_rects(&clear_frame.shapes), 0);
+
+        let (intr_out, _) = step(&mut term, vec![GuiEvent::Copy]);
+        assert_eq!(intr_out.writes, vec![0x03]);
+
+        // Right-to-left drag (col 14 -> col 5) also selects all 10 characters.
+        let _ = step(
+            &mut term,
+            vec![
+                GuiEvent::PointerMoved(end),
+                GuiEvent::PointerButton {
+                    pos: end,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = step(&mut term, vec![GuiEvent::PointerMoved(start)]);
+        let _ = step(
+            &mut term,
+            vec![GuiEvent::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(term.selection_text().as_deref(), Some("COPY_OK_99"));
     }
 }
