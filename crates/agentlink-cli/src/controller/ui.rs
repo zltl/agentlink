@@ -315,6 +315,7 @@ pub struct ControllerApp {
     desk_fullscreen: bool,
     desk_capture_keys: bool,
     desk_held_keys: HashSet<String>,
+    desk_key_state: super::desk_keys::KeyPairState,
     /// Grant/policy rejected further injection until the session restarts.
     desk_input_blocked: bool,
     /// Toolbar menu of chords the local OS may swallow.
@@ -592,6 +593,7 @@ impl ControllerApp {
             desk_fullscreen: false,
             desk_capture_keys: false,
             desk_held_keys: HashSet::new(),
+            desk_key_state: super::desk_keys::KeyPairState::default(),
             desk_input_blocked: false,
             desk_send_menu: false,
             desk_sticky: HashSet::new(),
@@ -1335,6 +1337,8 @@ impl eframe::App for ControllerApp {
             && !self.flags.quit.load(Ordering::Relaxed)
             && ctx.input(|input| input.viewport().close_requested())
         {
+            self.desk_capture_keys = false;
+            self.release_remote_input();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -3763,7 +3767,15 @@ impl ControllerApp {
             command: m.command || m.mac_cmd,
         };
 
+        let target_os = self
+            .nodes
+            .iter()
+            .find(|n| n.id == node)
+            .map(|n| desk_keys::TargetOs::from_node_os(&n.os))
+            .unwrap_or_default();
+
         let (slots, final_mods) = ui.ctx().input(|input| {
+            let frame_mods = snap(input.modifiers);
             let mut slots: Vec<Slot> = Vec::new();
             for event in &input.events {
                 match event {
@@ -3820,14 +3832,14 @@ impl ControllerApp {
                         slots.push(Slot::Pointer(FrameEvent::PointerGone));
                     }
                     other if capture_keys => {
-                        if let Some(host) = host_key_from_egui(other, snap) {
+                        if let Some(host) = host_key_from_egui(other, frame_mods, snap) {
                             slots.push(Slot::Key(host));
                         }
                     }
                     _ => {}
                 }
             }
-            (slots, snap(input.modifiers))
+            (slots, frame_mods)
         });
         if capture_keys {
             // Keys belong to the remote session. Leave pointer events so the
@@ -3836,7 +3848,14 @@ impl ControllerApp {
                 input.events.retain(|event| !egui_event_is_keyboard(event));
             });
         }
-        let events = desk_keys::interleave(true, capture_keys, &slots);
+        let events = desk_keys::interleave_with_state(
+            true,
+            capture_keys,
+            target_os,
+            &mut self.desk_key_state,
+            &slots,
+            final_mods,
+        );
 
         let out = adapt_frame(
             &mut self.desk_adapter,
@@ -3891,7 +3910,13 @@ impl ControllerApp {
     }
 
     fn release_keyboard_if_ungated(&mut self, ctx: &egui::Context) {
-        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        let focused = ctx.input(|input| {
+            let lost_event = input
+                .events
+                .iter()
+                .any(|ev| matches!(ev, egui::Event::WindowFocused(false)));
+            !lost_event && input.viewport().focused.unwrap_or(true)
+        });
         let exiting = self.flags.quit.load(Ordering::Relaxed) || self.debug_quit;
         let (on_desktop, control) = match &self.screen {
             Screen::Desktop { id, .. } => (
@@ -3924,12 +3949,14 @@ impl ControllerApp {
             self.release_remote_input_on(&id);
         } else {
             self.desk_held_keys.clear();
+            self.desk_key_state.clear();
             self.desk_adapter = super::input_adapter::AdapterState::default();
             self.desk_sticky.clear();
         }
     }
 
     fn release_remote_input_on(&mut self, node: &str) {
+        self.desk_key_state.clear();
         let keys: Vec<String> = self.desk_held_keys.drain().collect();
         for key in keys {
             self.inject_key_edge(node, &key, false);
@@ -4587,31 +4614,34 @@ fn egui_event_is_keyboard(event: &egui::Event) -> bool {
 
 fn host_key_from_egui(
     event: &egui::Event,
+    frame_mods: super::input_adapter::ModSnapshot,
     snap: impl Fn(egui::Modifiers) -> super::input_adapter::ModSnapshot,
 ) -> Option<super::desk_keys::HostKey> {
     use super::desk_keys::HostKey;
     match event {
         egui::Event::Key {
             key,
+            physical_key,
             pressed,
             repeat,
             modifiers,
-            ..
         } => {
-            let name = egui_key_name(*key)?;
+            let name = egui_key_name(*key).or_else(|| physical_key.and_then(egui_key_name))?;
+            let physical = physical_key.and_then(egui_key_name).map(str::to_string);
             Some(HostKey::Key {
                 name: name.to_string(),
+                physical,
                 pressed: *pressed,
                 repeat: *repeat,
                 mods: snap(*modifiers),
             })
         }
         egui::Event::Text(text) => Some(HostKey::Text(text.clone())),
-        egui::Event::Copy => Some(HostKey::Copy),
-        egui::Event::Cut => Some(HostKey::Cut),
+        egui::Event::Copy => Some(HostKey::Copy { mods: frame_mods }),
+        egui::Event::Cut => Some(HostKey::Cut { mods: frame_mods }),
         // Clipboard bytes stay on the desktop clipboard channel. A captured
-        // paste is the remote Ctrl+V chord, not a second typed payload.
-        egui::Event::Paste(_) => Some(HostKey::Paste),
+        // paste is the remote Ctrl+V (or Shift+Insert) chord, not typed text.
+        egui::Event::Paste(_) => Some(HostKey::Paste { mods: frame_mods }),
         egui::Event::Ime(egui::ImeEvent::Preedit(text)) => Some(HostKey::ImePreedit(text.clone())),
         egui::Event::Ime(egui::ImeEvent::Commit(text)) => Some(HostKey::ImeCommit(text.clone())),
         egui::Event::Ime(_) => None,
@@ -4636,6 +4666,9 @@ fn egui_key_name(key: egui::Key) -> Option<&'static str> {
         egui::Key::Home => Some("home"),
         egui::Key::End => Some("end"),
         egui::Key::Space => Some("space"),
+        egui::Key::Copy => Some("copy"),
+        egui::Key::Cut => Some("cut"),
+        egui::Key::Paste => Some("paste"),
         egui::Key::Minus => Some("-"),
         egui::Key::Plus => Some("+"),
         egui::Key::Equals => Some("="),
@@ -4643,10 +4676,16 @@ fn egui_key_name(key: egui::Key) -> Option<&'static str> {
         egui::Key::Period => Some("."),
         egui::Key::Slash => Some("/"),
         egui::Key::Backslash => Some("\\"),
+        egui::Key::Pipe => Some("|"),
+        egui::Key::Colon => Some(":"),
         egui::Key::Semicolon => Some(";"),
         egui::Key::Quote => Some("'"),
+        egui::Key::Questionmark => Some("?"),
+        egui::Key::Exclamationmark => Some("!"),
         egui::Key::OpenBracket => Some("["),
         egui::Key::CloseBracket => Some("]"),
+        egui::Key::OpenCurlyBracket => Some("{"),
+        egui::Key::CloseCurlyBracket => Some("}"),
         egui::Key::Backtick => Some("`"),
         egui::Key::F1 => Some("f1"),
         egui::Key::F2 => Some("f2"),
@@ -4660,6 +4699,18 @@ fn egui_key_name(key: egui::Key) -> Option<&'static str> {
         egui::Key::F10 => Some("f10"),
         egui::Key::F11 => Some("f11"),
         egui::Key::F12 => Some("f12"),
+        egui::Key::F13 => Some("f13"),
+        egui::Key::F14 => Some("f14"),
+        egui::Key::F15 => Some("f15"),
+        egui::Key::F16 => Some("f16"),
+        egui::Key::F17 => Some("f17"),
+        egui::Key::F18 => Some("f18"),
+        egui::Key::F19 => Some("f19"),
+        egui::Key::F20 => Some("f20"),
+        egui::Key::F21 => Some("f21"),
+        egui::Key::F22 => Some("f22"),
+        egui::Key::F23 => Some("f23"),
+        egui::Key::F24 => Some("f24"),
         egui::Key::A => Some("a"),
         egui::Key::B => Some("b"),
         egui::Key::C => Some("c"),
@@ -7022,6 +7073,122 @@ mod geometry_tests {
                 .iter()
                 .all(|(a, b, _, _)| !(b == "right" && (a == "down" || a == "up"))),
             "view-only must never inject remote right button: {events:?}"
+        );
+    }
+
+    fn drain_key_inputs(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Cmd>) -> Vec<(String, Option<bool>)> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let Cmd::Input { inject, .. } = cmd {
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(&inject) else {
+                    continue;
+                };
+                if val.get("action").and_then(|v| v.as_str()) == Some("key") {
+                    let keys = val
+                        .get("keys")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let down = val.get("down").and_then(|v| v.as_bool());
+                    out.push((keys, down));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn egui_key_table_maps_shifted_punctuation_and_f1_through_f24() {
+        for &key in egui::Key::ALL {
+            if matches!(
+                key,
+                egui::Key::F25
+                    | egui::Key::F26
+                    | egui::Key::F27
+                    | egui::Key::F28
+                    | egui::Key::F29
+                    | egui::Key::F30
+                    | egui::Key::F31
+                    | egui::Key::F32
+                    | egui::Key::F33
+                    | egui::Key::F34
+                    | egui::Key::F35
+            ) {
+                continue;
+            }
+            assert!(
+                egui_key_name(key).is_some(),
+                "egui::Key::{key:?} must be mapped in egui_key_name"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_desktop_releases_held_keys_on_window_focus_loss_and_pairs_shifted_plus() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let desk = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "sufa")
+            .cloned()
+            .expect("desktop fixture");
+        harn.app.open_desktop(&desk, true);
+        harn.pass();
+        harn.pass();
+        harn.app.desk_capture_keys = true;
+        harn.pass();
+        let _ = drain_key_inputs(&mut harn.cmd_rx);
+
+        let mut shift_mods = egui::Modifiers::default();
+        shift_mods.shift = true;
+        // Shift + `=` arrives as logical Plus on physical Equals.
+        harn.pending_events.push(egui::Event::Key {
+            key: egui::Key::Plus,
+            physical_key: Some(egui::Key::Equals),
+            pressed: true,
+            repeat: false,
+            modifiers: shift_mods,
+        });
+        harn.pass();
+        // Release Shift first, then release `=` (logical Equals on physical Equals).
+        harn.pending_events.push(egui::Event::Key {
+            key: egui::Key::Equals,
+            physical_key: Some(egui::Key::Equals),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harn.pass();
+        let edges = drain_key_inputs(&mut harn.cmd_rx);
+        assert!(edges.contains(&("+".into(), Some(true))), "{edges:?}");
+        assert!(edges.contains(&("+".into(), Some(false))), "{edges:?}");
+        assert!(
+            !harn.app.desk_held_keys.contains("+"),
+            "shifted '+' must not stay stuck: {:?}",
+            harn.app.desk_held_keys
+        );
+
+        // Hold `"a"`, then lose window focus via WindowFocused(false).
+        harn.pending_events.push(egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: Some(egui::Key::A),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harn.pass();
+        assert!(harn.app.desk_held_keys.contains("a"));
+        let _ = drain_key_inputs(&mut harn.cmd_rx);
+
+        harn.pending_events.push(egui::Event::WindowFocused(false));
+        harn.pass();
+        let released = drain_key_inputs(&mut harn.cmd_rx);
+        assert!(!harn.app.desk_capture_keys, "focus loss must drop capture");
+        assert!(harn.app.desk_held_keys.is_empty());
+        assert!(
+            released.contains(&("a".into(), Some(false))),
+            "focus loss must emit key-up for held keys: {released:?}"
         );
     }
 }
