@@ -1193,10 +1193,29 @@ async fn recv_blob(
                 };
                 // Wire payload bytes (compressed or hole header), not logical raw_len.
                 payload += frame.payload.len() as u64;
+                let Some(chunk_end) = frame.offset.checked_add(u64::from(frame.raw_len)) else {
+                    persist_partial(journal_path, expect_hash, size, &have);
+                    return Err(Error::Protocol("chunk offset overflow".into()));
+                };
+                if chunk_end > size {
+                    persist_partial(journal_path, expect_hash, size, &have);
+                    return Err(Error::Protocol(format!(
+                        "chunk range {}..{} exceeds declared blob size {}",
+                        frame.offset, chunk_end, size
+                    )));
+                }
                 if frame.hole {
                     if !frame.payload.is_empty() {
                         persist_partial(journal_path, expect_hash, size, &have);
                         return Err(Error::Message("hole frame must have empty payload".into()));
+                    }
+                    if u64::from(frame.raw_len) > sparse::FILE_MAX_HOLE {
+                        persist_partial(journal_path, expect_hash, size, &have);
+                        return Err(Error::Protocol(format!(
+                            "hole frame {} exceeds {} byte cap",
+                            frame.raw_len,
+                            sparse::FILE_MAX_HOLE
+                        )));
                     }
                     if size == 0 {
                         continue;
@@ -1204,6 +1223,14 @@ async fn recv_blob(
                     // Extend with zeros without densifying (no payload alloc).
                     write_hole(partial, frame.offset, u64::from(frame.raw_len))?;
                 } else {
+                    if (frame.raw_len as usize) > frame::MAX_CHUNK {
+                        persist_partial(journal_path, expect_hash, size, &have);
+                        return Err(Error::Protocol(format!(
+                            "chunk raw_len {} exceeds {} byte cap",
+                            frame.raw_len,
+                            frame::MAX_CHUNK
+                        )));
+                    }
                     let raw = if frame.compressed {
                         match decompress(&frame.payload, frame.raw_len as usize) {
                             Ok(raw) => {
@@ -1229,7 +1256,7 @@ async fn recv_blob(
                 }
                 have.push(ByteRange {
                     start: frame.offset,
-                    end: frame.offset + u64::from(frame.raw_len),
+                    end: chunk_end,
                 });
                 have = delta::merge_ranges(have);
                 since_save += frame.raw_len as u64;
@@ -2563,6 +2590,16 @@ fn decoded_chunk(bytes: &[u8]) -> Result<(u64, Vec<u8>, bool, u64)> {
             false,
             payload_len,
         ));
+    }
+    if frame.offset.checked_add(u64::from(frame.raw_len)).is_none() {
+        return Err(Error::Protocol("stream chunk offset overflow".into()));
+    }
+    if (frame.raw_len as usize) > frame::MAX_CHUNK {
+        return Err(Error::Protocol(format!(
+            "stream chunk raw_len {} exceeds {} byte cap",
+            frame.raw_len,
+            frame::MAX_CHUNK
+        )));
     }
     let compressed = frame.compressed;
     let raw = if compressed {
@@ -4109,5 +4146,67 @@ mod symlink_unpack_tests {
         assert_eq!(before, after, "{err}");
         assert!(err.to_string().contains("escapes"), "{err}");
         assert!(!dest.join("link").exists());
+    }
+}
+
+#[cfg(test)]
+mod chunk_bounds_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recv_blob_and_decoded_chunk_reject_oversized_zstd_and_out_of_bounds_hole() {
+        let req_id = uuid::Uuid::new_v4().to_string();
+        let bomb = zstd::bulk::compress(&vec![b'z'; 8 * 1024 * 1024], 3).unwrap();
+        let raw_bomb_frame = frame::encode(&frame::DataFrame {
+            request_id: req_id.clone(),
+            offset: 0,
+            raw_len: (8 * 1024 * 1024) as u32,
+            compressed: true,
+            hole: false,
+            tar: false,
+            payload: bomb,
+        })
+        .unwrap();
+        assert!(
+            decoded_chunk(&raw_bomb_frame).is_err(),
+            "decoded_chunk must reject raw_len > frame::MAX_CHUNK"
+        );
+
+        // Out-of-bounds hole frame in recv_blob (offset + raw_len > declared blob size)
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("blob.part");
+        let journal = dir.path().join("blob.journal.json");
+        let dest = dir.path().join("blob.final");
+        let (mut tx_link, mut rx_link) = Link::pair(8);
+        let hole_oob = frame::encode(&frame::DataFrame {
+            request_id: req_id,
+            offset: 512,
+            raw_len: 4096,
+            compressed: false,
+            hole: true,
+            tar: false,
+            payload: Vec::new(),
+        })
+        .unwrap();
+        tx_link.send_frame(hole_oob).await.unwrap();
+        drop(tx_link);
+        let res = recv_blob(
+            &mut rx_link,
+            &partial,
+            &journal,
+            1024,
+            "00",
+            Vec::new(),
+            &dest,
+            false,
+            &None,
+        )
+        .await;
+        assert!(res.is_err());
+        let len_on_disk = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            len_on_disk <= 1024,
+            "out-of-bounds hole extended partial file to {len_on_disk} > 1024"
+        );
     }
 }

@@ -45,6 +45,12 @@ pub fn compress_if_smaller(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub fn decompress(data: &[u8], raw_len: usize) -> crate::error::Result<Vec<u8>> {
+    if raw_len > crate::frame::MAX_CHUNK {
+        return Err(crate::error::Error::Protocol(format!(
+            "zstd raw_len {raw_len} exceeds {} byte chunk cap",
+            crate::frame::MAX_CHUNK
+        )));
+    }
     zstd::bulk::decompress(data, raw_len.max(64))
         .map_err(|e| crate::error::Error::Message(format!("zstd: {e}")))
 }
@@ -80,5 +86,16 @@ mod tests {
             Path::new("clip.webm")
         ));
         assert!(allow_compression(CompressPref::On, Path::new("clip.webm")));
+    }
+
+    #[test]
+    fn decompress_rejects_oversized_raw_len_before_zstd_alloc() {
+        let bomb = zstd::bulk::compress(&vec![0u8; 8 * 1024 * 1024], 3).unwrap();
+        assert!(bomb.len() < 4096);
+        let err = decompress(&bomb, 8 * 1024 * 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected raw_len cap error, got: {err}"
+        );
     }
 }
