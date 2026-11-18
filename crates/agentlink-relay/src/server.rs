@@ -263,6 +263,14 @@ impl RelayHandle {
             token.cancel();
         }
     }
+
+    pub fn disconnect_clients(&self) {
+        if let Ok(mut clients) = self.hub.clients.lock() {
+            for client in clients.drain(..) {
+                client.cancel.cancel();
+            }
+        }
+    }
 }
 
 impl Drop for RelayHandle {
@@ -2759,9 +2767,28 @@ async fn node_loop(ws: RelaySocket, hub: Arc<Hub>, node_id: String) -> Result<()
         }
     });
 
+    let mut keepalive = tokio::time::interval(Duration::from_secs(20));
+    keepalive.tick().await;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            _ = keepalive.tick() => {
+                let is_stale = lock_online(&hub)
+                    .ok()
+                    .and_then(|online| {
+                        online
+                            .get(&node_id)
+                            .filter(|live| live.generation == generation)
+                            .map(|live| live.last_seen.elapsed() >= stale_after())
+                    })
+                    .unwrap_or(false);
+                if is_stale {
+                    break;
+                }
+                if let Ok(ping) = ws::encode(&Envelope::Ping) {
+                    let _ = tx.try_send(ping);
+                }
+            }
             msg = stream.next() => {
                 let Some(msg) = msg else { break };
                 let msg = match msg {

@@ -287,6 +287,7 @@ pub struct ControllerApp {
     /// When the current shell open was requested; None once output arrives.
     term_open: Option<Instant>,
     term_got_output: bool,
+    term_alive: bool,
     file_path: String,
     files: Vec<agentlink_core::DirEntry>,
     files_loading: bool,
@@ -566,6 +567,7 @@ impl ControllerApp {
             term_size: (24, 80),
             term_open: None,
             term_got_output: false,
+            term_alive: false,
             file_path: ".".into(),
             files: Vec::new(),
             files_loading: false,
@@ -693,6 +695,12 @@ impl ControllerApp {
                 }
                 UiEvent::Failed(message) => {
                     self.files_loading = false;
+                    if matches!(self.screen, Screen::Terminal { .. }) && self.term_open.is_some() {
+                        self.term_open = None;
+                        if !self.term_got_output {
+                            self.term_alive = false;
+                        }
+                    }
                     if matches!(self.screen, Screen::Desktop { .. })
                         && super::desk_keys::failure_revokes_input(&message)
                     {
@@ -732,6 +740,7 @@ impl ControllerApp {
                     if !bytes.is_empty() {
                         self.term_got_output = true;
                         self.term_open = None;
+                        self.term_alive = true;
                     }
                     self.terminal.feed(&bytes);
                     let replies = self.terminal.take_writes();
@@ -741,6 +750,7 @@ impl ControllerApp {
                 }
                 UiEvent::PtyDone => {
                     self.term_open = None;
+                    self.term_alive = false;
                     if !self.term_got_output
                         && matches!(self.screen, Screen::Terminal { .. })
                         && self.error.is_empty()
@@ -928,7 +938,7 @@ impl ControllerApp {
 
     fn open_terminal(&mut self, node: &NodeInfo) {
         if let Screen::Terminal { id, .. } = &self.screen {
-            if id == &node.id {
+            if id == &node.id && (self.term_alive || self.term_open.is_some()) {
                 self.terminal.focused = true;
                 return;
             }
@@ -937,6 +947,7 @@ impl ControllerApp {
         self.terminal.focused = true;
         self.term_got_output = false;
         self.term_open = Some(Instant::now());
+        self.term_alive = true;
         self.error.clear();
         self.send(Cmd::PtyOpen {
             node: node.id.clone(),
@@ -1141,6 +1152,8 @@ impl ControllerApp {
 
     fn back_to_machines(&mut self) {
         self.release_remote_input();
+        self.term_open = None;
+        self.term_alive = false;
         self.send(Cmd::PtyClose);
         self.send(Cmd::LiveStop);
         if self.desk_fullscreen {
@@ -2393,22 +2406,58 @@ impl ControllerApp {
         ui.label(theme::muted_text(
             "Type in the terminal. Ctrl+Shift+C copies, Ctrl+Shift+V pastes. Ctrl+C sends interrupt.",
         ));
-        if !self.term_got_output {
+        if let Some(started) = self.term_open {
+            if !self.term_got_output {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let waited = started.elapsed().as_secs();
+                    if waited >= 8 {
+                        ui.label(theme::muted_text(
+                            "The shell has not sent any output yet. Waiting for the node to open a session…",
+                        ));
+                    } else {
+                        ui.label(theme::muted_text("Starting shell…"));
+                    }
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(250));
+                });
+            }
+        } else if !self.term_alive {
+            let mut reopen_target = None;
             ui.horizontal(|ui| {
-                ui.spinner();
-                let waited = self
-                    .term_open
-                    .map(|started| started.elapsed().as_secs())
-                    .unwrap_or(0);
-                if waited >= 8 {
-                    ui.label(theme::muted_text(
-                        "The shell has not sent any output yet. Waiting for the node to open a session…",
-                    ));
+                ui.label(theme::muted_text(if self.term_got_output {
+                    "Shell session ended."
                 } else {
-                    ui.label(theme::muted_text("Starting shell…"));
+                    "Shell session is not open."
+                }));
+                if ui.add(theme::secondary_button("Reopen shell")).clicked() {
+                    reopen_target = self
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .cloned()
+                        .or_else(|| {
+                            Some(NodeInfo {
+                                id: id.clone(),
+                                name: name.clone(),
+                                hostname: String::new(),
+                                os: String::new(),
+                                arch: String::new(),
+                                version: String::new(),
+                                online: true,
+                                policy: NodePolicy::exec(),
+                                effective: NodePolicy::exec(),
+                                owner: String::new(),
+                                relation: String::new(),
+                                access: "exec".into(),
+                                has_display: None,
+                            })
+                        });
                 }
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
             });
+            if let Some(node) = reopen_target {
+                self.open_terminal(&node);
+            }
         }
         let frame = egui::Frame::new()
             .fill(egui::Color32::from_rgb(0x0D, 0x0D, 0x12))
@@ -7208,6 +7257,71 @@ mod geometry_tests {
         assert!(
             released.contains(&("a".into(), Some(false))),
             "focus loss must emit key-up for held keys: {released:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_reopens_after_exit_and_clears_spinner_on_pty_open_failure() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let node = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "workstation")
+            .cloned()
+            .expect("fixture node");
+        while harn.cmd_rx.try_recv().is_ok() {}
+
+        // 1. Open terminal -> shell sends output -> shell exits (`exit` -> PtyDone).
+        harn.app.open_terminal(&node);
+        let mut saw_open_1 = false;
+        while let Ok(cmd) = harn.cmd_rx.try_recv() {
+            if matches!(cmd, Cmd::PtyOpen { .. }) {
+                saw_open_1 = true;
+            }
+        }
+        assert!(saw_open_1);
+        harn.app.shared.push(UiEvent::Pty(b"sufa$ ".to_vec()));
+        harn.pass();
+        assert!(harn.app.term_got_output);
+        harn.app.shared.push(UiEvent::PtyDone);
+        harn.pass();
+
+        // Clicking Terminal / calling open_terminal for the same node after `exit`
+        // MUST emit a fresh Cmd::PtyOpen instead of returning early!
+        harn.app.open_terminal(&node);
+        let mut saw_open_2 = false;
+        while let Ok(cmd) = harn.cmd_rx.try_recv() {
+            if matches!(cmd, Cmd::PtyOpen { .. }) {
+                saw_open_2 = true;
+            }
+        }
+        assert!(
+            saw_open_2,
+            "open_terminal after PtyDone returned early without sending Cmd::PtyOpen!"
+        );
+
+        // 2. When PtyOpen fails (e.g. timeout or node offline), UiEvent::Failed MUST
+        // clear term_open so the spinner does not spin forever saying
+        // "Waiting for the node to open a session…", and another open_terminal retries!
+        harn.app
+            .shared
+            .push(UiEvent::Failed("node offline: workstation".into()));
+        harn.pass();
+        assert!(
+            harn.app.term_open.is_none(),
+            "UiEvent::Failed left term_open set, leaving terminal spinner stuck forever!"
+        );
+        harn.app.open_terminal(&node);
+        let mut saw_open_3 = false;
+        while let Ok(cmd) = harn.cmd_rx.try_recv() {
+            if matches!(cmd, Cmd::PtyOpen { .. }) {
+                saw_open_3 = true;
+            }
+        }
+        assert!(
+            saw_open_3,
+            "open_terminal after Failed did not retry Cmd::PtyOpen!"
         );
     }
 }

@@ -91,6 +91,9 @@ pub(crate) struct ClientInner {
     fast: AtomicBool,
     /// Sticky first transport end cause (sanitized categories only).
     pub(crate) transport: crate::transport_status::TransportObserver,
+    /// First-seen timestamp for transient `"node offline"` replies per request
+    /// so `take_ready` stops swallowing offline replies after `OFFLINE_GRACE`.
+    offline_since: Mutex<HashMap<String, Instant>>,
     /// Test hook: PTY writes skip E2E and land here. Production stays None.
     write_hook: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
@@ -490,6 +493,7 @@ impl PtySession {
             resend: Notify::new(),
             fast: AtomicBool::new(false),
             transport: crate::transport_status::TransportObserver::new(),
+            offline_since: Mutex::new(HashMap::new()),
             write_hook: Mutex::new(Some(hook_tx)),
         });
         let session_id = "pty-test".to_string();
@@ -671,6 +675,7 @@ impl Client {
             resend: Notify::new(),
             fast: AtomicBool::new(false),
             transport: crate::transport_status::TransportObserver::new(),
+            offline_since: Mutex::new(HashMap::new()),
             write_hook: Mutex::new(None),
         });
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -2760,18 +2765,26 @@ async fn supervise(
             // straight through to AuthRejected below.
             let session_dir = inner.session_dir.lock().ok().and_then(|slot| slot.clone());
             if let Some(dir) = session_dir {
-                if let Ok(Some(fresh)) =
-                    refresh_or_adopt_for_client(&dir, &identity, &settings.token, true).await
-                {
-                    if fresh.token != settings.token && !fresh.token.is_empty() {
-                        settings.token = fresh.token.clone();
-                        if let Ok(mut slot) = live_token.lock() {
-                            *slot = fresh.token;
+                match refresh_or_adopt_for_client(&dir, &identity, &settings.token, true).await {
+                    Ok(Some(fresh)) => {
+                        if fresh.token != settings.token && !fresh.token.is_empty() {
+                            settings.token = fresh.token.clone();
+                            if let Ok(mut slot) = live_token.lock() {
+                                *slot = fresh.token;
+                            }
+                            let _ = inner.transport.bump_attempt();
+                            dial_res =
+                                dial_client(&settings, &identity, use_token, &inner.transport)
+                                    .await;
                         }
-                        let _ = inner.transport.bump_attempt();
-                        dial_res =
-                            dial_client(&settings, &identity, use_token, &inner.transport).await;
                     }
+                    Ok(None) => {}
+                    Err(refresh_err) if refresh_err.is_retryable() => {
+                        // Do not kill the Client on a transient network/TLS flap while
+                        // rotating an expired access token: treat as retryable backoff.
+                        dial_res = Err(refresh_err);
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -3268,18 +3281,47 @@ fn take_ready(inner: &ClientInner, env: Envelope) -> Vec<Envelope> {
     } = &env
     {
         if crate::resume::is_transient_message(message) {
-            if message.to_ascii_lowercase().contains("e2e session reset") {
-                if let Some(node) = inner
-                    .routes
+            let lower = message.to_ascii_lowercase();
+            let is_offline =
+                lower.contains("node offline") || lower.contains("node disconnected");
+            if is_offline && !request_id.is_empty() {
+                let expired = inner
+                    .offline_since
                     .lock()
                     .ok()
-                    .and_then(|routes| routes.get(request_id).cloned())
-                {
-                    inner.e2e.forget(&node);
+                    .map(|mut map| {
+                        let first = *map.entry(request_id.clone()).or_insert_with(Instant::now);
+                        if first.elapsed() >= crate::resume::OFFLINE_GRACE {
+                            map.remove(request_id);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(true);
+                if !expired {
+                    inner.resend.notify_waiters();
+                    return Vec::new();
                 }
+            } else {
+                if lower.contains("e2e session reset") {
+                    if let Some(node) = inner
+                        .routes
+                        .lock()
+                        .ok()
+                        .and_then(|routes| routes.get(request_id).cloned())
+                    {
+                        inner.e2e.forget(&node);
+                    }
+                }
+                inner.resend.notify_waiters();
+                return Vec::new();
             }
-            inner.resend.notify_waiters();
-            return Vec::new();
+        }
+    }
+    if let Some(id) = env.request_id() {
+        if let Ok(mut map) = inner.offline_since.lock() {
+            map.remove(id);
         }
     }
     let ready = inner
@@ -3982,5 +4024,47 @@ mod session_maintain_tests {
         let loaded = load_file(dir.path()).unwrap();
         assert_eq!(loaded.token.as_deref(), Some("access-winner"));
         assert_eq!(loaded.refresh_token.as_deref(), Some("refresh-winner"));
+    }
+
+    #[test]
+    fn take_ready_surfaces_node_offline_after_grace_instead_of_swallowing_forever() {
+        let (tx, _rx) = mpsc::channel(4);
+        let inner = ClientInner {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            binary: Arc::new(Mutex::new(HashMap::new())),
+            alive: Arc::new(AtomicBool::new(true)),
+            shutdown: CancellationToken::new(),
+            relay_addr: None,
+            direct_id: OnceLock::new(),
+            quic: Mutex::new(None),
+            e2e: crate::e2e::Endpoint::new(crate::identity::Identity::generate()),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            gates: Mutex::new(HashMap::new()),
+            session_id: "sess-1".into(),
+            inflight: Mutex::new(HashMap::new()),
+            cursors: Mutex::new(crate::resume::Cursors::default()),
+            transfers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            grant_dir: Arc::new(Mutex::new(None)),
+            session_dir: Arc::new(Mutex::new(None)),
+            resend: Notify::new(),
+            fast: AtomicBool::new(false),
+            transport: crate::transport_status::TransportObserver::new(),
+            offline_since: Mutex::new(HashMap::new()),
+            write_hook: Mutex::new(None),
+        };
+        let req = "pty-open-1";
+        let offline = Envelope::result_err(req.to_string(), "node offline: sufa");
+        // Initial offline reply within OFFLINE_GRACE is retried transiently.
+        assert!(take_ready(&inner, offline.clone()).is_empty());
+        // Once OFFLINE_GRACE has elapsed, take_ready MUST deliver the real error
+        // rather than swallowing it for 30s until Error::Timeout!
+        std::thread::sleep(crate::resume::OFFLINE_GRACE + Duration::from_millis(80));
+        let delivered = take_ready(&inner, offline);
+        assert_eq!(
+            delivered.len(),
+            1,
+            "node offline stayed swallowed past OFFLINE_GRACE, causing 30s PtyOpen timeout!"
+        );
     }
 }

@@ -737,16 +737,31 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 }
                 Cmd::PtyOpen { node, rows, cols } => {
                     close_pty(&mut pty).await;
-                    match client.as_ref() {
-                        Some(current) => {
-                            match current.open_pty(&node, None, None, rows, cols).await {
-                                Ok(session) => {
-                                    pty = Some(spawn_pty(session, Arc::clone(&shared)));
-                                }
-                                Err(err) => shared.push(UiEvent::Failed(err.to_string())),
+                    let node_arg = node;
+                    match run_with_worker_client_once_rebootstrap(
+                        &mut client,
+                        &config_dir,
+                        |current| {
+                            let node = node_arg.clone();
+                            Box::pin(async move {
+                                current
+                                    .open_pty(&node, None, None, rows, cols)
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            })
+                        },
+                    )
+                    .await
+                    {
+                        Ok((session, reconnected)) => {
+                            if reconnected {
+                                shared.push(UiEvent::Notice(
+                                    "Reconnected after a closed relay session.".into(),
+                                ));
                             }
+                            pty = Some(spawn_pty(session, Arc::clone(&shared)));
                         }
-                        None => shared.push(UiEvent::Failed("Sign in first.".into())),
+                        Err(err) => shared.push(UiEvent::Failed(err)),
                     }
                 }
                 Cmd::PtyWrite { data } => {
@@ -760,70 +775,152 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     }
                 }
                 Cmd::PtyClose => close_pty(&mut pty).await,
-                Cmd::List { node, path } => match client.as_ref() {
-                    Some(current) => match current.list_dir(&node, &path).await {
-                        Ok(entries) => shared.push(UiEvent::Dir { path, entries }),
-                        Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                    },
-                    None => shared.push(UiEvent::Failed("Sign in first.".into())),
-                },
-                Cmd::Read { node, path } => match client.as_ref() {
-                    Some(current) => match current.read_file(&node, &path, 0, 256 * 1024).await {
-                        Ok(bytes) if super::model::looks_textual(&bytes) => {
+                Cmd::List { node, path } => {
+                    let node_arg = node;
+                    let path_arg = path.clone();
+                    match run_with_worker_client_once_rebootstrap(
+                        &mut client,
+                        &config_dir,
+                        |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            Box::pin(async move {
+                                current
+                                    .list_dir(&node, &path)
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            })
+                        },
+                    )
+                    .await
+                    {
+                        Ok((entries, _)) => shared.push(UiEvent::Dir { path, entries }),
+                        Err(err) => shared.push(UiEvent::Failed(err)),
+                    }
+                }
+                Cmd::Read { node, path } => {
+                    let node_arg = node;
+                    let path_arg = path.clone();
+                    match run_with_worker_client_once_rebootstrap(
+                        &mut client,
+                        &config_dir,
+                        |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            Box::pin(async move {
+                                current
+                                    .read_file(&node, &path, 0, 256 * 1024)
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            })
+                        },
+                    )
+                    .await
+                    {
+                        Ok((bytes, _)) if super::model::looks_textual(&bytes) => {
                             let text = String::from_utf8_lossy(&bytes).to_string();
                             shared.push(UiEvent::File { path, text });
                         }
                         Ok(_) => shared.push(UiEvent::Failed(
                             "That file is not text. The browser can still download it.".into(),
                         )),
-                        Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                    },
-                    None => shared.push(UiEvent::Failed("Sign in first.".into())),
-                },
-                Cmd::Write { node, path, text } => match client.as_ref() {
-                    Some(current) => {
-                        match current.write_file(&node, &path, text.as_bytes()).await {
-                            Ok(()) => {
-                                shared.push(UiEvent::Notice(format!("Saved {path}")));
-                                shared.push(UiEvent::File { path, text });
-                            }
-                            Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                        }
+                        Err(err) => shared.push(UiEvent::Failed(err)),
                     }
-                    None => shared.push(UiEvent::Failed("Sign in first.".into())),
-                },
-                Cmd::Mkdir { node, path } => match client.as_ref() {
-                    Some(current) => match current.mkdir(&node, &path, true).await {
-                        Ok(()) => {
-                            let parent = super::model::parent_path(&path);
-                            match current.list_dir(&node, &parent).await {
-                                Ok(entries) => shared.push(UiEvent::Dir {
-                                    path: parent,
-                                    entries,
-                                }),
-                                Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                            }
+                }
+                Cmd::Write { node, path, text } => {
+                    let node_arg = node;
+                    let path_arg = path.clone();
+                    let text_arg = text.clone();
+                    match run_with_worker_client_once_rebootstrap(
+                        &mut client,
+                        &config_dir,
+                        |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            let text = text_arg.clone();
+                            Box::pin(async move {
+                                current
+                                    .write_file(&node, &path, text.as_bytes())
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            })
+                        },
+                    )
+                    .await
+                    {
+                        Ok(((), _)) => {
+                            shared.push(UiEvent::Notice(format!("Saved {path}")));
+                            shared.push(UiEvent::File { path, text });
                         }
-                        Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                    },
-                    None => shared.push(UiEvent::Failed("Sign in first.".into())),
-                },
-                Cmd::Remove { node, path } => match client.as_ref() {
-                    Some(current) => match current.remove(&node, &path, false).await {
-                        Ok(()) => {
-                            let parent = super::model::parent_path(&path);
-                            match current.list_dir(&node, &parent).await {
-                                Ok(entries) => shared.push(UiEvent::Dir {
-                                    path: parent,
-                                    entries,
-                                }),
-                                Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                            }
-                        }
-                        Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                    },
-                    None => shared.push(UiEvent::Failed("Sign in first.".into())),
-                },
+                        Err(err) => shared.push(UiEvent::Failed(err)),
+                    }
+                }
+                Cmd::Mkdir { node, path } => {
+                    let parent = super::model::parent_path(&path);
+                    let node_arg = node;
+                    let path_arg = path;
+                    let parent_arg = parent.clone();
+                    match run_with_worker_client_once_rebootstrap(
+                        &mut client,
+                        &config_dir,
+                        |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            let parent = parent_arg.clone();
+                            Box::pin(async move {
+                                current
+                                    .mkdir(&node, &path, true)
+                                    .await
+                                    .map_err(|err| err.to_string())?;
+                                current
+                                    .list_dir(&node, &parent)
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            })
+                        },
+                    )
+                    .await
+                    {
+                        Ok((entries, _)) => shared.push(UiEvent::Dir {
+                            path: parent,
+                            entries,
+                        }),
+                        Err(err) => shared.push(UiEvent::Failed(err)),
+                    }
+                }
+                Cmd::Remove { node, path } => {
+                    let parent = super::model::parent_path(&path);
+                    let node_arg = node;
+                    let path_arg = path;
+                    let parent_arg = parent.clone();
+                    match run_with_worker_client_once_rebootstrap(
+                        &mut client,
+                        &config_dir,
+                        |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            let parent = parent_arg.clone();
+                            Box::pin(async move {
+                                current
+                                    .remove(&node, &path, false)
+                                    .await
+                                    .map_err(|err| err.to_string())?;
+                                current
+                                    .list_dir(&node, &parent)
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            })
+                        },
+                    )
+                    .await
+                    {
+                        Ok((entries, _)) => shared.push(UiEvent::Dir {
+                            path: parent,
+                            entries,
+                        }),
+                        Err(err) => shared.push(UiEvent::Failed(err)),
+                    }
+                }
                 Cmd::Live {
                     node,
                     control,
@@ -901,19 +998,32 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                             viewer.send_control_move(&body)
                         };
                         // Closed/saturated barrier: do not Extension-bypass.
-                    } else if let Some(current) = &client {
+                    } else if client.is_some() {
                         let payload = serde_json::from_str(&inject).unwrap_or(json!({}));
-                        if let Err(err) = current
-                            .call_op(
-                                &node,
-                                Op::Extension {
-                                    name: PHASE2_INJECT_INPUT.to_string(),
-                                    payload,
-                                },
-                            )
-                            .await
+                        let node_arg = node;
+                        if let Err(err) = run_with_worker_client_once_rebootstrap(
+                            &mut client,
+                            &config_dir,
+                            |current| {
+                                let node = node_arg.clone();
+                                let payload = payload.clone();
+                                Box::pin(async move {
+                                    current
+                                        .call_op(
+                                            &node,
+                                            Op::Extension {
+                                                name: PHASE2_INJECT_INPUT.to_string(),
+                                                payload,
+                                            },
+                                        )
+                                        .await
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                        )
+                        .await
                         {
-                            shared.push(UiEvent::Failed(err.to_string()));
+                            shared.push(UiEvent::Failed(err));
                         }
                     }
                 }
@@ -989,35 +1099,58 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         shared.push(UiEvent::Notice("Clipboard sent to the machine.".into()));
                     }
                 }
-                Cmd::Shot { node, path } => match client.as_ref() {
-                    Some(current) => match save_screenshot(current, &node, &path).await {
-                        Ok(saved) => shared.push(UiEvent::Notice(format!("Saved {saved}"))),
+                Cmd::Shot { node, path } => {
+                    let node_arg = node;
+                    let path_arg = path;
+                    match run_with_worker_client_once_rebootstrap(
+                        &mut client,
+                        &config_dir,
+                        |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            Box::pin(async move { save_screenshot(&current, &node, &path).await })
+                        },
+                    )
+                    .await
+                    {
+                        Ok((saved, _)) => shared.push(UiEvent::Notice(format!("Saved {saved}"))),
                         Err(err) => shared.push(UiEvent::Failed(err)),
-                    },
-                    None => shared.push(UiEvent::Failed("Sign in first.".into())),
-                },
+                    }
+                }
                 Cmd::Enroll {
                     name,
                     access,
                     minutes,
-                } => match client.as_ref() {
-                    Some(current) => match parse_access(&access) {
-                        Ok(policy) => {
-                            let ttl = minutes.clamp(1, 7 * 24 * 60) * 60;
-                            match current.create_enrollment_token(&name, policy, ttl, 1).await {
-                                Ok(info) => {
-                                    let command = enroll_command(&info.token, &name, &access);
-                                    shared.push(UiEvent::Enrolled(format!(
-                                        "{command}\n\nToken: {}",
-                                        info.token
-                                    )));
-                                }
-                                Err(err) => shared.push(UiEvent::Failed(err.to_string())),
+                } => match parse_access(&access) {
+                    Ok(policy) => {
+                        let ttl = minutes.clamp(1, 7 * 24 * 60) * 60;
+                        let name_arg = name.clone();
+                        match run_with_worker_client_once_rebootstrap(
+                            &mut client,
+                            &config_dir,
+                            |current| {
+                                let name = name_arg.clone();
+                                Box::pin(async move {
+                                    current
+                                        .create_enrollment_token(&name, policy, ttl, 1)
+                                        .await
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                        )
+                        .await
+                        {
+                            Ok((info, _)) => {
+                                let command = enroll_command(&info.token, &name, &access);
+                                shared.push(UiEvent::Enrolled(format!(
+                                    "{command}\n\nToken: {}",
+                                    info.token
+                                )));
                             }
+                            Err(err) => shared.push(UiEvent::Failed(err)),
                         }
-                        Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                    },
-                    None => shared.push(UiEvent::Failed("Sign in first.".into())),
+                    }
+                    Err(err) => shared.push(UiEvent::Failed(err.to_string())),
                 },
             }
         }
@@ -1914,6 +2047,28 @@ where
                 monitors,
                 reconnected: true,
             })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn run_with_worker_client_once_rebootstrap<T, OpFn>(
+    client: &mut Option<Arc<Client>>,
+    config_dir: &std::path::Path,
+    mut op: OpFn,
+) -> Result<(T, bool), String>
+where
+    OpFn: FnMut(
+        Arc<Client>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>,
+{
+    let current = ensure_worker_client(client, config_dir, false).await?;
+    match op(Arc::clone(&current)).await {
+        Ok(value) => Ok((value, false)),
+        Err(err) if super::model::session_needs_rebootstrap(&err) => {
+            let current = ensure_worker_client(client, config_dir, true).await?;
+            let value = op(current).await?;
+            Ok((value, true))
         }
         Err(err) => Err(err),
     }
@@ -3342,5 +3497,251 @@ mod worker_client_recovery_tests {
             1,
             "must not loop saved_client forever"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_worker_recovers_dead_client_for_pty_open_and_files_after_prior_shell_exit() {
+        use agentlink_core::client::UserSession;
+        use agentlink_core::NodePolicy;
+        use agentlink_node::{run as run_node, NodeConfig};
+        use agentlink_relay::{RelayConfig, RelayHandle};
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let relay = RelayHandle::spawn(RelayConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            data_dir: tmp.path().join("relay"),
+            capture: None,
+            database_url: None,
+            allow_signup: false,
+            bootstrap_admin: true,
+            db_schema: None,
+            trust_proxy: Vec::new(),
+            print_admin_token: false,
+            legacy_admin_override: Some((true, Some(86_400))),
+        })
+        .await
+        .expect("spawn relay");
+        let admin_pw = relay.bootstrap_password.clone().expect("bootstrap pw");
+        let relay_url = format!("wss://{}/v1/connect", relay.local_addr);
+
+        // Pair and boot a real node ("sufa-sim") with root at tmp/work.
+        let work_root = tmp.path().join("work");
+        std::fs::create_dir_all(&work_root).expect("work root");
+        std::fs::write(work_root.join("hello.txt"), b"ok\n").expect("write hello.txt");
+        let setup_client = Client::connect(&ClientSettings {
+            relay: relay_url.clone(),
+            token: relay.admin_token.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        })
+        .await
+        .expect("setup client");
+        let pair = setup_client
+            .create_pairing_token("sufa-sim", NodePolicy::exec(), 600)
+            .await
+            .expect("pair");
+        let node_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&node_dir).expect("node dir");
+        let node_stop = CancellationToken::new();
+        let node_task = tokio::spawn(run_node(
+            NodeConfig {
+                relay_url: relay_url.clone(),
+                fingerprint: relay.fingerprint.clone(),
+                trust: None,
+                data_dir: node_dir.clone(),
+                name: "sufa-sim".into(),
+                pairing_token: Some(pair.token),
+                root: Some(work_root),
+                max_policy: NodePolicy::phase1_ceiling(),
+                version: "test".into(),
+                extensions: Vec::new(),
+                policy_hook: None,
+                capture: None,
+            },
+            node_stop.clone(),
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let box_id = loop {
+            if let Ok(nodes) = setup_client.list_nodes().await {
+                if let Some(n) = nodes.into_iter().find(|n| n.name == "sufa-sim" && n.online) {
+                    break n.id;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "node never came online");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        // Pre-create controller config_dir identity + local signed grant for sufa-sim.
+        let config_dir = tmp.path().join("controller-cfg");
+        std::fs::create_dir_all(&config_dir).expect("cfg dir");
+        let ctrl_id = Identity::load_or_create(&config_dir.join("identity.json")).expect("id");
+        let grant = agentlink_core::grant::issue_local_grant(&node_dir, &box_id, ctrl_id.public_hex())
+            .expect("issue grant");
+        agentlink_core::grant::save_grant(&config_dir, &grant).expect("save grant");
+
+        // Launch the REAL controller worker thread.
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::new());
+        let shared_worker = Arc::clone(&shared);
+        let cfg_worker = config_dir.clone();
+        let worker_thread = std::thread::spawn(move || {
+            super::run(cmd_rx, shared_worker, cfg_worker);
+        });
+
+        cmd_tx
+            .send(Cmd::Login {
+                username: "admin".into(),
+                password: admin_pw.clone(),
+                totp: String::new(),
+                relay: relay_url.clone(),
+                pin: relay.fingerprint.clone(),
+                trust: String::new(),
+            })
+            .expect("send login");
+
+        let wait_event = |pred: &dyn Fn(&UiEvent) -> bool, label: &str| {
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                for ev in shared.drain() {
+                    if pred(&ev) {
+                        return;
+                    }
+                }
+                assert!(std::time::Instant::now() < until, "timed out waiting for {label}");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+        wait_event(
+            &|ev| matches!(ev, UiEvent::Ready { user: Some(_) }),
+            "Login Ready",
+        );
+
+        // 1. Open PTY #1, execute command, and exit cleanly (`exit`).
+        cmd_tx
+            .send(Cmd::PtyOpen {
+                node: box_id.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .expect("pty open 1");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        cmd_tx
+            .send(Cmd::PtyWrite {
+                data: b"echo PTY1_MARKER && exit\n".to_vec(),
+            })
+            .expect("pty write 1");
+        let mut pty1_out = String::new();
+        let mut pty1_done = false;
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !(pty1_out.contains("PTY1_MARKER") && pty1_done) {
+            for ev in shared.drain() {
+                match ev {
+                    UiEvent::Pty(bytes) => pty1_out.push_str(&String::from_utf8_lossy(&bytes)),
+                    UiEvent::PtyDone => pty1_done = true,
+                    UiEvent::Failed(err) => panic!("PTY #1 failed unexpectedly: {err}"),
+                    _ => {}
+                }
+            }
+            assert!(std::time::Instant::now() < until, "PTY #1 did not finish: {pty1_out:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // 2. Kill the worker's cached Client over the real relay wire (revoke old device session
+        // + kick active client socket so worker's Client transitions to !is_alive()), then restore
+        // a valid fresh login session on disk (matching a still-valid session.json after an AFK drop).
+        crate::tray::sign_out(&config_dir)
+            .await
+            .expect("revoke old session");
+        relay.disconnect_clients();
+        // Give worker's Client ~300ms to fail its reconnect against the revoked token (`!is_alive()`).
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let fresh: UserSession = agentlink_core::client::login_user(
+            &relay_url,
+            &relay.fingerprint,
+            None,
+            &ctrl_id,
+            "admin",
+            &admin_pw,
+            None,
+            "controller-test",
+        )
+        .await
+        .expect("mint fresh valid session on disk");
+        agentlink_core::config::save_session(
+            &config_dir,
+            &ClientSettings {
+                relay: relay_url.clone(),
+                token: fresh.access_token,
+                fingerprint: relay.fingerprint.clone(),
+                trust: None,
+            },
+            &fresh.user,
+            &fresh.refresh_token,
+            fresh.access_expires_unix,
+        )
+        .expect("save fresh session");
+        let _ = shared.drain();
+
+        // 3. WITHOUT restarting Controller or re-sending Cmd::Login, open PTY #2 AND list files!
+        cmd_tx
+            .send(Cmd::List {
+                node: box_id.clone(),
+                path: ".".into(),
+            })
+            .expect("send list");
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let mut listed = false;
+        while !listed {
+            for ev in shared.drain() {
+                match ev {
+                    UiEvent::Dir { entries, .. } => {
+                        assert!(entries.iter().any(|e| e.name == "hello.txt"));
+                        listed = true;
+                    }
+                    UiEvent::Failed(err) => {
+                        panic!("Cmd::List failed on dead worker Client instead of rebootstrapping: {err}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(std::time::Instant::now() < until, "Cmd::List timed out");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        cmd_tx
+            .send(Cmd::PtyOpen {
+                node: box_id,
+                rows: 24,
+                cols: 80,
+            })
+            .expect("send pty open 2");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        cmd_tx
+            .send(Cmd::PtyWrite {
+                data: b"echo PTY2_RECOVERED && exit\n".to_vec(),
+            })
+            .expect("send pty write 2");
+        let mut pty2_out = String::new();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !pty2_out.contains("PTY2_RECOVERED") {
+            for ev in shared.drain() {
+                match ev {
+                    UiEvent::Pty(bytes) => pty2_out.push_str(&String::from_utf8_lossy(&bytes)),
+                    UiEvent::Failed(err) => {
+                        panic!("Cmd::PtyOpen #2 failed instead of rebootstrapping: {err}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(std::time::Instant::now() < until, "PTY #2 timed out: {pty2_out:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        drop(cmd_tx);
+        let _ = worker_thread.join();
+        node_stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), node_task).await;
     }
 }

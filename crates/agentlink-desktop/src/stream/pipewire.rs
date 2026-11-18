@@ -359,23 +359,25 @@ extern "C" {
         wait_ms: c_int,
     ) -> c_int;
     fn al_pw_close(cap: *mut c_void);
-    fn al_pw_validate_frame_copy(
-        width: c_int,
-        height: c_int,
-        chunk_stride: c_int,
-        chunk_offset: u32,
-        chunk_size: u32,
-        maxsize: u32,
-        out_stride: *mut usize,
-        out_alloc_bytes: *mut usize,
-        out_copy_bytes: *mut usize,
-    ) -> c_int;
 }
 
 #[cfg(all(test, pipewire_headers))]
 mod tests {
-    use super::al_pw_validate_frame_copy;
     use std::ffi::c_int;
+
+    extern "C" {
+        fn al_pw_validate_frame_copy(
+            width: c_int,
+            height: c_int,
+            chunk_stride: c_int,
+            chunk_offset: u32,
+            chunk_size: u32,
+            maxsize: u32,
+            out_stride: *mut usize,
+            out_alloc_bytes: *mut usize,
+            out_copy_bytes: *mut usize,
+        ) -> c_int;
+    }
 
     fn validate(
         width: c_int,

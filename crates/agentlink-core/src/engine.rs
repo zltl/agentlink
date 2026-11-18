@@ -4177,7 +4177,7 @@ mod chunk_bounds_tests {
         let partial = dir.path().join("blob.part");
         let journal = dir.path().join("blob.journal.json");
         let dest = dir.path().join("blob.final");
-        let (mut tx_link, mut rx_link) = Link::pair(8);
+        let (tx_link, mut rx_link) = Link::pair(8);
         let hole_oob = frame::encode(&frame::DataFrame {
             request_id: req_id,
             offset: 512,
