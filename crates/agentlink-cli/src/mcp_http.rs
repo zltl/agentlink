@@ -431,10 +431,16 @@ fn authorized(req: &Request, token: &str) -> bool {
     let Some(value) = header(&req.headers, "authorization") else {
         return false;
     };
-    if value.len() < 7 || !value[..7].eq_ignore_ascii_case("bearer ") {
+    let raw = value.as_bytes();
+    if raw.len() < 7 || !raw[..7].eq_ignore_ascii_case(b"bearer ") {
         return false;
     }
+    // `raw[..7]` is pure ASCII ("bearer "), so byte index 7 is guaranteed to
+    // lie on a valid UTF-8 character boundary.
     let got = value[7..].trim();
+    if got.is_empty() {
+        return false;
+    }
     constant_time_eq(got.as_bytes(), token.as_bytes())
 }
 
@@ -644,16 +650,38 @@ mod tests {
             "oversized body should return 413: {huge_resp}"
         );
 
-        // RFC 9110 case-insensitive `bearer ` scheme prefix MUST be accepted.
-        let lower_bearer = format!(
-            "POST /mcp HTTP/1.1\r\nHost: [::1]:8080\r\nAuthorization: bearer mcp-secret\r\nOrigin: http://[::1]:8080\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let lower_ok = exchange(addr, &lower_bearer).await;
-        assert!(
-            lower_ok.starts_with("HTTP/1.1 200"),
-            "case-insensitive bearer + IPv6 Host/Origin should succeed: {lower_ok}"
-        );
+        // RFC 9110 case-insensitive `bearer ` scheme prefix MUST be accepted,
+        // and non-ASCII UTF-8 / truncated / invalid Authorization headers MUST
+        // cleanly return 401 without panicking on UTF-8 char boundaries!
+        for upper_or_mixed in ["bearer mcp-secret", "BEARER mcp-secret", "BeArEr mcp-secret"] {
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nHost: [::1]:8080\r\nAuthorization: {upper_or_mixed}\r\nOrigin: http://[::1]:8080\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let resp = exchange(addr, &req).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 200"),
+                "case-insensitive {upper_or_mixed} should succeed: {resp}"
+            );
+        }
+        for bad_auth in [
+            "🔥🔥🔥",
+            "🔥Bearer mcp-secret",
+            "Bearer 🔥secret",
+            "Be",
+            "Bearer",
+            "Bearer ",
+            "Basic dXNlcjpwYXNz",
+        ] {
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {bad_auth}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+            );
+            let resp = exchange(addr, &req).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 401"),
+                "invalid Authorization '{bad_auth}' must return 401 without panicking, got: {resp:?}"
+            );
+        }
 
         // Exhausting concurrent GET /mcp SSE streams (16) MUST return 503 on the 17th SSE
         // while keeping POST /mcp responsive!
