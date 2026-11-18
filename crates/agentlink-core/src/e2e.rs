@@ -203,16 +203,18 @@ pub const MAX_TRACKED_PEERS: usize = 1024;
 pub const IDLE_PEER_TTL_MS: u64 = 15 * 60 * 1000;
 const MAX_PRUNED_RETIRED_HELLOS: usize = 4096;
 
+type DirectionRing = VecDeque<Arc<Direction>>;
+
 #[derive(Default)]
 struct PeerEntry {
     /// Sessions proven live (locally completed via `complete`, or acceptor
     /// sessions that decrypted at least one authenticated AEAD frame).
-    verified: VecDeque<Arc<Direction>>,
+    verified: DirectionRing,
     /// Accepted handshakes awaiting their first valid AEAD frame. Replayed
     /// historical `E2eHello` frames without the destroyed client ephemeral
     /// secret can never pass AEAD authentication, so they never leave `staged`
     /// and can never evict any `verified` active session.
-    staged: VecDeque<Arc<Direction>>,
+    staged: DirectionRing,
     retired_order: VecDeque<[u8; 32]>,
     retired_set: HashSet<[u8; 32]>,
 }
@@ -298,10 +300,8 @@ impl EndpointState {
         let stale_keys: Vec<String> = self
             .peers
             .iter()
-            .filter_map(|(peer, entry)| {
-                (now_ms.saturating_sub(entry.newest_activity_ms()) >= idle_ttl_ms)
-                    .then(|| peer.clone())
-            })
+            .filter(|(_, entry)| now_ms.saturating_sub(entry.newest_activity_ms()) >= idle_ttl_ms)
+            .map(|(peer, _)| peer.clone())
             .collect();
         for key in stale_keys {
             if let Some(removed) = self.peers.remove(&key) {
@@ -616,10 +616,7 @@ impl Endpoint {
             .ok_or_else(|| Error::Protocol(format!("no e2e session for {peer}")))
     }
 
-    fn sessions_for(
-        &self,
-        peer: &str,
-    ) -> Result<(VecDeque<Arc<Direction>>, VecDeque<Arc<Direction>>)> {
+    fn sessions_for(&self, peer: &str) -> Result<(DirectionRing, DirectionRing)> {
         let guard = self
             .state
             .lock()
