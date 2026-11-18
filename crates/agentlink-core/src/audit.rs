@@ -36,6 +36,12 @@ pub const CATEGORIES: &[&str] = &[
 ];
 
 pub const PRESETS: &[&str] = &["minimal", "standard", "full", "paranoid"];
+pub const MAX_RECORDING_IDLE_SECS: u64 = 86_400;
+pub const MAX_RETENTION_DAYS: u64 = 36_500;
+pub const MAX_RETENTION_BYTES_CAP: u64 = 1024 * 1024 * 1024 * 1024;
+const PARANOID_MAX_LOG_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const PARANOID_MAX_DIFF_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const PARANOID_MAX_RECORDING_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -745,7 +751,7 @@ impl AuditPolicy {
         self.validate()
     }
 
-    pub fn validate(&self) -> Result<()> {
+    fn validate_core(&self) -> Result<()> {
         if !PRESETS.contains(&self.preset.as_str()) {
             return Err(Error::Message(format!("unknown preset '{}'", self.preset)));
         }
@@ -765,6 +771,11 @@ impl AuditPolicy {
         if !(1..=30).contains(&self.recording.fps) {
             return Err(Error::Message("recording.fps must be 1..=30".into()));
         }
+        if !(1..=MAX_RECORDING_IDLE_SECS).contains(&self.recording.idle_secs) {
+            return Err(Error::Message(format!(
+                "recording.idle_secs must be 1..={MAX_RECORDING_IDLE_SECS}"
+            )));
+        }
         if !matches!(self.recording.mode.as_str(), "off" | "gui" | "always") {
             return Err(Error::Message(
                 "recording.mode must be off, gui, or always".into(),
@@ -780,15 +791,37 @@ impl AuditPolicy {
             ("diff_days", self.retention.diff_days),
             ("recording_days", self.retention.recording_days),
         ] {
-            if days > 36500 {
+            if days > MAX_RETENTION_DAYS {
                 return Err(Error::Message(format!("{label} is unreasonably large")));
+            }
+        }
+        for (label, bytes) in [
+            ("max_log_bytes", self.retention.max_log_bytes),
+            ("max_diff_bytes", self.retention.max_diff_bytes),
+            ("max_recording_bytes", self.retention.max_recording_bytes),
+        ] {
+            if bytes > MAX_RETENTION_BYTES_CAP {
+                return Err(Error::Message(format!("{label} exceeds the 1 TiB cap")));
             }
         }
         for pattern in &self.redact.patterns {
             regex::Regex::new(pattern).map_err(|e| Error::Message(format!("redact regex: {e}")))?;
         }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_core()?;
+        for agent in self.overrides.agent.keys() {
+            self.effective(Some(agent.as_str()), None)
+                .validate_core()?;
+        }
+        for node in self.overrides.node.keys() {
+            self.effective(None, Some(node.as_str()))
+                .validate_core()?;
+        }
         for rule in &self.alerts {
-            validate_webhook_url(&rule.name, &rule.webhook)?;
+            validate_local_webhook_url(&rule.name, &rule.webhook)?;
         }
         let mut names = BTreeSet::new();
         for sink in &self.sinks {
@@ -800,6 +833,22 @@ impl AuditPolicy {
                     "sink '{}' kind must be local, relay, or s3",
                     sink.name
                 )));
+            }
+            if let Some(days) = sink.retention_days {
+                if days > MAX_RETENTION_DAYS {
+                    return Err(Error::Message(format!(
+                        "sink '{}' retention_days is unreasonably large",
+                        sink.name
+                    )));
+                }
+            }
+            if let Some(bytes) = sink.max_bytes {
+                if bytes > MAX_RETENTION_BYTES_CAP {
+                    return Err(Error::Message(format!(
+                        "sink '{}' max_bytes exceeds the 1 TiB cap",
+                        sink.name
+                    )));
+                }
             }
             for item in &sink.data {
                 if !matches!(item.as_str(), "logs" | "diffs" | "recordings") {
@@ -829,21 +878,38 @@ impl AuditPolicy {
         }
     }
 
+    /// Stricter check for policies submitted remotely over the relay control API:
+    /// requires public routable webhook destinations in addition to `validate()`.
+    pub fn validate_remote_webhooks(&self) -> Result<()> {
+        for rule in &self.alerts {
+            validate_webhook_url(&rule.name, &rule.webhook)?;
+        }
+        Ok(())
+    }
+
     /// Validate and apply an unauthenticated `AuditPolicyPush` received over the
     /// relay control socket.
     ///
     /// Returns `Ok(None)` when `lock_local` is set. Even when an upgraded or
     /// opted-in node explicitly sets `lock_local = false`, an unsealed relay
-    /// push is never permitted to:
-    /// - inject or modify `alerts` webhooks or `s3` sinks (outbound egress / credential read),
-    /// - remove or narrow the `local` audit sink,
-    /// - disable the hash chain or downgrade/disable locally enabled categories,
-    /// - strip baseline secret redaction or sensitive path exclusions, or narrow `paths.include`.
+    /// push is checked across the base policy AND the complete `(agent, node)`
+    /// override basis so neither explicit fields, implicit preset defaults, nor
+    /// added/modified/deleted overrides can weaken local audit coverage, shrink
+    /// retention/capture/recording, alter path filters, strip redaction, or
+    /// inject S3/webhook egress.
     pub fn apply_untrusted_relay_push(&self, pushed_toml: &str) -> Result<Option<Self>> {
+        const MAX_UNTRUSTED_OVERRIDES: usize = 64;
         if self.lock_local {
             return Ok(None);
         }
         let mut next = Self::parse(pushed_toml)?;
+        if next.overrides.agent.len() > MAX_UNTRUSTED_OVERRIDES
+            || next.overrides.node.len() > MAX_UNTRUSTED_OVERRIDES
+        {
+            return Err(Error::Message(
+                "untrusted relay audit push has too many override entries".into(),
+            ));
+        }
         if next.alerts != self.alerts {
             return Err(Error::Message(
                 "untrusted relay audit push cannot add or modify alert webhooks".into(),
@@ -881,135 +947,178 @@ impl AuditPolicy {
                     )));
                 }
             }
-            if let Some(cur_days) = cur_local.retention_days {
-                if next_local.retention_days.is_some_and(|d| d < cur_days) {
+            match (cur_local.retention_days, next_local.retention_days) {
+                (Some(cur_d), Some(next_d)) if next_d < cur_d => {
                     return Err(Error::Message(
                         "untrusted relay audit push cannot lower local sink retention".into(),
                     ));
                 }
-            }
-            if let Some(cur_bytes) = cur_local.max_bytes {
-                if next_local.max_bytes.is_some_and(|b| b < cur_bytes) {
+                (None, Some(_)) => {
                     return Err(Error::Message(
-                        "untrusted relay audit push cannot lower local sink byte cap".into(),
+                        "untrusted relay audit push cannot impose new local sink retention cap"
+                            .into(),
                     ));
                 }
+                _ => {}
             }
-        }
-        if self.forward.chain && !next.forward.chain {
-            return Err(Error::Message(
-                "untrusted relay audit push cannot disable hash chain".into(),
-            ));
-        }
-        if (self.retention.log_days > 0 && next.retention.log_days == 0)
-            || (self.retention.diff_days > 0 && next.retention.diff_days == 0)
-            || (self.retention.recording_days > 0 && next.retention.recording_days == 0)
-            || (self.retention.max_log_bytes > 0 && next.retention.max_log_bytes == 0)
-        {
-            return Err(Error::Message(
-                "untrusted relay audit push cannot zero local retention".into(),
-            ));
-        }
-        for (cat_name, cur_cat) in &self.categories {
-            if cur_cat.enabled {
-                let Some(next_cat) = next.categories.get(cat_name) else {
-                    return Err(Error::Message(format!(
-                        "untrusted relay audit push cannot remove category '{cat_name}'"
-                    )));
-                };
-                if !next_cat.enabled || next_cat.detail.rank() < cur_cat.detail.rank() {
-                    return Err(Error::Message(format!(
-                        "untrusted relay audit push cannot disable or downgrade category '{cat_name}'"
-                    )));
-                }
-            }
-        }
-        for pattern in &self.redact.patterns {
-            if !next.redact.patterns.contains(pattern) {
+            if cur_local.max_bytes != next_local.max_bytes {
                 return Err(Error::Message(
-                    "untrusted relay audit push cannot remove redact patterns".into(),
+                    "untrusted relay audit push cannot modify local sink byte cap".into(),
                 ));
             }
         }
-        for env_key in &self.redact.env_keys {
-            if !next.redact.env_keys.contains(env_key) {
-                return Err(Error::Message(
-                    "untrusted relay audit push cannot remove redact env_keys".into(),
-                ));
+
+        let preset_defaults = Self::preset(&self.preset)?.retention;
+        let mut agent_keys: BTreeSet<Option<&str>> = BTreeSet::from([None]);
+        for key in self.overrides.agent.keys().chain(next.overrides.agent.keys()) {
+            agent_keys.insert(Some(key.as_str()));
+        }
+        let mut node_keys: BTreeSet<Option<&str>> = BTreeSet::from([None]);
+        for key in self.overrides.node.keys().chain(next.overrides.node.keys()) {
+            node_keys.insert(Some(key.as_str()));
+        }
+        for agent in &agent_keys {
+            for node in &node_keys {
+                let base_eff = self.effective(*agent, *node);
+                let next_eff = next.effective(*agent, *node);
+                ensure_effective_policy_not_weaker(&base_eff, &next_eff, &preset_defaults)?;
             }
         }
-        for excluded in &self.paths.exclude {
-            if !next.paths.exclude.contains(excluded) {
-                return Err(Error::Message(
-                    "untrusted relay audit push cannot remove path exclusions".into(),
-                ));
-            }
-        }
-        if self.paths.include != next.paths.include && !next.paths.include.is_empty() {
-            return Err(Error::Message(
-                "untrusted relay audit push cannot narrow paths.include".into(),
-            ));
-        }
-        if next.overrides != self.overrides {
-            for patch in next
-                .overrides
-                .agent
-                .values()
-                .chain(next.overrides.node.values())
-            {
-                validate_untrusted_override_patch(self, patch)?;
-            }
-        }
+
         next.lock_local = self.lock_local;
         Ok(Some(next))
     }
 }
 
-fn validate_untrusted_override_patch(base: &AuditPolicy, patch: &PolicyPatch) -> Result<()> {
-    if patch
-        .forward
-        .as_ref()
-        .is_some_and(|fwd| base.forward.chain && fwd.chain == Some(false))
-    {
+fn recording_mode_rank(mode: &str) -> u8 {
+    match mode {
+        "always" => 2,
+        "gui" => 1,
+        _ => 0,
+    }
+}
+
+fn recording_quality_rank(quality: &str) -> u8 {
+    match quality {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
+}
+
+/// Dual-bounded byte-cap check on untrusted relay pushes:
+/// - `base == 0` (unlimited locally): must remain `0` (cannot impose a finite cap to wipe logs).
+/// - `0 < base < preset_default` (operator configured a custom tight disk quota): must remain
+///   exact `base` (neither shrink to delete logs nor expand past the custom disk quota).
+/// - `base >= preset_default`: may stay or rise up to `base.max(paranoid_ceiling)` so preset
+///   upgrades (`minimal -> standard -> full -> paranoid`) work without allowing unbounded disk fill.
+fn retention_byte_cap_allowed(
+    base: u64,
+    preset_default: u64,
+    paranoid_ceiling: u64,
+    cand: u64,
+) -> bool {
+    if base == 0 {
+        cand == 0
+    } else if base < preset_default {
+        cand == base
+    } else {
+        cand >= base && cand <= base.max(paranoid_ceiling)
+    }
+}
+
+fn ensure_effective_policy_not_weaker(
+    base: &AuditPolicy,
+    cand: &AuditPolicy,
+    preset_defaults: &RetentionPolicy,
+) -> Result<()> {
+    if base.forward.chain && !cand.forward.chain {
         return Err(Error::Message(
-            "untrusted relay audit override cannot disable hash chain".into(),
+            "untrusted relay audit push cannot disable hash chain".into(),
         ));
     }
-    if let Some(patterns) = &patch.redact_patterns {
-        for required in &base.redact.patterns {
-            if !patterns.contains(required) {
-                return Err(Error::Message(
-                    "untrusted relay audit override cannot remove redact patterns".into(),
-                ));
-            }
-        }
-    }
-    if let Some(excluded) = &patch.path_exclude {
-        for required in &base.paths.exclude {
-            if !excluded.contains(required) {
-                return Err(Error::Message(
-                    "untrusted relay audit override cannot remove path exclusions".into(),
-                ));
-            }
-        }
-    }
-    if patch
-        .path_include
-        .as_ref()
-        .is_some_and(|inc| !inc.is_empty() && *inc != base.paths.include)
-    {
-        return Err(Error::Message(
-            "untrusted relay audit override cannot narrow path_include".into(),
-        ));
-    }
-    for (cat_name, cat) in &patch.categories {
-        if let Some(cur) = base.categories.get(cat_name) {
-            if cur.enabled && (!cat.enabled || cat.detail.rank() < cur.detail.rank()) {
+    for (cat_name, cur_cat) in &base.categories {
+        if cur_cat.enabled {
+            let Some(next_cat) = cand.categories.get(cat_name) else {
                 return Err(Error::Message(format!(
-                    "untrusted relay audit override cannot downgrade category '{cat_name}'"
+                    "untrusted relay audit push cannot remove category '{cat_name}'"
+                )));
+            };
+            if !next_cat.enabled || next_cat.detail.rank() < cur_cat.detail.rank() {
+                return Err(Error::Message(format!(
+                    "untrusted relay audit push cannot disable or downgrade category '{cat_name}'"
                 )));
             }
         }
+    }
+    if (base.capture.stdout_stderr && !cand.capture.stdout_stderr)
+        || (base.capture.pty_transcript && !cand.capture.pty_transcript)
+        || (base.capture.diff && !cand.capture.diff)
+        || (base.capture.hashes && !cand.capture.hashes)
+        || cand.capture.stdout_cap_bytes < base.capture.stdout_cap_bytes
+        || cand.capture.pty_cap_bytes < base.capture.pty_cap_bytes
+        || cand.capture.diff_cap_bytes < base.capture.diff_cap_bytes
+    {
+        return Err(Error::Message(
+            "untrusted relay audit push cannot downgrade capture settings".into(),
+        ));
+    }
+    if recording_mode_rank(&cand.recording.mode) < recording_mode_rank(&base.recording.mode)
+        || recording_quality_rank(&cand.recording.quality)
+            < recording_quality_rank(&base.recording.quality)
+        || cand.recording.fps < base.recording.fps
+        || cand.recording.idle_secs < base.recording.idle_secs
+        || (base.recording.per_session && !cand.recording.per_session)
+    {
+        return Err(Error::Message(
+            "untrusted relay audit push cannot downgrade recording settings".into(),
+        ));
+    }
+    if cand.retention.log_days < base.retention.log_days
+        || cand.retention.diff_days < base.retention.diff_days
+        || cand.retention.recording_days < base.retention.recording_days
+        || !retention_byte_cap_allowed(
+            base.retention.max_log_bytes,
+            preset_defaults.max_log_bytes,
+            PARANOID_MAX_LOG_BYTES,
+            cand.retention.max_log_bytes,
+        )
+        || !retention_byte_cap_allowed(
+            base.retention.max_diff_bytes,
+            preset_defaults.max_diff_bytes,
+            PARANOID_MAX_DIFF_BYTES,
+            cand.retention.max_diff_bytes,
+        )
+        || !retention_byte_cap_allowed(
+            base.retention.max_recording_bytes,
+            preset_defaults.max_recording_bytes,
+            PARANOID_MAX_RECORDING_BYTES,
+            cand.retention.max_recording_bytes,
+        )
+    {
+        return Err(Error::Message(
+            "untrusted relay audit push cannot lower retention or exceed local disk quota bounds"
+                .into(),
+        ));
+    }
+    for pattern in &base.redact.patterns {
+        if !cand.redact.patterns.contains(pattern) {
+            return Err(Error::Message(
+                "untrusted relay audit push cannot remove redact patterns".into(),
+            ));
+        }
+    }
+    for env_key in &base.redact.env_keys {
+        if !cand.redact.env_keys.contains(env_key) {
+            return Err(Error::Message(
+                "untrusted relay audit push cannot remove redact env_keys".into(),
+            ));
+        }
+    }
+    if cand.paths != base.paths {
+        return Err(Error::Message(
+            "untrusted relay audit push cannot modify local path filters".into(),
+        ));
     }
     Ok(())
 }
@@ -1053,6 +1162,121 @@ fn is_public_webhook_ipv4(v4: std::net::Ipv4Addr) -> bool {
         || is_benchmark
         || is_ietf_special
         || is_reserved)
+}
+
+fn is_metadata_webhook_domain(domain: &str) -> bool {
+    let host = domain.trim_end_matches('.').to_ascii_lowercase();
+    host.is_empty()
+        || host == "metadata"
+        || host == "instance-data"
+        || host == "metadata.google.internal"
+        || host.ends_with(".metadata.google.internal")
+}
+
+fn is_forbidden_webhook_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    oct[0] == 0
+        || v4.is_unspecified()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || oct[0] >= 240
+}
+
+pub fn is_forbidden_webhook_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_forbidden_webhook_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return false;
+            }
+            if v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            if let Some(mapped) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                return is_forbidden_webhook_ipv4(mapped);
+            }
+            let seg0 = v6.segments()[0];
+            (seg0 & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn is_loopback_ip_any(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6
+                    .to_ipv4_mapped()
+                    .or_else(|| v6.to_ipv4())
+                    .is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+fn domain_is_explicit_localhost(domain: &str) -> bool {
+    let host = domain.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
+
+/// Validates alert webhook URLs in node-local `audit.toml`: allows explicit
+/// operator-configured private-LAN, loopback, and internal SIEM destinations,
+/// while unconditionally blocking cloud metadata/link-local (`169.254.0.0/16`,
+/// `::ffff:169.254.0.0/112`, `fe80::/10`, `metadata.google.internal`),
+/// unspecified (`0.0.0.0/8`, `::`), multicast/broadcast, and embedded credentials.
+pub fn validate_local_webhook_url(rule_name: &str, raw_url: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(raw_url).map_err(|_| {
+        Error::Message(format!(
+            "alert '{rule_name}' needs a valid http(s) webhook URL"
+        ))
+    })?;
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err(Error::Message(format!(
+            "alert '{rule_name}' needs an http(s) webhook"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::Message(format!(
+            "alert '{rule_name}' webhook must not embed credentials"
+        )));
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if is_forbidden_webhook_ip(std::net::IpAddr::V4(v4)) {
+                return Err(Error::Message(format!(
+                    "alert '{rule_name}' webhook IP {v4} is forbidden"
+                )));
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if is_forbidden_webhook_ip(std::net::IpAddr::V6(v6)) {
+                return Err(Error::Message(format!(
+                    "alert '{rule_name}' webhook IP {v6} is forbidden"
+                )));
+            }
+        }
+        Some(url::Host::Domain(domain)) => {
+            if is_metadata_webhook_domain(domain) {
+                return Err(Error::Message(format!(
+                    "alert '{rule_name}' webhook host '{domain}' is not allowed"
+                )));
+            }
+            if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
+                if is_forbidden_webhook_ip(ip) {
+                    return Err(Error::Message(format!(
+                        "alert '{rule_name}' webhook IP {ip} is forbidden"
+                    )));
+                }
+            }
+        }
+        None => {
+            return Err(Error::Message(format!(
+                "alert '{rule_name}' webhook is missing a host"
+            )));
+        }
+    }
+    Ok(parsed)
 }
 
 fn is_blocked_webhook_domain(domain: &str) -> bool {
@@ -1120,6 +1344,56 @@ pub fn validate_webhook_url(rule_name: &str, raw_url: &str) -> Result<url::Url> 
     Ok(parsed)
 }
 
+fn resolve_vetted_local_webhook_addrs(
+    parsed: &url::Url,
+) -> Result<Option<(String, Vec<std::net::SocketAddr>)>> {
+    use std::net::ToSocketAddrs;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if is_forbidden_webhook_ip(std::net::IpAddr::V4(v4)) {
+                return Err(Error::Message("forbidden webhook IPv4".into()));
+            }
+            Ok(None)
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if is_forbidden_webhook_ip(std::net::IpAddr::V6(v6)) {
+                return Err(Error::Message("forbidden webhook IPv6".into()));
+            }
+            Ok(None)
+        }
+        Some(url::Host::Domain(domain)) => {
+            if is_metadata_webhook_domain(domain) {
+                return Err(Error::Message("forbidden metadata webhook domain".into()));
+            }
+            let allow_loopback = domain_is_explicit_localhost(domain);
+            let resolved: Vec<std::net::SocketAddr> = (domain, port)
+                .to_socket_addrs()
+                .map_err(|e| Error::Message(format!("webhook dns resolve: {e}")))?
+                .collect();
+            if resolved.is_empty() {
+                return Err(Error::Message("webhook dns returned no addresses".into()));
+            }
+            for addr in &resolved {
+                if is_forbidden_webhook_ip(addr.ip()) {
+                    return Err(Error::Message(
+                        "webhook dns resolved to a forbidden link-local/unspecified address".into(),
+                    ));
+                }
+                if !allow_loopback && is_loopback_ip_any(addr.ip()) {
+                    return Err(Error::Message(
+                        "non-localhost webhook domain resolved to loopback (DNS rebinding blocked)"
+                            .into(),
+                    ));
+                }
+            }
+            Ok(Some((domain.to_string(), resolved)))
+        }
+        None => Err(Error::Message("webhook missing host".into())),
+    }
+}
+
+#[cfg(test)]
 fn resolve_vetted_webhook_addrs(
     parsed: &url::Url,
 ) -> Result<Option<(String, Vec<std::net::SocketAddr>)>> {
@@ -1465,10 +1739,10 @@ pub fn fire_webhook(url: &str, payload: &Value) {
     let url = url.to_string();
     let body = payload.to_string();
     std::thread::spawn(move || {
-        let Ok(parsed) = validate_webhook_url("alert", &url) else {
+        let Ok(parsed) = validate_local_webhook_url("alert", &url) else {
             return;
         };
-        let Ok(pinned) = resolve_vetted_webhook_addrs(&parsed) else {
+        let Ok(pinned) = resolve_vetted_local_webhook_addrs(&parsed) else {
             return;
         };
         let mut builder = reqwest::blocking::Client::builder()
@@ -2150,6 +2424,103 @@ mod tests {
         assert!(unlocked
             .apply_untrusted_relay_push(
                 "preset = \"standard\"\nlock_local = false\n[forward]\nchain = false\n"
+            )
+            .is_err());
+
+        // Local operator-authored audit.toml (`AuditPolicy::parse`) MUST allow explicit
+        // private-LAN, loopback, and internal-domain SIEM webhooks while still blocking
+        // cloud metadata/link-local (`169.254.0.0/16`, `::ffff:169.254.169.254`), `0.0.0.0/8`,
+        // multicast, and embedded credentials!
+        for allowed_local_siem in [
+            "https://10.0.5.20:8443/siem-hook",
+            "https://192.168.1.50/hook",
+            "http://127.0.0.1:9000/hook",
+            "http://[::1]:9000/hook",
+            "http://localhost:9000/hook",
+            "https://siem.corp.internal/hook",
+        ] {
+            let local_toml = format!(
+                "preset = \"standard\"\nlock_local = true\n[[alerts]]\nname = \"siem\"\nwebhook = \"{allowed_local_siem}\"\n"
+            );
+            assert!(
+                AuditPolicy::parse(&local_toml).is_ok(),
+                "local operator SIEM webhook should be accepted in local audit.toml: {allowed_local_siem}"
+            );
+        }
+        for forbidden_even_locally in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/hook",
+            "http://[fe80::1]/hook",
+            "http://0.0.0.0/hook",
+            "http://0.1.2.3/hook",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "https://user:pass@10.0.5.20/hook",
+        ] {
+            let local_toml = format!(
+                "preset = \"standard\"\nlock_local = true\n[[alerts]]\nname = \"bad\"\nwebhook = \"{forbidden_even_locally}\"\n"
+            );
+            assert!(
+                AuditPolicy::parse(&local_toml).is_err(),
+                "cloud metadata / invalid webhook must be rejected even locally: {forbidden_even_locally}"
+            );
+        }
+
+        // EB-02a: extreme idle_secs, invalid override fields, and unbounded disk quota inflation
+        // MUST be rejected while legitimate preset upgrades (`standard -> full -> paranoid`) succeed!
+        let overflow_idle = format!(
+            "preset = \"full\"\nlock_local = false\n[recording]\nmode = \"gui\"\nidle_secs = {}\n",
+            i64::MAX
+        );
+        assert!(
+            AuditPolicy::parse(&overflow_idle).is_err(),
+            "extreme recording.idle_secs must fail validation"
+        );
+        for bad_override in [
+            "preset = \"standard\"\n[overrides.agent.bot.recording]\nidle_secs = 9999999\n",
+            "preset = \"standard\"\n[overrides.agent.bot.recording]\nmode = \"invalid\"\n",
+            "preset = \"standard\"\n[overrides.agent.bot]\nredact_patterns = [\"[\"]\n",
+            "preset = \"standard\"\n[overrides.node.box.retention]\nlog_days = 999999\n",
+        ] {
+            assert!(
+                AuditPolicy::parse(bad_override).is_err(),
+                "invalid override must fail AuditPolicy::validate(): {bad_override}"
+            );
+        }
+
+        // Preset upgrades on unlocked node succeed (`standard -> full -> paranoid`):
+        let mut std_unlocked = AuditPolicy::preset("standard").unwrap();
+        std_unlocked.lock_local = false;
+        let full_upgraded = std_unlocked
+            .apply_untrusted_relay_push("preset = \"full\"\nlock_local = false\n")
+            .expect("standard -> full upgrade must succeed")
+            .expect("unlocked");
+        let _paranoid_upgraded = full_upgraded
+            .apply_untrusted_relay_push("preset = \"paranoid\"\nlock_local = false\n")
+            .expect("full -> paranoid upgrade must succeed")
+            .expect("unlocked");
+
+        // Unbounded disk quota inflation (> paranoid ceiling) on untrusted push MUST fail:
+        assert!(
+            std_unlocked
+                .apply_untrusted_relay_push(
+                    "preset = \"standard\"\nlock_local = false\n[retention]\nmax_log_bytes = 549755813888\n"
+                )
+                .is_err(),
+            "untrusted push must not inflate max_log_bytes to 512 GiB"
+        );
+
+        // Custom tight operator disk cap (50 MiB < standard 1 GiB) must neither shrink nor expand:
+        let mut custom_tight = AuditPolicy::preset("standard").unwrap();
+        custom_tight.lock_local = false;
+        custom_tight.retention.max_log_bytes = 50 * 1024 * 1024;
+        assert!(custom_tight
+            .apply_untrusted_relay_push(
+                "preset = \"standard\"\nlock_local = false\n[retention]\nmax_log_bytes = 10485760\n"
+            )
+            .is_err());
+        assert!(custom_tight
+            .apply_untrusted_relay_push(
+                "preset = \"standard\"\nlock_local = false\n[retention]\nmax_log_bytes = 1073741824\n"
             )
             .is_err());
     }

@@ -19,7 +19,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::mcp::{self, Mcp};
 
@@ -28,6 +28,8 @@ const MAX_HTTP_BODY_BYTES: usize = mcp::MAX_MCP_MESSAGE_BYTES;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MCP_HTTP_SESSIONS: usize = 64;
 const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(3600);
+const MAX_CONCURRENT_MCP_CONNS: usize = 64;
+const MAX_CONCURRENT_MCP_SSE: usize = 16;
 
 struct SessionSlot {
     mcp: Arc<Mutex<Mcp>>,
@@ -45,15 +47,34 @@ pub async fn serve(
     eprintln!("mcp http listening on http://{addr}/mcp");
     let _ = std::io::stderr().flush();
     let sessions: Arc<Mutex<HashMap<String, SessionSlot>>> = Arc::new(Mutex::new(HashMap::new()));
+    let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_MCP_CONNS));
+    let sse_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_MCP_SSE));
     let token = Arc::new(token);
     loop {
-        let (socket, _) = listener.accept().await?;
+        let (mut socket, _) = listener.accept().await?;
+        let Ok(conn_permit) = conn_sem.clone().try_acquire_owned() else {
+            tokio::spawn(async move {
+                let _ = write_response(
+                    &mut socket,
+                    503,
+                    "application/json",
+                    None,
+                    br#"{"error":"too many connections"}"#,
+                )
+                .await;
+            });
+            continue;
+        };
         let sessions = sessions.clone();
+        let sse_sem = sse_sem.clone();
         let settings = settings.clone();
         let token = token.clone();
         let identity_path = identity_path.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_conn(socket, sessions, settings, token, identity_path).await {
+            let _permit = conn_permit;
+            if let Err(err) =
+                handle_conn(socket, sessions, sse_sem, settings, token, identity_path).await
+            {
                 tracing::debug!(error = %err, "mcp http connection ended");
             }
         });
@@ -69,6 +90,7 @@ enum ReadRequestError {
 async fn handle_conn(
     mut socket: TcpStream,
     sessions: Arc<Mutex<HashMap<String, SessionSlot>>>,
+    sse_sem: Arc<Semaphore>,
     settings: ClientSettings,
     token: Arc<String>,
     identity_path: PathBuf,
@@ -188,6 +210,16 @@ async fn handle_conn(
             .await
         }
         "GET" => {
+            let Ok(_sse_permit) = sse_sem.try_acquire_owned() else {
+                return write_response(
+                    &mut socket,
+                    503,
+                    "application/json",
+                    None,
+                    br#"{"error":"too many sse streams"}"#,
+                )
+                .await;
+            };
             let session_id = match resolve_session_id(&req.headers) {
                 Some(id) => id,
                 None => {
@@ -399,9 +431,16 @@ fn authorized(req: &Request, token: &str) -> bool {
     let Some(value) = header(&req.headers, "authorization") else {
         return false;
     };
-    let Some(got) = value.strip_prefix("Bearer ") else {
+    let raw = value.as_bytes();
+    if raw.len() < 7 || !raw[..7].eq_ignore_ascii_case(b"bearer ") {
         return false;
-    };
+    }
+    // `raw[..7]` is pure ASCII ("bearer "), so byte index 7 is guaranteed to
+    // lie on a valid UTF-8 character boundary.
+    let got = value[7..].trim();
+    if got.is_empty() {
+        return false;
+    }
     constant_time_eq(got.as_bytes(), token.as_bytes())
 }
 
@@ -475,6 +514,7 @@ async fn write_response(
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let mut head = format!(
@@ -609,6 +649,71 @@ mod tests {
             huge_resp.starts_with("HTTP/1.1 413"),
             "oversized body should return 413: {huge_resp}"
         );
+
+        // RFC 9110 case-insensitive `bearer ` scheme prefix MUST be accepted,
+        // and non-ASCII UTF-8 / truncated / invalid Authorization headers MUST
+        // cleanly return 401 without panicking on UTF-8 char boundaries!
+        for upper_or_mixed in ["bearer mcp-secret", "BEARER mcp-secret", "BeArEr mcp-secret"] {
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nHost: [::1]:8080\r\nAuthorization: {upper_or_mixed}\r\nOrigin: http://[::1]:8080\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let resp = exchange(addr, &req).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 200"),
+                "case-insensitive {upper_or_mixed} should succeed: {resp}"
+            );
+        }
+        for bad_auth in [
+            "🔥🔥🔥",
+            "🔥Bearer mcp-secret",
+            "Bearer 🔥secret",
+            "Be",
+            "Bearer",
+            "Bearer ",
+            "Basic dXNlcjpwYXNz",
+        ] {
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {bad_auth}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+            );
+            let resp = exchange(addr, &req).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 401"),
+                "invalid Authorization '{bad_auth}' must return 401 without panicking, got: {resp:?}"
+            );
+        }
+
+        // Exhausting concurrent GET /mcp SSE streams (16) MUST return 503 on the 17th SSE
+        // while keeping POST /mcp responsive!
+        let mut held_sse = Vec::new();
+        for _ in 0..16 {
+            let mut s = connect_when_up(addr).await;
+            s.write_all(
+                b"GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer mcp-secret\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut head_buf = [0u8; 256];
+            let n = s.read(&mut head_buf).await.unwrap();
+            let head_str = String::from_utf8_lossy(&head_buf[..n]);
+            assert!(head_str.starts_with("HTTP/1.1 200"), "{head_str}");
+            held_sse.push(s);
+        }
+        let sse_overflow = exchange(
+            addr,
+            "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer mcp-secret\r\n\r\n",
+        )
+        .await;
+        assert!(
+            sse_overflow.starts_with("HTTP/1.1 503"),
+            "17th concurrent SSE stream should return 503: {sse_overflow}"
+        );
+        let post_still_works = exchange(addr, &raw).await;
+        assert!(
+            post_still_works.starts_with("HTTP/1.1 200"),
+            "POST /mcp must remain available while SSE cap is full: {post_still_works}"
+        );
+        drop(held_sse);
     }
 
     #[tokio::test]

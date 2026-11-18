@@ -738,9 +738,10 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 Cmd::PtyOpen { node, rows, cols } => {
                     close_pty(&mut pty).await;
                     let node_arg = node;
-                    match run_with_worker_client_once_rebootstrap(
+                    match run_non_idempotent_with_live_worker_client(
                         &mut client,
                         &config_dir,
+                        "opening terminal session",
                         |current| {
                             let node = node_arg.clone();
                             Box::pin(async move {
@@ -753,12 +754,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     )
                     .await
                     {
-                        Ok((session, reconnected)) => {
-                            if reconnected {
-                                shared.push(UiEvent::Notice(
-                                    "Reconnected after a closed relay session.".into(),
-                                ));
-                            }
+                        Ok(session) => {
                             pty = Some(spawn_pty(session, Arc::clone(&shared)));
                         }
                         Err(err) => shared.push(UiEvent::Failed(err)),
@@ -778,7 +774,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 Cmd::List { node, path } => {
                     let node_arg = node;
                     let path_arg = path.clone();
-                    match run_with_worker_client_once_rebootstrap(
+                    match run_idempotent_with_once_rebootstrap(
                         &mut client,
                         &config_dir,
                         |current| {
@@ -801,7 +797,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 Cmd::Read { node, path } => {
                     let node_arg = node;
                     let path_arg = path.clone();
-                    match run_with_worker_client_once_rebootstrap(
+                    match run_idempotent_with_once_rebootstrap(
                         &mut client,
                         &config_dir,
                         |current| {
@@ -831,9 +827,10 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     let node_arg = node;
                     let path_arg = path.clone();
                     let text_arg = text.clone();
-                    match run_with_worker_client_once_rebootstrap(
+                    match run_non_idempotent_with_live_worker_client(
                         &mut client,
                         &config_dir,
+                        "saving file",
                         |current| {
                             let node = node_arg.clone();
                             let path = path_arg.clone();
@@ -848,7 +845,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     )
                     .await
                     {
-                        Ok(((), _)) => {
+                        Ok(()) => {
                             shared.push(UiEvent::Notice(format!("Saved {path}")));
                             shared.push(UiEvent::File { path, text });
                         }
@@ -857,23 +854,18 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 }
                 Cmd::Mkdir { node, path } => {
                     let parent = super::model::parent_path(&path);
-                    let node_arg = node;
+                    let node_arg = node.clone();
                     let path_arg = path;
-                    let parent_arg = parent.clone();
-                    match run_with_worker_client_once_rebootstrap(
+                    match run_non_idempotent_with_live_worker_client(
                         &mut client,
                         &config_dir,
+                        "creating folder",
                         |current| {
                             let node = node_arg.clone();
                             let path = path_arg.clone();
-                            let parent = parent_arg.clone();
                             Box::pin(async move {
                                 current
                                     .mkdir(&node, &path, true)
-                                    .await
-                                    .map_err(|err| err.to_string())?;
-                                current
-                                    .list_dir(&node, &parent)
                                     .await
                                     .map_err(|err| err.to_string())
                             })
@@ -881,32 +873,48 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     )
                     .await
                     {
-                        Ok((entries, _)) => shared.push(UiEvent::Dir {
-                            path: parent,
-                            entries,
-                        }),
+                        Ok(()) => {
+                            let parent_arg = parent.clone();
+                            match run_idempotent_with_once_rebootstrap(
+                                &mut client,
+                                &config_dir,
+                                |current| {
+                                    let node = node.clone();
+                                    let parent = parent_arg.clone();
+                                    Box::pin(async move {
+                                        current
+                                            .list_dir(&node, &parent)
+                                            .await
+                                            .map_err(|err| err.to_string())
+                                    })
+                                },
+                            )
+                            .await
+                            {
+                                Ok((entries, _)) => shared.push(UiEvent::Dir {
+                                    path: parent,
+                                    entries,
+                                }),
+                                Err(err) => shared.push(UiEvent::Failed(err)),
+                            }
+                        }
                         Err(err) => shared.push(UiEvent::Failed(err)),
                     }
                 }
                 Cmd::Remove { node, path } => {
                     let parent = super::model::parent_path(&path);
-                    let node_arg = node;
+                    let node_arg = node.clone();
                     let path_arg = path;
-                    let parent_arg = parent.clone();
-                    match run_with_worker_client_once_rebootstrap(
+                    match run_non_idempotent_with_live_worker_client(
                         &mut client,
                         &config_dir,
+                        "removing path",
                         |current| {
                             let node = node_arg.clone();
                             let path = path_arg.clone();
-                            let parent = parent_arg.clone();
                             Box::pin(async move {
                                 current
                                     .remove(&node, &path, false)
-                                    .await
-                                    .map_err(|err| err.to_string())?;
-                                current
-                                    .list_dir(&node, &parent)
                                     .await
                                     .map_err(|err| err.to_string())
                             })
@@ -914,10 +922,31 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     )
                     .await
                     {
-                        Ok((entries, _)) => shared.push(UiEvent::Dir {
-                            path: parent,
-                            entries,
-                        }),
+                        Ok(()) => {
+                            let parent_arg = parent.clone();
+                            match run_idempotent_with_once_rebootstrap(
+                                &mut client,
+                                &config_dir,
+                                |current| {
+                                    let node = node.clone();
+                                    let parent = parent_arg.clone();
+                                    Box::pin(async move {
+                                        current
+                                            .list_dir(&node, &parent)
+                                            .await
+                                            .map_err(|err| err.to_string())
+                                    })
+                                },
+                            )
+                            .await
+                            {
+                                Ok((entries, _)) => shared.push(UiEvent::Dir {
+                                    path: parent,
+                                    entries,
+                                }),
+                                Err(err) => shared.push(UiEvent::Failed(err)),
+                            }
+                        }
                         Err(err) => shared.push(UiEvent::Failed(err)),
                     }
                 }
@@ -998,12 +1027,13 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                             viewer.send_control_move(&body)
                         };
                         // Closed/saturated barrier: do not Extension-bypass.
-                    } else if client.is_some() {
+                    } else {
                         let payload = serde_json::from_str(&inject).unwrap_or(json!({}));
                         let node_arg = node;
-                        if let Err(err) = run_with_worker_client_once_rebootstrap(
+                        match run_non_idempotent_with_live_worker_client(
                             &mut client,
                             &config_dir,
+                            "sending input",
                             |current| {
                                 let node = node_arg.clone();
                                 let payload = payload.clone();
@@ -1023,7 +1053,9 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         )
                         .await
                         {
-                            shared.push(UiEvent::Failed(err));
+                            Ok(_) => {}
+                            Err(err) if err == "Sign in first." => {}
+                            Err(err) => shared.push(UiEvent::Failed(err)),
                         }
                     }
                 }
@@ -1102,7 +1134,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 Cmd::Shot { node, path } => {
                     let node_arg = node;
                     let path_arg = path;
-                    match run_with_worker_client_once_rebootstrap(
+                    match run_idempotent_with_once_rebootstrap(
                         &mut client,
                         &config_dir,
                         |current| {
@@ -1125,9 +1157,10 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     Ok(policy) => {
                         let ttl = minutes.clamp(1, 7 * 24 * 60) * 60;
                         let name_arg = name.clone();
-                        match run_with_worker_client_once_rebootstrap(
+                        match run_non_idempotent_with_live_worker_client(
                             &mut client,
                             &config_dir,
+                            "creating enrollment token",
                             |current| {
                                 let name = name_arg.clone();
                                 Box::pin(async move {
@@ -1140,7 +1173,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         )
                         .await
                         {
-                            Ok((info, _)) => {
+                            Ok(info) => {
                                 let command = enroll_command(&info.token, &name, &access);
                                 shared.push(UiEvent::Enrolled(format!(
                                     "{command}\n\nToken: {}",
@@ -2052,7 +2085,9 @@ where
     }
 }
 
-async fn run_with_worker_client_once_rebootstrap<T, OpFn>(
+/// Read-only idempotent operations (`List`, `Read`, `Shot`): rebuild a dead
+/// cached `Client` before sending AND retry once on transport closure.
+async fn run_idempotent_with_once_rebootstrap<T, OpFn>(
     client: &mut Option<Arc<Client>>,
     config_dir: &std::path::Path,
     mut op: OpFn,
@@ -2071,6 +2106,77 @@ where
             Ok((value, true))
         }
         Err(err) => Err(err),
+    }
+}
+
+/// Non-idempotent / side-effecting operations (`PtyOpen`, `Write`, `Mkdir`,
+/// `Remove`, `Input` fallback, `Enroll`): rebuilds a dead cached `Client`
+/// *before* sending so pre-existing dead handles still recover transparently,
+/// but executes `op` **at most once** once dispatched on a live `Client`. If
+/// the transport drops before confirmation arrives, clears the dead handle for
+/// the next command and returns an explicit indeterminate-outcome error instead
+/// of silently replaying the side effect.
+async fn run_non_idempotent_with_live_worker_client<T, OpFn>(
+    client: &mut Option<Arc<Client>>,
+    config_dir: &std::path::Path,
+    action_label: &'static str,
+    op: OpFn,
+) -> Result<T, String>
+where
+    OpFn: FnOnce(
+        Arc<Client>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>,
+{
+    run_mutation_at_most_once_inner(
+        client,
+        action_label,
+        Client::is_alive,
+        |slot, force| {
+            let config_dir = config_dir.to_path_buf();
+            Box::pin(async move { ensure_worker_client(slot, &config_dir, force).await })
+        },
+        op,
+    )
+    .await
+}
+
+async fn run_mutation_at_most_once_inner<C, T, Ensure, OpFn>(
+    client: &mut Option<Arc<C>>,
+    action_label: &'static str,
+    is_alive: impl Fn(&C) -> bool,
+    mut ensure: Ensure,
+    op: OpFn,
+) -> Result<T, String>
+where
+    C: 'static,
+    Ensure: for<'a> FnMut(
+        &'a mut Option<Arc<C>>,
+        bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<C>, String>> + 'a>,
+    >,
+    OpFn: FnOnce(
+        Arc<C>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>,
+{
+    let current = ensure(client, false).await?;
+    match op(Arc::clone(&current)).await {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let dead_after = !is_alive(&current);
+            let transport_lost = super::model::session_needs_rebootstrap(&err)
+                || (dead_after && err.to_ascii_lowercase().contains("session expired"));
+            if dead_after || super::model::session_needs_rebootstrap(&err) {
+                *client = None;
+            }
+            if transport_lost {
+                Err(format!(
+                    "Connection closed before confirming {action_label} ({err}); outcome is unknown and was not automatically retried to avoid duplicate execution."
+                ))
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
@@ -3743,5 +3849,315 @@ mod worker_client_recovery_tests {
         let _ = worker_thread.join();
         node_stop.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), node_task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_worker_non_idempotent_input_executes_at_most_once_on_mid_call_disconnect() {
+        use agentlink_core::client::UserSession;
+        use agentlink_core::{NodeExtension, NodePolicy, PHASE2_INJECT_INPUT};
+        use agentlink_node::{run as run_node, NodeConfig};
+        use agentlink_relay::{RelayConfig, RelayHandle};
+        use tokio_util::sync::CancellationToken;
+
+        struct CountingInjectExt {
+            calls: Arc<AtomicU32>,
+            entered_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+
+        impl NodeExtension for CountingInjectExt {
+            fn name(&self) -> &'static str {
+                PHASE2_INJECT_INPUT
+            }
+            fn handle(&self, _payload: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                if let Some(tx) = self.entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let relay = RelayHandle::spawn(RelayConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            data_dir: tmp.path().join("relay"),
+            capture: None,
+            database_url: None,
+            allow_signup: false,
+            bootstrap_admin: true,
+            db_schema: None,
+            trust_proxy: Vec::new(),
+            print_admin_token: false,
+            legacy_admin_override: Some((true, Some(86_400))),
+        })
+        .await
+        .expect("spawn relay");
+        let admin_pw = relay.bootstrap_password.clone().expect("bootstrap pw");
+        let relay_url = format!("wss://{}/v1/connect", relay.local_addr);
+
+        let setup_client = Client::connect(&ClientSettings {
+            relay: relay_url.clone(),
+            token: relay.admin_token.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        })
+        .await
+        .expect("setup client");
+        let pair = setup_client
+            .create_pairing_token("desk-sim", NodePolicy::full(), 600)
+            .await
+            .expect("pair");
+        let node_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&node_dir).expect("node dir");
+        let calls = Arc::new(AtomicU32::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let ext: Arc<dyn NodeExtension> = Arc::new(CountingInjectExt {
+            calls: Arc::clone(&calls),
+            entered_tx: Mutex::new(Some(entered_tx)),
+        });
+        let node_stop = CancellationToken::new();
+        let node_task = tokio::spawn(run_node(
+            NodeConfig {
+                relay_url: relay_url.clone(),
+                fingerprint: relay.fingerprint.clone(),
+                trust: None,
+                data_dir: node_dir.clone(),
+                name: "desk-sim".into(),
+                pairing_token: Some(pair.token),
+                root: Some(tmp.path().to_path_buf()),
+                max_policy: NodePolicy::full(),
+                version: "test".into(),
+                extensions: vec![ext],
+                policy_hook: None,
+                capture: None,
+            },
+            node_stop.clone(),
+        ));
+        let box_id = loop {
+            if let Ok(nodes) = setup_client.list_nodes().await {
+                if let Some(n) = nodes.into_iter().find(|n| n.name == "desk-sim" && n.online) {
+                    break n.id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        };
+
+        let config_dir = tmp.path().join("ctrl");
+        std::fs::create_dir_all(&config_dir).expect("cfg");
+        let ctrl_id = Identity::load_or_create(&config_dir.join("identity.json")).expect("id");
+        let grant =
+            agentlink_core::grant::issue_local_grant(&node_dir, &box_id, ctrl_id.public_hex())
+                .expect("grant");
+        agentlink_core::grant::save_grant(&config_dir, &grant).expect("save grant");
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::new());
+        let shared_worker = Arc::clone(&shared);
+        let cfg_worker = config_dir.clone();
+        let worker_thread = std::thread::spawn(move || {
+            super::run(cmd_rx, shared_worker, cfg_worker);
+        });
+        cmd_tx
+            .send(Cmd::Login {
+                username: "admin".into(),
+                password: admin_pw.clone(),
+                totp: String::new(),
+                relay: relay_url.clone(),
+                pin: relay.fingerprint.clone(),
+                trust: String::new(),
+            })
+            .expect("login");
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if shared
+                .drain()
+                .iter()
+                .any(|ev| matches!(ev, UiEvent::Ready { user: Some(_) }))
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "login timed out");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Send non-idempotent Cmd::Input (stills fallback extension route).
+        cmd_tx
+            .send(Cmd::Input {
+                node: box_id.clone(),
+                live: String::new(),
+                inject: r#"{"action":"click","x":0.5,"y":0.5,"button":"left","count":1}"#.into(),
+                barrier: false,
+            })
+            .expect("send input");
+
+        // Wait until the real node extension handler has ALREADY started executing call #1!
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("extension never entered")
+            .expect("entered rx");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        // Kill worker's Client #1 mid-flight before the 600ms extension reply returns, while
+        // seeding a valid replacement session on disk (the exact condition where automatic
+        // rebootstrap would dangerously replay the already-executed click!).
+        crate::tray::sign_out(&config_dir)
+            .await
+            .expect("revoke session 1");
+        relay.disconnect_clients();
+        let fresh: UserSession = agentlink_core::client::login_user(
+            &relay_url,
+            &relay.fingerprint,
+            None,
+            &ctrl_id,
+            "admin",
+            &admin_pw,
+            None,
+            "ctrl-2",
+        )
+        .await
+        .expect("fresh login");
+        agentlink_core::config::save_session(
+            &config_dir,
+            &ClientSettings {
+                relay: relay_url.clone(),
+                token: fresh.access_token,
+                fingerprint: relay.fingerprint.clone(),
+                trust: None,
+            },
+            &fresh.user,
+            &fresh.refresh_token,
+            fresh.access_expires_unix,
+        )
+        .expect("save fresh");
+
+        // Wait for UiEvent::Failed from the interrupted Cmd::Input.
+        let mut fail_msg = String::new();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while fail_msg.is_empty() {
+            for ev in shared.drain() {
+                if let UiEvent::Failed(msg) = ev {
+                    fail_msg = msg;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "expected explicit indeterminate-outcome failure, calls={}",
+                calls.load(AtomicOrdering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "non-idempotent Cmd::Input replayed a second time after mid-call disconnect!"
+        );
+        assert!(
+            fail_msg.to_ascii_lowercase().contains("unknown")
+                || fail_msg.to_ascii_lowercase().contains("not automatically retried"),
+            "expected explicit indeterminate outcome message, got: {fail_msg}"
+        );
+
+        // Next read-only command MUST still reconnect cleanly via pre-call ensure_worker_client!
+        cmd_tx
+            .send(Cmd::List {
+                node: box_id,
+                path: ".".into(),
+            })
+            .expect("list after drop");
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let mut listed = false;
+        while !listed {
+            for ev in shared.drain() {
+                if matches!(ev, UiEvent::Dir { .. }) {
+                    listed = true;
+                }
+            }
+            assert!(std::time::Instant::now() < until, "subsequent List did not recover");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        drop(cmd_tx);
+        let _ = worker_thread.join();
+        node_stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), node_task).await;
+    }
+
+    #[tokio::test]
+    async fn mutation_helper_rebuilds_dead_before_send_and_never_replays_connection_closed() {
+        // 1. Pre-existing dead handle rebuilds BEFORE sending and runs op once.
+        let connects = Arc::new(AtomicU32::new(0));
+        let mut slot: Option<Arc<FakeClient>> = Some(FakeClient::dead(1));
+        let runs = Arc::new(AtomicU32::new(0));
+        let connects_c = Arc::clone(&connects);
+        let runs_c = Arc::clone(&runs);
+        let ok = run_mutation_at_most_once_inner(
+            &mut slot,
+            "removing path",
+            FakeClient::is_alive,
+            |slot, force| {
+                let connects = Arc::clone(&connects_c);
+                Box::pin(async move {
+                    if let Some(cur) =
+                        replace_worker_client_slot(slot, force, FakeClient::is_alive)
+                    {
+                        return Ok(cur);
+                    }
+                    connects.fetch_add(1, AtomicOrdering::SeqCst);
+                    let next = FakeClient::alive(2, Vec::new());
+                    *slot = Some(Arc::clone(&next));
+                    Ok(next)
+                })
+            },
+            move |cur| {
+                Box::pin(async move {
+                    runs_c.fetch_add(1, AtomicOrdering::SeqCst);
+                    assert_eq!(cur.id, 2);
+                    Ok(())
+                })
+            },
+        )
+        .await;
+        assert!(ok.is_ok());
+        assert_eq!(connects.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(runs.load(AtomicOrdering::SeqCst), 1);
+
+        // 2. Live handle returning `"connection closed"` mid-call MUST NOT run op a second time!
+        let mut slot2: Option<Arc<FakeClient>> = Some(FakeClient::alive(10, Vec::new()));
+        let runs2 = Arc::new(AtomicU32::new(0));
+        let connects2 = Arc::new(AtomicU32::new(0));
+        let runs2_c = Arc::clone(&runs2);
+        let connects2_c = Arc::clone(&connects2);
+        let err = run_mutation_at_most_once_inner(
+            &mut slot2,
+            "saving file",
+            FakeClient::is_alive,
+            |slot, force| {
+                let connects = Arc::clone(&connects2_c);
+                Box::pin(async move {
+                    if let Some(cur) =
+                        replace_worker_client_slot(slot, force, FakeClient::is_alive)
+                    {
+                        return Ok(cur);
+                    }
+                    connects.fetch_add(1, AtomicOrdering::SeqCst);
+                    let next = FakeClient::alive(11, Vec::new());
+                    *slot = Some(Arc::clone(&next));
+                    Ok(next)
+                })
+            },
+            move |_cur| {
+                Box::pin(async move {
+                    runs2_c.fetch_add(1, AtomicOrdering::SeqCst);
+                    Err::<(), String>("connection closed".into())
+                })
+            },
+        )
+        .await
+        .expect_err("mid-call connection closed must fail without re-running");
+        assert_eq!(runs2.load(AtomicOrdering::SeqCst), 1, "must execute at most once");
+        assert_eq!(connects2.load(AtomicOrdering::SeqCst), 0, "must not force-rebootstrap mid-mutation");
+        assert!(slot2.is_none(), "dead slot must be cleared for next command");
+        assert!(err.contains("outcome is unknown") && err.contains("not automatically retried"), "{err}");
     }
 }

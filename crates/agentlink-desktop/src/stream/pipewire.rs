@@ -412,7 +412,8 @@ mod tests {
         assert_eq!(validate(16384, 16384, 65536, 0, u32::MAX, u32::MAX), None);
         // Oversized dimensions > 16384 must be rejected.
         assert_eq!(validate(16385, 100, 0, 0, 16385 * 400, 16385 * 400), None);
-        // Stride smaller than width * 4 must be rejected.
+        // Stride smaller than width * 4 or negative must be rejected.
+        assert_eq!(validate(1920, 1080, -7680, 0, 16_000_000, 16_000_000), None);
         assert_eq!(validate(1920, 1080, 1920 * 2, 0, 16_000_000, 16_000_000), None);
         // Metadata-only cursor buffer (chunk_size == 0) must not copy video pixels.
         assert_eq!(validate(1920, 1080, 1920 * 4, 0, 0, 16_000_000), None);
