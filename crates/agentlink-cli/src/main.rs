@@ -17102,7 +17102,10 @@ async fn connect_client(cli: &Cli, _label: &str) -> Result<Client> {
         })?;
     if let Ok(dir) = config_dir(cli) {
         client.remember_node_pins(dir.clone());
-        client.remember_grants(dir);
+        client.remember_grants(dir.clone());
+        if cli.token.is_none() {
+            client.remember_session(dir);
+        }
     }
     warn_ca_only(&settings);
     Ok(client)

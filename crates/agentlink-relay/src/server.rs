@@ -2039,8 +2039,8 @@ async fn handle_client(
         }
     }
     if principal.operator && !principal.access_hash.is_empty() {
-        match hub.db.session_by_hash(&principal.access_hash).await {
-            Ok(Some(_)) => {}
+        match hub.db.active_socket_session_valid(&principal.access_hash).await {
+            Ok(true) => {}
             _ => {
                 let _ = send_out(
                     tx,

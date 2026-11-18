@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agentlink_core::client::{login_user, maintain_session};
+use agentlink_core::client::{login_user, maintain_session_skew};
 use agentlink_core::{
     apply_relay_defaults, parse_access, Client, ClientSettings, DirEntry, Identity, NodeInfo, Op,
     PtyEvent, PtySession, RelayTrust, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
@@ -1977,7 +1977,9 @@ async fn saved_client(
         diag_client(config_dir, "bootstrap_err", Some("Bootstrap"), None, None);
         err.to_string()
     })?;
-    if let Err(err) = maintain_session(config_dir, &identity).await {
+    // Refresh if the stored 15m access token already spent >3m so opening the
+    // GUI never starts on an aged token that expires a few minutes later.
+    if let Err(err) = maintain_session_skew(config_dir, &identity, 12 * 60).await {
         diag_client(config_dir, "bootstrap_err", Some("Bootstrap"), None, None);
         return Err(err.to_string());
     }
@@ -2004,6 +2006,7 @@ async fn saved_client(
     attach_closure_sink(&client, config_dir);
     client.remember_node_pins(config_dir);
     client.remember_grants(config_dir);
+    client.remember_session(config_dir);
     Ok(Some((
         Arc::new(client),
         user.unwrap_or_else(|| "signed in".into()),
@@ -2084,6 +2087,7 @@ async fn sign_in(
     attach_closure_sink(&client, config_dir);
     client.remember_node_pins(config_dir);
     client.remember_grants(config_dir);
+    client.remember_session(config_dir);
     Ok((Arc::new(client), session.user))
 }
 

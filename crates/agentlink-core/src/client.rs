@@ -84,6 +84,9 @@ pub(crate) struct ClientInner {
     pub(crate) transfers: Arc<Mutex<HashSet<String>>>,
     /// Config directory holding `grants/<node_id>.json`.
     pub(crate) grant_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// Config directory holding `config.json` (`refresh_token` / `access_expires_unix`)
+    /// so long-lived clients can rotate expiring access tokens under `lock_session`.
+    pub(crate) session_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
     resend: Notify,
     fast: AtomicBool,
     /// Sticky first transport end cause (sanitized categories only).
@@ -483,6 +486,7 @@ impl PtySession {
             cursors: Mutex::new(crate::resume::Cursors::default()),
             transfers: std::sync::Arc::new(Mutex::new(HashSet::new())),
             grant_dir: std::sync::Arc::new(Mutex::new(None)),
+            session_dir: std::sync::Arc::new(Mutex::new(None)),
             resend: Notify::new(),
             fast: AtomicBool::new(false),
             transport: crate::transport_status::TransportObserver::new(),
@@ -663,6 +667,7 @@ impl Client {
             cursors: Mutex::new(crate::resume::Cursors::default()),
             transfers: Arc::new(Mutex::new(HashSet::new())),
             grant_dir: Arc::new(Mutex::new(None)),
+            session_dir: Arc::new(Mutex::new(None)),
             resend: Notify::new(),
             fast: AtomicBool::new(false),
             transport: crate::transport_status::TransportObserver::new(),
@@ -758,6 +763,15 @@ impl Client {
     /// Look for grants in `dir/grants/<node_id>.json` (usually the config dir).
     pub fn remember_grants(&self, dir: impl Into<std::path::PathBuf>) {
         if let Ok(mut slot) = self.inner.grant_dir.lock() {
+            *slot = Some(dir.into());
+        }
+    }
+
+    /// Track `dir/config.json` so a long-lived client refreshes an expiring
+    /// device access token in the background and before reconnects without
+    /// losing to concurrent CLI rotations. Revoked sessions still fail closed.
+    pub fn remember_session(&self, dir: impl Into<std::path::PathBuf>) {
+        if let Ok(mut slot) = self.inner.session_dir.lock() {
             *slot = Some(dir.into());
         }
     }
@@ -2685,7 +2699,7 @@ enum SocketEnd {
 async fn supervise(
     inner: Arc<ClientInner>,
     mut app_rx: mpsc::Receiver<Outbound>,
-    settings: ClientSettings,
+    mut settings: ClientSettings,
     identity: crate::identity::Identity,
     use_token: bool,
     mut ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
@@ -2695,6 +2709,7 @@ async fn supervise(
     let mut connected_once = false;
     let mut down_since: Option<Instant> = None;
     let mut heartbeat = false;
+    let live_token = Arc::new(Mutex::new(settings.token.clone()));
     loop {
         if inner.shutdown.is_cancelled() {
             let _ = inner.transport.bump_attempt();
@@ -2705,8 +2720,55 @@ async fn supervise(
             fail_waiters(&inner);
             break;
         }
+        if connected_once && use_token {
+            if let Ok(latest) = live_token.lock() {
+                if !latest.is_empty() {
+                    settings.token = latest.clone();
+                }
+            }
+            let session_dir = inner.session_dir.lock().ok().and_then(|slot| slot.clone());
+            if let Some(dir) = session_dir {
+                if let Ok(Some(fresh)) =
+                    refresh_or_adopt_for_client(&dir, &identity, &settings.token, false).await
+                {
+                    settings.token = fresh.token.clone();
+                    if let Ok(mut slot) = live_token.lock() {
+                        *slot = fresh.token;
+                    }
+                }
+            }
+        }
         let _ = inner.transport.bump_attempt();
-        match dial_client(&settings, &identity, use_token, &inner.transport).await {
+        let mut dial_res = dial_client(&settings, &identity, use_token, &inner.transport).await;
+        if connected_once
+            && use_token
+            && matches!(
+                &dial_res,
+                Err(Error::Auth(msg)) if msg.contains("session expired or revoked")
+            )
+        {
+            // One-shot refresh if the cached access token expired (e.g. relay
+            // dropped the socket at access_expires + skew, or clock skew hid
+            // local staleness). True revocation rejects refresh_user and falls
+            // straight through to AuthRejected below.
+            let session_dir = inner.session_dir.lock().ok().and_then(|slot| slot.clone());
+            if let Some(dir) = session_dir {
+                if let Ok(Some(fresh)) =
+                    refresh_or_adopt_for_client(&dir, &identity, &settings.token, true).await
+                {
+                    if fresh.token != settings.token && !fresh.token.is_empty() {
+                        settings.token = fresh.token.clone();
+                        if let Ok(mut slot) = live_token.lock() {
+                            *slot = fresh.token;
+                        }
+                        let _ = inner.transport.bump_attempt();
+                        dial_res =
+                            dial_client(&settings, &identity, use_token, &inner.transport).await;
+                    }
+                }
+            }
+        }
+        match dial_res {
             Err(err) => {
                 if !connected_once {
                     // A first-dial TLS/IO flap should not fail a CLI command
@@ -2797,6 +2859,9 @@ async fn supervise(
                     heartbeat = true;
                     let beat_tx = inner.tx.clone();
                     let beat_shutdown = inner.shutdown.clone();
+                    let beat_inner = inner.clone();
+                    let beat_identity = identity.clone();
+                    let beat_token = live_token.clone();
                     tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(Duration::from_secs(20));
                         ticker.tick().await;
@@ -2804,6 +2869,32 @@ async fn supervise(
                             tokio::select! {
                                 _ = beat_shutdown.cancelled() => break,
                                 _ = ticker.tick() => {
+                                    if use_token {
+                                        let dir = beat_inner
+                                            .session_dir
+                                            .lock()
+                                            .ok()
+                                            .and_then(|slot| slot.clone());
+                                        if let Some(dir) = dir {
+                                            let cur = beat_token
+                                                .lock()
+                                                .ok()
+                                                .map(|s| s.clone())
+                                                .unwrap_or_default();
+                                            if let Ok(Some(fresh)) = refresh_or_adopt_for_client(
+                                                &dir,
+                                                &beat_identity,
+                                                &cur,
+                                                false,
+                                            )
+                                            .await
+                                            {
+                                                if let Ok(mut slot) = beat_token.lock() {
+                                                    *slot = fresh.token;
+                                                }
+                                            }
+                                        }
+                                    }
                                     let Ok(out) = ws::encode(&Envelope::Ping) else { break };
                                     if beat_tx.send(out).await.is_err() {
                                         break;
@@ -2843,6 +2934,7 @@ async fn supervise(
             }
         }
     }
+    inner.alive.store(false, Ordering::SeqCst);
     if ready.is_some() {
         inner
             .transport
@@ -3306,8 +3398,19 @@ pub async fn maintain_session(
     dir: &std::path::Path,
     identity: &crate::identity::Identity,
 ) -> Result<Option<crate::config::ClientSettings>> {
+    maintain_session_skew(dir, identity, 60).await
+}
+
+/// Like [`maintain_session`], with an explicit early-refresh window `skew_secs`
+/// before `access_expires_unix`. Long-lived interactive sessions pass a wider
+/// window at bootstrap so they do not open a socket on a nearly spent token.
+pub async fn maintain_session_skew(
+    dir: &std::path::Path,
+    identity: &crate::identity::Identity,
+    skew_secs: i64,
+) -> Result<Option<crate::config::ClientSettings>> {
     let identity = identity.clone();
-    maintain_session_with(dir, &identity, |req, identity| {
+    maintain_session_with_skew(dir, &identity, skew_secs, |req, identity| {
         let SessionRefreshRequest {
             relay,
             fingerprint,
@@ -3329,6 +3432,113 @@ pub async fn maintain_session(
     .await
 }
 
+fn in_process_session_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn lock_session_async(dir: &std::path::Path) -> Result<crate::config::ConfigSessionLock> {
+    let owned = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::config::lock_session(&owned))
+        .await
+        .map_err(|err| Error::Message(format!("session lock join: {err}")))?
+}
+
+/// Adopt a token rotated by a sibling CLI/GUI process sharing `dir`, or rotate
+/// the refresh token under `lock_session` when within 120s of expiry (or when
+/// `force_refresh` is set after the relay rejected `current_token` as expired).
+async fn refresh_or_adopt_for_client(
+    dir: &std::path::Path,
+    identity: &crate::identity::Identity,
+    current_token: &str,
+    force_refresh: bool,
+) -> Result<Option<crate::config::ClientSettings>> {
+    let file_probe = crate::config::load_file(dir).unwrap_or_default();
+    let now = crate::util::unix_now();
+    let probe_tok = file_probe.token.as_deref().unwrap_or("");
+    if !force_refresh
+        && probe_tok == current_token
+        && crate::config::access_token_is_fresh(&file_probe, now, 120)
+    {
+        return Ok(None);
+    }
+
+    let _async_guard = in_process_session_gate().lock().await;
+    let _lock = lock_session_async(dir).await?;
+    let file = crate::config::load_file(dir).unwrap_or_default();
+    let relay = file.relay.clone().unwrap_or_default();
+    let fingerprint = file.fingerprint.clone().unwrap_or_default();
+    let trust = file.trust.clone().filter(|value| !value.trim().is_empty());
+    if relay.is_empty() || (fingerprint.is_empty() && trust.is_none()) {
+        return Ok(None);
+    }
+    let disk_token = file.token.clone().unwrap_or_default();
+    let now = crate::util::unix_now();
+    if !disk_token.trim().is_empty()
+        && disk_token != current_token
+        && crate::config::access_token_is_fresh(&file, now, 0)
+    {
+        return Ok(Some(crate::config::ClientSettings {
+            relay,
+            token: disk_token,
+            fingerprint,
+            trust,
+        }));
+    }
+    if !force_refresh && crate::config::access_token_is_fresh(&file, now, 120) {
+        return Ok(None);
+    }
+    let Some(refresh) = file
+        .refresh_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    match refresh_user(
+        &relay,
+        &fingerprint,
+        trust.as_deref(),
+        identity,
+        &refresh,
+    )
+    .await
+    {
+        Ok(session) => {
+            let settings = crate::config::ClientSettings {
+                relay,
+                token: session.access_token.clone(),
+                fingerprint,
+                trust,
+            };
+            crate::config::save_session_unlocked(
+                dir,
+                &settings,
+                &session.user,
+                &session.refresh_token,
+                session.access_expires_unix,
+            )?;
+            Ok(Some(settings))
+        }
+        Err(err) => {
+            let again = crate::config::load_file(dir).unwrap_or_default();
+            let now = crate::util::unix_now();
+            if crate::config::access_token_is_fresh(&again, now, 0) {
+                let token = again.token.unwrap_or_default();
+                if !token.is_empty() && token != current_token {
+                    return Ok(Some(crate::config::ClientSettings {
+                        relay: again.relay.unwrap_or(relay),
+                        token,
+                        fingerprint: again.fingerprint.unwrap_or(fingerprint),
+                        trust: again.trust.filter(|v| !v.trim().is_empty()).or(trust),
+                    }));
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
 /// Like [`maintain_session`], but the refresh step is injectable for hermetic
 /// tests. Never copies a production session file.
 pub async fn maintain_session_with<F, Fut>(
@@ -3340,7 +3550,21 @@ where
     F: FnOnce(SessionRefreshRequest, &crate::identity::Identity) -> Fut,
     Fut: std::future::Future<Output = Result<UserSession>>,
 {
-    let _lock = crate::config::lock_session(dir)?;
+    maintain_session_with_skew(dir, identity, 60, refresh_fn).await
+}
+
+pub async fn maintain_session_with_skew<F, Fut>(
+    dir: &std::path::Path,
+    identity: &crate::identity::Identity,
+    skew_secs: i64,
+    refresh_fn: F,
+) -> Result<Option<crate::config::ClientSettings>>
+where
+    F: FnOnce(SessionRefreshRequest, &crate::identity::Identity) -> Fut,
+    Fut: std::future::Future<Output = Result<UserSession>>,
+{
+    let _async_guard = in_process_session_gate().lock().await;
+    let _lock = lock_session_async(dir).await?;
     let file = crate::config::load_file(dir).unwrap_or_default();
     let Some(refresh) = file
         .refresh_token
@@ -3356,7 +3580,7 @@ where
         return Ok(None);
     }
     let now = crate::util::unix_now();
-    if crate::config::access_token_is_fresh(&file, now, 60) {
+    if crate::config::access_token_is_fresh(&file, now, skew_secs) {
         return Ok(None);
     }
     let req = SessionRefreshRequest {

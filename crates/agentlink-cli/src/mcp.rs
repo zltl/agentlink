@@ -1050,6 +1050,7 @@ async fn ensure_client(state: &mut Mcp) -> std::result::Result<&Client, String> 
         if let Some(dir) = state.identity_path.parent() {
             client.remember_node_pins(dir);
             client.remember_grants(dir);
+            client.remember_session(dir);
         }
         if let Some(warning) = agentlink_core::config::ca_only_warning(
             &state.settings.fingerprint,
