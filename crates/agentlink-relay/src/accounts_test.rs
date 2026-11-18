@@ -280,7 +280,7 @@ fn install_script_dry_run_skips_the_network() {
         .args([
             "--dry-run",
             "--token",
-            "abc",
+            "secret-enroll-abc",
             "--relay",
             "wss://relay.example.com",
             "--max-access",
@@ -294,7 +294,11 @@ fn install_script_dry_run_skips_the_network() {
         .unwrap();
     assert!(enrolled.status.success());
     let text = String::from_utf8_lossy(&enrolled.stdout);
-    assert!(text.contains("pairing=abc"), "{text}");
+    assert!(
+        !text.contains("secret-enroll-abc"),
+        "dry-run must redact secret tokens: {text}"
+    );
+    assert!(text.contains("pairing=[redacted]"), "{text}");
     assert!(text.contains("token= "), "{text}");
     assert!(text.contains("enroll=1"), "{text}");
     assert!(text.contains("max_access=desktop"), "{text}");

@@ -16,8 +16,6 @@ use std::cmp::Ordering;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -1009,10 +1007,15 @@ pub fn extract_binary(archive_name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+
 fn extract_zip(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes)).context("open zip")?;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
+        if !file.is_file() {
+            continue;
+        }
         // zip 9+: `name()` is fallible (invalid UTF-8 / encoding). Skip bad entries.
         let Ok(name) = file.name() else {
             continue;
@@ -1020,9 +1023,13 @@ fn extract_zip(bytes: &[u8]) -> Result<Vec<u8>> {
         if !is_binary_name(name.as_ref()) {
             continue;
         }
+        if file.size() > MAX_ARCHIVE_ENTRY_BYTES {
+            bail!("archive entry is too large");
+        }
         let mut buf = Vec::new();
-        io::copy(&mut file, &mut buf)?;
-        if buf.len() > 128 * 1024 * 1024 {
+        let mut limited = (&mut file).take(MAX_ARCHIVE_ENTRY_BYTES + 1);
+        io::copy(&mut limited, &mut buf)?;
+        if (buf.len() as u64) > MAX_ARCHIVE_ENTRY_BYTES {
             bail!("archive entry is too large");
         }
         return Ok(buf);
@@ -1035,13 +1042,20 @@ fn extract_tar_gz(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut archive = tar::Archive::new(decoder);
     for entry in archive.entries().context("read tar")? {
         let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
         let path = entry.path()?.into_owned();
         if !is_binary_name(&path.to_string_lossy()) {
             continue;
         }
+        if entry.header().size().unwrap_or(0) > MAX_ARCHIVE_ENTRY_BYTES {
+            bail!("archive entry is too large");
+        }
         let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
-        if buf.len() > 128 * 1024 * 1024 {
+        let mut limited = (&mut entry).take(MAX_ARCHIVE_ENTRY_BYTES + 1);
+        limited.read_to_end(&mut buf)?;
+        if (buf.len() as u64) > MAX_ARCHIVE_ENTRY_BYTES {
             bail!("archive entry is too large");
         }
         return Ok(buf);
@@ -1618,6 +1632,34 @@ fn swap_binary(current: &Path, new_path: &Path, old_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn escape_cmd_assignment_path(path: &Path) -> Result<String> {
+    let raw = path.display().to_string();
+    if raw.contains('"') || raw.contains('\r') || raw.contains('\n') {
+        bail!("unsafe character in executable path: {raw}");
+    }
+    Ok(raw.replace('%', "%%"))
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn format_windows_update_cmd(target: &Path, source: &Path, restart: &str) -> Result<String> {
+    let escaped_target = escape_cmd_assignment_path(target)?;
+    let escaped_source = escape_cmd_assignment_path(source)?;
+    Ok(format!(
+        "@echo off\r\n\
+set \"TARGET={escaped_target}\"\r\n\
+set \"SOURCE={escaped_source}\"\r\n\
+for /L %%i in (1,1,30) do (\r\n\
+  move /Y \"%SOURCE%\" \"%TARGET%\" >nul 2>&1 && goto :moved\r\n\
+  timeout /t 1 /nobreak >nul\r\n\
+)\r\n\
+>> \"%TARGET%.update.log\" echo agentlink update could not replace target executable\r\n\
+exit /b 1\r\n\
+:moved\r\n\
+{restart}\r\n\
+del \"%~f0\"\r\n"
+    ))
+}
+
 #[cfg(windows)]
 fn stage_windows_replace(
     current: &Path,
@@ -1631,23 +1673,7 @@ fn stage_windows_replace(
     fs::write(&new_path, bytes).with_context(|| format!("write {}", new_path.display()))?;
     let script = current.with_extension("update.cmd");
     let mode = windows_restart_mode(active);
-    let body = format!(
-        "@echo off\r\n\
-set TARGET={target}\r\n\
-set SOURCE={source}\r\n\
-for /L %%i in (1,1,30) do (\r\n\
-  move /Y \"%SOURCE%\" \"%TARGET%\" >nul 2>&1 && goto :moved\r\n\
-  timeout /t 1 /nobreak >nul\r\n\
-)\r\n\
-echo agentlink update could not replace %TARGET% >> \"%TARGET%.update.log\"\r\n\
-exit /b 1\r\n\
-:moved\r\n\
-{restart}\r\n\
-del \"%~f0\"\r\n",
-        target = current.display(),
-        source = new_path.display(),
-        restart = mode,
-    );
+    let body = format_windows_update_cmd(current, &new_path, &mode)?;
     fs::write(&script, body)?;
     // CREATE_NO_WINDOW only (via process::detached). DETACHED_PROCESS would
     // make Windows ignore CREATE_NO_WINDOW and flash cmd.exe. Dropping the
@@ -2616,5 +2642,47 @@ mod tests {
         assert!(swap_binary(&current, &missing, &old).is_err());
         assert_eq!(fs::read(&current).unwrap(), b"old");
         assert!(!old.exists());
+    }
+
+    #[test]
+    fn extract_tar_gz_skips_symlink_entries() {
+        let mut raw_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw_tar);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_path("agentlink").unwrap();
+            header.set_link_name("/etc/passwd").unwrap();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &raw_tar).unwrap();
+        let gz_bytes = gz.finish().unwrap();
+        assert!(
+            extract_binary("agentlink-test.tar.gz", &gz_bytes).is_err(),
+            "extract_tar_gz must not accept a symlink as the release binary"
+        );
+    }
+
+    #[test]
+    fn windows_update_cmd_quotes_paths_with_parens_and_ampersands() {
+        let target = Path::new(r"C:\Program Files (x86)\A&B%1\agentlink.exe");
+        let source = Path::new(r"C:\Program Files (x86)\A&B%1\agentlink.exe.new");
+        let script = format_windows_update_cmd(target, source, "rem ok").unwrap();
+        assert!(
+            script.contains("set \"TARGET=C:\\Program Files (x86)\\A&B%%1\\agentlink.exe\"\r\n"),
+            "{script}"
+        );
+        assert!(
+            !script.contains("replace %TARGET%"),
+            "must not expand unquoted %TARGET% in echo: {script}"
+        );
+        assert!(
+            format_windows_update_cmd(Path::new("bad\"quote.exe"), source, "rem").is_err()
+        );
     }
 }

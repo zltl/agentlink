@@ -837,10 +837,11 @@ pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
         ensure_unpacked_stays_inside(dest, &out)?;
         let mode = entry.header().mode().ok();
         let mtime = entry.header().mtime().ok();
-        if entry.header().entry_type().is_dir() {
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
             util::create_dir_all_as_dir(&out)?;
             apply_mode_mtime(&out, mode, mtime);
-        } else if entry.header().entry_type().is_symlink() {
+        } else if entry_type.is_symlink() {
             if let Some(parent) = out.parent() {
                 util::create_dir_all_parent(parent)?;
                 ensure_unpacked_stays_inside(dest, parent)?;
@@ -861,7 +862,7 @@ pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
             create_symlink(&target, &out)?;
             // Do not chmod or utimens through the link.
             files += 1;
-        } else {
+        } else if entry_type.is_file() || entry_type == tar::EntryType::Continuous {
             if let Some(parent) = out.parent() {
                 util::create_dir_all_parent(parent)?;
                 ensure_unpacked_stays_inside(dest, parent)?;
@@ -871,6 +872,11 @@ pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
             drop(file);
             apply_mode_mtime(&out, mode, mtime);
             files += 1;
+        } else {
+            return Err(Error::Protocol(format!(
+                "unsupported tar entry type {:?} for {}",
+                entry_type, rel
+            )));
         }
     }
     Ok(files)
@@ -4146,6 +4152,31 @@ mod symlink_unpack_tests {
         assert_eq!(before, after, "{err}");
         assert!(err.to_string().contains("escapes"), "{err}");
         assert!(!dest.join("link").exists());
+    }
+
+    #[test]
+    fn unpack_tar_rejects_hardlink_and_fifo_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("hardlink.tar");
+        {
+            let file = File::create(&tar_path).unwrap();
+            let mut builder = tar::Builder::new(file);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_path("hard").unwrap();
+            header.set_link_name("/etc/passwd").unwrap();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+            builder.finish().unwrap();
+        }
+        let dest = dir.path().join("dest");
+        assert!(
+            unpack_tar(&tar_path, &dest).is_err(),
+            "unpack_tar must reject tar hardlink entries instead of creating stub files"
+        );
+        assert!(!dest.join("hard").exists());
     }
 }
 

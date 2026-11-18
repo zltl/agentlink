@@ -87,7 +87,11 @@ if [ "${AGENTLINK_ENROLL:-0}" = "1" ] && [ -n "$TOKEN" ] && [ -z "$PAIRING" ]; t
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "dry-run os=$OS arch=$ARCH relay=$RELAY fingerprint=$FINGERPRINT pairing=$PAIRING token=$TOKEN enroll=${AGENTLINK_ENROLL:-0} download=${AGENTLINK_DOWNLOAD_BASE:-} trust=$TRUST max_access=$MAX_ACCESS"
+    PAIRING_DISP=""
+    TOKEN_DISP=""
+    [ -n "$PAIRING" ] && PAIRING_DISP="[redacted]"
+    [ -n "$TOKEN" ] && TOKEN_DISP="[redacted]"
+    echo "dry-run os=$OS arch=$ARCH relay=$RELAY fingerprint=$FINGERPRINT pairing=$PAIRING_DISP token=$TOKEN_DISP enroll=${AGENTLINK_ENROLL:-0} download=${AGENTLINK_DOWNLOAD_BASE:-} trust=$TRUST max_access=$MAX_ACCESS"
     exit 0
 fi
 

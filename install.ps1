@@ -65,7 +65,10 @@ if ($AgentlinkServeEnroll -eq "1" -and $Token -and -not $PairingToken) {
     $Token = ""
 }
 if ($DryRun) {
-    Write-Output "dry-run enroll=$AgentlinkServeEnroll relay=$Relay pairing=$PairingToken"
+    $pairingDisp = if ($PairingToken) { "[redacted]" } else { "" }
+    $tokenDisp = if ($Token) { "[redacted]" } else { "" }
+    $dlDisp = if ($AgentlinkServeDownload) { $AgentlinkServeDownload } elseif ($env:AGENTLINK_DOWNLOAD_BASE) { $env:AGENTLINK_DOWNLOAD_BASE } else { "" }
+    Write-Output "dry-run enroll=$AgentlinkServeEnroll relay=$Relay pairing=$pairingDisp token=$tokenDisp download=$dlDisp"
     exit 0
 }
 
@@ -84,10 +87,20 @@ function Save-AgentlinkFile([string]$Url, [string]$Dest) {
 }
 
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
+$downloadOverride = if ($AgentlinkServeDownload) { $AgentlinkServeDownload.TrimEnd("/") } elseif ($env:AGENTLINK_DOWNLOAD_BASE) { $env:AGENTLINK_DOWNLOAD_BASE.TrimEnd("/") } else { "" }
 if (-not $Version) {
-    $latest = Get-AgentlinkText "https://api.github.com/repos/$Repo/releases/latest"
-    $tag = $latest.tag_name
-    if (-not $tag) { throw "could not read the latest release tag" }
+    if ($downloadOverride) {
+        $sumsRaw = (Invoke-WebRequest -Uri "$downloadOverride/SHA256SUMS" -UseBasicParsing -Headers @{ "User-Agent" = "agentlink-install" }).Content
+        if ($sumsRaw -match "agentlink-([0-9][0-9.]*)-$arch-pc-windows-msvc\.zip") {
+            $tag = "v" + $Matches[1]
+        } else {
+            throw "SHA256SUMS at $downloadOverride has no archive for windows/$arch"
+        }
+    } else {
+        $latest = Get-AgentlinkText "https://api.github.com/repos/$Repo/releases/latest"
+        $tag = $latest.tag_name
+        if (-not $tag) { throw "could not read the latest release tag" }
+    }
 } elseif ($Version.StartsWith("v")) {
     $tag = $Version
 } else {
@@ -95,8 +108,8 @@ if (-not $Version) {
 }
 $ver = $tag.TrimStart("v")
 $asset = "agentlink-$ver-$arch-pc-windows-msvc.zip"
-if ($AgentlinkServeDownload) {
-    $base = $AgentlinkServeDownload.TrimEnd("/")
+if ($downloadOverride) {
+    $base = $downloadOverride
 } else {
     $base = "https://github.com/$Repo/releases/download/$tag"
 }
