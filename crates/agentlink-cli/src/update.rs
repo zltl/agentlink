@@ -1695,21 +1695,16 @@ fn stage_windows_replace(
     })
 }
 
-#[cfg(windows)]
-fn windows_restart_mode(active: &[service::InstalledService]) -> String {
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_restart_mode_for_kinds(kinds: &[service::ServiceKind]) -> String {
     let mut lines = Vec::new();
-    for service in active {
-        match service.kind {
+    for kind in kinds {
+        match kind {
             service::ServiceKind::WindowsTask => {
                 lines.push("schtasks /Run /TN agentlink-node".to_string());
             }
             service::ServiceKind::WindowsRun => {
-                let exe =
-                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentlink.exe"));
-                lines.push(format!(
-                    "start \"\" \"{}\" tray --background",
-                    exe.display()
-                ));
+                lines.push("start \"\" \"%TARGET%\" tray --background".to_string());
             }
             service::ServiceKind::WindowsService => {
                 lines.push("sc.exe start agentlink-node".to_string());
@@ -1718,6 +1713,12 @@ fn windows_restart_mode(active: &[service::InstalledService]) -> String {
         }
     }
     lines.join("\r\n")
+}
+
+#[cfg(windows)]
+fn windows_restart_mode(active: &[service::InstalledService]) -> String {
+    let kinds: Vec<service::ServiceKind> = active.iter().map(|s| s.kind).collect();
+    windows_restart_mode_for_kinds(&kinds)
 }
 
 pub(crate) fn compare_versions(left: &str, right: &str) -> Ordering {
@@ -2672,9 +2673,15 @@ mod tests {
     fn windows_update_cmd_quotes_paths_with_parens_and_ampersands() {
         let target = Path::new(r"C:\Program Files (x86)\A&B%1\agentlink.exe");
         let source = Path::new(r"C:\Program Files (x86)\A&B%1\agentlink.exe.new");
-        let script = format_windows_update_cmd(target, source, "rem ok").unwrap();
+        let restart = windows_restart_mode_for_kinds(&[service::ServiceKind::WindowsRun]);
+        assert_eq!(restart, "start \"\" \"%TARGET%\" tray --background");
+        let script = format_windows_update_cmd(target, source, &restart).unwrap();
         assert!(
             script.contains("set \"TARGET=C:\\Program Files (x86)\\A&B%%1\\agentlink.exe\"\r\n"),
+            "{script}"
+        );
+        assert!(
+            script.contains("start \"\" \"%TARGET%\" tray --background\r\n"),
             "{script}"
         );
         assert!(

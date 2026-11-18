@@ -488,6 +488,7 @@ struct Route {
     origin_node: Option<String>,
     #[allow(dead_code)]
     target_node: String,
+    last_activity: Instant,
 }
 
 struct Online {
@@ -2253,6 +2254,7 @@ async fn handle_client(
                     target_tx: node_tx.clone(),
                     origin_node: None,
                     target_node: target_node.clone(),
+                    last_activity: Instant::now(),
                 },
             ) {
                 return send_out(tx, &Envelope::result_err(request_id, err.to_string())).await;
@@ -3100,6 +3102,7 @@ async fn route_e2e(
             target_tx: node_tx.clone(),
             origin_node: from_node.map(|id| id.to_string()),
             target_node: node.id.clone(),
+            last_activity: Instant::now(),
         },
     ) {
         return send_out(from_tx, &Envelope::result_err(request_id, err.to_string())).await;
@@ -3473,6 +3476,7 @@ async fn open_or_forward(
             target_tx: target_tx.clone(),
             origin_node: from_node.map(|id| id.to_string()),
             target_node: node.id.clone(),
+            last_activity: Instant::now(),
         },
     ) {
         return fail_transfer(from_tx, request_id, node.name, err.to_string()).await;
@@ -3646,6 +3650,7 @@ async fn open_direct(
             target_tx: target_tx.clone(),
             origin_node: from_node.map(|id| id.to_string()),
             target_node: node.id.clone(),
+            last_activity: Instant::now(),
         },
     )?;
     let env = Envelope::DirectOffer {
@@ -3678,14 +3683,18 @@ async fn forward_existing(
         }
     }
     let tx = {
-        let routes = lock_routes(hub)?;
-        routes
-            .get(request_id)
-            .map(|route| dest_tx(route, from_node))
+        let mut routes = lock_routes(hub)?;
+        if terminal {
+            routes
+                .remove(request_id)
+                .map(|route| dest_tx(&route, from_node))
+        } else {
+            routes.get_mut(request_id).map(|route| {
+                route.last_activity = Instant::now();
+                dest_tx(route, from_node)
+            })
+        }
     };
-    if terminal {
-        lock_routes(hub)?.remove(request_id);
-    }
     if let Some(tx) = tx {
         remember(hub, &env);
         send_out(&tx, &env).await?;
@@ -3733,10 +3742,11 @@ async fn route_binary(hub: &Hub, from_node: Option<&str>, bytes: Vec<u8>) -> Res
         return Ok(());
     };
     let tx = {
-        let routes = lock_routes(hub)?;
-        routes
-            .get(&request_id)
-            .map(|route| dest_tx(route, from_node))
+        let mut routes = lock_routes(hub)?;
+        routes.get_mut(&request_id).map(|route| {
+            route.last_activity = Instant::now();
+            dest_tx(route, from_node)
+        })
     };
     if let Some(tx) = tx {
         if let Some(capture) = &hub.capture {
@@ -3773,9 +3783,20 @@ async fn fail_transfer(
 
 const MAX_ROUTES_PER_ORIGIN: usize = 256;
 const MAX_TOTAL_ROUTES: usize = 16_384;
+const ROUTE_IDLE_TTL: Duration = Duration::from_secs(3600);
 const MAX_PUNCH_ENTRIES: usize = 4_096;
 const PUNCH_TTL: Duration = Duration::from_secs(300);
 const MAX_RATE_WINDOWS: usize = 16_384;
+
+fn reap_stale_routes(hub: &Hub, idle_ttl: Duration) {
+    if let Ok(mut routes) = lock_routes(hub) {
+        routes.retain(|_, r| {
+            !r.origin_tx.is_closed()
+                && !r.target_tx.is_closed()
+                && r.last_activity.elapsed() < idle_ttl
+        });
+    }
+}
 
 fn try_insert_route(hub: &Hub, request_id: String, route: Route) -> Result<()> {
     let mut routes = lock_routes(hub)?;
@@ -3788,7 +3809,11 @@ fn try_insert_route(hub: &Hub, request_id: String, route: Route) -> Result<()> {
         .filter(|r| r.origin_tx.same_channel(&route.origin_tx))
         .count();
     if origin_count >= MAX_ROUTES_PER_ORIGIN || routes.len() >= MAX_TOTAL_ROUTES {
-        routes.retain(|_, r| !r.origin_tx.is_closed() && !r.target_tx.is_closed());
+        routes.retain(|_, r| {
+            !r.origin_tx.is_closed()
+                && !r.target_tx.is_closed()
+                && r.last_activity.elapsed() < ROUTE_IDLE_TTL
+        });
         let origin_after = routes
             .values()
             .filter(|r| r.origin_tx.same_channel(&route.origin_tx))
@@ -3937,6 +3962,7 @@ fn enrolled_to_info(node: &EnrolledNode, live: Option<&Online>) -> NodeInfo {
 }
 
 fn reap_stale_nodes(hub: &Hub) {
+    reap_stale_routes(hub, ROUTE_IDLE_TTL);
     let stale_after = stale_after();
     let Ok(online) = lock_online(hub) else {
         return;
@@ -4063,7 +4089,23 @@ pub(crate) fn login_allowed(hub: &Hub, peer: SocketAddr) -> bool {
     rate_allow(hub, "login", peer.ip(), 30, 60)
 }
 
-/// Per-IP counter. `limit` events are allowed in each `window_secs` window.
+fn rate_bucket_ip_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.to_string();
+            }
+            let seg = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", seg[0], seg[1], seg[2], seg[3])
+        }
+    }
+}
+
+/// Per-IP (or IPv6 `/64`) counter. `limit` events are allowed in each
+/// `window_secs` window. When the active window table is completely full of
+/// unexpired buckets, new buckets fail closed instead of evicting active
+/// rate-limited peers.
 pub(crate) fn rate_allow(
     hub: &Hub,
     bucket: &str,
@@ -4075,18 +4117,12 @@ pub(crate) fn rate_allow(
         return false;
     };
     let now = unix_now();
-    let key = format!("{bucket}:{ip}");
+    let key = format!("{bucket}:{}", rate_bucket_ip_key(ip));
     if !windows.contains_key(&key) && windows.len() >= MAX_RATE_WINDOWS {
-        let expire_after = window_secs.max(60);
+        let expire_after = window_secs.max(1);
         windows.retain(|_, (started, _)| now.saturating_sub(*started) < expire_after);
         if windows.len() >= MAX_RATE_WINDOWS {
-            if let Some(oldest_key) = windows
-                .iter()
-                .min_by_key(|(_, (started, _))| *started)
-                .map(|(k, _)| k.clone())
-            {
-                windows.remove(&oldest_key);
-            }
+            return false;
         }
     }
     let entry = windows.entry(key).or_insert((now, 0));
@@ -5518,6 +5554,7 @@ mod route_rebind_tests {
                     target_tx: target_tx.clone(),
                     origin_node: None,
                     target_node: bob.id.clone(),
+                    last_activity: Instant::now(),
                 },
             );
         }
@@ -5696,7 +5733,30 @@ mod route_rebind_tests {
         };
         assert!(txt.contains("too many"), "{txt}");
 
-        // Rate-limit window map must stay bounded under synthetic IP churn.
+        // 1. IPv6 /64 normalization: 30 distinct host IPs inside one /64 share one bucket.
+        for host_id in 1..=30u16 {
+            let v6 = std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0x0db8, 0xabcd, 0x1234, 0, 0, 0, host_id,
+            ));
+            assert!(rate_allow(hub, "login", v6, 30, 60));
+        }
+        let v6_31 = std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0x0db8, 0xabcd, 0x1234, 9, 9, 9, 9,
+        ));
+        assert!(
+            !rate_allow(hub, "login", v6_31, 30, 60),
+            "IPv6 /64 churn bypassed per-subnet rate limit!"
+        );
+
+        // 2. Pin an attacker IPv4 at its limit, then flood 20,000 distinct IPv4s:
+        // the pinned attacker's active rate-limit counter MUST NOT be evicted, and
+        // once 16,384 active buckets are full, new buckets fail closed (`false`).
+        let pinned_ip: std::net::IpAddr = "198.51.100.77".parse().unwrap();
+        for _ in 0..30 {
+            assert!(rate_allow(hub, "login", pinned_ip, 30, 60));
+        }
+        assert!(!rate_allow(hub, "login", pinned_ip, 30, 60));
+
         for idx in 0..20_000u32 {
             let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(idx.wrapping_add(1)));
             let _ = rate_allow(hub, "login", ip, 30, 60);
@@ -5705,6 +5765,29 @@ mod route_rebind_tests {
         assert!(
             win_len <= 16_384,
             "login_windows map grew unbounded to {win_len}"
+        );
+        assert!(
+            !rate_allow(hub, "login", pinned_ip, 30, 60),
+            "IP churn evicted an active rate-limited attacker bucket!"
+        );
+        let overflow_ip: std::net::IpAddr = "203.0.113.250".parse().unwrap();
+        assert!(
+            !rate_allow(hub, "login", overflow_ip, 30, 60),
+            "full unexpired rate-limit table must fail closed"
+        );
+
+        // 3. Stale open-socket routes past idle TTL are reaped and free per-origin slots.
+        {
+            let mut routes = lock_routes(hub).unwrap();
+            for r in routes.values_mut() {
+                r.last_activity = Instant::now() - Duration::from_secs(3700);
+            }
+        }
+        reap_stale_routes(hub, ROUTE_IDLE_TTL);
+        assert_eq!(
+            lock_routes(hub).unwrap().len(),
+            0,
+            "stale open-socket routes must be reaped after ROUTE_IDLE_TTL"
         );
     }
 }
