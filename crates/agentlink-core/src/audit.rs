@@ -36,6 +36,12 @@ pub const CATEGORIES: &[&str] = &[
 ];
 
 pub const PRESETS: &[&str] = &["minimal", "standard", "full", "paranoid"];
+pub const MAX_RECORDING_IDLE_SECS: u64 = 86_400;
+pub const MAX_RETENTION_DAYS: u64 = 36_500;
+pub const MAX_RETENTION_BYTES_CAP: u64 = 1024 * 1024 * 1024 * 1024;
+const PARANOID_MAX_LOG_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const PARANOID_MAX_DIFF_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const PARANOID_MAX_RECORDING_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -745,7 +751,7 @@ impl AuditPolicy {
         self.validate()
     }
 
-    pub fn validate(&self) -> Result<()> {
+    fn validate_core(&self) -> Result<()> {
         if !PRESETS.contains(&self.preset.as_str()) {
             return Err(Error::Message(format!("unknown preset '{}'", self.preset)));
         }
@@ -765,6 +771,11 @@ impl AuditPolicy {
         if !(1..=30).contains(&self.recording.fps) {
             return Err(Error::Message("recording.fps must be 1..=30".into()));
         }
+        if !(1..=MAX_RECORDING_IDLE_SECS).contains(&self.recording.idle_secs) {
+            return Err(Error::Message(format!(
+                "recording.idle_secs must be 1..={MAX_RECORDING_IDLE_SECS}"
+            )));
+        }
         if !matches!(self.recording.mode.as_str(), "off" | "gui" | "always") {
             return Err(Error::Message(
                 "recording.mode must be off, gui, or always".into(),
@@ -780,12 +791,34 @@ impl AuditPolicy {
             ("diff_days", self.retention.diff_days),
             ("recording_days", self.retention.recording_days),
         ] {
-            if days > 36500 {
+            if days > MAX_RETENTION_DAYS {
                 return Err(Error::Message(format!("{label} is unreasonably large")));
+            }
+        }
+        for (label, bytes) in [
+            ("max_log_bytes", self.retention.max_log_bytes),
+            ("max_diff_bytes", self.retention.max_diff_bytes),
+            ("max_recording_bytes", self.retention.max_recording_bytes),
+        ] {
+            if bytes > MAX_RETENTION_BYTES_CAP {
+                return Err(Error::Message(format!("{label} exceeds the 1 TiB cap")));
             }
         }
         for pattern in &self.redact.patterns {
             regex::Regex::new(pattern).map_err(|e| Error::Message(format!("redact regex: {e}")))?;
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_core()?;
+        for agent in self.overrides.agent.keys() {
+            self.effective(Some(agent.as_str()), None)
+                .validate_core()?;
+        }
+        for node in self.overrides.node.keys() {
+            self.effective(None, Some(node.as_str()))
+                .validate_core()?;
         }
         for rule in &self.alerts {
             validate_local_webhook_url(&rule.name, &rule.webhook)?;
@@ -800,6 +833,22 @@ impl AuditPolicy {
                     "sink '{}' kind must be local, relay, or s3",
                     sink.name
                 )));
+            }
+            if let Some(days) = sink.retention_days {
+                if days > MAX_RETENTION_DAYS {
+                    return Err(Error::Message(format!(
+                        "sink '{}' retention_days is unreasonably large",
+                        sink.name
+                    )));
+                }
+            }
+            if let Some(bytes) = sink.max_bytes {
+                if bytes > MAX_RETENTION_BYTES_CAP {
+                    return Err(Error::Message(format!(
+                        "sink '{}' max_bytes exceeds the 1 TiB cap",
+                        sink.name
+                    )));
+                }
             }
             for item in &sink.data {
                 if !matches!(item.as_str(), "logs" | "diffs" | "recordings") {
@@ -912,26 +961,14 @@ impl AuditPolicy {
                 }
                 _ => {}
             }
-            match (cur_local.max_bytes, next_local.max_bytes) {
-                (Some(cur_b), Some(next_b)) if !byte_cap_not_weaker(cur_b, next_b) => {
-                    return Err(Error::Message(
-                        "untrusted relay audit push cannot lower local sink byte cap".into(),
-                    ));
-                }
-                (Some(cur_b), None) if cur_b > 0 => {
-                    return Err(Error::Message(
-                        "untrusted relay audit push cannot remove local sink byte cap".into(),
-                    ));
-                }
-                (None, Some(_)) => {
-                    return Err(Error::Message(
-                        "untrusted relay audit push cannot impose new local sink byte cap".into(),
-                    ));
-                }
-                _ => {}
+            if cur_local.max_bytes != next_local.max_bytes {
+                return Err(Error::Message(
+                    "untrusted relay audit push cannot modify local sink byte cap".into(),
+                ));
             }
         }
 
+        let preset_defaults = Self::preset(&self.preset)?.retention;
         let mut agent_keys: BTreeSet<Option<&str>> = BTreeSet::from([None]);
         for key in self.overrides.agent.keys().chain(next.overrides.agent.keys()) {
             agent_keys.insert(Some(key.as_str()));
@@ -944,7 +981,7 @@ impl AuditPolicy {
             for node in &node_keys {
                 let base_eff = self.effective(*agent, *node);
                 let next_eff = next.effective(*agent, *node);
-                ensure_effective_policy_not_weaker(&base_eff, &next_eff)?;
+                ensure_effective_policy_not_weaker(&base_eff, &next_eff, &preset_defaults)?;
             }
         }
 
@@ -969,15 +1006,32 @@ fn recording_quality_rank(quality: &str) -> u8 {
     }
 }
 
-fn byte_cap_not_weaker(base: u64, cand: u64) -> bool {
+/// Dual-bounded byte-cap check on untrusted relay pushes:
+/// - `base == 0` (unlimited locally): must remain `0` (cannot impose a finite cap to wipe logs).
+/// - `0 < base < preset_default` (operator configured a custom tight disk quota): must remain
+///   exact `base` (neither shrink to delete logs nor expand past the custom disk quota).
+/// - `base >= preset_default`: may stay or rise up to `base.max(paranoid_ceiling)` so preset
+///   upgrades (`minimal -> standard -> full -> paranoid`) work without allowing unbounded disk fill.
+fn retention_byte_cap_allowed(
+    base: u64,
+    preset_default: u64,
+    paranoid_ceiling: u64,
+    cand: u64,
+) -> bool {
     if base == 0 {
         cand == 0
+    } else if base < preset_default {
+        cand == base
     } else {
-        cand >= base
+        cand >= base && cand <= base.max(paranoid_ceiling)
     }
 }
 
-fn ensure_effective_policy_not_weaker(base: &AuditPolicy, cand: &AuditPolicy) -> Result<()> {
+fn ensure_effective_policy_not_weaker(
+    base: &AuditPolicy,
+    cand: &AuditPolicy,
+    preset_defaults: &RetentionPolicy,
+) -> Result<()> {
     if base.forward.chain && !cand.forward.chain {
         return Err(Error::Message(
             "untrusted relay audit push cannot disable hash chain".into(),
@@ -1023,15 +1077,28 @@ fn ensure_effective_policy_not_weaker(base: &AuditPolicy, cand: &AuditPolicy) ->
     if cand.retention.log_days < base.retention.log_days
         || cand.retention.diff_days < base.retention.diff_days
         || cand.retention.recording_days < base.retention.recording_days
-        || !byte_cap_not_weaker(base.retention.max_log_bytes, cand.retention.max_log_bytes)
-        || !byte_cap_not_weaker(base.retention.max_diff_bytes, cand.retention.max_diff_bytes)
-        || !byte_cap_not_weaker(
+        || !retention_byte_cap_allowed(
+            base.retention.max_log_bytes,
+            preset_defaults.max_log_bytes,
+            PARANOID_MAX_LOG_BYTES,
+            cand.retention.max_log_bytes,
+        )
+        || !retention_byte_cap_allowed(
+            base.retention.max_diff_bytes,
+            preset_defaults.max_diff_bytes,
+            PARANOID_MAX_DIFF_BYTES,
+            cand.retention.max_diff_bytes,
+        )
+        || !retention_byte_cap_allowed(
             base.retention.max_recording_bytes,
+            preset_defaults.max_recording_bytes,
+            PARANOID_MAX_RECORDING_BYTES,
             cand.retention.max_recording_bytes,
         )
     {
         return Err(Error::Message(
-            "untrusted relay audit push cannot lower local retention".into(),
+            "untrusted relay audit push cannot lower retention or exceed local disk quota bounds"
+                .into(),
         ));
     }
     for pattern in &base.redact.patterns {
@@ -2397,5 +2464,64 @@ mod tests {
                 "cloud metadata / invalid webhook must be rejected even locally: {forbidden_even_locally}"
             );
         }
+
+        // EB-02a: extreme idle_secs, invalid override fields, and unbounded disk quota inflation
+        // MUST be rejected while legitimate preset upgrades (`standard -> full -> paranoid`) succeed!
+        let overflow_idle = format!(
+            "preset = \"full\"\nlock_local = false\n[recording]\nmode = \"gui\"\nidle_secs = {}\n",
+            i64::MAX
+        );
+        assert!(
+            AuditPolicy::parse(&overflow_idle).is_err(),
+            "extreme recording.idle_secs must fail validation"
+        );
+        for bad_override in [
+            "preset = \"standard\"\n[overrides.agent.bot.recording]\nidle_secs = 9999999\n",
+            "preset = \"standard\"\n[overrides.agent.bot.recording]\nmode = \"invalid\"\n",
+            "preset = \"standard\"\n[overrides.agent.bot]\nredact_patterns = [\"[\"]\n",
+            "preset = \"standard\"\n[overrides.node.box.retention]\nlog_days = 999999\n",
+        ] {
+            assert!(
+                AuditPolicy::parse(bad_override).is_err(),
+                "invalid override must fail AuditPolicy::validate(): {bad_override}"
+            );
+        }
+
+        // Preset upgrades on unlocked node succeed (`standard -> full -> paranoid`):
+        let mut std_unlocked = AuditPolicy::preset("standard").unwrap();
+        std_unlocked.lock_local = false;
+        let full_upgraded = std_unlocked
+            .apply_untrusted_relay_push("preset = \"full\"\nlock_local = false\n")
+            .expect("standard -> full upgrade must succeed")
+            .expect("unlocked");
+        let _paranoid_upgraded = full_upgraded
+            .apply_untrusted_relay_push("preset = \"paranoid\"\nlock_local = false\n")
+            .expect("full -> paranoid upgrade must succeed")
+            .expect("unlocked");
+
+        // Unbounded disk quota inflation (> paranoid ceiling) on untrusted push MUST fail:
+        assert!(
+            std_unlocked
+                .apply_untrusted_relay_push(
+                    "preset = \"standard\"\nlock_local = false\n[retention]\nmax_log_bytes = 549755813888\n"
+                )
+                .is_err(),
+            "untrusted push must not inflate max_log_bytes to 512 GiB"
+        );
+
+        // Custom tight operator disk cap (50 MiB < standard 1 GiB) must neither shrink nor expand:
+        let mut custom_tight = AuditPolicy::preset("standard").unwrap();
+        custom_tight.lock_local = false;
+        custom_tight.retention.max_log_bytes = 50 * 1024 * 1024;
+        assert!(custom_tight
+            .apply_untrusted_relay_push(
+                "preset = \"standard\"\nlock_local = false\n[retention]\nmax_log_bytes = 10485760\n"
+            )
+            .is_err());
+        assert!(custom_tight
+            .apply_untrusted_relay_push(
+                "preset = \"standard\"\nlock_local = false\n[retention]\nmax_log_bytes = 1073741824\n"
+            )
+            .is_err());
     }
 }

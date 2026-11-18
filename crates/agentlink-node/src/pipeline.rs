@@ -165,9 +165,10 @@ impl AuditService {
             .policy
             .read()
             .map(|policy| policy.recording.idle_secs)
-            .unwrap_or(30);
+            .unwrap_or(30)
+            .clamp(1, agentlink_core::audit::MAX_RECORDING_IDLE_SECS);
         self.gui_until
-            .store(now_secs() + idle as i64, Ordering::Relaxed);
+            .store(now_secs().saturating_add(idle as i64), Ordering::Relaxed);
         self.touch();
     }
 
@@ -466,7 +467,11 @@ impl AuditService {
             let Ok(keys) = client.list(&format!("{}/", self.node_id)) else {
                 continue;
             };
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+            let clamped_days = days.min(agentlink_core::audit::MAX_RETENTION_DAYS);
+            let Some(delta) = chrono::TimeDelta::try_days(clamped_days as i64) else {
+                continue;
+            };
+            let cutoff = chrono::Utc::now() - delta;
             for key in keys {
                 if let Some(day) = key_day(&key) {
                     if day < cutoff.format("%Y-%m-%d").to_string() {
@@ -482,8 +487,12 @@ impl AuditService {
         match RecordMode::parse(&policy.recording.mode) {
             Some(RecordMode::Off) | None => false,
             Some(RecordMode::Always) => {
-                let idle = policy.recording.idle_secs as i64;
-                now_secs() - self.activity.load(Ordering::Relaxed) < idle.max(1)
+                let idle = policy
+                    .recording
+                    .idle_secs
+                    .clamp(1, agentlink_core::audit::MAX_RECORDING_IDLE_SECS)
+                    as i64;
+                now_secs().saturating_sub(self.activity.load(Ordering::Relaxed)) < idle
             }
             Some(RecordMode::Gui) => now_secs() < self.gui_until.load(Ordering::Relaxed),
         }
@@ -826,6 +835,22 @@ mod tests {
         assert_eq!(
             captured.rgba.len(),
             captured.width as usize * captured.height as usize * 4
+        );
+    }
+
+    #[test]
+    fn touch_gui_and_recording_active_never_overflow_even_on_extreme_idle_secs() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AuditService::open_quiet(dir.path(), "n1", "box");
+        let mut pol = AuditPolicy::preset("full").unwrap();
+        pol.recording.mode = "gui".into();
+        // Force extreme u64 directly in struct to verify defense-in-depth arithmetic in pipeline.rs:
+        pol.recording.idle_secs = u64::MAX;
+        svc.replace_policy(pol, false);
+        svc.touch_gui();
+        assert!(
+            svc.recording_active(),
+            "touch_gui overflowed or wrapped negative on extreme idle_secs!"
         );
     }
 }
