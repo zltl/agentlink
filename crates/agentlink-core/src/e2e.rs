@@ -197,22 +197,31 @@ pub struct PendingHello {
 /// own e2e handshake. Replacing the only session made an in-flight `cp` fail
 /// to decrypt replies after another command shook hands.
 const MAX_SESSIONS_PER_PEER: usize = 8;
+const MAX_STAGED_PER_PEER: usize = 4;
+const MAX_RETIRED_PER_PEER: usize = 64;
 pub const MAX_TRACKED_PEERS: usize = 1024;
 pub const IDLE_PEER_TTL_MS: u64 = 15 * 60 * 1000;
-const MAX_RETIRED_HELLOS: usize = 8192;
+const MAX_PRUNED_RETIRED_HELLOS: usize = 4096;
 
 #[derive(Default)]
-struct EndpointState {
-    peers: HashMap<String, VecDeque<Arc<Direction>>>,
+struct PeerEntry {
+    /// Sessions proven live (locally completed via `complete`, or acceptor
+    /// sessions that decrypted at least one authenticated AEAD frame).
+    verified: VecDeque<Arc<Direction>>,
+    /// Accepted handshakes awaiting their first valid AEAD frame. Replayed
+    /// historical `E2eHello` frames without the destroyed client ephemeral
+    /// secret can never pass AEAD authentication, so they never leave `staged`
+    /// and can never evict any `verified` active session.
+    staged: VecDeque<Arc<Direction>>,
     retired_order: VecDeque<[u8; 32]>,
     retired_set: HashSet<[u8; 32]>,
 }
 
-impl EndpointState {
+impl PeerEntry {
     fn retire_eph(&mut self, eph: [u8; 32]) {
         if self.retired_set.insert(eph) {
             self.retired_order.push_back(eph);
-            while self.retired_order.len() > MAX_RETIRED_HELLOS {
+            while self.retired_order.len() > MAX_RETIRED_PER_PEER {
                 if let Some(oldest) = self.retired_order.pop_front() {
                     self.retired_set.remove(&oldest);
                 }
@@ -220,13 +229,68 @@ impl EndpointState {
         }
     }
 
-    fn retire_sessions<'a>(&mut self, sessions: impl IntoIterator<Item = &'a Arc<Direction>>) {
-        let ephs: Vec<[u8; 32]> = sessions
-            .into_iter()
-            .filter_map(|dir| dir.client_eph)
-            .collect();
-        for eph in ephs {
-            self.retire_eph(eph);
+    fn newest_activity_ms(&self) -> u64 {
+        self.verified
+            .iter()
+            .chain(self.staged.iter())
+            .map(|dir| dir.last_active_ms.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn push_verified(&mut self, direction: Arc<Direction>) {
+        self.verified.push_back(direction);
+        while self.verified.len() > MAX_SESSIONS_PER_PEER {
+            let evict_idx = self
+                .verified
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, dir)| dir.last_active_ms.load(Ordering::Relaxed))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            if let Some(evicted) = self.verified.remove(evict_idx) {
+                if let Some(eph) = evicted.client_eph {
+                    self.retire_eph(eph);
+                }
+            }
+        }
+    }
+
+    fn push_staged(&mut self, direction: Arc<Direction>) {
+        self.staged.push_back(direction);
+        while self.staged.len() > MAX_STAGED_PER_PEER {
+            let _ = self.staged.pop_front();
+        }
+    }
+}
+
+#[derive(Default)]
+struct EndpointState {
+    peers: HashMap<String, PeerEntry>,
+    pruned_retired_order: VecDeque<[u8; 32]>,
+    pruned_retired_set: HashSet<[u8; 32]>,
+}
+
+impl EndpointState {
+    fn retire_pruned_eph(&mut self, eph: [u8; 32]) {
+        if self.pruned_retired_set.insert(eph) {
+            self.pruned_retired_order.push_back(eph);
+            while self.pruned_retired_order.len() > MAX_PRUNED_RETIRED_HELLOS {
+                if let Some(oldest) = self.pruned_retired_order.pop_front() {
+                    self.pruned_retired_set.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    fn retire_peer_entry(&mut self, entry: PeerEntry) {
+        for eph in entry.retired_order {
+            self.retire_pruned_eph(eph);
+        }
+        for dir in entry.verified.into_iter().chain(entry.staged) {
+            if let Some(eph) = dir.client_eph {
+                self.retire_pruned_eph(eph);
+            }
         }
     }
 
@@ -234,18 +298,14 @@ impl EndpointState {
         let stale_keys: Vec<String> = self
             .peers
             .iter()
-            .filter_map(|(peer, sessions)| {
-                let newest = sessions
-                    .iter()
-                    .map(|dir| dir.last_active_ms.load(Ordering::Relaxed))
-                    .max()
-                    .unwrap_or(0);
-                (now_ms.saturating_sub(newest) >= idle_ttl_ms).then(|| peer.clone())
+            .filter_map(|(peer, entry)| {
+                (now_ms.saturating_sub(entry.newest_activity_ms()) >= idle_ttl_ms)
+                    .then(|| peer.clone())
             })
             .collect();
         for key in stale_keys {
             if let Some(removed) = self.peers.remove(&key) {
-                self.retire_sessions(removed.iter());
+                self.retire_peer_entry(removed);
             }
         }
     }
@@ -293,7 +353,7 @@ impl Endpoint {
     pub fn forget(&self, peer: &str) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(removed) = state.peers.remove(peer) {
-                state.retire_sessions(removed.iter());
+                state.retire_peer_entry(removed);
             }
         }
     }
@@ -333,29 +393,6 @@ impl Endpoint {
         let signed = transcript("client", &client_eph, self.identity.public_hex());
         identity::verify_message(&client_id, signed.as_bytes(), &hex::encode(sig))?;
 
-        {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| Error::Message("e2e session lock poisoned".into()))?;
-            if state.retired_set.contains(&client_eph) {
-                return Err(Error::Protocol("replayed e2e hello".into()));
-            }
-            if let Some(existing) = state.peers.get(&client_id).and_then(|list| {
-                list.iter()
-                    .find(|dir| dir.client_eph == Some(client_eph))
-                    .cloned()
-            }) {
-                if !existing.received_any.load(Ordering::Acquire) {
-                    if let Some(welcome) = &existing.cached_welcome {
-                        existing.touch();
-                        return Ok((client_id, welcome.clone()));
-                    }
-                }
-                return Err(Error::Protocol("replayed e2e hello".into()));
-            }
-        }
-
         let secret = EphemeralSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         let node_eph = public.to_bytes();
@@ -366,18 +403,58 @@ impl Endpoint {
         welcome.extend_from_slice(&node_eph);
         welcome.extend_from_slice(&message);
         let now_ms = self.now_ms();
-        self.insert_with_now(
-            &client_id,
-            Direction::new(
-                n2c,
-                c2n,
-                self.epoch,
-                now_ms,
-                Some(client_eph),
-                Some(welcome.clone()),
-            ),
+        let candidate = Arc::new(Direction::new(
+            n2c,
+            c2n,
+            self.epoch,
             now_ms,
-        )?;
+            Some(client_eph),
+            Some(welcome.clone()),
+        ));
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Message("e2e session lock poisoned".into()))?;
+        if state.pruned_retired_set.contains(&client_eph) {
+            return Err(Error::Protocol("replayed e2e hello".into()));
+        }
+        if let Some(peer_entry) = state.peers.get(&client_id) {
+            if peer_entry.retired_set.contains(&client_eph)
+                || peer_entry
+                    .verified
+                    .iter()
+                    .any(|dir| dir.client_eph == Some(client_eph))
+            {
+                return Err(Error::Protocol("replayed e2e hello".into()));
+            }
+            if let Some(existing) = peer_entry
+                .staged
+                .iter()
+                .find(|dir| dir.client_eph == Some(client_eph))
+                .cloned()
+            {
+                if !existing.received_any.load(Ordering::Acquire) {
+                    if let Some(cached) = &existing.cached_welcome {
+                        existing.touch();
+                        return Ok((client_id, cached.clone()));
+                    }
+                }
+                return Err(Error::Protocol("replayed e2e hello".into()));
+            }
+        } else if state.peers.len() >= MAX_TRACKED_PEERS {
+            state.prune_idle_peers(now_ms, IDLE_PEER_TTL_MS);
+            if state.peers.len() >= MAX_TRACKED_PEERS {
+                return Err(Error::Protocol(format!(
+                    "e2e peer table at capacity ({MAX_TRACKED_PEERS} active peers)"
+                )));
+            }
+        }
+        state
+            .peers
+            .entry(client_id.clone())
+            .or_default()
+            .push_staged(candidate);
         Ok((client_id, welcome))
     }
 
@@ -394,7 +471,7 @@ impl Endpoint {
         let shared = pending.secret.diffie_hellman(&PublicKey::from(node_eph));
         let (c2n, n2c) = derive(shared.as_bytes(), &client_eph, &node_eph);
         let now_ms = self.now_ms();
-        self.insert_with_now(
+        self.insert_verified_with_now(
             &pending.node_id,
             Direction::new(c2n, n2c, self.epoch, now_ms, Some(client_eph), None),
             now_ms,
@@ -420,11 +497,20 @@ impl Endpoint {
         aad: &[u8],
         blob: &[u8],
     ) -> Result<(Vec<u8>, Arc<Direction>)> {
-        let sessions = self.sessions_for(peer)?;
+        let (verified, staged) = self.sessions_for(peer)?;
         let mut last_err = Error::Protocol(format!("no e2e session for {peer}"));
-        for keys in sessions.iter().rev() {
+        for keys in verified.iter().rev() {
             match keys.open_one(aad, blob) {
                 Ok(plain) => return Ok((plain, Arc::clone(keys))),
+                Err(err) => last_err = err,
+            }
+        }
+        for keys in staged.iter().rev() {
+            match keys.open_one(aad, blob) {
+                Ok(plain) => {
+                    self.promote_staged(peer, keys);
+                    return Ok((plain, Arc::clone(keys)));
+                }
                 Err(err) => last_err = err,
             }
         }
@@ -476,7 +562,30 @@ impl Endpoint {
         crate::frame::replace_payload(frame, &plain, false)
     }
 
-    fn insert_with_now(&self, peer: &str, direction: Direction, now_ms: u64) -> Result<()> {
+    fn promote_staged(&self, peer: &str, matched: &Arc<Direction>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(entry) = state.peers.get_mut(peer) else {
+            return;
+        };
+        if let Some(pos) = entry
+            .staged
+            .iter()
+            .position(|cand| Arc::ptr_eq(cand, matched))
+        {
+            let _ = entry.staged.remove(pos);
+        }
+        if !entry
+            .verified
+            .iter()
+            .any(|cand| Arc::ptr_eq(cand, matched))
+        {
+            entry.push_verified(Arc::clone(matched));
+        }
+    }
+
+    fn insert_verified_with_now(&self, peer: &str, direction: Direction, now_ms: u64) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -489,41 +598,37 @@ impl Endpoint {
                 )));
             }
         }
-        let mut evicted_eph = Vec::new();
-        {
-            let entry = state.peers.entry(peer.to_string()).or_default();
-            entry.push_back(Arc::new(direction));
-            while entry.len() > MAX_SESSIONS_PER_PEER {
-                if let Some(oldest) = entry.pop_front() {
-                    if let Some(eph) = oldest.client_eph {
-                        evicted_eph.push(eph);
-                    }
-                }
-            }
-        }
-        for eph in evicted_eph {
-            state.retire_eph(eph);
-        }
+        state
+            .peers
+            .entry(peer.to_string())
+            .or_default()
+            .push_verified(Arc::new(direction));
         Ok(())
     }
 
     /// Newest session for `peer` (used when this process seals as the initiator).
     fn direction(&self, peer: &str) -> Result<Arc<Direction>> {
-        let sessions = self.sessions_for(peer)?;
-        sessions
+        let (verified, staged) = self.sessions_for(peer)?;
+        verified
             .back()
+            .or_else(|| staged.back())
             .cloned()
             .ok_or_else(|| Error::Protocol(format!("no e2e session for {peer}")))
     }
 
-    fn sessions_for(&self, peer: &str) -> Result<VecDeque<Arc<Direction>>> {
-        self.state
+    fn sessions_for(
+        &self,
+        peer: &str,
+    ) -> Result<(VecDeque<Arc<Direction>>, VecDeque<Arc<Direction>>)> {
+        let guard = self
+            .state
             .lock()
-            .map_err(|_| Error::Message("e2e session lock poisoned".into()))?
+            .map_err(|_| Error::Message("e2e session lock poisoned".into()))?;
+        let entry = guard
             .peers
             .get(peer)
-            .cloned()
-            .ok_or_else(|| Error::Protocol(format!("no e2e session for {peer}")))
+            .ok_or_else(|| Error::Protocol(format!("no e2e session for {peer}")))?;
+        Ok((entry.verified.clone(), entry.staged.clone()))
     }
 
     pub fn peer_ids(&self) -> Vec<String> {
@@ -1101,8 +1206,8 @@ mod tests {
         {
             let mut state = node.state.lock().unwrap();
             for i in 1..MAX_TRACKED_PEERS {
-                let mut dq = VecDeque::new();
-                dq.push_back(Arc::new(Direction::new(
+                let mut pe = PeerEntry::default();
+                pe.push_verified(Arc::new(Direction::new(
                     [1u8; 32],
                     [2u8; 32],
                     node.epoch,
@@ -1110,10 +1215,11 @@ mod tests {
                     Some([i as u8; 32]),
                     None,
                 )));
-                state.peers.insert(format!("peer-{i}"), dq);
+                state.peers.insert(format!("peer-{i}"), pe);
             }
             // Mark active peer fresh too.
-            for dir in state.peers.get(active.peer_id()).unwrap() {
+            let active_pe = state.peers.get(active.peer_id()).unwrap();
+            for dir in active_pe.verified.iter().chain(active_pe.staged.iter()) {
                 dir.last_active_ms.store(1_000_000, Ordering::SeqCst);
             }
         }
@@ -1135,13 +1241,94 @@ mod tests {
         // retiring its hello and keeping active peers intact.
         {
             let mut state = node.state.lock().unwrap();
-            state.peers.get("peer-1").unwrap()[0]
+            state.peers.get("peer-1").unwrap().verified[0]
                 .last_active_ms
                 .store(0, Ordering::SeqCst);
             state.prune_idle_peers(IDLE_PEER_TTL_MS + 10, IDLE_PEER_TTL_MS);
             assert!(!state.peers.contains_key("peer-1"));
-            assert!(state.retired_set.contains(&[1u8; 32]));
+            assert!(state.pruned_retired_set.contains(&[1u8; 32]));
         }
         assert!(node.accept(Endpoint::hello_bytes(&p_new)).is_ok());
+    }
+
+    #[test]
+    fn cross_peer_churn_ancient_replays_and_concurrent_identical_hellos_preserve_active_sessions() {
+        // 1. Concurrent identical first-time E2eHellos across 8 threads must be atomic & idempotent.
+        let node = Endpoint::new(Identity::generate());
+        let client = Endpoint::new(Identity::generate());
+        let pending = client.client_hello(node.peer_id()).unwrap();
+        let hello_bytes = Endpoint::hello_bytes(&pending).to_vec();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let n = node.clone();
+            let h = hello_bytes.clone();
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                n.accept(&h).unwrap().1
+            }));
+        }
+        let welcomes: Vec<Vec<u8>> = handles.into_iter().map(|t| t.join().unwrap()).collect();
+        for w in &welcomes[1..] {
+            assert_eq!(
+                w, &welcomes[0],
+                "concurrent identical E2eHellos returned divergent node_eph welcomes!"
+            );
+        }
+        client.complete(pending, &welcomes[0]).unwrap();
+        let ct = client.seal(node.peer_id(), b"c0", b"atomic-ok").unwrap();
+        assert_eq!(node.open(client.peer_id(), b"c0", &ct).unwrap(), b"atomic-ok");
+
+        // 2. Ancient historical E2eHello replays (even past per-peer retired cap and cross-peer churn)
+        // must NEVER evict a verified active session or allow old ciphertext replay.
+        let victim = Endpoint::new(Identity::generate());
+        let mut ancient_hellos = Vec::new();
+        let mut ancient_ct = Vec::new();
+        for idx in 0..80 {
+            let p = victim.client_hello(node.peer_id()).unwrap();
+            let h = Endpoint::hello_bytes(&p).to_vec();
+            let (_, w) = node.accept(&h).unwrap();
+            victim.complete(p, &w).unwrap();
+            let c = victim.seal(node.peer_id(), b"old", b"payload").unwrap();
+            assert_eq!(node.open(victim.peer_id(), b"old", &c).unwrap(), b"payload");
+            if idx < 12 {
+                if idx == 0 {
+                    ancient_ct = c;
+                }
+                ancient_hellos.push(h);
+            }
+        }
+        // Victim establishes its current verified live session:
+        let p_live = victim.client_hello(node.peer_id()).unwrap();
+        let (_, w_live) = node.accept(Endpoint::hello_bytes(&p_live)).unwrap();
+        victim.complete(p_live, &w_live).unwrap();
+        let live1 = victim.seal(node.peer_id(), b"l1", b"live-1").unwrap();
+        assert_eq!(node.open(victim.peer_id(), b"l1", &live1).unwrap(), b"live-1");
+
+        // Simulate >MAX_PRUNED_RETIRED_HELLOS cross-peer churn without spending 60s on debug Ed25519:
+        {
+            let mut st = node.state.lock().unwrap();
+            for i in 0..9000u32 {
+                let mut eph = [0u8; 32];
+                eph[..4].copy_from_slice(&i.to_le_bytes());
+                eph[31] = 0xff;
+                st.retire_pruned_eph(eph);
+            }
+        }
+
+        // Relay replays all 12 ancient victim E2eHellos (which fell past the 64-entry retired ring):
+        for h in &ancient_hellos {
+            let _ = node.accept(h);
+        }
+        // Old ciphertext MUST still fail AEAD authentication:
+        assert!(node.open(victim.peer_id(), b"old", &ancient_ct).is_err());
+        // Victim's verified live session MUST still be intact and decrypting!
+        let live2 = victim.seal(node.peer_id(), b"l2", b"live-2").unwrap();
+        assert_eq!(
+            node.open(victim.peer_id(), b"l2", &live2).unwrap(),
+            b"live-2",
+            "replayed ancient E2eHellos evicted an active verified session!"
+        );
     }
 }
