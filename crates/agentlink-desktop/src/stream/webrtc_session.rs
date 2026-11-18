@@ -583,7 +583,7 @@ impl SessionManager {
                 }
             });
         }
-        {
+        let overflow_peer = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             sessions.retain(|session| {
                 let alive = !session.stop.load(Ordering::Relaxed);
@@ -597,27 +597,31 @@ impl SessionManager {
                 if control_held.swap(false, Ordering::SeqCst) {
                     control_indicator::note_control_session(false);
                 }
-                drop(sessions);
-                built.peer.close().await;
-                return Err(format!(
-                    "too many concurrent desktop stream sessions (limit {MAX_LIVE_STREAMS})"
-                ));
+                Some(built.peer)
+            } else {
+                sessions.push(LiveSession {
+                    id,
+                    stop: built.stop,
+                    control: built.control,
+                    peer: Arc::new(Mutex::new(Some(built.peer))),
+                    started: built.started,
+                    viewer,
+                    peer_id: peer.to_string(),
+                    control_held,
+                    remote_ufrag: Mutex::new(sdp_ice_ufrag(
+                        payload.get("sdp").and_then(Value::as_str).unwrap_or(""),
+                    )),
+                    grant_jti: payload_grant_jti(payload),
+                    grant_exp_unix: payload_grant_exp(payload),
+                });
+                None
             }
-            sessions.push(LiveSession {
-                id,
-                stop: built.stop,
-                control: built.control,
-                peer: Arc::new(Mutex::new(Some(built.peer))),
-                started: built.started,
-                viewer,
-                peer_id: peer.to_string(),
-                control_held,
-                remote_ufrag: Mutex::new(sdp_ice_ufrag(
-                    payload.get("sdp").and_then(Value::as_str).unwrap_or(""),
-                )),
-                grant_jti: payload_grant_jti(payload),
-                grant_exp_unix: payload_grant_exp(payload),
-            });
+        };
+        if let Some(peer_to_close) = overflow_peer {
+            peer_to_close.close().await;
+            return Err(format!(
+                "too many concurrent desktop stream sessions (limit {MAX_LIVE_STREAMS})"
+            ));
         }
         // Re-check after insert: a revoke/expiry that landed while the answer
         // was being built must still tear the session down.

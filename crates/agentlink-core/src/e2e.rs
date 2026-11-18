@@ -201,20 +201,11 @@ pub const MAX_TRACKED_PEERS: usize = 1024;
 pub const IDLE_PEER_TTL_MS: u64 = 15 * 60 * 1000;
 const MAX_RETIRED_HELLOS: usize = 8192;
 
+#[derive(Default)]
 struct EndpointState {
     peers: HashMap<String, VecDeque<Arc<Direction>>>,
     retired_order: VecDeque<[u8; 32]>,
     retired_set: HashSet<[u8; 32]>,
-}
-
-impl Default for EndpointState {
-    fn default() -> Self {
-        Self {
-            peers: HashMap::new(),
-            retired_order: VecDeque::new(),
-            retired_set: HashSet::new(),
-        }
-    }
 }
 
 impl EndpointState {

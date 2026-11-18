@@ -3771,8 +3771,8 @@ const MAX_RATE_WINDOWS: usize = 16_384;
 
 fn try_insert_route(hub: &Hub, request_id: String, route: Route) -> Result<()> {
     let mut routes = lock_routes(hub)?;
-    if routes.contains_key(&request_id) {
-        routes.insert(request_id, route);
+    if let Some(existing) = routes.get_mut(&request_id) {
+        *existing = route;
         return Ok(());
     }
     let origin_count = routes

@@ -62,7 +62,7 @@ pub async fn serve(
 
 enum ReadRequestError {
     PayloadTooLarge,
-    BadRequest(&'static str),
+    BadRequest,
     Io(anyhow::Error),
 }
 
@@ -85,7 +85,7 @@ async fn handle_conn(
             )
             .await;
         }
-        Ok(Err(ReadRequestError::BadRequest(_))) => {
+        Ok(Err(ReadRequestError::BadRequest)) => {
             return write_response(
                 &mut socket,
                 400,
@@ -253,7 +253,7 @@ async fn get_or_insert_session(
     sessions: &Arc<Mutex<HashMap<String, SessionSlot>>>,
     session_id: &str,
     settings: &ClientSettings,
-    identity_path: &PathBuf,
+    identity_path: &std::path::Path,
 ) -> Arc<Mutex<Mcp>> {
     let mut map = sessions.lock().await;
     let now = Instant::now();
@@ -275,7 +275,7 @@ async fn get_or_insert_session(
     }
     let mcp = Arc::new(Mutex::new(mcp::new_state(
         settings.clone(),
-        identity_path.clone(),
+        identity_path.to_path_buf(),
     )));
     map.insert(
         session_id.to_string(),
@@ -310,7 +310,7 @@ async fn read_request(socket: &mut TcpStream) -> std::result::Result<Request, Re
             break pos;
         }
         if buf.len() > MAX_HTTP_HEADERS_BYTES {
-            return Err(ReadRequestError::BadRequest("headers too large"));
+            return Err(ReadRequestError::BadRequest);
         }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
@@ -326,22 +326,20 @@ async fn read_request(socket: &mut TcpStream) -> std::result::Result<Request, Re
         }
     }
     if header(&headers, "transfer-encoding").is_some() {
-        return Err(ReadRequestError::BadRequest(
-            "transfer-encoding unsupported",
-        ));
+        return Err(ReadRequestError::BadRequest);
     }
     let mut content_len: Option<usize> = None;
     for (k, v) in &headers {
         if k == "content-length" {
             let parsed = v
                 .parse::<usize>()
-                .map_err(|_| ReadRequestError::BadRequest("invalid content-length"))?;
+                .map_err(|_| ReadRequestError::BadRequest)?;
             if parsed > MAX_HTTP_BODY_BYTES {
                 return Err(ReadRequestError::PayloadTooLarge);
             }
             if let Some(prev) = content_len {
                 if prev != parsed {
-                    return Err(ReadRequestError::BadRequest("conflicting content-length"));
+                    return Err(ReadRequestError::BadRequest);
                 }
             }
             content_len = Some(parsed);
