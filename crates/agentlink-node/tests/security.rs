@@ -442,6 +442,41 @@ detail = "off"
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // Attempt D (CB-01): after benign upgrade to recording="always", pushing retention shrink
+    // (`max_log_bytes = 1`), capture disable (`stdout_stderr = false`), recording downgrade (`"off"`),
+    // implicit preset downgrade (`preset = "minimal"`), wildcard path exclusion (`["**"]`), or
+    // agent override downgrade MUST ALL BE REJECTED by the live node handler!
+    for downgrade_toml in [
+        "preset = \"standard\"\nlock_local = false\n[recording]\nmode = \"always\"\n[retention]\nmax_log_bytes = 1\n",
+        "preset = \"standard\"\nlock_local = false\n[recording]\nmode = \"always\"\n[capture]\nstdout_stderr = false\n",
+        "preset = \"standard\"\nlock_local = false\n[recording]\nmode = \"off\"\n",
+        "preset = \"minimal\"\nlock_local = false\n",
+        "preset = \"standard\"\nlock_local = false\n[recording]\nmode = \"always\"\n[paths]\nexclude = [\"**\", \"**/.ssh/**\", \"**/*.pem\", \"**/id_rsa\", \"**/.aws/**\", \"**/.gnupg/**\"]\n",
+        "preset = \"standard\"\nlock_local = false\n[recording]\nmode = \"always\"\n[overrides.agent.bot.capture]\nstdout_stderr = false\n",
+    ] {
+        admin
+            .set_audit_policy("legacy-box", None, downgrade_toml)
+            .await
+            .expect("relay accepts syntax");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = AuditPolicy::parse(
+            &std::fs::read_to_string(legacy_dir.join("audit.toml")).expect("read audit.toml"),
+        )
+        .expect("parse after downgrade attempt");
+        assert_eq!(
+            after.recording.mode, "always",
+            "untrusted push downgraded recording.mode via:\n{downgrade_toml}"
+        );
+        assert!(
+            after.capture.stdout_stderr && after.retention.max_log_bytes > 1024,
+            "untrusted push downgraded capture/retention via:\n{downgrade_toml}"
+        );
+        assert!(
+            after.effective(Some("bot"), Some("legacy-box")).capture.stdout_stderr,
+            "untrusted push downgraded effective override capture via:\n{downgrade_toml}"
+        );
+    }
+
     legacy_stop.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), legacy_task).await;
 }

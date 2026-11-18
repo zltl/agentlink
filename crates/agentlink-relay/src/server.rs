@@ -2649,8 +2649,16 @@ async fn handle_client(
                 )
                 .await;
             }
-            if let Err(err) = agentlink_core::audit::AuditPolicy::parse(&toml) {
-                return send_out(tx, &Envelope::result_err(request_id, err.to_string())).await;
+            match agentlink_core::audit::AuditPolicy::parse(&toml) {
+                Ok(parsed) => {
+                    if let Err(err) = parsed.validate_remote_webhooks() {
+                        return send_out(tx, &Envelope::result_err(request_id, err.to_string()))
+                            .await;
+                    }
+                }
+                Err(err) => {
+                    return send_out(tx, &Envelope::result_err(request_id, err.to_string())).await;
+                }
             }
             if let Some(username) = user.filter(|name| !name.is_empty()) {
                 if !principal.admin && username != principal.user {
@@ -5080,8 +5088,16 @@ async fn handle_account(
             if !principal.admin && username != principal.user {
                 return send_out(tx, &Envelope::result_err(request_id, "not found")).await;
             }
-            if let Err(err) = agentlink_core::audit::AuditPolicy::parse(&toml) {
-                return send_out(tx, &Envelope::result_err(request_id, err.to_string())).await;
+            match agentlink_core::audit::AuditPolicy::parse(&toml) {
+                Ok(parsed) => {
+                    if let Err(err) = parsed.validate_remote_webhooks() {
+                        return send_out(tx, &Envelope::result_err(request_id, err.to_string()))
+                            .await;
+                    }
+                }
+                Err(err) => {
+                    return send_out(tx, &Envelope::result_err(request_id, err.to_string())).await;
+                }
             }
             match hub.db.set_user_audit(&username, &toml).await {
                 Ok(()) => {
