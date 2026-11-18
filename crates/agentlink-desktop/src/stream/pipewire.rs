@@ -359,4 +359,86 @@ extern "C" {
         wait_ms: c_int,
     ) -> c_int;
     fn al_pw_close(cap: *mut c_void);
+    fn al_pw_validate_frame_copy(
+        width: c_int,
+        height: c_int,
+        chunk_stride: c_int,
+        chunk_offset: u32,
+        chunk_size: u32,
+        maxsize: u32,
+        out_stride: *mut usize,
+        out_alloc_bytes: *mut usize,
+        out_copy_bytes: *mut usize,
+    ) -> c_int;
+}
+
+#[cfg(all(test, pipewire_headers))]
+mod tests {
+    use super::al_pw_validate_frame_copy;
+    use std::ffi::c_int;
+
+    fn validate(
+        width: c_int,
+        height: c_int,
+        chunk_stride: c_int,
+        chunk_offset: u32,
+        chunk_size: u32,
+        maxsize: u32,
+    ) -> Option<(usize, usize, usize)> {
+        let mut stride = 0usize;
+        let mut alloc = 0usize;
+        let mut copy = 0usize;
+        let ok = unsafe {
+            al_pw_validate_frame_copy(
+                width,
+                height,
+                chunk_stride,
+                chunk_offset,
+                chunk_size,
+                maxsize,
+                &mut stride,
+                &mut alloc,
+                &mut copy,
+            )
+        };
+        (ok != 0).then_some((stride, alloc, copy))
+    }
+
+    #[test]
+    fn native_c_frame_validator_blocks_overflow_offset_oob_and_zero_chunk() {
+        // 32-bit signed multiplication overflow (65536 * 65536 == 0 in int32_t) must be rejected.
+        assert_eq!(validate(16384, 16384, 65536, 0, u32::MAX, u32::MAX), None);
+        // Oversized dimensions > 16384 must be rejected.
+        assert_eq!(validate(16385, 100, 0, 0, 16385 * 400, 16385 * 400), None);
+        // Stride smaller than width * 4 must be rejected.
+        assert_eq!(validate(1920, 1080, 1920 * 2, 0, 16_000_000, 16_000_000), None);
+        // Metadata-only cursor buffer (chunk_size == 0) must not copy video pixels.
+        assert_eq!(validate(1920, 1080, 1920 * 4, 0, 0, 16_000_000), None);
+        // Non-zero chunk_offset pushing copy past data->maxsize must be rejected.
+        let full = 640u32 * 480 * 4;
+        assert_eq!(validate(640, 480, 640 * 4, 4096, full, full + 2048), None);
+        // Valid frame with non-zero chunk_offset within maxsize succeeds.
+        assert_eq!(
+            validate(640, 480, 640 * 4, 4096, full, full + 4096),
+            Some((2560, full as usize, full as usize))
+        );
+        // Valid padded-stride frame whose final row omits trailing stride pad succeeds.
+        let padded_stride = 2600u32;
+        let unpadded_end = 479 * padded_stride + 640 * 4;
+        assert_eq!(
+            validate(
+                640,
+                480,
+                padded_stride as c_int,
+                128,
+                unpadded_end,
+                128 + unpadded_end
+            ),
+            Some((
+                padded_stride as usize,
+                (padded_stride * 480) as usize,
+                unpadded_end as usize
+            ))
+        );
+    }
 }

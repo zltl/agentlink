@@ -23,6 +23,51 @@
 
 /* Bound matches Rust MAX_CURSOR_BITMAP_EDGE. */
 #define AL_PW_CURSOR_EDGE 128
+#define AL_PW_MAX_DIM 16384
+#define AL_PW_MAX_FRAME_BYTES (64u * 1024u * 1024u)
+
+int al_pw_validate_frame_copy(
+    int width,
+    int height,
+    int chunk_stride,
+    uint32_t chunk_offset,
+    uint32_t chunk_size,
+    uint32_t maxsize,
+    size_t *out_stride,
+    size_t *out_alloc_bytes,
+    size_t *out_copy_bytes
+) {
+    uint64_t min_row;
+    uint64_t stride64;
+    uint64_t alloc64;
+    uint64_t min_valid64;
+    uint64_t copy64;
+
+    if (width <= 0 || height <= 0 || width > AL_PW_MAX_DIM || height > AL_PW_MAX_DIM) {
+        return 0;
+    }
+    min_row = (uint64_t)(uint32_t)width * 4ULL;
+    stride64 = chunk_stride > 0 ? (uint64_t)(uint32_t)chunk_stride : min_row;
+    if (stride64 < min_row || stride64 > (uint64_t)AL_PW_MAX_FRAME_BYTES) {
+        return 0;
+    }
+    alloc64 = stride64 * (uint64_t)(uint32_t)height;
+    if (alloc64 == 0 || alloc64 > (uint64_t)AL_PW_MAX_FRAME_BYTES) {
+        return 0;
+    }
+    min_valid64 = (uint64_t)(uint32_t)(height - 1) * stride64 + min_row;
+    if ((uint64_t)chunk_size < min_valid64) {
+        return 0;
+    }
+    copy64 = (uint64_t)chunk_size < alloc64 ? (uint64_t)chunk_size : alloc64;
+    if ((uint64_t)maxsize < copy64 || (uint64_t)chunk_offset > (uint64_t)maxsize - copy64) {
+        return 0;
+    }
+    if (out_stride) *out_stride = (size_t)stride64;
+    if (out_alloc_bytes) *out_alloc_bytes = (size_t)alloc64;
+    if (out_copy_bytes) *out_copy_bytes = (size_t)copy64;
+    return 1;
+}
 
 typedef struct PwCapture {
     struct pw_thread_loop *loop;
@@ -110,8 +155,14 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
         return;
     }
     pthread_mutex_lock(&cap->mu);
-    cap->width = (int)info.info.raw.size.width;
-    cap->height = (int)info.info.raw.size.height;
+    if (info.info.raw.size.width > 0 && info.info.raw.size.width <= AL_PW_MAX_DIM
+        && info.info.raw.size.height > 0 && info.info.raw.size.height <= AL_PW_MAX_DIM) {
+        cap->width = (int)info.info.raw.size.width;
+        cap->height = (int)info.info.raw.size.height;
+    } else {
+        cap->width = 0;
+        cap->height = 0;
+    }
     cap->src_width = cap->width;
     cap->src_height = cap->height;
     cap->format = (int)info.info.raw.format;
@@ -294,31 +345,40 @@ static void on_process(void *userdata) {
 
     if (spa_buf->n_datas >= 1) {
         data = &spa_buf->datas[0];
-        if (data->data != NULL && data->chunk != NULL) {
-            height = cap->height;
-            stride = data->chunk->stride > 0 ? data->chunk->stride : cap->width * 4;
-            if (height > 0 && cap->width > 0 && is_bgra((uint32_t)cap->format)) {
-                size = stride * height;
-                if (size > 0 && size <= 64 * 1024 * 1024) {
-                    if (cap->bgra_size < size) {
-                        uint8_t *grown = (uint8_t *)realloc(cap->bgra, (size_t)size);
-                        if (grown) {
-                            cap->bgra = grown;
-                            cap->bgra_size = size;
-                        }
+        if (data->data != NULL && data->chunk != NULL && is_bgra((uint32_t)cap->format)) {
+            size_t valid_stride = 0;
+            size_t alloc_bytes = 0;
+            size_t copy_bytes = 0;
+            if (al_pw_validate_frame_copy(
+                    cap->width,
+                    cap->height,
+                    data->chunk->stride,
+                    data->chunk->offset,
+                    data->chunk->size,
+                    data->maxsize,
+                    &valid_stride,
+                    &alloc_bytes,
+                    &copy_bytes)) {
+                size = (int)alloc_bytes;
+                if (cap->bgra_size < size) {
+                    uint8_t *grown = (uint8_t *)realloc(cap->bgra, alloc_bytes);
+                    if (grown) {
+                        cap->bgra = grown;
+                        cap->bgra_size = size;
                     }
-                    if (cap->bgra && cap->bgra_size >= size) {
-                        dst = cap->bgra;
-                        if (data->chunk->size > 0 && (int)data->chunk->size < size) {
-                            size = (int)data->chunk->size;
-                        }
-                        memcpy(dst, data->data, (size_t)size);
-                        cap->stride = stride;
-                        cap->src_width = cap->width;
-                        cap->src_height = cap->height;
-                        cap->dma_buf = data->type == SPA_DATA_DmaBuf;
-                        have_video = 1;
+                }
+                if (cap->bgra && (size_t)cap->bgra_size >= alloc_bytes) {
+                    const void *src_ptr = SPA_PTROFF(data->data, data->chunk->offset, const void);
+                    dst = cap->bgra;
+                    memcpy(dst, src_ptr, copy_bytes);
+                    if (alloc_bytes > copy_bytes) {
+                        memset(dst + copy_bytes, 0, alloc_bytes - copy_bytes);
                     }
+                    cap->stride = (int)valid_stride;
+                    cap->src_width = cap->width;
+                    cap->src_height = cap->height;
+                    cap->dma_buf = data->type == SPA_DATA_DmaBuf;
+                    have_video = 1;
                 }
             }
         }
@@ -382,18 +442,21 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
     pthread_mutex_init(&cap->mu, NULL);
     cap->loop = pw_thread_loop_new("agentlink-pw", NULL);
     if (!cap->loop) {
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
     cap->context = pw_context_new(pw_thread_loop_get_loop(cap->loop), NULL, 0);
     if (!cap->context) {
         pw_thread_loop_destroy(cap->loop);
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
     if (pw_thread_loop_start(cap->loop) < 0) {
         pw_context_destroy(cap->context);
         pw_thread_loop_destroy(cap->loop);
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
@@ -409,6 +472,7 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
         pw_thread_loop_stop(cap->loop);
         pw_context_destroy(cap->context);
         pw_thread_loop_destroy(cap->loop);
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
@@ -438,6 +502,7 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
                 pw_thread_loop_stop(cap->loop);
                 pw_context_destroy(cap->context);
                 pw_thread_loop_destroy(cap->loop);
+                pthread_mutex_destroy(&cap->mu);
                 free(cap);
                 return NULL;
             }
@@ -464,6 +529,7 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
         pw_thread_loop_stop(cap->loop);
         pw_context_destroy(cap->context);
         pw_thread_loop_destroy(cap->loop);
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
@@ -517,6 +583,7 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
             pw_thread_loop_stop(cap->loop);
             pw_context_destroy(cap->context);
             pw_thread_loop_destroy(cap->loop);
+            pthread_mutex_destroy(&cap->mu);
             free(cap);
             return NULL;
         }
@@ -537,7 +604,7 @@ int al_pw_take(
 ) {
     int spins;
     int step_us = 5000;
-    if (!cap || !dst) {
+    if (!cap || !dst || dst_cap < 0) {
         return -1;
     }
     spins = wait_ms <= 0 ? 1 : (wait_ms * 1000) / step_us;
@@ -546,12 +613,15 @@ int al_pw_take(
     }
     for (int i = 0; i < spins; i++) {
         int seq;
-        int size;
         pthread_mutex_lock(&cap->mu);
         seq = cap->seq;
-        if (seq != cap->last_taken && cap->bgra && cap->width > 0 && cap->height > 0) {
-            size = cap->stride * cap->height;
-            if (size > dst_cap) {
+        if (seq != cap->last_taken && cap->bgra && cap->width > 0 && cap->height > 0 && cap->stride > 0) {
+            uint64_t size64 = (uint64_t)(uint32_t)cap->stride * (uint64_t)(uint32_t)cap->height;
+            if (size64 > (uint64_t)AL_PW_MAX_FRAME_BYTES || (size_t)size64 > (size_t)cap->bgra_size) {
+                pthread_mutex_unlock(&cap->mu);
+                return -1;
+            }
+            if (size64 > (uint64_t)(uint32_t)dst_cap) {
                 /* Report the real geometry so the caller can resize. */
                 *width = cap->width;
                 *height = cap->height;
@@ -563,26 +633,26 @@ int al_pw_take(
             if (cap->target_width > 0 && cap->target_width < cap->width) {
                 int out_w = cap->target_width;
                 int out_h = (int)(((int64_t)cap->height * (int64_t)out_w + cap->width / 2) / cap->width);
-                int out_stride;
-                int out_size;
+                uint64_t out_stride64;
+                uint64_t out_size64;
                 if (out_h < 1) out_h = 1;
-                out_stride = out_w * 4;
-                out_size = out_stride * out_h;
-                if (out_size > dst_cap) {
+                out_stride64 = (uint64_t)(uint32_t)out_w * 4ULL;
+                out_size64 = out_stride64 * (uint64_t)(uint32_t)out_h;
+                if (out_size64 > (uint64_t)(uint32_t)dst_cap) {
                     *width = out_w;
                     *height = out_h;
-                    *stride = out_stride;
+                    *stride = (int)out_stride64;
                     *dma_buf = cap->dma_buf;
                     pthread_mutex_unlock(&cap->mu);
                     return -2;
                 }
                 downsample_nn(cap->bgra, cap->width, cap->height, cap->stride,
-                              dst, out_w, out_h, out_stride);
+                              dst, out_w, out_h, (int)out_stride64);
                 *width = out_w;
                 *height = out_h;
-                *stride = out_stride;
+                *stride = (int)out_stride64;
             } else {
-                memcpy(dst, cap->bgra, (size_t)size);
+                memcpy(dst, cap->bgra, (size_t)size64);
                 *width = cap->width;
                 *height = cap->height;
                 *stride = cap->stride;
