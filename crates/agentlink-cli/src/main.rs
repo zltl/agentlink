@@ -45,7 +45,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use endpoint::{parse_endpoint, Endpoint};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -188,70 +188,267 @@ enum CpProgressMode {
     Off,
 }
 
+#[derive(Args, Debug)]
+struct RelayArgs {
+    /// Listen address.
+    #[arg(long, default_value = "0.0.0.0:7443")]
+    bind: String,
+    /// Certificate, admin token, and enrollment live here.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Postgres URL. Empty uses SQLite at `<data-dir>/relay.db`.
+    #[arg(long, env = "AGENTLINK_DATABASE_URL")]
+    database_url: Option<String>,
+    /// Accept `Signup` from the network. Off unless set.
+    #[arg(long)]
+    allow_signup: bool,
+    /// Print the admin token even when the store already exists.
+    /// Leave this off in a service unit so the token stays out of the journal.
+    #[arg(long)]
+    print_admin_token: bool,
+    /// Trust X-Forwarded-For and X-Real-IP when the TCP peer is in this CIDR.
+    /// Repeat for more than one proxy. A bare IP means a single host.
+    /// Example: `--trust-proxy 127.0.0.1/32`.
+    #[arg(long = "trust-proxy")]
+    trust_proxy: Vec<String>,
+    #[command(subcommand)]
+    action: Option<account::RelayAction>,
+}
+
+#[derive(Args, Debug)]
+struct NodeArgs {
+    /// Display name. Defaults to the hostname.
+    #[arg(long)]
+    name: Option<String>,
+    /// One-time token from `agentlink pair`.
+    #[arg(long)]
+    pairing_token: Option<String>,
+    /// Invite string from `agentlink pair` (`agentlink-invite:v1:...`).
+    /// It carries the relay URL, trust mode, and pairing token.
+    #[arg(long)]
+    invite: Option<String>,
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Confine file paths, and the exec working directory, to this directory.
+    #[arg(long)]
+    root: Option<PathBuf>,
+    /// Local permission ceiling: read-only, read-write, exec, desktop, remote-view, remote-control, or full.
+    #[arg(long)]
+    max_access: Option<String>,
+    /// Consent before a viewer attaches: auto, notify, prompt, or deny.
+    #[arg(long, default_value = "notify")]
+    stream_consent: String,
+    /// Command allow glob. Repeatable. Written to limits.json.
+    #[arg(long = "allow-cmd")]
+    allow_cmd: Vec<String>,
+    /// Command deny glob. Deny wins. Written to limits.json.
+    #[arg(long = "deny-cmd")]
+    deny_cmd: Vec<String>,
+    /// Seconds to wait for `agentlink approve` before a held op is denied.
+    #[arg(long)]
+    confirm_timeout: Option<u64>,
+    /// Audit preset written to audit.toml before the node starts: minimal, standard, full, paranoid.
+    #[arg(long)]
+    audit_preset: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct CpArgs {
+    src: String,
+    dst: String,
+    /// Chunk size, for example `1MiB` or `256KiB`.
+    #[arg(long, default_value = "1MiB")]
+    chunk_size: String,
+    /// Chunks kept in flight.
+    #[arg(long, default_value_t = 8)]
+    window: usize,
+    /// Workers that pull different ranges at once.
+    #[arg(long, default_value_t = 4)]
+    parallel: usize,
+    /// `auto`, `on`, or `off`. Auto skips formats that are already compressed.
+    #[arg(long, default_value = "auto")]
+    compress: String,
+    /// Stay on the relay instead of trying a direct QUIC path.
+    #[arg(long = "no-direct", action = clap::ArgAction::SetTrue)]
+    no_direct: bool,
+    /// Progress on stderr: `auto`, `on`, or `off`.
+    ///
+    /// `auto` (default) prints while stderr is a terminal. `on` always
+    /// prints. `off` stays quiet. `--progress` with no value means `on`.
+    ///
+    /// A terminal gets one updating line (bytes done / total, percent,
+    /// throughput, and ETA). Forced progress on a pipe prints a new line
+    /// about twice a second. Directory copies show overall progress of the
+    /// archive stream. With `--json`, the line stays on stderr and stdout
+    /// is only the final JSON object.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        num_args = 0..=1,
+        default_missing_value = "on",
+        require_equals = true,
+        value_name = "WHEN"
+    )]
+    progress: CpProgressMode,
+}
+
+#[derive(Args, Debug)]
+struct SearchArgs {
+    node: String,
+    pattern: String,
+    /// Directory or file. Defaults to `.`.
+    path: Option<String>,
+    #[arg(long)]
+    literal: bool,
+    #[arg(long)]
+    include: Vec<String>,
+    #[arg(long)]
+    exclude: Vec<String>,
+    #[arg(long)]
+    include_hidden: bool,
+    #[arg(long)]
+    ignore_case: bool,
+    #[arg(long)]
+    no_gitignore: bool,
+    #[arg(long, default_value_t = 0)]
+    before: u32,
+    #[arg(long, default_value_t = 0)]
+    after: u32,
+    #[arg(long, default_value_t = 0)]
+    offset: u32,
+    #[arg(long, default_value_t = 100)]
+    limit: u32,
+}
+
+#[derive(Args, Debug)]
+struct FindArgs {
+    node: String,
+    pattern: String,
+    path: Option<String>,
+    #[arg(long)]
+    regex: bool,
+    #[arg(long)]
+    include_hidden: bool,
+    #[arg(long)]
+    ignore_case: bool,
+    #[arg(long)]
+    no_gitignore: bool,
+    #[arg(long, default_value_t = 0)]
+    offset: u32,
+    #[arg(long, default_value_t = 200)]
+    limit: u32,
+}
+
+#[derive(Args, Debug)]
+struct ScreenshotArgs {
+    node: String,
+    /// Optional output path (same as `--out`). Lets `screenshot NODE path.jpg` work.
+    #[arg(value_name = "OUT")]
+    out_path: Option<PathBuf>,
+    /// screen, monitor, region, window, or monitors.
+    #[arg(long, default_value = "screen")]
+    target: String,
+    #[arg(long)]
+    monitor: Option<u32>,
+    /// Window id or a title substring.
+    #[arg(long)]
+    window_id: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    x: Option<i64>,
+    #[arg(long, allow_hyphen_values = true)]
+    y: Option<i64>,
+    #[arg(long)]
+    width: Option<u64>,
+    #[arg(long)]
+    height: Option<u64>,
+    /// png, jpeg, webp, or auto (from `--out` / OUT extension; jpeg if unknown).
+    #[arg(long = "format", default_value = "auto")]
+    image_format: String,
+    #[arg(long, default_value_t = 80)]
+    quality: u8,
+    /// Scale factor from 0.05 to 1.
+    #[arg(long, default_value_t = 1.0)]
+    scale: f32,
+    /// Image path. Same as the optional positional `OUT`. Without `--json`, a
+    /// file is written even when both are omitted (auto-named in cwd).
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ClickArgs {
+    node: String,
+    /// X pixel, or 0–1 fraction of the primary monitor.
+    x: Coord,
+    /// Y pixel, or 0–1 fraction of the primary monitor.
+    y: Coord,
+    #[arg(long, default_value = "left")]
+    button: String,
+    #[arg(long, default_value_t = 1)]
+    count: u32,
+    /// Drag target X pixel, or 0–1 fraction of the primary monitor.
+    #[arg(long, allow_hyphen_values = true)]
+    to_x: Option<Coord>,
+    /// Drag target Y pixel, or 0–1 fraction of the primary monitor.
+    #[arg(long, allow_hyphen_values = true)]
+    to_y: Option<Coord>,
+    /// Move the pointer and do not click.
+    #[arg(long)]
+    move_only: bool,
+}
+
+#[derive(Args, Debug)]
+struct ControllerArgs {
+    /// Node data directory shown for this computer. Defaults to the per-user directory.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Hide the window until the status icon is opened. The window stays
+    /// visible when this session has no icon.
+    #[arg(long)]
+    background: bool,
+    /// Print whether this build includes the window, then exit.
+    #[arg(long)]
+    check: bool,
+    /// Listen for JSON-line debug commands on this Unix socket.
+    #[arg(long, value_name = "PATH")]
+    debug_socket: Option<PathBuf>,
+    /// Drive the UI with mock desktop frames (no relay).
+    #[arg(long)]
+    mock: bool,
+    /// Run without a real window (logical egui loop). Pair with `--debug-socket`.
+    #[arg(long)]
+    headless: bool,
+    /// Mock only: fail the session connect so the UI lands in the error state.
+    #[arg(long)]
+    fail_connect: bool,
+    /// Seconds to wait for the first frame before marking the session failed.
+    #[arg(long, default_value_t = 12)]
+    connect_timeout_secs: u64,
+    /// Capture/encode fps cap sent in the live offer (default 30).
+    #[arg(long, default_value_t = 30)]
+    max_fps: u32,
+    /// Append client perf CSV every 2s (fps, decode/present ms, stalls…).
+    #[arg(long, value_name = "PATH")]
+    perf_log: Option<PathBuf>,
+    /// Open this node's desktop as soon as the machine list loads.
+    ///
+    /// Skips the machines page, which makes headless screenshotting and
+    /// smoke tests possible without synthesising clicks.
+    #[arg(long, value_name = "NODE")]
+    open_desktop: Option<String>,
+    /// Isolated layout fixture. Temporary directories, labeled sample
+    /// machines, no live account, and no production auto-start.
+    #[arg(long)]
+    preview_ui: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the relay. Nodes and clients connect out to it.
-    Relay {
-        /// Listen address.
-        #[arg(long, default_value = "0.0.0.0:7443")]
-        bind: String,
-        /// Certificate, admin token, and enrollment live here.
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Postgres URL. Empty uses SQLite at `<data-dir>/relay.db`.
-        #[arg(long, env = "AGENTLINK_DATABASE_URL")]
-        database_url: Option<String>,
-        /// Accept `Signup` from the network. Off unless set.
-        #[arg(long)]
-        allow_signup: bool,
-        /// Print the admin token even when the store already exists.
-        /// Leave this off in a service unit so the token stays out of the journal.
-        #[arg(long)]
-        print_admin_token: bool,
-        /// Trust X-Forwarded-For and X-Real-IP when the TCP peer is in this CIDR.
-        /// Repeat for more than one proxy. A bare IP means a single host.
-        /// Example: `--trust-proxy 127.0.0.1/32`.
-        #[arg(long = "trust-proxy")]
-        trust_proxy: Vec<String>,
-        #[command(subcommand)]
-        action: Option<account::RelayAction>,
-    },
+    Relay(Box<RelayArgs>),
     /// Run a node daemon. It dials the relay and reconnects on its own.
-    Node {
-        /// Display name. Defaults to the hostname.
-        #[arg(long)]
-        name: Option<String>,
-        /// One-time token from `agentlink pair`.
-        #[arg(long)]
-        pairing_token: Option<String>,
-        /// Invite string from `agentlink pair` (`agentlink-invite:v1:...`).
-        /// It carries the relay URL, trust mode, and pairing token.
-        #[arg(long)]
-        invite: Option<String>,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Confine file paths, and the exec working directory, to this directory.
-        #[arg(long)]
-        root: Option<PathBuf>,
-        /// Local permission ceiling: read-only, read-write, exec, desktop, remote-view, remote-control, or full.
-        #[arg(long)]
-        max_access: Option<String>,
-        /// Consent before a viewer attaches: auto, notify, prompt, or deny.
-        #[arg(long, default_value = "notify")]
-        stream_consent: String,
-        /// Command allow glob. Repeatable. Written to limits.json.
-        #[arg(long = "allow-cmd")]
-        allow_cmd: Vec<String>,
-        /// Command deny glob. Deny wins. Written to limits.json.
-        #[arg(long = "deny-cmd")]
-        deny_cmd: Vec<String>,
-        /// Seconds to wait for `agentlink approve` before a held op is denied.
-        #[arg(long)]
-        confirm_timeout: Option<u64>,
-        /// Audit preset written to audit.toml before the node starts: minimal, standard, full, paranoid.
-        #[arg(long)]
-        audit_preset: Option<String>,
-    },
+    Node(Box<NodeArgs>),
     /// Mint a one-time pairing token.
     Pair {
         #[arg(long)]
@@ -283,45 +480,7 @@ enum Command {
         content: Option<String>,
     },
     /// Copy a file or directory. Endpoints are local paths or `node://name/path`. A file copied onto an existing directory lands inside it (Unix `cp`).
-    Cp {
-        src: String,
-        dst: String,
-        /// Chunk size, for example `1MiB` or `256KiB`.
-        #[arg(long, default_value = "1MiB")]
-        chunk_size: String,
-        /// Chunks kept in flight.
-        #[arg(long, default_value_t = 8)]
-        window: usize,
-        /// Workers that pull different ranges at once.
-        #[arg(long, default_value_t = 4)]
-        parallel: usize,
-        /// `auto`, `on`, or `off`. Auto skips formats that are already compressed.
-        #[arg(long, default_value = "auto")]
-        compress: String,
-        /// Stay on the relay instead of trying a direct QUIC path.
-        #[arg(long = "no-direct", action = clap::ArgAction::SetTrue)]
-        no_direct: bool,
-        /// Progress on stderr: `auto`, `on`, or `off`.
-        ///
-        /// `auto` (default) prints while stderr is a terminal. `on` always
-        /// prints. `off` stays quiet. `--progress` with no value means `on`.
-        ///
-        /// A terminal gets one updating line (bytes done / total, percent,
-        /// throughput, and ETA). Forced progress on a pipe prints a new line
-        /// about twice a second. Directory copies show overall progress of the
-        /// archive stream. With `--json`, the line stays on stderr and stdout
-        /// is only the final JSON object.
-        #[arg(
-            long,
-            value_enum,
-            default_value = "auto",
-            num_args = 0..=1,
-            default_missing_value = "on",
-            require_equals = true,
-            value_name = "WHEN"
-        )]
-        progress: CpProgressMode,
-    },
+    Cp(Box<CpArgs>),
     /// Create a directory on a node.
     Mkdir {
         node: String,
@@ -371,32 +530,7 @@ enum Command {
     /// Order is `search <NODE> <PATTERN> [PATH]`. Putting a path before the
     /// pattern (`search example /tmp needle`) is rejected with a did-you-mean.
     #[command(visible_alias = "grep")]
-    Search {
-        node: String,
-        pattern: String,
-        /// Directory or file. Defaults to `.`.
-        path: Option<String>,
-        #[arg(long)]
-        literal: bool,
-        #[arg(long)]
-        include: Vec<String>,
-        #[arg(long)]
-        exclude: Vec<String>,
-        #[arg(long)]
-        include_hidden: bool,
-        #[arg(long)]
-        ignore_case: bool,
-        #[arg(long)]
-        no_gitignore: bool,
-        #[arg(long, default_value_t = 0)]
-        before: u32,
-        #[arg(long, default_value_t = 0)]
-        after: u32,
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
-        #[arg(long, default_value_t = 100)]
-        limit: u32,
-    },
+    Search(Box<SearchArgs>),
     /// Search file names by glob, or by regex with `--regex`.
     ///
     /// Machine name comes first (`agentlink find example '*.rs'`). Swapping
@@ -404,23 +538,7 @@ enum Command {
     /// Putting PATH before PATTERN (`find example /tmp '*.rs'`) is also rejected
     /// with a did-you-mean pointing at `find NODE PATTERN PATH`. Unix `-name`/
     /// `-iname` predicates are rejected with a did-you-mean too.
-    Find {
-        node: String,
-        pattern: String,
-        path: Option<String>,
-        #[arg(long)]
-        regex: bool,
-        #[arg(long)]
-        include_hidden: bool,
-        #[arg(long)]
-        ignore_case: bool,
-        #[arg(long)]
-        no_gitignore: bool,
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
-        #[arg(long, default_value_t = 200)]
-        limit: u32,
-    },
+    Find(Box<FindArgs>),
     /// Replace an exact string. Fails when the match is not unique unless `--all`.
     ///
     /// `edit` is a visible alias (agents and muscle memory often reach for it).
@@ -481,62 +599,10 @@ enum Command {
         line: bool,
     },
     /// Capture the screen, a monitor, a region, or a window.
-    Screenshot {
-        node: String,
-        /// Optional output path (same as `--out`). Lets `screenshot NODE path.jpg` work.
-        #[arg(value_name = "OUT")]
-        out_path: Option<PathBuf>,
-        /// screen, monitor, region, window, or monitors.
-        #[arg(long, default_value = "screen")]
-        target: String,
-        #[arg(long)]
-        monitor: Option<u32>,
-        /// Window id or a title substring.
-        #[arg(long)]
-        window_id: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        x: Option<i64>,
-        #[arg(long, allow_hyphen_values = true)]
-        y: Option<i64>,
-        #[arg(long)]
-        width: Option<u64>,
-        #[arg(long)]
-        height: Option<u64>,
-        /// png, jpeg, webp, or auto (from `--out` / OUT extension; jpeg if unknown).
-        #[arg(long = "format", default_value = "auto")]
-        image_format: String,
-        #[arg(long, default_value_t = 80)]
-        quality: u8,
-        /// Scale factor from 0.05 to 1.
-        #[arg(long, default_value_t = 1.0)]
-        scale: f32,
-        /// Image path. Same as the optional positional `OUT`. Without `--json`, a
-        /// file is written even when both are omitted (auto-named in cwd).
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
+    Screenshot(Box<ScreenshotArgs>),
     /// Move, click, or drag. Coordinates are pixels, or 0–1 fractions of the
     /// primary monitor (same as Android / web JPEG).
-    Click {
-        node: String,
-        /// X pixel, or 0–1 fraction of the primary monitor.
-        x: Coord,
-        /// Y pixel, or 0–1 fraction of the primary monitor.
-        y: Coord,
-        #[arg(long, default_value = "left")]
-        button: String,
-        #[arg(long, default_value_t = 1)]
-        count: u32,
-        /// Drag target X pixel, or 0–1 fraction of the primary monitor.
-        #[arg(long, allow_hyphen_values = true)]
-        to_x: Option<Coord>,
-        /// Drag target Y pixel, or 0–1 fraction of the primary monitor.
-        #[arg(long, allow_hyphen_values = true)]
-        to_y: Option<Coord>,
-        /// Move the pointer and do not click.
-        #[arg(long)]
-        move_only: bool,
-    },
+    Click(Box<ClickArgs>),
     /// Type Unicode text.
     Type { node: String, text: String },
     /// Press a key combo, for example ctrl+shift+a.
@@ -697,49 +763,7 @@ enum Command {
     ///
     /// The window ships in the Windows, macOS, and glibc Linux builds. A musl
     /// binary prints how to build the glibc controller instead.
-    Controller {
-        /// Node data directory shown for this computer. Defaults to the per-user directory.
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Hide the window until the status icon is opened. The window stays
-        /// visible when this session has no icon.
-        #[arg(long)]
-        background: bool,
-        /// Print whether this build includes the window, then exit.
-        #[arg(long)]
-        check: bool,
-        /// Listen for JSON-line debug commands on this Unix socket.
-        #[arg(long, value_name = "PATH")]
-        debug_socket: Option<PathBuf>,
-        /// Drive the UI with mock desktop frames (no relay).
-        #[arg(long)]
-        mock: bool,
-        /// Run without a real window (logical egui loop). Pair with `--debug-socket`.
-        #[arg(long)]
-        headless: bool,
-        /// Mock only: fail the session connect so the UI lands in the error state.
-        #[arg(long)]
-        fail_connect: bool,
-        /// Seconds to wait for the first frame before marking the session failed.
-        #[arg(long, default_value_t = 12)]
-        connect_timeout_secs: u64,
-        /// Capture/encode fps cap sent in the live offer (default 30).
-        #[arg(long, default_value_t = 30)]
-        max_fps: u32,
-        /// Append client perf CSV every 2s (fps, decode/present ms, stalls…).
-        #[arg(long, value_name = "PATH")]
-        perf_log: Option<PathBuf>,
-        /// Open this node's desktop as soon as the machine list loads.
-        ///
-        /// Skips the machines page, which makes headless screenshotting and
-        /// smoke tests possible without synthesising clicks.
-        #[arg(long, value_name = "NODE")]
-        open_desktop: Option<String>,
-        /// Isolated layout fixture. Temporary directories, labeled sample
-        /// machines, no live account, and no production auto-start.
-        #[arg(long)]
-        preview_ui: bool,
-    },
+    Controller(Box<ControllerArgs>),
     /// Notification-area icon and status window.
     ///
     /// On Windows this is the user-scope node. With no subcommand it opens
@@ -1138,56 +1162,39 @@ fn main() {
     }
     // The window owns the main thread. Starting it inside the CLI runtime makes
     // the Linux accessibility bus look for a Tokio reactor that is not there.
-    if let Command::Controller {
-        check: false,
-        preview_ui: true,
-        ..
-    } = &cli.command
-    {
-        if let Some(err) = preview_incompatible_flags(&matches) {
-            eprintln!("error: {err}");
-            std::process::exit(2);
-        }
-        std::process::exit(controller::enter_preview());
-    }
-    if let Command::Controller {
-        data_dir,
-        background,
-        check: false,
-        debug_socket,
-        mock,
-        headless,
-        fail_connect,
-        connect_timeout_secs,
-        max_fps,
-        perf_log,
-        open_desktop,
-        preview_ui,
-    } = &cli.command
-    {
-        let config_dir = match config_dir(&cli) {
-            Ok(dir) => dir,
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
+    if let Command::Controller(args) = &cli.command {
+        if !args.check && args.preview_ui {
+            if let Some(err) = preview_incompatible_flags(&matches) {
+                eprintln!("error: {err}");
+                std::process::exit(2);
             }
-        };
-        std::process::exit(controller::enter_args(controller::EnterArgs {
-            config_dir,
-            data_dir: data_dir.clone(),
-            tray: true,
-            background: *background,
-            check: false,
-            debug_socket: debug_socket.clone(),
-            mock: *mock,
-            headless: *headless,
-            fail_connect: *fail_connect,
-            connect_timeout_secs: *connect_timeout_secs,
-            max_fps: *max_fps,
-            perf_log: perf_log.clone(),
-            open_desktop: open_desktop.clone(),
-            preview_ui: *preview_ui,
-        }));
+            std::process::exit(controller::enter_preview());
+        }
+        if !args.check {
+            let config_dir = match config_dir(&cli) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    std::process::exit(1);
+                }
+            };
+            std::process::exit(controller::enter_args(controller::EnterArgs {
+                config_dir,
+                data_dir: args.data_dir.clone(),
+                tray: true,
+                background: args.background,
+                check: false,
+                debug_socket: args.debug_socket.clone(),
+                mock: args.mock,
+                headless: args.headless,
+                fail_connect: args.fail_connect,
+                connect_timeout_secs: args.connect_timeout_secs,
+                max_fps: args.max_fps,
+                perf_log: args.perf_log.clone(),
+                open_desktop: args.open_desktop.clone(),
+                preview_ui: args.preview_ui,
+            }));
+        }
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1203,7 +1210,7 @@ async fn async_main(cli: Cli) {
         }
     }
     let default_filter = match &cli.command {
-        Command::Relay { .. } | Command::Node { .. } => "info",
+        Command::Relay(_) | Command::Node(_) => "info",
         _ => "warn",
     };
     init_tracing(default_filter);
@@ -1354,15 +1361,16 @@ fn init_tracing(default_filter: &str) {
 
 async fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.command {
-        Command::Relay {
-            bind,
-            data_dir,
-            database_url,
-            allow_signup,
-            action,
-            print_admin_token,
-            trust_proxy,
-        } => {
+        Command::Relay(args) => {
+            let RelayArgs {
+                bind,
+                data_dir,
+                database_url,
+                allow_signup,
+                action,
+                print_admin_token,
+                trust_proxy,
+            } = &**args;
             let data_dir = match data_dir {
                 Some(dir) => dir.clone(),
                 None => agentlink_core::config::default_data_dir("relay")?,
@@ -1388,19 +1396,20 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
             .await?;
             Ok(0)
         }
-        Command::Node {
-            name,
-            pairing_token,
-            invite,
-            data_dir,
-            root,
-            max_access,
-            stream_consent,
-            allow_cmd,
-            deny_cmd,
-            confirm_timeout,
-            audit_preset,
-        } => {
+        Command::Node(args) => {
+            let NodeArgs {
+                name,
+                pairing_token,
+                invite,
+                data_dir,
+                root,
+                max_access,
+                stream_consent,
+                allow_cmd,
+                deny_cmd,
+                confirm_timeout,
+                audit_preset,
+            } = &**args;
             let config = node_cfg::load(node_cfg::NodeArgs {
                 relay: cli.relay.clone(),
                 fingerprint: cli.fingerprint.clone(),
@@ -1443,39 +1452,24 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
             )
             .await
         }
-        Command::Controller {
-            preview_ui: true,
-            check: false,
-            ..
-        } => Ok(controller::enter_preview()),
-        Command::Controller {
-            data_dir,
-            background,
-            check,
-            debug_socket,
-            mock,
-            headless,
-            fail_connect,
-            connect_timeout_secs,
-            max_fps,
-            perf_log,
-            open_desktop,
-            preview_ui,
-        } => Ok(controller::enter_args(controller::EnterArgs {
+        Command::Controller(args) if args.preview_ui && !args.check => {
+            Ok(controller::enter_preview())
+        }
+        Command::Controller(args) => Ok(controller::enter_args(controller::EnterArgs {
             config_dir: config_dir(cli)?,
-            data_dir: data_dir.clone(),
+            data_dir: args.data_dir.clone(),
             tray: true,
-            background: *background,
-            check: *check,
-            debug_socket: debug_socket.clone(),
-            mock: *mock,
-            headless: *headless,
-            fail_connect: *fail_connect,
-            connect_timeout_secs: *connect_timeout_secs,
-            max_fps: *max_fps,
-            perf_log: perf_log.clone(),
-            open_desktop: open_desktop.clone(),
-            preview_ui: *preview_ui,
+            background: args.background,
+            check: args.check,
+            debug_socket: args.debug_socket.clone(),
+            mock: args.mock,
+            headless: args.headless,
+            fail_connect: args.fail_connect,
+            connect_timeout_secs: args.connect_timeout_secs,
+            max_fps: args.max_fps,
+            perf_log: args.perf_log.clone(),
+            open_desktop: args.open_desktop.clone(),
+            preview_ui: args.preview_ui,
         })),
         Command::Tray {
             data_dir,
@@ -1932,16 +1926,17 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                     );
                     Ok(0)
                 }
-                Command::Cp {
-                    src,
-                    dst,
-                    chunk_size,
-                    window,
-                    parallel,
-                    compress,
-                    no_direct,
-                    progress,
-                } => {
+                Command::Cp(args) => {
+                    let CpArgs {
+                        src,
+                        dst,
+                        chunk_size,
+                        window,
+                        parallel,
+                        compress,
+                        no_direct,
+                        progress,
+                    } = &**args;
                     copy_path(
                         &client,
                         src,
@@ -2169,21 +2164,22 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                         }
                     }
                 }
-                Command::Search {
-                    node,
-                    pattern,
-                    path,
-                    literal,
-                    include,
-                    exclude,
-                    include_hidden,
-                    ignore_case,
-                    no_gitignore,
-                    before,
-                    after,
-                    offset,
-                    limit,
-                } => {
+                Command::Search(args) => {
+                    let SearchArgs {
+                        node,
+                        pattern,
+                        path,
+                        literal,
+                        include,
+                        exclude,
+                        include_hidden,
+                        ignore_case,
+                        no_gitignore,
+                        before,
+                        after,
+                        offset,
+                        limit,
+                    } = &**args;
                     if let Some(root) = path.as_deref() {
                         reject_dash_remote_path("search", root)?;
                     }
@@ -2269,17 +2265,18 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                     }
                     Ok(0)
                 }
-                Command::Find {
-                    node,
-                    pattern,
-                    path,
-                    regex,
-                    include_hidden,
-                    ignore_case,
-                    no_gitignore,
-                    offset,
-                    limit,
-                } => {
+                Command::Find(args) => {
+                    let FindArgs {
+                        node,
+                        pattern,
+                        path,
+                        regex,
+                        include_hidden,
+                        ignore_case,
+                        no_gitignore,
+                        offset,
+                        limit,
+                    } = &**args;
                     if let Some(root) = path.as_deref() {
                         reject_dash_remote_path("find", root)?;
                     }
@@ -2504,21 +2501,22 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                         Ok(code)
                     }
                 }
-                Command::Screenshot {
-                    node,
-                    out_path,
-                    target,
-                    monitor,
-                    window_id,
-                    x,
-                    y,
-                    width,
-                    height,
-                    image_format,
-                    quality,
-                    scale,
-                    out,
-                } => {
+                Command::Screenshot(args) => {
+                    let ScreenshotArgs {
+                        node,
+                        out_path,
+                        target,
+                        monitor,
+                        window_id,
+                        x,
+                        y,
+                        width,
+                        height,
+                        image_format,
+                        quality,
+                        scale,
+                        out,
+                    } = &**args;
                     let out = match (out.as_ref(), out_path.as_ref()) {
                         (Some(flag), Some(pos)) if flag != pos => {
                             return Err(anyhow!(
@@ -2596,16 +2594,17 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                     }
                     Ok(0)
                 }
-                Command::Click {
-                    node,
-                    x,
-                    y,
-                    button,
-                    count,
-                    to_x,
-                    to_y,
-                    move_only,
-                } => {
+                Command::Click(args) => {
+                    let ClickArgs {
+                        node,
+                        x,
+                        y,
+                        button,
+                        count,
+                        to_x,
+                        to_y,
+                        move_only,
+                    } = &**args;
                     let (action, mut payload) = if *move_only {
                         ("move", json!({"x": x.as_json(), "y": y.as_json()}))
                     } else if let (Some(to_x), Some(to_y)) = (to_x, to_y) {
@@ -2724,8 +2723,8 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                     );
                     Ok(0)
                 }
-                Command::Relay { .. }
-                | Command::Node { .. }
+                Command::Relay(_)
+                | Command::Node(_)
                 | Command::Mcp { .. }
                 | Command::Login { .. }
                 | Command::Logout
@@ -2738,13 +2737,11 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
                 | Command::Approve { .. }
                 | Command::Audit { .. }
                 | Command::Service { .. }
-                | Command::Controller { .. }
+                | Command::Controller(_)
                 | Command::Tray { .. }
                 | Command::Update(_)
                 | Command::View { .. }
                 | Command::Guide { .. }
-                | Command::Status
-                | Command::Identity { .. }
                 | Command::Internal { .. }
                 | Command::Bench { .. } => unreachable!(),
             }
@@ -20298,9 +20295,9 @@ mod hyphen_value_cli_tests {
         ])
         .unwrap();
         match cli.command {
-            super::Command::Click { to_x, to_y, .. } => {
-                assert_eq!(to_x.unwrap().as_json(), serde_json::json!(-5));
-                assert_eq!(to_y.unwrap().as_json(), serde_json::json!(50));
+            super::Command::Click(args) => {
+                assert_eq!(args.to_x.unwrap().as_json(), serde_json::json!(-5));
+                assert_eq!(args.to_y.unwrap().as_json(), serde_json::json!(50));
             }
             other => panic!("expected Click, got {other:?}"),
         }
@@ -20805,7 +20802,7 @@ mod synonym_alias_tests {
     #[test]
     fn grep_delete_move_sys_aliases() {
         let grep = Cli::try_parse_from(["agentlink", "grep", "box", "needle", "/tmp"]).unwrap();
-        assert!(matches!(grep.command, Command::Search { .. }));
+        assert!(matches!(grep.command, Command::Search(_)));
 
         let delete = Cli::try_parse_from(["agentlink", "delete", "box", "/tmp/x"]).unwrap();
         assert!(matches!(delete.command, Command::Rm { .. }));
@@ -21606,7 +21603,7 @@ mod cp_progress_tests {
         full.extend_from_slice(args);
         let cli = Cli::try_parse_from(full).unwrap_or_else(|err| panic!("{err}"));
         match cli.command {
-            Command::Cp { progress, .. } => progress,
+            Command::Cp(args) => args.progress,
             other => panic!("expected cp, got {other:?}"),
         }
     }
@@ -21655,9 +21652,33 @@ mod cp_progress_tests {
         .unwrap();
         assert!(cli.json);
         match cli.command {
-            Command::Cp { progress, .. } => assert_eq!(progress, CpProgressMode::On),
+            Command::Cp(args) => assert_eq!(args.progress, CpProgressMode::On),
             other => panic!("expected cp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_command_and_parse_fit_on_default_two_mib_test_stack() {
+        let handle = std::thread::Builder::new()
+            .name("cli-2mib-stack".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let mut cmd = Cli::command();
+                let help = cmd.render_long_help().to_string();
+                assert!(help.contains("relay") && help.contains("controller"));
+                let parsed = Cli::try_parse_from([
+                    "agentlink",
+                    "--json",
+                    "cp",
+                    "--progress=on",
+                    "./a",
+                    "node://box/b",
+                ])
+                .expect("parse cp on 2 MiB stack");
+                assert!(parsed.json);
+            })
+            .expect("spawn 2 MiB thread");
+        handle.join().expect("2 MiB thread must not overflow stack");
     }
 
     #[test]
