@@ -10,7 +10,7 @@ use zbus::Connection;
 use crate::a11y::{A11yBackend, ElementOp, UiNode};
 use crate::capture::{
     scale_frame, stream_interval, unix_ms, wait_until_due, CaptureBackend, CaptureRequest,
-    CaptureTarget, CursorSample, Frame, FrameSource, MonitorInfo, StreamMode,
+    CaptureTarget, CursorCaptureMode, CursorSample, Frame, FrameSource, MonitorInfo, StreamMode,
 };
 use crate::error::{msg, Result};
 use crate::input::{perform, HidBackend, InputAction, Pointer};
@@ -37,6 +37,13 @@ struct Session {
     pipewire: Option<crate::stream::pipewire::PwCapture>,
     #[cfg(pipewire_headers)]
     dma_buf: bool,
+    /// True when this session's PipeWire consumer excludes the embedded cursor.
+    #[cfg(pipewire_headers)]
+    cursor_excluded: bool,
+    /// Mutter ScreenCast session path opened for metadata-only RecordMonitor;
+    /// stopped when the capture session closes (does not touch the shared desk).
+    #[cfg(pipewire_headers)]
+    mutter_meta_session: Option<String>,
 }
 
 struct LinuxState {
@@ -69,7 +76,18 @@ impl LinuxState {
     }
 
     fn capture(&mut self, request: &CaptureRequest) -> Result<Frame> {
-        self.capture_frame(request, 1000)
+        match self.capture_frame(request, 1000) {
+            Ok(frame) => Ok(frame),
+            Err(err) if capture_needs_reconnect(&err) => {
+                tracing::info!(
+                    error = %err,
+                    "desktop capture stalled; restarting the display session"
+                );
+                self.shutdown_display();
+                self.capture_frame(request, 1000)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn capture_frame(
@@ -110,42 +128,42 @@ impl LinuxState {
                         .block_on(desk.capture_window(query, wait_ms, request.max_width))
                     {
                         Ok(frame) => frame,
-                        Err(err) => match X11Desk::connect()
-                            .and_then(|mut x11| x11.capture_window(query))
-                        {
-                            Ok(frame) => {
-                                tracing::info!(
-                                    error = %err,
-                                    "Mutter RecordWindow unavailable; captured the X11 window drawable"
-                                );
-                                frame
-                            }
-                            Err(x11_err) => {
-                                match self.rt.block_on(portal_window::capture_window(
-                                    &desk.connection(),
-                                    query,
-                                    wait_ms,
-                                    request.max_width,
-                                    &monitor_sizes,
-                                )) {
-                                    Ok(frame) => {
-                                        tracing::info!(
-                                            mutter = %err,
-                                            x11 = %x11_err,
-                                            "Mutter/X11 window capture unavailable; used portal ScreenCast WINDOW"
-                                        );
-                                        frame
-                                    }
-                                    Err(portal_err) => {
-                                        return Err(msg(format!(
+                        Err(err) => {
+                            match X11Desk::connect().and_then(|mut x11| x11.capture_window(query)) {
+                                Ok(frame) => {
+                                    tracing::info!(
+                                        error = %err,
+                                        "Mutter RecordWindow unavailable; captured the X11 window drawable"
+                                    );
+                                    frame
+                                }
+                                Err(x11_err) => {
+                                    match self.rt.block_on(portal_window::capture_window(
+                                        &desk.connection(),
+                                        query,
+                                        wait_ms,
+                                        request.max_width,
+                                        &monitor_sizes,
+                                    )) {
+                                        Ok(frame) => {
+                                            tracing::info!(
+                                                mutter = %err,
+                                                x11 = %x11_err,
+                                                "Mutter/X11 window capture unavailable; used portal ScreenCast WINDOW"
+                                            );
+                                            frame
+                                        }
+                                        Err(portal_err) => {
+                                            return Err(msg(format!(
                                             "{err}; X11 window fallback also failed ({x11_err}); \
                                              portal ScreenCast WINDOW also failed ({portal_err}). \
                                              Full-screen or monitor capture still works."
                                         )));
+                                        }
                                     }
                                 }
                             }
-                        },
+                        }
                     }
                 } else {
                     desk.capture_wait(&request.target, wait_ms, request.max_width)?
@@ -173,6 +191,7 @@ impl LinuxState {
             DisplayConn::Mutter(desk) => StreamMode::PipeWire {
                 node: desk.node(),
                 dma_buf: false,
+                cursor_excluded: false,
             },
         };
         let id = self.next_id;
@@ -185,6 +204,10 @@ impl LinuxState {
             pipewire: None,
             #[cfg(pipewire_headers)]
             dma_buf: false,
+            #[cfg(pipewire_headers)]
+            cursor_excluded: false,
+            #[cfg(pipewire_headers)]
+            mutter_meta_session: None,
         };
         #[cfg(pipewire_headers)]
         if let DisplayConn::Wayland(desk) = self.display.as_mut().unwrap() {
@@ -196,11 +219,62 @@ impl LinuxState {
                             mode = StreamMode::PipeWire {
                                 node,
                                 dma_buf: false,
+                                // Portal path: cursor mode was not requested as
+                                // metadata; keep embedded/default presentation.
+                                cursor_excluded: false,
                             };
                         }
                         Err(err) => {
                             tracing::info!(error = %err, "PipeWire map failed; using the portal")
                         }
+                    }
+                }
+            }
+        }
+        // Per-session Mutter metadata stream (cursor-mode=2). Leaves the shared
+        // desk RecordMonitor at embedded (mode 1) so legacy/multi-client peers
+        // keep a visible pointer and never see a double cursor on this path.
+        #[cfg(pipewire_headers)]
+        if request.cursor_mode == CursorCaptureMode::Metadata {
+            if let DisplayConn::Mutter(desk) = self.display.as_mut().unwrap() {
+                match self.rt.block_on(desk.open_metadata_monitor()) {
+                    Ok((sc_session, node)) => {
+                        match crate::stream::pipewire::PwCapture::open_default(node) {
+                            Ok(mut capture) => {
+                                let target = crate::stream::pipewire::resolve_target_width(
+                                    request.max_width,
+                                );
+                                capture.set_target_width(target);
+                                session.pipewire = Some(capture);
+                                session.cursor_excluded = true;
+                                session.mutter_meta_session = Some(sc_session);
+                                mode = StreamMode::PipeWire {
+                                    node,
+                                    dma_buf: false,
+                                    cursor_excluded: true,
+                                };
+                                tracing::info!(
+                                    node,
+                                    "Mutter metadata ScreenCast ready (cursor excluded from video)"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "Mutter metadata PipeWire connect failed; keeping embedded desk stream"
+                                );
+                                let _ = self.rt.block_on(mutter::stop_screencast_session(
+                                    &desk.connection(),
+                                    &sc_session,
+                                ));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "Mutter metadata RecordMonitor failed; answer stays legacy/embedded"
+                        );
                     }
                 }
             }
@@ -255,8 +329,7 @@ impl LinuxState {
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| msg("capture session is closed"))?;
-            let target =
-                crate::stream::pipewire::resolve_target_width(session.request.max_width);
+            let target = crate::stream::pipewire::resolve_target_width(session.request.max_width);
             let capture = session
                 .pipewire
                 .as_mut()
@@ -289,7 +362,64 @@ impl LinuxState {
     }
 
     fn close_session(&mut self, id: u64) {
-        self.sessions.remove(&id);
+        #[cfg(pipewire_headers)]
+        let meta = self
+            .sessions
+            .remove(&id)
+            .and_then(|session| session.mutter_meta_session);
+        #[cfg(not(pipewire_headers))]
+        {
+            self.sessions.remove(&id);
+        }
+        #[cfg(pipewire_headers)]
+        if let Some(sc_session) = meta {
+            if let Some(DisplayConn::Mutter(desk)) = self.display.as_ref() {
+                let _ = self.rt.block_on(mutter::stop_screencast_session(
+                    &desk.connection(),
+                    &sc_session,
+                ));
+            }
+        }
+        // A closed live session must not leave a PipeWire consumer or
+        // RemoteDesktop session around for the next Retry to trip over.
+        if self.sessions.is_empty() {
+            self.shutdown_display();
+        }
+    }
+
+    fn shutdown_display(&mut self) {
+        if !self.sessions.is_empty() {
+            let ids: Vec<u64> = self.sessions.keys().copied().collect();
+            for id in ids {
+                #[cfg(pipewire_headers)]
+                let meta = self
+                    .sessions
+                    .remove(&id)
+                    .and_then(|session| session.mutter_meta_session);
+                #[cfg(not(pipewire_headers))]
+                {
+                    self.sessions.remove(&id);
+                }
+                #[cfg(pipewire_headers)]
+                if let Some(sc_session) = meta {
+                    if let Some(DisplayConn::Mutter(desk)) = self.display.as_ref() {
+                        let _ = self.rt.block_on(mutter::stop_screencast_session(
+                            &desk.connection(),
+                            &sc_session,
+                        ));
+                    }
+                }
+            }
+        }
+        match self.display.take() {
+            #[cfg(pipewire_headers)]
+            Some(DisplayConn::Mutter(mut desk)) => {
+                if let Err(err) = self.rt.block_on(desk.stop()) {
+                    tracing::info!(error = %err, "stopping Mutter RemoteDesktop session");
+                }
+            }
+            other => drop(other),
+        }
     }
 
     fn inject(&mut self, action: &InputAction) -> Result<()> {
@@ -297,10 +427,7 @@ impl LinuxState {
         // Literal text: prefer AT-SPI InsertText (bypasses IME). Otherwise
         // temporarily switch composing IMEs to Latin, type keysyms, restore.
         let _ime_guard = if let InputAction::Type { text } = action {
-            match self
-                .rt
-                .block_on(super::atspi::insert_text_at_focus(text))
-            {
+            match self.rt.block_on(super::atspi::insert_text_at_focus(text)) {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     // No writable focused field: never report success via keysyms.
@@ -386,6 +513,12 @@ impl LinuxState {
                 }
             }
         }
+    }
+}
+
+impl Drop for LinuxState {
+    fn drop(&mut self) {
+        self.shutdown_display();
     }
 }
 
@@ -550,8 +683,12 @@ impl Pointer for MutterPointer<'_> {
 impl MutterPointer<'_> {
     fn send_key(&mut self, key: &str, down: bool) -> Result<()> {
         let keysym = wayland::keysym_for_name(key)?;
-        self.rt
-            .block_on(mutter::notify_keysym(&self.conn, &self.session, keysym, down))
+        self.rt.block_on(mutter::notify_keysym(
+            &self.conn,
+            &self.session,
+            keysym,
+            down,
+        ))
     }
 }
 
@@ -562,6 +699,10 @@ fn capture_x11(desk: &mut X11Desk, target: &CaptureTarget) -> Result<Frame> {
         CaptureTarget::Region(rect) => desk.capture_region(*rect),
         CaptureTarget::Window(id) => desk.capture_window(id),
     }
+}
+
+fn capture_needs_reconnect(err: &crate::error::DesktopError) -> bool {
+    super::mutter_session::capture_needs_reconnect(&err.to_string())
 }
 
 fn connect_display(rt: &Runtime) -> Result<DisplayConn> {
@@ -623,9 +764,7 @@ fn connect_wayland(rt: &Runtime) -> Result<DisplayConn> {
             }
         }
     }
-    Ok(DisplayConn::Wayland(
-        rt.block_on(WaylandDesk::connect())?,
-    ))
+    Ok(DisplayConn::Wayland(rt.block_on(WaylandDesk::connect())?))
 }
 
 #[cfg(pipewire_headers)]
@@ -696,6 +835,29 @@ pub fn open() -> Arc<Desktop> {
     })
 }
 
+fn scale_cursor_sample(mut sample: CursorSample) -> CursorSample {
+    // Stream-pixel cursor → capture-frame pixels when PipeWire downsampled
+    // (out/src). Identity when the factor is 1.
+    #[cfg(pipewire_headers)]
+    {
+        let (out, src) = crate::stream::pipewire::coord_scale();
+        if src > 0 && out > 0 && out != src {
+            sample.x = ((sample.x as i64) * (out as i64) / (src as i64)) as i32;
+            sample.y = ((sample.y as i64) * (out as i64) / (src as i64)) as i32;
+            sample.hotspot_x = ((sample.hotspot_x as u64) * (out as u64) / (src as u64))
+                .min(u16::MAX as u64) as u16;
+            sample.hotspot_y = ((sample.hotspot_y as u64) * (out as u64) / (src as u64))
+                .min(u16::MAX as u64) as u16;
+            if let Some(ref mut rgba) = sample.bitmap_rgba {
+                // Bitmap pixels stay 1:1; only hotspot/position scale with the
+                // frame. Clear oversized sprites rather than inventing a scale.
+                let _ = rgba;
+            }
+        }
+    }
+    sample
+}
+
 impl CaptureBackend for LinuxDesktop {
     fn backend_name(&self) -> &str {
         "linux"
@@ -708,34 +870,79 @@ impl CaptureBackend for LinuxDesktop {
     fn cursor(&self) -> Option<CursorSample> {
         self.worker
             .call(|state| {
-                let point = match state.display.as_ref() {
-                    Some(DisplayConn::X11(desk)) => desk.pointer(),
+                // Prefer live SPA_META_Cursor from a metadata session so the
+                // cursor data channel does not wait on the encode/video loop.
+                #[cfg(pipewire_headers)]
+                {
+                    for session in state.sessions.values() {
+                        if !session.cursor_excluded {
+                            continue;
+                        }
+                        if let Some(capture) = session.pipewire.as_ref() {
+                            if let Some(sample) = capture.cursor_sample() {
+                                return Ok(Some(scale_cursor_sample(sample)));
+                            }
+                        }
+                    }
+                }
+                let sample = match state.display.as_ref() {
+                    Some(DisplayConn::X11(desk)) => desk.cursor_sample(),
+                    // Wayland / Mutter without metadata and without X11: do not
+                    // invent a fake arrow.
                     _ => None,
                 };
-                Ok(point.map(|(x, y)| {
-                    // Stream-pixel cursor → capture-frame pixels when PipeWire
-                    // downsampled (out/src). Identity when factor is 1.
-                    #[cfg(pipewire_headers)]
-                    let (x, y) = {
-                        let (out, src) = crate::stream::pipewire::coord_scale();
-                        if src > 0 && out > 0 && out != src {
-                            (
-                                ((x as i64) * (out as i64) / (src as i64)) as i32,
-                                ((y as i64) * (out as i64) / (src as i64)) as i32,
-                            )
-                        } else {
-                            (x, y)
-                        }
-                    };
-                    CursorSample {
-                        x,
-                        y,
-                        shape: "arrow".into(),
-                    }
-                }))
+                Ok(sample.map(scale_cursor_sample))
             })
             .ok()
             .flatten()
+    }
+
+    fn cursor_visible(&self) -> bool {
+        self.worker
+            .call(|state| {
+                #[cfg(pipewire_headers)]
+                {
+                    for session in state.sessions.values() {
+                        if !session.cursor_excluded {
+                            continue;
+                        }
+                        if let Some(capture) = session.pipewire.as_ref() {
+                            if let Some(visible) = capture.cursor_visible() {
+                                return Ok(visible);
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            })
+            .unwrap_or(true)
+    }
+
+    fn cursor_exclude_supported(&self) -> bool {
+        // Exclude only when the SPA_META_Cursor parser is compiled into the
+        // PipeWire bridge (HAVE_PIPEWIRE). Claiming exclude without a parser
+        // would advertise Metadata that cannot deliver bitmaps. X11 GetImage
+        // burns the cursor in — never claim exclude there.
+        #[cfg(pipewire_headers)]
+        {
+            if !crate::cursor_meta_policy::exclude_cap_allowed(true) {
+                return false;
+            }
+            return self
+                .worker
+                .call(|state| {
+                    Ok(matches!(
+                        state.display.as_ref(),
+                        Some(DisplayConn::Mutter(_))
+                    ))
+                })
+                .unwrap_or(false);
+        }
+        #[cfg(not(pipewire_headers))]
+        {
+            let _ = crate::cursor_meta_policy::exclude_cap_allowed(false);
+            false
+        }
     }
 
     fn capture(&self, request: &CaptureRequest) -> Result<Frame> {

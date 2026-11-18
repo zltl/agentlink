@@ -263,6 +263,14 @@ impl RelayHandle {
             token.cancel();
         }
     }
+
+    pub fn disconnect_clients(&self) {
+        if let Ok(mut clients) = self.hub.clients.lock() {
+            for client in clients.drain(..) {
+                client.cancel.cancel();
+            }
+        }
+    }
 }
 
 impl Drop for RelayHandle {
@@ -361,7 +369,7 @@ pub(crate) struct Hub {
     db: Database,
     online: Mutex<HashMap<String, Online>>,
     routes: Mutex<HashMap<String, Route>>,
-    punch: Mutex<HashMap<String, SocketAddr>>,
+    punch: Mutex<HashMap<String, (SocketAddr, Instant)>>,
     kick: Arc<Mutex<Vec<CancellationToken>>>,
     generation: AtomicU64,
     admins: Mutex<Vec<LiveOperator>>,
@@ -746,6 +754,13 @@ fn html_response(body: String) -> ErrorResponse {
     Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
+        .header("x-content-type-options", "nosniff")
+        .header("x-frame-options", "DENY")
+        .header("referrer-policy", "no-referrer")
+        .header(
+            "content-security-policy",
+            "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+        )
         .body(Some(body))
         .expect("static response")
 }
@@ -1955,7 +1970,7 @@ async fn client_loop(
                     tracing::debug!(%peer, error = %err, "binary forward failed");
                 }
             }
-            Incoming::Closed => break,
+            Incoming::Closed { .. } => break,
             Incoming::Ignore => {}
         }
     }
@@ -2039,8 +2054,8 @@ async fn handle_client(
         }
     }
     if principal.operator && !principal.access_hash.is_empty() {
-        match hub.db.session_by_hash(&principal.access_hash).await {
-            Ok(Some(_)) => {}
+        match hub.db.active_socket_session_valid(&principal.access_hash).await {
+            Ok(true) => {}
             _ => {
                 let _ = send_out(
                     tx,
@@ -2230,17 +2245,17 @@ async fn handle_client(
                 .await;
             };
             let target_node = node.id.clone();
-            {
-                let mut routes = lock_routes(hub)?;
-                routes.insert(
-                    request_id.clone(),
-                    Route {
-                        origin_tx: tx.clone(),
-                        target_tx: node_tx.clone(),
-                        origin_node: None,
-                        target_node: target_node.clone(),
-                    },
-                );
+            if let Err(err) = try_insert_route(
+                hub,
+                request_id.clone(),
+                Route {
+                    origin_tx: tx.clone(),
+                    target_tx: node_tx.clone(),
+                    origin_node: None,
+                    target_node: target_node.clone(),
+                },
+            ) {
+                return send_out(tx, &Envelope::result_err(request_id, err.to_string())).await;
             }
             let forward = Envelope::Invoke {
                 request_id,
@@ -2759,9 +2774,28 @@ async fn node_loop(ws: RelaySocket, hub: Arc<Hub>, node_id: String) -> Result<()
         }
     });
 
+    let mut keepalive = tokio::time::interval(Duration::from_secs(20));
+    keepalive.tick().await;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            _ = keepalive.tick() => {
+                let is_stale = lock_online(&hub)
+                    .ok()
+                    .and_then(|online| {
+                        online
+                            .get(&node_id)
+                            .filter(|live| live.generation == generation)
+                            .map(|live| live.last_seen.elapsed() >= stale_after())
+                    })
+                    .unwrap_or(false);
+                if is_stale {
+                    break;
+                }
+                if let Ok(ping) = ws::encode(&Envelope::Ping) {
+                    let _ = tx.try_send(ping);
+                }
+            }
             msg = stream.next() => {
                 let Some(msg) = msg else { break };
                 let msg = match msg {
@@ -2785,7 +2819,7 @@ async fn node_loop(ws: RelaySocket, hub: Arc<Hub>, node_id: String) -> Result<()
                         mark_seen(&hub, &node_id).await;
                         let _ = tx.try_send(Outbound::Pong(payload));
                     }
-                    Incoming::Closed => break,
+                    Incoming::Closed { .. } => break,
                     Incoming::Ignore => {}
                 }
             }
@@ -3050,17 +3084,17 @@ async fn route_e2e(
         )
         .await;
     };
-    {
-        let mut routes = lock_routes(hub)?;
-        routes.insert(
-            request_id.clone(),
-            Route {
-                origin_tx: from_tx.clone(),
-                target_tx: node_tx.clone(),
-                origin_node: from_node.map(|id| id.to_string()),
-                target_node: node.id.clone(),
-            },
-        );
+    if let Err(err) = try_insert_route(
+        hub,
+        request_id.clone(),
+        Route {
+            origin_tx: from_tx.clone(),
+            target_tx: node_tx.clone(),
+            origin_node: from_node.map(|id| id.to_string()),
+            target_node: node.id.clone(),
+        },
+    ) {
+        return send_out(from_tx, &Envelope::result_err(request_id, err.to_string())).await;
     }
     match &mut env {
         Envelope::E2eHello { node_id, .. } => *node_id = node.id.clone(),
@@ -3423,17 +3457,17 @@ async fn open_or_forward(
         )
         .await;
     };
-    {
-        let mut routes = lock_routes(hub)?;
-        routes.insert(
-            request_id.clone(),
-            Route {
-                origin_tx: from_tx.clone(),
-                target_tx: target_tx.clone(),
-                origin_node: from_node.map(|id| id.to_string()),
-                target_node: node.id.clone(),
-            },
-        );
+    if let Err(err) = try_insert_route(
+        hub,
+        request_id.clone(),
+        Route {
+            origin_tx: from_tx.clone(),
+            target_tx: target_tx.clone(),
+            origin_node: from_node.map(|id| id.to_string()),
+            target_node: node.id.clone(),
+        },
+    ) {
+        return fail_transfer(from_tx, request_id, node.name, err.to_string()).await;
     }
     let target_id = node.id.clone();
     let env = Envelope::Transfer {
@@ -3596,18 +3630,16 @@ async fn open_direct(
         return Err(Error::Message(format!("node offline: {}", node.name)));
     };
     let reflexive = reflexive.or_else(|| punch_of(hub, &public_key));
-    {
-        let mut routes = lock_routes(hub)?;
-        routes.insert(
-            request_id.clone(),
-            Route {
-                origin_tx: from_tx.clone(),
-                target_tx: target_tx.clone(),
-                origin_node: from_node.map(|id| id.to_string()),
-                target_node: node.id.clone(),
-            },
-        );
-    }
+    try_insert_route(
+        hub,
+        request_id.clone(),
+        Route {
+            origin_tx: from_tx.clone(),
+            target_tx: target_tx.clone(),
+            origin_node: from_node.map(|id| id.to_string()),
+            target_node: node.id.clone(),
+        },
+    )?;
     let env = Envelope::DirectOffer {
         request_id,
         node_id: node.id,
@@ -3731,11 +3763,53 @@ async fn fail_transfer(
     .await
 }
 
+const MAX_ROUTES_PER_ORIGIN: usize = 256;
+const MAX_TOTAL_ROUTES: usize = 16_384;
+const MAX_PUNCH_ENTRIES: usize = 4_096;
+const PUNCH_TTL: Duration = Duration::from_secs(300);
+const MAX_RATE_WINDOWS: usize = 16_384;
+
+fn try_insert_route(hub: &Hub, request_id: String, route: Route) -> Result<()> {
+    let mut routes = lock_routes(hub)?;
+    if let Some(existing) = routes.get_mut(&request_id) {
+        *existing = route;
+        return Ok(());
+    }
+    let origin_count = routes
+        .values()
+        .filter(|r| r.origin_tx.same_channel(&route.origin_tx))
+        .count();
+    if origin_count >= MAX_ROUTES_PER_ORIGIN || routes.len() >= MAX_TOTAL_ROUTES {
+        routes.retain(|_, r| !r.origin_tx.is_closed() && !r.target_tx.is_closed());
+        let origin_after = routes
+            .values()
+            .filter(|r| r.origin_tx.same_channel(&route.origin_tx))
+            .count();
+        if origin_after >= MAX_ROUTES_PER_ORIGIN {
+            return Err(Error::Message(format!(
+                "too many concurrent in-flight requests on this connection (limit {MAX_ROUTES_PER_ORIGIN})"
+            )));
+        }
+        if routes.len() >= MAX_TOTAL_ROUTES {
+            return Err(Error::Message(
+                "too many concurrent relay routes; try again shortly".into(),
+            ));
+        }
+    }
+    routes.insert(request_id, route);
+    Ok(())
+}
+
 fn punch_of(hub: &Hub, public_key: &str) -> Option<String> {
-    hub.punch
-        .lock()
-        .ok()
-        .and_then(|map| map.get(public_key).map(|addr| addr.to_string()))
+    hub.punch.lock().ok().and_then(|mut map| {
+        let valid = map
+            .get(public_key)
+            .and_then(|(addr, ts)| (ts.elapsed() < PUNCH_TTL).then(|| addr.to_string()));
+        if valid.is_none() {
+            map.remove(public_key);
+        }
+        valid
+    })
 }
 
 async fn punch_loop(udp: UdpSocket, hub: Arc<Hub>, shutdown: CancellationToken) {
@@ -3747,7 +3821,19 @@ async fn punch_loop(udp: UdpSocket, hub: Arc<Hub>, shutdown: CancellationToken) 
                 let Ok((n, src)) = recvd else { continue };
                 let Ok(id) = agentlink_core::p2p::decode_punch(&buf[..n]) else { continue };
                 if let Ok(mut map) = hub.punch.lock() {
-                    map.insert(id, src);
+                    if !map.contains_key(&id) && map.len() >= MAX_PUNCH_ENTRIES {
+                        map.retain(|_, (_, ts)| ts.elapsed() < PUNCH_TTL);
+                        if map.len() >= MAX_PUNCH_ENTRIES {
+                            if let Some(oldest) = map
+                                .iter()
+                                .min_by_key(|(_, (_, ts))| *ts)
+                                .map(|(k, _)| k.clone())
+                            {
+                                map.remove(&oldest);
+                            }
+                        }
+                    }
+                    map.insert(id, (src, Instant::now()));
                 }
             }
         }
@@ -3921,7 +4007,7 @@ where
             .map_err(|e| Error::Ws(e.to_string()))?;
         match ws::parse_incoming(msg)? {
             Incoming::Env(env) => return Ok(env),
-            Incoming::Closed => return Err(Error::Ws("connection closed".into())),
+            Incoming::Closed { .. } => return Err(Error::Ws("connection closed".into())),
             Incoming::Ping(_) | Incoming::Ignore | Incoming::Binary(_) => continue,
         }
     }
@@ -3982,6 +4068,19 @@ pub(crate) fn rate_allow(
     };
     let now = unix_now();
     let key = format!("{bucket}:{ip}");
+    if !windows.contains_key(&key) && windows.len() >= MAX_RATE_WINDOWS {
+        let expire_after = window_secs.max(60);
+        windows.retain(|_, (started, _)| now.saturating_sub(*started) < expire_after);
+        if windows.len() >= MAX_RATE_WINDOWS {
+            if let Some(oldest_key) = windows
+                .iter()
+                .min_by_key(|(_, (started, _))| *started)
+                .map(|(k, _)| k.clone())
+            {
+                windows.remove(&oldest_key);
+            }
+        }
+    }
     let entry = windows.entry(key).or_insert((now, 0));
     if now.saturating_sub(entry.0) >= window_secs {
         *entry = (now, 0);
@@ -5509,5 +5608,87 @@ mod route_rebind_tests {
             }
             other => panic!("owner name should resolve to the bound node, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn route_e2e_enforces_per_origin_route_cap_and_rate_windows_stay_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = RelayHandle::spawn(RelayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.path().join("relay"),
+            capture: None,
+            database_url: None,
+            allow_signup: false,
+            bootstrap_admin: false,
+            db_schema: None,
+            trust_proxy: Vec::new(),
+            print_admin_token: false,
+            legacy_admin_override: Some((true, Some(86_400))),
+        })
+        .await
+        .unwrap();
+        let hub = &relay.hub;
+        hub.db
+            .create_user("alice", "password-alice", "user")
+            .await
+            .unwrap();
+        let alice_node = hub
+            .db
+            .enroll_self(
+                "alice",
+                agentlink_core::Identity::generate().public_hex(),
+                "alice-cap-box",
+                NodePolicy::full(),
+                meta("alice-cap-box"),
+            )
+            .await
+            .unwrap();
+        let (target_tx, _target_rx) = mpsc::channel(1024);
+        lock_online(hub).unwrap().insert(
+            alice_node.id.clone(),
+            Online {
+                generation: 1,
+                tx: target_tx,
+                last_seen: Instant::now(),
+                cancel: CancellationToken::new(),
+            },
+        );
+
+        let (origin_tx, mut origin_rx) = mpsc::channel(512);
+        let p = principal("alice");
+        for idx in 0..300 {
+            route_e2e(
+                hub,
+                None,
+                &origin_tx,
+                Some(&p),
+                e2e(&format!("req-cap-{idx}"), &alice_node.id),
+            )
+            .await
+            .unwrap();
+        }
+        let active_routes = lock_routes(hub).unwrap().len();
+        assert!(
+            active_routes <= 256,
+            "per-origin routes grew unbounded to {active_routes}"
+        );
+        let refusal = origin_rx
+            .try_recv()
+            .expect("excess in-flight route must receive explicit refusal");
+        let Outbound::Text(txt) = refusal else {
+            panic!("expected text refusal");
+        };
+        assert!(txt.contains("too many"), "{txt}");
+
+        // Rate-limit window map must stay bounded under synthetic IP churn.
+        for idx in 0..20_000u32 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(idx.wrapping_add(1)));
+            let _ = rate_allow(hub, "login", ip, 30, 60);
+        }
+        let win_len = hub.login_windows.lock().unwrap().len();
+        assert!(
+            win_len <= 16_384,
+            "login_windows map grew unbounded to {win_len}"
+        );
     }
 }

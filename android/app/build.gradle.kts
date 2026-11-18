@@ -64,6 +64,18 @@ android {
     }
 }
 
+tasks.named("preBuild") {
+    doFirst {
+        val jniDir = file("src/main/jniLibs")
+        if (!jniDir.isDirectory || jniDir.walkTopDown().none { it.extension == "so" }) {
+            logger.warn(
+                "agentlink: src/main/jniLibs has no libagentlink_ffi.so; JVM/UI compile works, " +
+                    "but run ../android/build-native.sh before installing an APK on a device."
+            )
+        }
+    }
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
     implementation(composeBom)

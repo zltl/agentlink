@@ -27,6 +27,7 @@ pub mod grant_request;
 pub mod ice;
 pub mod identity;
 pub mod invite;
+pub mod lan_priority;
 pub mod node_pin;
 pub mod operate_guide;
 pub mod p2p;
@@ -42,14 +43,15 @@ pub mod s3;
 pub mod sandbox;
 pub mod sparse;
 pub mod tls;
+pub mod transport_status;
 pub mod tunnel;
 pub mod turn;
 pub mod util;
 pub mod ws;
 
 pub use client::{
-    Client, ExecOutput, ExecRequest, PairingInfo, PtyEvent, PtyRead, PtySession, PtyTestIo,
-    PtyWriter,
+    Client, ExecOutput, ExecRequest, ObservedConnectError, PairingInfo, PtyEvent, PtyRead,
+    PtySession, PtyTestIo, PtyWriter,
 };
 pub use config::{
     apply_relay_defaults, is_public_relay, load_settings, save_settings, ClientSettings,
@@ -60,11 +62,15 @@ pub use extensions::{NodeExtension, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHAS
 pub use grant::{resolve_e2e_policy, SignedGrant, OWNER_KEYS_FILE};
 pub use ice::{
     ice_attempts, is_default_stun_url, prepare_stun_urls, rewrite_ice_urls,
-    stun_rewrite_mode_from_env, stun_rewrite_mode_from_value, stun_urls, stun_urls_from_env, stun_urls_ready_for_ice, IceAttempt,
-    StunRewriteMode, DEFAULT_STUN_URLS,
+    stun_rewrite_mode_from_env, stun_rewrite_mode_from_value, stun_urls, stun_urls_from_env,
+    stun_urls_ready_for_ice, IceAttempt, StunRewriteMode, DEFAULT_STUN_URLS,
 };
 pub use identity::Identity;
 pub use invite::{decode_invite, encode_invite, parse_join_text, Invite, JoinText};
+pub use lan_priority::{
+    prefer_on_link_hosts_in_candidate, prefer_on_link_hosts_in_sdp, rewrite_candidate_line,
+    rewrite_sdp_remote_hosts, HOST_ACCEPTANCE_MIN_WAIT,
+};
 pub use node_pin::{observe as observe_node_pin, PinStatus};
 pub use operate_guide::{
     decode_operate_guide, encode_operate_guide, operate_guide_url, OperateGuide, OPERATE_GUIDE_KEYS,
@@ -75,4 +81,5 @@ pub use protocol::{
 };
 pub use relay_url::{parse_relay_url, viewer_url, RelayUrl};
 pub use tls::{parse_fingerprint, FingerprintVerifier, RelayCert, RelayTrust};
+pub use transport_status::{ClosureCategory, ClosureSink, TransportObserver, TransportStatus};
 pub use turn::{mint as mint_turn_credential, rest_credential, rest_username};

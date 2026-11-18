@@ -4,6 +4,11 @@
 //! explains how to compile the window.
 
 mod autostart;
+#[cfg(not(target_env = "musl"))]
+mod diagnostics;
+/// STD-only ordered input reducer (also `rustc --test` without workspace deps).
+#[cfg(not(target_env = "musl"))]
+mod input_policy;
 mod model;
 
 #[cfg(not(target_env = "musl"))]
@@ -20,12 +25,19 @@ mod indicator;
 mod term;
 mod theme;
 #[cfg(not(target_env = "musl"))]
+mod field_pad;
+#[cfg(not(target_env = "musl"))]
+mod desk_keys;
+#[cfg(not(target_env = "musl"))]
+mod input_adapter;
+#[cfg(not(target_env = "musl"))]
+mod ordered_send;
+#[cfg(not(target_env = "musl"))]
 mod ui;
 #[cfg(not(target_env = "musl"))]
 mod viewport;
 #[cfg(not(target_env = "musl"))]
 mod worker;
-
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,6 +79,16 @@ impl LiveHooks {
         }
     }
 
+    /// Test hooks that never read or write production autostart / HKCU / data-dir.
+    pub fn inert_for_tests() -> Self {
+        Self {
+            counters: Arc::new(LiveCounters::default()),
+            resolve_data_dir: inert_resolve_data_dir,
+            start_on_login: inert_start_on_login,
+            load_view: inert_load_view,
+        }
+    }
+
     pub fn resolve_data_dir(&self, explicit: Option<&Path>) -> Result<PathBuf, String> {
         self.counters
             .resolve_data_dir
@@ -75,9 +97,7 @@ impl LiveHooks {
     }
 
     pub fn start_on_login(&self) -> bool {
-        self.counters
-            .start_on_login
-            .fetch_add(1, Ordering::SeqCst);
+        self.counters.start_on_login.fetch_add(1, Ordering::SeqCst);
         (self.start_on_login)()
     }
 
@@ -107,6 +127,27 @@ fn production_start_on_login() -> bool {
     #[cfg(not(windows))]
     {
         autostart::enabled()
+    }
+}
+
+fn inert_resolve_data_dir(_explicit: Option<&Path>) -> Result<PathBuf, String> {
+    Err("test inert: production data-dir resolve disabled".into())
+}
+
+fn inert_start_on_login() -> bool {
+    false
+}
+
+fn inert_load_view(_data_dir: &Path, _config_dir: &Path) -> crate::tray::StatusView {
+    crate::tray::StatusView {
+        connection: "Stopped".into(),
+        relay: String::new(),
+        node_name: String::new(),
+        pairing: "off".into(),
+        account: "test".into(),
+        detail: String::new(),
+        running: false,
+        enrolled: false,
     }
 }
 
@@ -320,7 +361,6 @@ pub fn enter_args(args: EnterArgs) -> i32 {
     }
 }
 
-
 #[cfg(test)]
 mod preview_isolation_tests {
     use super::*;
@@ -337,5 +377,19 @@ mod preview_isolation_tests {
         assert!(dirs.data_dir.is_dir());
         // Isolation keeps the temp tree; this test must not delete it.
         assert!(isolated_preview_root().starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn inert_hooks_never_touch_production_autostart() {
+        let live = LiveHooks::inert_for_tests();
+        assert!(!live.start_on_login());
+        assert_eq!(live.counts(), (0, 1, 0));
+        let err = live
+            .resolve_data_dir(None)
+            .expect_err("inert must not resolve production data-dir");
+        assert!(err.contains("inert"));
+        let view = live.load_view(Path::new("/nope"), Path::new("/nope"));
+        assert!(!view.running);
+        assert_eq!(live.counts(), (1, 1, 1));
     }
 }

@@ -131,8 +131,6 @@ impl PwCapture {
         )
     }
 
-    /// `Ok(None)` means the screen has not produced a new buffer (seq unchanged —
-    /// no stale-frame memcpy).
     /// VideoCrop on the last captured source buffer, in source pixels.
     /// `None` when the producer omitted crop metadata.
     pub fn videocrop(&self) -> Option<crate::capture::Rect> {
@@ -151,6 +149,93 @@ impl PwCapture {
         } else {
             None
         }
+    }
+
+    /// Latest `SPA_META_Cursor` without waiting on [`Self::take`].
+    ///
+    /// Independent of the encode loop so the cursor data channel can update
+    /// while video is idle. `None` until the producer has attached cursor meta.
+    pub fn cursor_sample(&self) -> Option<crate::capture::CursorSample> {
+        let mut x = 0i32;
+        let mut y = 0i32;
+        let mut hx = 0i32;
+        let mut hy = 0i32;
+        let mut visible = 0i32;
+        let mut bw = 0i32;
+        let mut bh = 0i32;
+        let mut has_bm = 0i32;
+        let mut rgba = vec![0u8; (crate::MAX_CURSOR_BITMAP_EDGE as usize).pow(2) * 4];
+        let rc = unsafe {
+            al_pw_cursor(
+                self.raw,
+                &mut x,
+                &mut y,
+                &mut hx,
+                &mut hy,
+                &mut visible,
+                &mut bw,
+                &mut bh,
+                &mut has_bm,
+                rgba.as_mut_ptr(),
+                rgba.len() as c_int,
+            )
+        };
+        if rc != 1 {
+            return None;
+        }
+        let _ = visible; // exposed via cursor_visible(); sample carries shape.
+        let (bitmap_rgba, bitmap_w, bitmap_h, shape) = if has_bm != 0
+            && bw > 0
+            && bh > 0
+            && crate::bitmap_within_bound(bw as u32, bh as u32)
+        {
+            let need = (bw as usize) * (bh as usize) * 4;
+            rgba.truncate(need);
+            (Some(rgba), bw as u32, bh as u32, "custom".to_string())
+        } else {
+            (None, 0, 0, "unknown".to_string())
+        };
+        Some(crate::capture::CursorSample {
+            x,
+            y,
+            shape,
+            hotspot_x: hx.max(0).min(u16::MAX as i32) as u16,
+            hotspot_y: hy.max(0).min(u16::MAX as i32) as u16,
+            bitmap_rgba,
+            bitmap_w,
+            bitmap_h,
+        })
+    }
+
+    /// OS pointer visibility from the last cursor meta (`None` = no meta yet).
+    pub fn cursor_visible(&self) -> Option<bool> {
+        let mut x = 0i32;
+        let mut y = 0i32;
+        let mut hx = 0i32;
+        let mut hy = 0i32;
+        let mut visible = 0i32;
+        let mut bw = 0i32;
+        let mut bh = 0i32;
+        let mut has_bm = 0i32;
+        let rc = unsafe {
+            al_pw_cursor(
+                self.raw,
+                &mut x,
+                &mut y,
+                &mut hx,
+                &mut hy,
+                &mut visible,
+                &mut bw,
+                &mut bh,
+                &mut has_bm,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 1 {
+            return None;
+        }
+        Some(visible != 0)
     }
 
     pub fn take(&mut self, wait_ms: i32) -> Result<Option<(Frame, bool)>> {
@@ -243,6 +328,19 @@ extern "C" {
         w: *mut c_int,
         h: *mut c_int,
     ) -> c_int;
+    fn al_pw_cursor(
+        cap: *mut c_void,
+        x: *mut c_int,
+        y: *mut c_int,
+        hotspot_x: *mut c_int,
+        hotspot_y: *mut c_int,
+        visible: *mut c_int,
+        width: *mut c_int,
+        height: *mut c_int,
+        has_bitmap: *mut c_int,
+        rgba_out: *mut u8,
+        rgba_cap: c_int,
+    ) -> c_int;
     fn al_pw_geometry(
         cap: *mut c_void,
         src_width: *mut c_int,
@@ -261,4 +359,88 @@ extern "C" {
         wait_ms: c_int,
     ) -> c_int;
     fn al_pw_close(cap: *mut c_void);
+}
+
+#[cfg(all(test, pipewire_headers))]
+mod tests {
+    use std::ffi::c_int;
+
+    extern "C" {
+        fn al_pw_validate_frame_copy(
+            width: c_int,
+            height: c_int,
+            chunk_stride: c_int,
+            chunk_offset: u32,
+            chunk_size: u32,
+            maxsize: u32,
+            out_stride: *mut usize,
+            out_alloc_bytes: *mut usize,
+            out_copy_bytes: *mut usize,
+        ) -> c_int;
+    }
+
+    fn validate(
+        width: c_int,
+        height: c_int,
+        chunk_stride: c_int,
+        chunk_offset: u32,
+        chunk_size: u32,
+        maxsize: u32,
+    ) -> Option<(usize, usize, usize)> {
+        let mut stride = 0usize;
+        let mut alloc = 0usize;
+        let mut copy = 0usize;
+        let ok = unsafe {
+            al_pw_validate_frame_copy(
+                width,
+                height,
+                chunk_stride,
+                chunk_offset,
+                chunk_size,
+                maxsize,
+                &mut stride,
+                &mut alloc,
+                &mut copy,
+            )
+        };
+        (ok != 0).then_some((stride, alloc, copy))
+    }
+
+    #[test]
+    fn native_c_frame_validator_blocks_overflow_offset_oob_and_zero_chunk() {
+        // 32-bit signed multiplication overflow (65536 * 65536 == 0 in int32_t) must be rejected.
+        assert_eq!(validate(16384, 16384, 65536, 0, u32::MAX, u32::MAX), None);
+        // Oversized dimensions > 16384 must be rejected.
+        assert_eq!(validate(16385, 100, 0, 0, 16385 * 400, 16385 * 400), None);
+        // Stride smaller than width * 4 must be rejected.
+        assert_eq!(validate(1920, 1080, 1920 * 2, 0, 16_000_000, 16_000_000), None);
+        // Metadata-only cursor buffer (chunk_size == 0) must not copy video pixels.
+        assert_eq!(validate(1920, 1080, 1920 * 4, 0, 0, 16_000_000), None);
+        // Non-zero chunk_offset pushing copy past data->maxsize must be rejected.
+        let full = 640u32 * 480 * 4;
+        assert_eq!(validate(640, 480, 640 * 4, 4096, full, full + 2048), None);
+        // Valid frame with non-zero chunk_offset within maxsize succeeds.
+        assert_eq!(
+            validate(640, 480, 640 * 4, 4096, full, full + 4096),
+            Some((2560, full as usize, full as usize))
+        );
+        // Valid padded-stride frame whose final row omits trailing stride pad succeeds.
+        let padded_stride = 2600u32;
+        let unpadded_end = 479 * padded_stride + 640 * 4;
+        assert_eq!(
+            validate(
+                640,
+                480,
+                padded_stride as c_int,
+                128,
+                unpadded_end,
+                128 + unpadded_end
+            ),
+            Some((
+                padded_stride as usize,
+                (padded_stride * 480) as usize,
+                unpadded_end as usize
+            ))
+        );
+    }
 }

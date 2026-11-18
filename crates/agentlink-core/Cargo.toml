@@ -50,6 +50,7 @@ sha1.workspace = true
 webpki-roots = "0.26"
 rustls-native-certs = "0.8"
 x509-parser = "0.16"
+if-addrs = "0.13"
 
 [dev-dependencies]
 proptest = "1.6"

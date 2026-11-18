@@ -37,6 +37,10 @@ zbus = { version = "4.4", default-features = false, features = ["tokio", "blocki
 libloading = "0.8"
 libc = "0.2"
 futures-util.workspace = true
+# Native clipboard so a node or controller does not depend on xclip/wl-clipboard
+# being installed (GNOME/Mutter often has neither). Wayland data-control is
+# tried first; X11/XWayland is the fallback, which Mutter can sync.
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [

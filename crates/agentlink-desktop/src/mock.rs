@@ -454,6 +454,7 @@ mod tests {
                 scale: 1.0,
                 max_fps: 30.0,
                 max_width: 0,
+                cursor_mode: crate::capture::CursorCaptureMode::Embedded,
             })
             .unwrap();
         assert!(session

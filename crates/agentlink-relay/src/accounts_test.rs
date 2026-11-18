@@ -280,7 +280,7 @@ fn install_script_dry_run_skips_the_network() {
         .args([
             "--dry-run",
             "--token",
-            "abc",
+            "secret-enroll-abc",
             "--relay",
             "wss://relay.example.com",
             "--max-access",
@@ -294,7 +294,11 @@ fn install_script_dry_run_skips_the_network() {
         .unwrap();
     assert!(enrolled.status.success());
     let text = String::from_utf8_lossy(&enrolled.stdout);
-    assert!(text.contains("pairing=abc"), "{text}");
+    assert!(
+        !text.contains("secret-enroll-abc"),
+        "dry-run must redact secret tokens: {text}"
+    );
+    assert!(text.contains("pairing=[redacted]"), "{text}");
     assert!(text.contains("token= "), "{text}");
     assert!(text.contains("enroll=1"), "{text}");
     assert!(text.contains("max_access=desktop"), "{text}");
@@ -499,6 +503,70 @@ async fn bob_cannot_access_alice_node_by_id_or_name() {
     );
     let err_name = db.access_to(&bob, "secret-box").await.unwrap_err();
     assert!(err_name.to_string().contains("not found"), "{err_name}");
+}
+
+#[tokio::test]
+async fn active_socket_session_survives_rotation_but_drops_on_expiry_or_revocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path(), None, None).await;
+    db.create_user("alice", "password-alice", "user")
+        .await
+        .unwrap();
+    let device_key = util::random_hex(32);
+    let initial = db.issue_session("alice", &device_key, "gui").await.unwrap();
+    let initial_hash = agentlink_core::accounts::token_hash(&initial.access_token);
+    assert!(db.active_socket_session_valid(&initial_hash).await.unwrap());
+
+    // Force initial access token past ACCESS_TTL_SECS + ACCESS_SKEW_SECS without rotating:
+    // must NOT extend TTL on its own.
+    db.testing_set_access_expiry(&initial.access_token, 1)
+        .await
+        .unwrap();
+    assert!(
+        !db.active_socket_session_valid(&initial_hash).await.unwrap(),
+        "expired access token without a fresh rotation must drop"
+    );
+
+    // Once the same device rotates its refresh token, the open socket stays valid,
+    // while new handshakes with the expired initial token remain rejected.
+    let rotated = db
+        .rotate_refresh(&initial.refresh_token, &device_key)
+        .await
+        .unwrap();
+    assert!(
+        db.access_session(&initial.access_token).await.unwrap().is_none(),
+        "expired initial token must not authenticate new handshakes"
+    );
+    assert!(
+        db.active_socket_session_valid(&initial_hash).await.unwrap(),
+        "already-open socket on an active rotated device must stay valid"
+    );
+
+    // Logout of the rotated session drops the open socket immediately.
+    let rotated_hash = agentlink_core::accounts::token_hash(&rotated.access_token);
+    db.end_session(&rotated_hash, Some(&rotated.refresh_token))
+        .await
+        .unwrap();
+    assert!(
+        !db.active_socket_session_valid(&initial_hash).await.unwrap(),
+        "logout must invalidate the open socket immediately"
+    );
+
+    // Device revocation also invalidates immediately.
+    let next = db.issue_session("alice", &device_key, "gui").await.unwrap();
+    let next_hash = agentlink_core::accounts::token_hash(&next.access_token);
+    let _rot2 = db
+        .rotate_refresh(&next.refresh_token, &device_key)
+        .await
+        .unwrap();
+    db.testing_set_access_expiry(&next.access_token, 1)
+        .await
+        .unwrap();
+    assert!(db.active_socket_session_valid(&next_hash).await.unwrap());
+    db.revoke_device(&next.device_id, Some("alice"))
+        .await
+        .unwrap();
+    assert!(!db.active_socket_session_valid(&next_hash).await.unwrap());
 }
 
 async fn open_db(dir: &Path, url: Option<&str>, schema: Option<&str>) -> Database {

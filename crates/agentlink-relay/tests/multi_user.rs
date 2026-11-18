@@ -457,3 +457,177 @@ fn cookie(response: &str, name: &str) -> String {
     }
     String::new()
 }
+
+#[tokio::test]
+async fn long_lived_gui_client_refreshes_across_expiry_and_parallel_cli_but_fails_on_revoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay_dir = dir.path().join("relay");
+    let cfg_dir = dir.path().join("client-cfg");
+    std::fs::create_dir_all(&relay_dir).unwrap();
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+
+    let relay = spawn(&relay_dir).await;
+    let addr = relay.local_addr;
+    let fp = relay.fingerprint.clone();
+    let relay_url = format!("wss://127.0.0.1:{}", addr.port());
+
+    admin_add(&relay, "alice", "password-alice").await;
+
+    let device = Identity::generate();
+    let initial = agentlink_core::client::login_user(
+        &relay_url,
+        &fp,
+        None,
+        &device,
+        "alice",
+        "password-alice",
+        None,
+        "controller",
+    )
+    .await
+    .unwrap();
+
+    let settings = ClientSettings {
+        relay: relay_url.clone(),
+        token: initial.access_token.clone(),
+        fingerprint: fp.clone(),
+        trust: None,
+    };
+    agentlink_core::config::save_session(
+        &cfg_dir,
+        &settings,
+        &initial.user,
+        &initial.refresh_token,
+        initial.access_expires_unix,
+    )
+    .unwrap();
+
+    let gui = Client::connect_identity(&settings, device.clone(), true)
+        .await
+        .unwrap();
+    gui.remember_session(&cfg_dir);
+    assert!(gui.list_nodes().await.is_ok());
+
+    // 1. Parallel CLI + GUI sharing the exact same config.json rotate cleanly without conflict.
+    let (cli_a, cli_b) = tokio::join!(
+        agentlink_core::client::maintain_session_skew(&cfg_dir, &device, 3600),
+        agentlink_core::client::maintain_session_skew(&cfg_dir, &device, 3600),
+    );
+    assert!(cli_a.is_ok() && cli_b.is_ok(), "{cli_a:?} / {cli_b:?}");
+
+    // Expire the GUI's initial access token in the relay SQLite DB (simulates >20m elapsed).
+    let db_url = format!("sqlite://{}", relay_dir.join("relay.db").display());
+    let pool = sqlx::SqlitePool::connect(&db_url).await.unwrap();
+    let initial_hash = agentlink_core::accounts::token_hash(&initial.access_token);
+    sqlx::query("UPDATE access_tokens SET expires_unix = 1 WHERE token_hash = ?1")
+        .bind(&initial_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Open GUI socket stays usable because the same active device rotated a fresh token.
+    assert!(
+        gui.list_nodes().await.is_ok(),
+        "open GUI socket must stay valid after sibling CLI rotated config.json"
+    );
+
+    // 2. Un-upgraded relay socket-drop / restart simulation: expire ALL currently minted
+    // access tokens in DB and local config, then restart the relay on the same port so
+    // the GUI Client must reconnect and rotate its refresh token in `supervise`!
+    sqlx::query("UPDATE access_tokens SET expires_unix = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    {
+        let file = agentlink_core::config::load_file(&cfg_dir).unwrap();
+        agentlink_core::config::save_session(
+            &cfg_dir,
+            &ClientSettings {
+                relay: relay_url.clone(),
+                token: file.token.unwrap(),
+                fingerprint: fp.clone(),
+                trust: None,
+            },
+            "alice",
+            &file.refresh_token.unwrap(),
+            1, // expired locally as well
+        )
+        .unwrap();
+    }
+    drop(relay);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let relay = RelayHandle::spawn(RelayConfig {
+        bind: addr,
+        data_dir: relay_dir.clone(),
+        capture: None,
+        database_url: None,
+        allow_signup: false,
+        bootstrap_admin: false,
+        db_schema: None,
+        trust_proxy: Vec::new(),
+        print_admin_token: false,
+        legacy_admin_override: Some((true, Some(86_400))),
+    })
+    .await
+    .unwrap();
+
+    // GUI Client automatically refreshes via `remember_session` during reconnect instead
+    // of failing permanently with `session expired or revoked`.
+    let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match gui.list_nodes().await {
+                Ok(_) => return Ok::<(), String>(()),
+                Err(err) => {
+                    let msg = err.to_string();
+                    assert!(
+                        !msg.contains("session expired or revoked"),
+                        "expired access token must refresh instead of failing with: {msg}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("GUI client reconnect timeout");
+    assert!(recovered.is_ok());
+    assert!(gui.is_alive());
+
+    // 3. True revocation (`revoke_device`) must still fail closed immediately and stay dead.
+    let admin = Client::connect_identity(
+        &ClientSettings {
+            relay: relay_url.clone(),
+            token: relay.admin_token.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        },
+        Identity::generate(),
+        true,
+    )
+    .await
+    .unwrap();
+    admin.revoke_device(&initial.device_id).await.unwrap();
+
+    let err = gui
+        .list_nodes()
+        .await
+        .expect_err("revoked device must fail");
+    assert!(
+        err.to_string().contains("revoked") || err.to_string().contains("closed"),
+        "unexpected error after true revocation: {err}"
+    );
+    // Give supervise a moment to hit refresh rejection and shut down.
+    for _ in 0..40 {
+        if !gui.is_alive() {
+            break;
+        }
+        let _ = gui.list_nodes().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !gui.is_alive(),
+        "genuinely revoked session must terminate Client instead of bypassing revocation"
+    );
+    drop(relay);
+}

@@ -50,10 +50,11 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
@@ -751,18 +752,22 @@ fn send_mouse(
 }
 
 fn send_key(vk: u16, up: bool) -> Result<()> {
-    let flags = if up {
+    let mut flags = if up {
         KEYEVENTF_KEYUP
     } else {
         Default::default()
     };
+    if crate::keys::is_windows_extended_vk(vk) {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
     unsafe {
+        let scan = MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16;
         let input = INPUT {
             r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(vk),
-                    wScan: 0,
+                    wScan: scan,
                     dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,
@@ -1155,6 +1160,13 @@ impl CaptureBackend for WindowsDesktop {
             x: point.x,
             y: point.y,
             shape: current_cursor_shape(),
+            // Stock IDC shapes use the conventional top-left hot spot; custom
+            // icon hotspots are not yet extracted on this path.
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bitmap_rgba: None,
+            bitmap_w: 0,
+            bitmap_h: 0,
         })
     }
 
@@ -1198,12 +1210,26 @@ impl CaptureBackend for WindowsDesktop {
     }
 }
 
+fn secure_attention(action: &InputAction) -> bool {
+    match action {
+        InputAction::Key { keys } | InputAction::KeyEdge { keys, .. } => {
+            crate::keys::is_secure_attention_sequence(keys)
+        }
+        _ => false,
+    }
+}
+
 impl HidBackend for WindowsDesktop {
     fn backend_name(&self) -> &str {
         "sendinput"
     }
 
     fn inject(&self, action: &InputAction) -> Result<()> {
+        if secure_attention(action) {
+            return Err(msg(
+                "Ctrl+Alt+Del is the Windows secure attention sequence. Ordinary SendInput cannot open the security screen.",
+            ));
+        }
         let action = action.clone();
         self.worker.call(move |state| perform(state, &action))
     }

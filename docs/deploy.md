@@ -14,7 +14,7 @@ The first start generates `cert.pem` and `key.pem`. It does not mint or write `a
 
 `<data-dir>` is created mode 0700 (`util::ensure_dir`). New secret files (`write_secret`, `admin.token`, `bootstrap.password`, `node.json`) are 0600. After the default SQLite backend opens `<data-dir>/relay.db` in WAL mode, the relay also restricts `relay.db`, `relay.db-wal`, and `relay.db-shm` to owner-only access (0600, or a private ACL on Windows). There is no API that imports a client-supplied SQLite file: `AGENTLINK_DATABASE_URL` / `--database-url` must be a `postgres://` (or `postgresql://`) URL, otherwise the process refuses to start. The only file import is `store.json` already in the operator data directory, which is renamed to `store.json.bak` after a one-time read. Operators should not point the data directory at a folder writable by untrusted accounts.
 
-The default build still links a **bundled** `libsqlite3-sys` 0.30.1 (`RUSTSEC-2026-0459`, bundled SQLite before 3.54.0). The published exploit needs a crafted local database plus a sibling WAL with a mismatched page size. sqlx 0.8.6 cannot legally take `libsqlite3-sys` 0.39, and this tree does not vendor or split sqlx. The platform default is left buildable; cargo-audit is not `--ignore`d. An optional system SQLite 3.54+ build is possible by compiling `libsqlite3-sys` without `bundled` against a distro library, but that is not the default and must be validated on the target OS (`pkg-config sqlite3` / `sqlite3 --version`) before use.
+The default build links crates.io `libsqlite3-sys =0.39.1` (`bundled` SQLite `3.54.1`, which includes the upstream fix for `RUSTSEC-2026-0459`). Because crates.io `sqlx` (`0.8.6` / `0.9.0`) has not yet published a release allowing `libsqlite3-sys 0.39.x`, the workspace pins the official `launchbadge/sqlx` merge commit of PR #4502 (`10462fa4414c6c7f1ed1d39bb31678e3b726878c`) in `Cargo.toml` and `Cargo.lock`. That full-SHA pin keeps `cargo build --locked` reproducible, but offline or distribution builds must either run `cargo vendor` ahead of time or wait for the next crates.io `sqlx` release before publishing crates to crates.io.
 
 ## systemd
 
@@ -345,14 +345,14 @@ Do not leave `bootstrap.password` on disk after the admin password is set. Tip u
 ```sh
 deploy/sync-box-bundle.sh --dry-run   # create the bundle, print cp/exec commands
 deploy/sync-box-bundle.sh             # copy and fast-forward box
-SUFA_BASE=<sha-on-box> deploy/sync-box-bundle.sh   # incremental bundle
+TARGET_BASE=<sha-on-box> deploy/sync-box-bundle.sh   # incremental bundle
 ```
 
 The working tree may be dirty; the bundle always records HEAD. Add `--require-clean` to refuse that. A merge that is not fast-forward fails instead of creating a merge commit. The bundle stays in `/tmp/agentlink-bundle/` on box and is overwritten on the next run.
 
 ## Build a release on box
 
-`deploy/box-release-build.sh` chains the sync with a release build: it calls `deploy/sync-box-bundle.sh` (same `--repo`/`--node`/`--checkout`/`--dry-run` flags, `SUFA_BASE` passed through) and then runs `cargo build -p agentlink-cli --release` on box with `AGENTLINK_RELEASE_VERSION` exported. The version comes from an exact tag on HEAD, else the nearest `git describe --tags` with the `-<n>-g<sha>` suffix and leading `v` stripped (so `0.1.137-2-gaffb434` becomes `0.1.137`); pass `--version` to override it. The build runs through `agentlink exec --timeout-secs 600` and prints `./target/release/agentlink --version` plus the binary size. This is an ops helper only: it does not tag, push, or publish `/dl`.
+`deploy/box-release-build.sh` chains the sync with a release build: it calls `deploy/sync-box-bundle.sh` (same `--repo`/`--node`/`--checkout`/`--dry-run` flags, `TARGET_BASE` passed through) and then runs `cargo build -p agentlink-cli --release` on box with `AGENTLINK_RELEASE_VERSION` exported. The version comes from an exact tag on HEAD, else the nearest `git describe --tags` with the `-<n>-g<sha>` suffix and leading `v` stripped (so `0.1.137-2-gaffb434` becomes `0.1.137`); pass `--version` to override it. The build runs through `agentlink exec --timeout-secs 600` and prints `./target/release/agentlink --version` plus the binary size. This is an ops helper only: it does not tag, push, or publish `/dl`.
 
 ```sh
 deploy/box-release-build.sh              # sync the tip, then release-build on box

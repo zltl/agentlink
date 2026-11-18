@@ -664,7 +664,7 @@ async fn connect_once(
                 Ok(Incoming::Ping(payload)) => {
                     let _ = tx.try_send(Outbound::Pong(payload));
                 }
-                Ok(Incoming::Closed) => break SessionEnd::Closed,
+                Ok(Incoming::Closed { .. }) => break SessionEnd::Closed,
                 Ok(Incoming::Ignore) => {}
             },
         }
@@ -834,18 +834,27 @@ async fn handle_env(
         }
         Envelope::Pong => {}
         Envelope::AuditPolicyPush { toml } => {
-            if live.service.policy().lock_local {
-                tracing::info!("ignoring relay audit policy because lock_local is set");
-                return;
-            }
-            match agentlink_core::audit::AuditPolicy::parse(&toml) {
-                Ok(policy) => {
-                    if let Err(err) = std::fs::write(config.data_dir.join("audit.toml"), &toml) {
-                        tracing::warn!(error = %err, "could not save pushed audit policy");
-                    }
-                    live.service.replace_policy(policy, true);
+            let current = live.service.policy();
+            match current.apply_untrusted_relay_push(&toml) {
+                Ok(None) => {
+                    tracing::info!("ignoring relay audit policy because lock_local is set");
                 }
-                Err(err) => tracing::warn!(error = %err, "pushed audit policy is invalid"),
+                Ok(Some(sanitized)) => {
+                    match sanitized.to_toml() {
+                        Ok(clean_toml) => {
+                            if let Err(err) =
+                                std::fs::write(config.data_dir.join("audit.toml"), clean_toml)
+                            {
+                                tracing::warn!(error = %err, "could not save pushed audit policy");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "could not serialize pushed audit policy");
+                        }
+                    }
+                    live.service.replace_policy(sanitized, true);
+                }
+                Err(err) => tracing::warn!(error = %err, "rejected relay audit policy push"),
             }
         }
         Envelope::ApprovalDecision { approval_id, allow } => {
@@ -1302,7 +1311,7 @@ where
                 .map_err(|e| Error::Ws(e.to_string()))?;
             match ws::parse_incoming(msg)? {
                 Incoming::Env(env) => return Ok(env),
-                Incoming::Closed => return Err(Error::Ws("connection closed".into())),
+                Incoming::Closed { .. } => return Err(Error::Ws("connection closed".into())),
                 Incoming::Ping(_) | Incoming::Ignore | Incoming::Binary(_) => continue,
             }
         }

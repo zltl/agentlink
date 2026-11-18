@@ -756,6 +756,51 @@ impl Database {
         }))
     }
 
+    /// Check whether an already-authenticated operator socket may stay open.
+    ///
+    /// Returns `true` when the socket's initial access token is still fresh, or
+    /// when that row has not been deleted/revoked and the same active device
+    /// holds a freshly rotated access token. Logout, device revocation, user
+    /// disable, and password changes delete or mark those rows and still drop
+    /// the socket immediately; a client that never refreshed also drops once
+    /// its initial token passes `expires_unix + ACCESS_SKEW_SECS`.
+    pub async fn active_socket_session_valid(&self, token_hash: &str) -> Result<bool> {
+        if self.session_by_hash(token_hash).await?.is_some() {
+            return Ok(true);
+        }
+        let now = unix_now();
+        let rows: Vec<AccessJoin> = fetch_all!(
+            self,
+            "SELECT a.username, u.user_role, a.device_id, a.expires_unix, d.revoked, u.disabled, a.refresh_hash FROM access_tokens a JOIN devices d ON d.id = a.device_id JOIN users u ON u.username = a.username WHERE a.token_hash = ?1",
+            token_hash,
+        )?;
+        let Some(initial) = rows.into_iter().next() else {
+            return Ok(false);
+        };
+        if initial.revoked != 0 || initial.disabled != 0 {
+            return Ok(false);
+        }
+        let fresh_cutoff = now.saturating_sub(ACCESS_SKEW_SECS);
+        let live: Vec<AccessJoin> = fetch_all!(
+            self,
+            "SELECT a.username, u.user_role, a.device_id, a.expires_unix, d.revoked, u.disabled, a.refresh_hash FROM access_tokens a JOIN devices d ON d.id = a.device_id JOIN users u ON u.username = a.username WHERE a.username = ?1 AND a.device_id = ?2 AND a.expires_unix > ?3 LIMIT 1",
+            &initial.username,
+            &initial.device_id,
+            fresh_cutoff,
+        )?;
+        if let Some(current) = live.into_iter().next() {
+            if let Some(refresh_hash) = current.refresh_hash.as_deref().filter(|h| !h.is_empty()) {
+                let _ = exec!(
+                    self,
+                    "UPDATE refresh_tokens SET acknowledged = 1 WHERE token_hash = ?1 AND acknowledged = 0",
+                    refresh_hash,
+                );
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Rotate a refresh token.
     ///
     /// The previous token stays redeemable until the replacement access token

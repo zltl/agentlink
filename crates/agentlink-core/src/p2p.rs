@@ -44,7 +44,7 @@ impl QuicPeer {
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| Error::Tls(e.to_string()))?;
         server_crypto.alpn_protocols = vec![b"agentlink".to_vec()];
-        server_crypto.max_early_data_size = u32::MAX;
+        server_crypto.max_early_data_size = 0;
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .map_err(|e| Error::Tls(e.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
@@ -126,7 +126,7 @@ impl QuicPeer {
             .with_custom_certificate_verifier(tls::pinned_verifier(fp))
             .with_no_client_auth();
         client_crypto.alpn_protocols = vec![b"agentlink".to_vec()];
-        client_crypto.enable_early_data = true;
+        client_crypto.enable_early_data = false;
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .map_err(|e| Error::Tls(e.to_string()))?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic_client));

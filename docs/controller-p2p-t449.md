@@ -1,6 +1,6 @@
 # Controller remote screen and P2P — t449
 
-Worktree: `/workspace/agentlink-t449-controller-p2p`
+Worktree: `<workspace>/repo`
 Branch: `feat/controller-p2p-observe-t449`
 Base (do not modify): `684e1adf3cd2b441a167c735be3f9d6937d3d4b7`
 (`integrate/controller-android-t447` / frozen 0307 and 0851 artifacts left untouched.)
@@ -9,7 +9,7 @@ Local only. Not pushed, merged, or deployed.
 
 ## Official design (ops + source)
 
-From `/home/box/reference/agentlink-ops.md` (no secrets reproduced):
+From `<sdk-home>` (no secrets reproduced):
 
 - Control-plane signaling is WebSocket (`wss://` relay).
 - File `cat`/`write`/`cp` default to **direct QUIC**, then relay.
@@ -106,7 +106,7 @@ ICE cannot connect in the first place.
 
 ## 0851 frozen GUI (do not overwrite, do not mix with this source)
 
-Archive: `/workspace/agentlink-t427-recovery/20261112-0851-t449-controller-p2p/`
+Archive: `<workspace>/repo`
 
 - Binary SHA-256 `0d7f5e9b38ebb60088597f6a00faae9ad9debd7fd45b875ba62dab4ceaf1ec2f`
   matches the recorded 0851 bin.
@@ -114,7 +114,7 @@ Archive: `/workspace/agentlink-t427-recovery/20261112-0851-t449-controller-p2p/`
   notes and was not in `SHA256SUMS` as `8723222fe78332c6ac84200f7948c839a23759acec8b541313d3b6ff9c314f84`.
   Record the truly frozen artifacts; do not treat the current worktree
   source as the 0851 bin.
-- Parent GUI (Asia/Shanghai): sufa View stayed `jpeg · relay` for about
+- Parent GUI (Asia/Shanghai): workstation View stayed `jpeg · relay` for about
   3 minutes (2736×1824 JPEG), fps/bitrate/latency 0, hint “JPEG stills
   over the WebSocket relay — not WebRTC P2P”. No H.264. Launch used
   `AGENTLINK_LIVE_PATH_LOG=1`; the terminal after the command had no
@@ -125,20 +125,20 @@ Archive: `/workspace/agentlink-t427-recovery/20261112-0851-t449-controller-p2p/`
   without a stage line, or may have completed signaling without ever
   selecting a pair.
 
-## Live probe against sufa (this follow-up, existing identity only)
+## Live probe against workstation (this follow-up, existing identity only)
 
 Readonly, Asia/Shanghai on 2026-11-12. `Identity::load` only (no new
 identity). Ordinary `maintain_session` refresh of the already-authorized
 client. Existing grant used as-is; not copied, not extended, no new
-grant. No sufa/relay restart, no input/clipboard/portal, no deploy.
+grant. No workstation/relay restart, no input/clipboard/portal, no deploy.
 
 `agentlink nodes` (existing config dir):
 
-- `sufa` **ONLINE**, `DISPLAY=desktop` (`has_display=Some(true)`),
+- `workstation` **ONLINE**, `DISPLAY=desktop` (`has_display=Some(true)`),
   `linux/x86_64`, access `full`, version `0.1.0`
   (`bc97ba1050f1e186ca3ac37a7cb1b2c021db3012`).
 
-`crates/agentlink-view/examples/t449_sufa_stage.rs` (view-only offer,
+`crates/agentlink-view/examples/webrtc_stage_probe.rs` (view-only offer,
 then close):
 
 - `list_monitors` **ok in 721ms**, 1 monitor, not screenshot fallback.
@@ -158,7 +158,7 @@ offer/answer/keyframe. What did **not** happen in the observation window
 is ICE completion (no selected pair, no video). The Controller offer in
 this probe included STUN only (no TURN). That is the current product
 call chain, not a missing node package. Do **not** treat TURN as a
-substitute for native P2P, and do **not** deploy or restart sufa/relay
+substitute for native P2P, and do **not** deploy or restart workstation/relay
 from this worker. See the 0910 GUI and post-STUN-rewrite probe below
 for the later diagnosis.
 
@@ -170,7 +170,7 @@ on this pair in that earlier window.
 ## 0910 frozen GUI (do not overwrite)
 
 Parent handshake/path/fallback acceptance used the 0910 archive
-`/workspace/agentlink-t427-recovery/20261112-0910-t449-controller-p2p/`
+`<workspace>/repo`
 (debug bin SHA `12c3ddab8c45dc37f67b133f6b3454d370e98c663b7fba5203d99d0b381f59c6`,
 SOURCE-COMMIT `b9c1704`). That tree is frozen and was not modified here.
 
@@ -226,9 +226,9 @@ Same authorized repair, current worktree only:
 On this box, system DNS (including UDP to 8.8.8.8 / 1.1.1.1) returns
 `198.18.0.1` for the default STUN hostnames in ~0–1ms. A STUN binding
 to that address times out, so the 0910 / pre-fix Controller offer had
-**typ host only** (private `172.30.0.2` and `172.17.0.1`),
+**typ host only** (private `172.16.0.10` and `172.17.0.1`),
 `gather_complete=false`, and trickle ICE also carried typ host only.
-Host paths to sufa’s `192.168.1.12` / `10.67.0.2` / `100.91.104.2` are
+Host paths to workstation’s `192.168.1.12` / `10.0.0.10` / `100.64.0.10` are
 not on-net from this box (see routability below).
 
 `usable_ice_url` already skipped *literal* `198.18.0.0/15` in a URL, but
@@ -268,22 +268,22 @@ TURN. The Controller offer also sends `gather_ms: 4000`. Node
 without a node deploy. Local viewer gather stays 1.5s; with working
 STUN it now finishes complete.
 
-## Post-rewrite readonly sufa probe (2026-11-12 09:22 CST)
+## Post-rewrite readonly workstation probe (2026-11-12 09:22 CST)
 
 Existing identity only (`Identity::load` + ordinary session refresh).
 No grant change, no GUI, no deploy, no firewall/routing change, no
 phone/probe SSH, 0910/0851 untouched.
 
-- sufa still ONLINE, desktop, `ffmpeg:h264_vaapi`, 1 monitor.
+- workstation still ONLINE, desktop, `ffmpeg:h264_vaapi`, 1 monitor.
 - System DNS still poisons default STUN hostnames to 198.18/15; DoH
   rewrite ran; ICE URLs became literal IPs.
 - Local offer: `sdp_len=2159`, **`gather_complete=true`**, stun=3,
   turn=0, **host=4 srflx=8** (public typ srflx on this box, e.g.
-  `52.22.132.46`, `23.23.43.111`, `18.204.15.153`).
+  `198.51.100.11`, `198.51.100.12`, `198.51.100.13`).
 - Offer answered: `session_len=78`, `sdp_len=2307`, encoder
-  `ffmpeg:h264_vaapi`, sufa candidates host=6 srflx=4 (same as before:
-  `192.168.1.12`, `10.67.0.2`, `100.91.104.2` / `cgnat`, srflx
-  `120.85.255.194`).
+  `ffmpeg:h264_vaapi`, workstation candidates host=6 srflx=4 (same as before:
+  `192.168.1.12`, `10.0.0.10`, `100.64.0.10` / `cgnat`, srflx
+  `203.0.113.10`).
 - Trickle viewer→node now includes typ srflx, not only typ host.
 - `Viewer::connect` Ok in 5909ms, path still `connecting`.
 - **No selected ICE pair and no H.264 frame in 15s**;
@@ -291,7 +291,7 @@ phone/probe SSH, 0910/0851 untouched.
 
 So the missing typ srflx / incomplete gather **was** a real Controller
 defect and is fixed for gathering, but it is **not sufficient** for a
-selected pair on box↔sufa.
+selected pair on box↔workstation.
 
 ## typ srflx is STUN XOR-MAPPED, not a resolver or relay IP
 
@@ -299,23 +299,23 @@ webrtc 0.21.1 `stun_gatherer.rs` builds typ srflx only from a STUN
 Binding success’s **XOR-MAPPED-ADDRESS**, with `raddr`/`rport` equal
 to the local host socket (`four_tuple.local_addr`). typ relay is a
 separate TURN allocation path and was **0** in every Controller offer
-and sufa answer here.
+and workstation answer here.
 
 Independent Binding requests from this box to the rewritten literal
 STUN servers (Asia/Shanghai 2026-11-12 09:27 CST), one attempt then a
 repeat, no credentials:
 
 - `74.125.250.129:19302` (Google STUN) → Binding success (`0x101`)
-  from that same peer, XOR-MAPPED `52.1.169.66:45535` then
-  `54.209.17.224:43320`. No MAPPED-ADDRESS attribute.
+  from that same peer, XOR-MAPPED `198.51.100.21:45535` then
+  `198.51.100.22:43320`. No MAPPED-ADDRESS attribute.
 - `162.159.207.0:3478` (Cloudflare STUN) → Binding success from that
-  peer, XOR-MAPPED `54.209.17.224:33986` then `52.1.169.66:25309`.
+  peer, XOR-MAPPED `198.51.100.22:33986` then `198.51.100.21:25309`.
 
 Those mapped IPs are **not** the STUN server / DoH target IPs
 (`74.125…`, `162.159…`) and **not** typ relay. Offer inventories now
 print `typ:scope:addr;proto=udp;raddr=…`. typ srflx lines show
-`raddr=172.30.0.2` or `raddr=172.17.0.1` (this box’s host sockets).
-Sufa typ srflx is `120.85.255.194` with `raddr=192.168.1.12` (sufa’s
+`raddr=172.16.0.10` or `raddr=172.17.0.1` (this box’s host sockets).
+Workstation typ srflx is `203.0.113.10` with `raddr=192.168.1.12` (workstation’s
 WLAN host). Classification is not a resolver-target or relay
 mis-label.
 
@@ -325,13 +325,13 @@ SNAT pool / per-attempt mapping), not a closed NAT-type certificate.
 
 ## Answer-candidate routability (read-only `ip route get`)
 
-All sufa answer addresses are reached from this box via the default
-gateway `172.30.0.1 dev enp0s3 src 172.30.0.2`:
+All workstation answer addresses are reached from this box via the default
+gateway `172.16.0.10 dev enp0s3 src 172.16.0.10`:
 
-- typ host `192.168.1.12`, `10.67.0.2`, typ host/cgnat `100.91.104.2`:
+- typ host `192.168.1.12`, `10.0.0.10`, typ host/cgnat `100.64.0.10`:
   not on-link. These are not a same-LAN or Tailscale path from this
-  box (`100.91.104.2` is still `cgnat`, not `tailscale`).
-- typ srflx `120.85.255.194`: also via the default route (has a next
+  box (`100.64.0.10` is still `cgnat`, not `tailscale`).
+- typ srflx `203.0.113.10`: also via the default route (has a next
   hop). That is not proof that a STUN check or reply will pass NAT.
 
 No routing table or firewall was changed.
@@ -341,7 +341,7 @@ No routing table or firewall was changed.
 - `gather_ms: 4000` is honored by node `bc97ba1` as above. No node
   deploy. There is still no node→viewer trickle after the answer;
   lengthening node gather is how late node candidates get into the
-  answer. Sufa srflx was already in the answer.
+  answer. Workstation srflx was already in the answer.
 - Viewer→node trickle `ice` succeeded (host and typ srflx). No
   trickle signal errors were observed, so retrying trickle is not
   motivated by this evidence. Failed trickle would only be logged
@@ -353,7 +353,7 @@ No routing table or firewall was changed.
   Connecting / no-pair wait does **not** ICE-restart, so it does not
   tear down a forming checklist by restart. The 12s/15s wait then
   closes the viewer; if a pair had already been selected it would be
-  closed with JPEG remaining. In these box↔sufa runs no pair was
+  closed with JPEG remaining. In these box↔workstation runs no pair was
   selected first.
 
 ## ICE library stats (2026-11-12 09:33 CST, one instrumented probe)
@@ -365,12 +365,12 @@ packet payloads. Same-host loopback already showed the API working
 after a selected pair (`role=controlling`, `nominated=true`,
 `req_sent`/`req_recv` > 0, typ srflx with raddr).
 
-Box↔sufa, `Viewer::connect` Ok 5941ms, then 15s:
+Box↔workstation, `Viewer::connect` Ok 5941ms, then 15s:
 
 - Offer: `gather_complete=true`, host=4 srflx=8, proto=udp, typ srflx
-  `raddr` on `172.30.0.2` / `172.17.0.1`.
-- Answer: `ffmpeg:h264_vaapi`, host `192.168.1.12` / `10.67.0.2` /
-  `100.91.104.2`, typ srflx `120.85.255.194` with
+  `raddr` on `172.16.0.10` / `172.17.0.1`.
+- Answer: `ffmpeg:h264_vaapi`, host `192.168.1.12` / `10.0.0.10` /
+  `100.64.0.10`, typ srflx `203.0.113.10` with
   `raddr=192.168.1.12`. Trickle ice ok (host + srflx).
 - `agentlink live-ice:` throughout: `role=controlling`
   `ice_state=checking` `selected=-` `pair_changes=0` `pairs=0`
@@ -385,7 +385,7 @@ webrtc 0.21.1 `get_stats()` only copies ICE agent
 `IceTransport` API exposes local/remote candidates and the selected
 pair, not the full checklist. Therefore `pairs=0` / `req_sent=0` while
 `ice_state=checking` does **not** prove that Binding checks to
-`120.85.255.194` were never sent. It does prove the public stats
+`203.0.113.10` were never sent. It does prove the public stats
 surface never observed a nominated or selected pair, and never exposed
 per-pair send/recv counts for this session.
 
@@ -396,15 +396,15 @@ a network/node change we are not allowed to make. Stopped here.
 ## What remains unverified (and is not claimed)
 
 - Whether the ICE agent actually transmitted connectivity checks to
-  sufa typ srflx `120.85.255.194:6594` / `:6600`, and whether any
+  workstation typ srflx `203.0.113.10:6594` / `:6600`, and whether any
   request or response was dropped by NAT.
 - Whether this box’s changing XOR-MAPPED addresses would make an
-  advertised typ srflx unusable toward sufa even if checks are sent.
-- sufa-side check logs (readonly SSH was not expanded in this step;
+  advertised typ srflx unusable toward workstation even if checks are sent.
+- workstation-side check logs (readonly SSH was not expanded in this step;
   no node restart).
 - Public NAT traversal success. typ srflx / `stun` is not a public
   P2P success claim. TURN would be a media relay, not direct P2P.
-  typ host on `100.91.104.2` is `cgnat`, not Tailscale overlay, and
+  typ host on `100.64.0.10` is `cgnat`, not Tailscale overlay, and
   Tailscale overlay would not be public P2P either. No TURN was
   added or deployed.
 
@@ -417,7 +417,7 @@ a network/node change we are not allowed to make. Stopped here.
 `cargo test -p agentlink-view --test loopback -- --nocapture`
 
 Latest observed selected pair (box clock, Asia/Shanghai): typ host
-`172.30.0.2` ↔ `172.30.0.2` UDP, path token **`private`**, Annex-B IDR,
+`172.16.0.10` ↔ `172.16.0.10` UDP, path token **`private`**, Annex-B IDR,
 encoder `minih264`. Earlier loopback runs on this box used `172.17.0.1`.
 Both are same-machine addresses. **Not cross-machine, not public NAT,
 not “same LAN.”** Stages printed: `list_monitors` → gather → offer
@@ -456,22 +456,22 @@ answered → ICE pair.
 - No Controller GUI was started in this follow-up (parent will retest a
   **new** candidate, not 0851).
 - No production node/relay restart, no firewall or routing change, no
-  grant create/extend, no identity copy or rotation, no sufa
+  grant create/extend, no identity copy or rotation, no workstation
   input / clipboard / portal, no phone/ADB, no deploy of TURN or node
   packages.
-- Cross-machine STUN completing a selected pair on box↔sufa: **not
+- Cross-machine STUN completing a selected pair on box↔workstation: **not
   observed**, even after typ srflx appeared on both sides.
 - File/exec QUIC P2P was not re-verified (different path).
 
 ## Parent GUI path (new candidate only)
 
 1. Use the new dated archive under
-   `/workspace/agentlink-t427-recovery/20261112-*-t449-controller-p2p/`
+   `<workspace>/repo*-t449-controller-p2p/`
    once created. Do **not** overwrite or mix with 0851 / 0307. Launch is
    for the parent, not this worker. Example env:
    `AGENTLINK_CONFIG_DIR` = existing config, isolated `--data-dir`.
    Stage lines now print even without `AGENTLINK_LIVE_PATH_LOG`.
-2. Open sufa **View** (read-only). Do not send keys, mouse, or clipboard.
+2. Open workstation **View** (read-only). Do not send keys, mouse, or clipboard.
 3. Confirm:
    - `path  jpeg · relay` while JPEG is painted, **even if** handshake
      shows offer/ICE in progress. Do not expect `h264 · connecting` as
@@ -501,7 +501,7 @@ remain immutable, as do 0910 and 0924.
 
 1. **GUI 0924 already accepted (frozen bin, not this source).** Parent
    GUI used
-   `/workspace/agentlink-t427-recovery/20261112-0924-t449-controller-p2p/`
+   `<workspace>/repo`
    (debug bin SHA
    `f6497e7ab0b0f6e9186613f4cef4bb629fb6054f98e1e0b447cf5ca430d2c2f4`,
    SOURCE-COMMIT `d98f8a8`). That run showed JPEG stills continuing and
@@ -517,7 +517,7 @@ remain immutable, as do 0910 and 0924.
    fallback and sticky no-pair handshake; also expect
    `AGENTLINK_STUN_REWRITE` defaults-only behavior and `live-ice:`
    lines. This is a code/instrumentation change, not a new P2P result.
-3. **Actual public NAT P2P is still not passed.** Box↔sufa never
+3. **Actual public NAT P2P is still not passed.** Box↔workstation never
    selected an ICE pair. typ srflx is confirmed XOR-MAPPED, but that
    is not public P2P success. TURN and Tailscale overlay are not
    public P2P. No further probes, packet captures, or network/service
@@ -552,7 +552,7 @@ tests outside `controller::`, deploy/functional/smoke, and any GUI.
 ## Parent GUI path (this final candidate only)
 
 Use
-`/workspace/agentlink-t427-recovery/20261112-0938-t449-controller-p2p/`
+`<workspace>/repo`
 once created. Launch is for the parent, not this worker:
 
 `./run-controller.sh`
@@ -561,7 +561,7 @@ once created. Launch is for the parent, not this worker:
 is isolated (`/tmp/agentlink-t449-0938-controller-data`). Do not point
 it at a production node data dir. Do not mix with 0924/0910/0851/0307.
 
-Read-only View of sufa. Confirm JPEG stills keep refreshing, handshake
+Read-only View of workstation. Confirm JPEG stills keep refreshing, handshake
 keeps a no-pair (or no-first-frame) terminal reason after close, no
 redundant stats `link` row, and stderr `agentlink live-ice:` / rewrite
 logs. Do not expect a selected public P2P pair.
@@ -570,10 +570,10 @@ logs. Do not expect a selected public P2P pair.
 ## 0938 GUI: `fps  0.0` on refreshing JPEG stills
 
 Frozen evidence (not modified):
-`/workspace/t449-0938-session-stats.png`,
-`/workspace/t449-0938-terminal-stages.png`,
-`/workspace/t449-0938-terminal-final.png`, and archive
-`/workspace/agentlink-t427-recovery/20261112-0938-t449-controller-p2p/`
+`<workspace>/repo`,
+`<workspace>/repo`,
+`<workspace>/repo`, and archive
+`<workspace>/repo`
 (debug bin SHA
 `62ca7605f131a5f19930d8bbeab4b330fe7a25cb5bb96d1354b94888ad97bd62`).
 0938 remains frozen.
@@ -665,7 +665,7 @@ No new network probe, packet capture, or remote/service change.
 ## Parent GUI path (0951 candidate only)
 
 Use
-`/workspace/agentlink-t427-recovery/20261112-0951-t449-controller-p2p/`
+`<workspace>/repo`
 once created. Launch is for the parent, not this worker:
 
 `./run-controller.sh`
@@ -675,7 +675,7 @@ is frozen and was not overwritten. Isolated `--data-dir`
 `/tmp/agentlink-t449-0951-controller-data`. Do not point it at a
 production node data dir. Do not mix with 0938/0924/0910/0851/0307.
 
-Read-only View of sufa. In Session stats, while JPEG stills are
+Read-only View of workstation. In Session stats, while JPEG stills are
 refreshing, expect `stills  X.X Hz` (or `stills  n/a` only before a
 second still), `bitrate  n/a`, `latency  n/a` — not `fps  0.0`.
 Open stats during offer → answer → waiting → 12s timeout → close,
@@ -691,7 +691,7 @@ User t450 asked whether P2P was already fixed and how Tailscale
 does it. It was **not** fixed after 0951. This section is the
 official-source study and the first implementation batch: keep
 JPEG up and renegotiate with a backoff budget. Public NAT P2P
-on box↔sufa is still not claimed.
+on box↔workstation is still not claimed.
 
 ### Official sources (fetched 2026-11-12, not cloned)
 
@@ -761,7 +761,7 @@ Not equivalent, and not claimed:
   here.
 - The current node **batches** ICE candidates in the offer
   answer and accepts viewer trickle (`action: ice`) but does
-  **not** push late answer candidates back. Prior box↔sufa
+  **not** push late answer candidates back. Prior box↔workstation
   probes already showed `gather_complete=true` and public `srflx`
   in *both* inventories, so missing trickle is a real protocol
   gap but **not** a proven root cause of the no-pair result.
@@ -822,29 +822,29 @@ claim that public P2P is done.
 
 **102 passed, 0 failed** in that set. Not run: remaining
 `agentlink-core` lib tests, other bins, deploy/smoke, GUI, or any
-new sufa/phone probe.
+new workstation/phone probe.
 
 ### Cross-machine P2P?
 
 **No.** This batch did not select a public ICE pair or receive
-H.264 from sufa. Same-host recovery in the harness is not public
+H.264 from workstation. Same-host recovery in the harness is not public
 NAT P2P. TURN and Tailscale overlay are not native public P2P.
 
 ### If a later close-the-loop needs user approval
 
 Do **not** deploy from here. The smallest useful authorized
 follow-up would be: (1) collect *safe* ICE check / candidate
-inventories from the **sufa node process logs** during one
+inventories from the **workstation node process logs** during one
 read-only View (no ufrag/password packet capture, no app
 input/clip/portal), and/or (2) a reviewed both-sides trickle /
-`ice_pull` deploy to a non-production node. Changing box or sufa
+`ice_pull` deploy to a non-production node. Changing box or workstation
 firewall/routes to “make P2P work” is out of scope unless the
 user explicitly asks for that change and accepts the risk.
 
 ## Parent GUI path (1212 candidate only)
 
 Use
-`/workspace/agentlink-t427-recovery/20261112-1212-t449-controller-p2p/`
+`<workspace>/repo`
 once created. Launch is for the parent, not this worker:
 
 `./run-controller.sh`
@@ -852,14 +852,14 @@ once created. Launch is for the parent, not this worker:
 **0951 is frozen** and was not overwritten (bin SHA
 `5d237d80ef4ae70a8de2abd63c41f76306951dbd0a3754f769df5b1d4b7ae612`).
 Isolated `--data-dir` `/tmp/agentlink-t449-1212-controller-data`.
-Do not mix binaries. Read-only View of sufa. Expect JPEG to
+Do not mix binaries. Read-only View of workstation. Expect JPEG to
 remain through a no-pair miss, then up to two further offers
 (3s / 6s backoff) rather than a single 12s-and-done live
 attempt. Do not expect a selected public P2P pair.
 
 # t450 — offer/gather/trickle lifecycle (local protocol, not a new 1212)
 
-1212 remains frozen. This batch did not probe sufa, change log
+1212 remains frozen. This batch did not probe workstation, change log
 levels, deploy, capture packets, or alter third-party crates.
 
 ## Does `live_pipeline` / loopback match the production path?
@@ -878,7 +878,7 @@ grant), in-process signaling rather than the relay, and both
 peers on the same box. A selected `path=private` typ host pair
 here is not public NAT P2P.
 
-The deployed sufa node is still `0.1.0` / `bc97ba1`. These
+The deployed workstation node is still `0.1.0` / `bc97ba1`. These
 tests run against the worktree node handler, which is the same
 offer/ice/session contract plus the ice-ack honesty fix below.
 
@@ -947,12 +947,12 @@ still required so a future miss cannot hide behind `ok`.
 
 A complete-gather Viewer offer already embeds host+srflx in the
 SDP, so trickle is often a duplicate of what `set_remote` has
-already applied. The box↔sufa no-pair miss, after the DNS
+already applied. The box↔workstation no-pair miss, after the DNS
 rewrite gave both sides public typ srflx, is **not** explained
 by mid/ufrag JSON mismatch, ice-before-session, or silent
 parse-drop of the Viewer shape. It is also not a NAT-type
 conclusion: this batch did not observe check send/receive on
-the wire to sufa.
+the wire to workstation.
 
 What still needs a user-authorized remote step (not done here):
 safe node-side check inventories during a live View, or a
@@ -1055,7 +1055,7 @@ NAT result. Test frames, not a live desktop portal.
   the malformed / short-gather / no-grant loopback tests still pass.
 - `cross_process_fixture_selects_a_pair_and_delivers_h264` —
   parent Viewer, child real handler: IDR, selected typ host
-  `172.17.0.1:47205` ↔ `172.30.0.2:33092`,
+  `172.17.0.1:47205` ↔ `172.16.0.10:33092`,
   `req_sent=3 req_recv=6 resp_sent=6 resp_recv=5`, then ice
   on the closed session is rejected. Finished in 0.52s.
 - Unit: `sdp_ice_ufrag_*`, `ice_ufrag_matches_*`,
@@ -1073,9 +1073,9 @@ NAT result. Test frames, not a live desktop portal.
 
 ### Still unverified on the public internet
 
-This batch did **not** re-run box↔sufa or any other
+This batch did **not** re-run box↔workstation or any other
 cross-network pair. Local selected typ host + H.264 is not a
-public P2P claim. The earlier box↔sufa no-pair miss (after
+public P2P claim. The earlier box↔workstation no-pair miss (after
 DNS rewrite produced public typ srflx on both sides) is still
 unexplained at the check-send/receive layer on that path:
 webrtc-0.21 often only exposes selected-pair stats, and no
@@ -1088,7 +1088,7 @@ parent/user step.
 ## t452 review — grant/peer isolation, bounded queue, full related tests
 
 1332 (`b4a4cc0`, bin `8d5bc974…`) stays frozen for the parent GUI /
-old-sufa compatibility run. Do not overwrite it, and do not attribute
+old-workstation compatibility run. Do not overwrite it, and do not attribute
 that GUI result to later commits.
 
 ### Related test totals on frozen 1332 / `b4a4cc0` (no double-count)
@@ -1204,7 +1204,7 @@ Run 2026-11-12 13:39–13:40 CST (Asia/Shanghai):
 
 - A passing local or **same-host cross-process** fixture (selected typ
   host + H.264 IDR) is **not** a cross-network or public NAT P2P
-  result. 1332 and this follow-up still did not re-run box↔sufa.
+  result. 1332 and this follow-up still did not re-run box↔workstation.
 - `checks=unavailable-selected-stats-only` means webrtc-0.21
   `get_stats()` did not expose a selected pair, so send/recv check
   counters are **unavailable**, not that zero checks were sent or

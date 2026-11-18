@@ -127,8 +127,10 @@ pub struct SealTarget {
     pub session: Option<std::sync::Arc<Direction>>,
 }
 
+const SESSION_WIRE_BOUND: usize = 256;
+
 pub struct TransferHost {
-    pub sessions: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Wire>>>>,
+    pub sessions: Arc<Mutex<HashMap<String, mpsc::Sender<Wire>>>>,
     pub direct_wait: Arc<Mutex<HashMap<String, oneshot::Sender<DirectReply>>>>,
     pub allowed: Arc<Mutex<HashMap<String, Instant>>>,
     pub quic: Option<Arc<QuicPeer>>,
@@ -190,7 +192,7 @@ pub fn fail_session(host: &TransferHost, request_id: &str, message: String) {
     else {
         return;
     };
-    let _ = tx.send(Wire::Msg(TransferMsg::Failed { message }));
+    let _ = tx.try_send(Wire::Msg(TransferMsg::Failed { message }));
 }
 
 pub async fn on_transfer(
@@ -206,7 +208,11 @@ pub async fn on_transfer(
         .ok()
         .and_then(|map| map.get(&request_id).cloned())
     {
-        let _ = tx.send(Wire::Msg(msg));
+        if tx.try_send(Wire::Msg(msg)).is_err() {
+            if let Ok(mut map) = host.sessions.lock() {
+                map.remove(&request_id);
+            }
+        }
         return;
     }
     if let Ok(mut seals) = host.seals.lock() {
@@ -430,7 +436,11 @@ pub fn on_binary(host: &TransferHost, bytes: Vec<u8>) {
                 .ok()
                 .and_then(|map| map.get(&id).cloned())
             {
-                let _ = tx.send(Wire::Frame(opened));
+                if tx.try_send(Wire::Frame(opened)).is_err() {
+                    if let Ok(mut map) = host.sessions.lock() {
+                        map.remove(&id);
+                    }
+                }
             }
         }
         Err(err) => fail_session(host, &id, err.to_string()),
@@ -475,7 +485,7 @@ pub fn on_direct_answer(host: &TransferHost, env: Envelope) {
 
 fn attach(host: &TransferHost, request_id: &str, reply_node: &str) -> Link {
     let (worker, mut adapter) = Link::pair(64);
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(SESSION_WIRE_BOUND);
     if let Ok(mut map) = host.sessions.lock() {
         map.insert(request_id.to_string(), tx);
     }

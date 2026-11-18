@@ -1,6 +1,9 @@
 # Relay image. The binary is the same one a node runs; the entrypoint is the relay.
-# The first start prints the admin token and certificate fingerprint in the logs
-# and stores them in the data volume.
+# First start writes `cert.pem`, `key.pem`, `fingerprint.txt`, and (when the user
+# table is empty) a one-time `bootstrap.password` for `admin` in `/var/lib/agentlink`.
+# Rotate that password immediately (`agentlink relay --data-dir /var/lib/agentlink
+# user passwd admin`), which removes `bootstrap.password`. Legacy `admin.token` is
+# disabled by default unless AGENTLINK_LEGACY_ADMIN=1 and a TTL are set.
 
 FROM rust:1.99.1-bookworm AS build
 WORKDIR /src

@@ -24,7 +24,7 @@ The message came from Android but did not name a surface. These are the
    `crates/agentlink-cli/src/controller/` (`ui.rs` ~3671 lines, `theme.rs`,
    `chrome.rs`). Login, machine list, then terminal / files / desktop each
    replace the central panel (no persistent list+detail). Historical
-   screenshot: `/workspace/uploads/pr37/controller-login.png` (may predate
+   screenshot: `<workspace>/repo` (may predate
    the current tide/navy Android theme; still shows the desktop login
    hierarchy problem).
 3. **Relay web dashboard** — `crates/agentlink-relay/src/dashboard.html`
@@ -155,7 +155,7 @@ terminal leaves enough height and does not overflow.
 
 ## Relation to t443
 
-Same branch, same worktree `/workspace/agentlink-t443`. Terminal
+Same branch, same worktree `<workspace>/repo`. Terminal
 interactivity commits stay separate (`docs/terminal-ux-t443.md` + code).
 Controller layout commits reference this file. No grant/ops changes in
 either series.
@@ -227,7 +227,7 @@ was not installed.
 ## t447 desktop Controller — real GUI acceptance (2026-11-12 00:55 Asia/Shanghai)
 
 The 0050 candidate was `ba0eae8`, binary at
-`/workspace/agentlink-t427-recovery/20261112-0050-t446-controller-candidate/`.
+`<workspace>/repo`.
 Parent computerUse tested the **desktop** window, not the Android typography
 pass. Source in that build already had `action_button` labels `Terminal`,
 `Files`, and `Desktop`, plus a `View`/`Control` **mode toggle**. The live
@@ -238,15 +238,15 @@ Evidence (read-only screenshots, not driven from this worker):
 - List: `/tmp/computer-use/sand-subagent-92852702-680e-7005-f8ec-719909f8daac.9d3e7161-36b7-4756-bf2f-dc8310a62ac0.webp`
   — visible card actions were **Terminal / Control / View**. Files and Desktop
   were not on screen. Cards sat in two columns with large vertical gaps
-  between rows. Headless nodes (quant67, tc-cn, tc-external) still showed
-  Control/View. Signed in as ltl without a password (the earlier Sign in
+  between rows. Headless nodes (quant67, tc-cn, node-external) still showed
+  Control/View. Signed in as operator without a password (the earlier Sign in
   flash was bootstrap, not a confirmed session-read defect).
 - Terminal: `...88f0fa95-8460-439f-aeab-1411ddcfe979.webp` — quant67 hostname
   and whoami worked as root. The pane was a **line box** (“Enter sends the
   line”), not a cell-grid emulator.
 - Control: `...9daa52c0-4ee1-40ea-8a03-cf56c1fff608.webp` — quant67 Control
   became selected and stayed on Machines. No sub-page, no error.
-- sufa View: `...b9e541dc-454d-4842-92e4-2eedef685f4e.webp` — click stayed
+- workstation View: `...b9e541dc-454d-4842-92e4-2eedef685f4e.webp` — click stayed
   on the list. No picture, no error, no portal prompt, no input capture.
   Selecting View is **not** a desktop session.
 
@@ -286,11 +286,11 @@ of the new candidate.
 The 0111 candidate confirmed real progress: quant67 `hostname` / `whoami` (root)
 / `printf` worked; Files could create a folder and `probe.txt`, save, close,
 reopen with matching content, and delete the file and empty folder through the
-UI; sufa View showed a read-only remote desktop (no portal, input not
+UI; workstation View showed a read-only remote desktop (no portal, input not
 captured). Five defects remained and are addressed in this revision:
 
 - **C (first).** Enter in a focused quant67 terminal could open another node's
-  Terminal (sufa). Keyboard, IME, and clipboard events are now consumed
+  Terminal (workstation). Keyboard, IME, and clipboard events are now consumed
   at the start of the frame, before the machine rail or any default button
   is drawn. Card and rail actions have unique ids, do not wrap label
   letters, and surrender focus so they are click-only. Switching nodes
@@ -394,8 +394,8 @@ fallback face is loaded.
 
 - Maximized Machines (`4b1ea262-…webp`): short full-width card bars,
   overlapping hostname / id / “Headless. Shell and files only.”, and a
-  second column (sufa, tc-external, probe) clipped off the right edge.
-- Session (`cff5c06a-…webp`): sufa **View desktop** clipped to **View d…**
+  second column (workstation, node-external, probe) clipped off the right edge.
+- Session (`cff5c06a-…webp`): workstation **View desktop** clipped to **View d…**
   past the 260 px rail, plus a wide black gap between the gray rail and
   the terminal.
 

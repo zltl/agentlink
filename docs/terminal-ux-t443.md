@@ -194,7 +194,7 @@ Untested here: real phone, real IME on a device, production E2E RTT,
 CJK two-cell width, remote flow-control pause.
 
 Code lands on `feat/terminal-ux-t443` only. Bundles go under
-`/workspace/agentlink-t427-recovery/` and must not overwrite the t427
+`<workspace>/repo` and must not overwrite the t427
 GNU candidate or `20261111-2004` artifacts. No push, merge, deploy, or
 production node restart.
 
@@ -277,7 +277,7 @@ Earlier accepted counts stay historical: ffi lib 16, Android filtered 28,
   (`app-debug.apk`, 19M). Compose UI packaged. The APK contains
   `libjnidispatch.so` and `libandroidx.graphics.path.so` only — **no
   `libagentlink_ffi.so`**. `android/app/src/main/jniLibs` is absent;
-  `ANDROID_NDK_HOME` is unset and `/home/box/Android/Sdk/ndk` is not
+  `ANDROID_NDK_HOME` is unset and `<sdk-home>` is not
   present, so `android/build-native.sh` was **not** run. This is a UI
   compile, not a runnable on-device native build. The APK was **not**
   installed.

@@ -531,7 +531,7 @@ async fn connect_once(
                     Incoming::Ping(payload) => {
                         let _ = tx.try_send(Outbound::Pong(payload));
                     }
-                    Incoming::Closed => break Err(Error::Ws("connection closed".into())),
+                    Incoming::Closed { .. } => break Err(Error::Ws("connection closed".into())),
                     Incoming::Ignore => {}
                 }
             }
@@ -607,6 +607,10 @@ async fn handle_env(
                 Ok(triple) => triple,
                 Err(err) => {
                     tracing::warn!(error = %err, "e2e open failed");
+                    let reset = Envelope::result_err(request_id, "e2e session reset");
+                    if let Ok(out) = ws::encode(&reset) {
+                        let _ = tx.send(out).await;
+                    }
                     return;
                 }
             };
@@ -626,14 +630,27 @@ async fn handle_env(
             )
         }
         Envelope::AuditPolicyPush { toml } => {
-            match agentlink_core::audit::AuditPolicy::parse(&toml) {
-                Ok(next) => {
-                    if let Err(err) = std::fs::write(config.data_dir.join("audit.toml"), &toml) {
-                        tracing::warn!(error = %err, "could not save pushed audit policy");
-                    }
-                    audit_hub.replace_policy(next);
+            let current = audit_hub.policy();
+            match current.apply_untrusted_relay_push(&toml) {
+                Ok(None) => {
+                    tracing::info!("ignoring relay audit policy because lock_local is set");
                 }
-                Err(err) => tracing::warn!(error = %err, "pushed audit policy is invalid"),
+                Ok(Some(sanitized)) => {
+                    match sanitized.to_toml() {
+                        Ok(clean_toml) => {
+                            if let Err(err) =
+                                std::fs::write(config.data_dir.join("audit.toml"), clean_toml)
+                            {
+                                tracing::warn!(error = %err, "could not save pushed audit policy");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "could not serialize pushed audit policy");
+                        }
+                    }
+                    audit_hub.replace_policy(sanitized);
+                }
+                Err(err) => tracing::warn!(error = %err, "rejected relay audit policy push"),
             }
             return;
         }
@@ -1390,7 +1407,7 @@ async fn run_exec(
         .unwrap_or(&session_id)
         .to_string();
     host_sessions.register(&session_id, peer, &release)?;
-    poll_until_end(
+    let res = poll_until_end(
         resp,
         cancel,
         host_sessions,
@@ -1401,7 +1418,9 @@ async fn run_exec(
         timeout_ms,
         "stdout",
     )
-    .await
+    .await;
+    close_quiet(host_sessions, host, &session_id, &release).await;
+    res
 }
 
 async fn run_pty(
@@ -1507,12 +1526,12 @@ async fn poll_until_end(
                 return Ok(());
             }
         }
-        let host = host.clone();
+        let host_for_poll = host.clone();
         let sid = session_id.to_string();
         let caller_s = caller.to_string();
         // Registry check happens here so a forged caller never reaches the host.
         registry.authorize_caller(session_id, caller)?;
-        let raw = tokio::task::spawn_blocking(move || host.poll_session(sid, caller_s))
+        let raw = tokio::task::spawn_blocking(move || host_for_poll.poll_session(sid, caller_s))
             .await
             .map_err(|e| Error::Message(format!("host task: {e}")))?;
         let body = host::parse_host(&raw)?;
@@ -1530,10 +1549,12 @@ async fn poll_until_end(
             }
             "exit" => {
                 let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                close_quiet(registry, host, session_id, release).await;
                 resp.end(Some(code), None).await?;
                 return Ok(());
             }
             _ => {
+                close_quiet(registry, host, session_id, release).await;
                 return Err(Error::Message(format!("host session event '{event}'")));
             }
         }
@@ -1732,7 +1753,7 @@ where
                 .map_err(|e| Error::Ws(e.to_string()))?;
             match ws::parse_incoming(msg)? {
                 Incoming::Env(env) => return Ok(env),
-                Incoming::Closed => return Err(Error::Ws("connection closed".into())),
+                Incoming::Closed { .. } => return Err(Error::Ws("connection closed".into())),
                 Incoming::Ping(_) | Incoming::Ignore | Incoming::Binary(_) => continue,
             }
         }
@@ -1797,5 +1818,113 @@ mod tests {
         );
         assert!(empty_jti.get("_grant_jti").is_none());
         assert!(empty_jti.get("_grant_exp").is_none());
+    }
+
+    struct ExitTestHost {
+        released: Mutex<Vec<(String, String)>>,
+        event: String,
+    }
+
+    impl NodeHost for ExitTestHost {
+        fn unary(&self, _: String, _: String) -> String {
+            r#"{"ok":true,"body":{}}"#.into()
+        }
+        fn open_session(&self, _: String, _: String) -> String {
+            r#"{"ok":true,"body":{"session_id":"sess-1"}}"#.into()
+        }
+        fn poll_session(&self, _: String, _: String) -> String {
+            self.event.clone()
+        }
+        fn session_input(&self, _: String, _: String, _: String) -> String {
+            r#"{"ok":true,"body":{}}"#.into()
+        }
+        fn close_session(&self, _: String, _: String) -> String {
+            r#"{"ok":true,"body":{}}"#.into()
+        }
+        fn release_session(&self, session_id: String, release: String) -> String {
+            self.released.lock().unwrap().push((session_id, release));
+            r#"{"ok":true,"body":{}}"#.into()
+        }
+        fn prepare_path(&self, _: String, _: bool) -> String {
+            r#"{"ok":true,"body":{}}"#.into()
+        }
+        fn publish_path(&self, _: String, _: String) -> String {
+            r#"{"ok":true,"body":{}}"#.into()
+        }
+        fn on_status(&self, _: String) {}
+    }
+
+    #[tokio::test]
+    async fn poll_until_end_releases_session_idempotently_on_normal_exit_and_error() {
+        let registry = crate::host::HostSessionRegistry::default();
+        let release = crate::host::HostSessionRegistry::mint_release();
+        registry
+            .register("sess-exit", "peer-alice", &release)
+            .expect("register");
+        let host_impl = Arc::new(ExitTestHost {
+            released: Mutex::new(Vec::new()),
+            event: r#"{"ok":true,"body":{"event":"exit","code":0}}"#.into(),
+        });
+        let host: Arc<dyn NodeHost> = host_impl.clone();
+        let resp = Responder {
+            socket: Arc::new(SocketSlot::default()),
+            request_id: "req-exit".into(),
+            seal: None,
+            log: Arc::new(ReplayLog::default()),
+        };
+        let cancel = CancellationToken::new();
+        poll_until_end(
+            &resp,
+            &cancel,
+            &registry,
+            &host,
+            "sess-exit",
+            "peer-alice",
+            &release,
+            Some(5_000),
+            "stdout",
+        )
+        .await
+        .expect("normal exit");
+        // Idempotent second cleanup (as in run_exec's guard) must not double-release.
+        close_quiet(&registry, &host, "sess-exit", &release).await;
+
+        assert!(
+            registry.authorize_caller("sess-exit", "peer-alice").is_err(),
+            "normal exit must remove session from HostSessionRegistry"
+        );
+        assert_eq!(
+            host_impl.released.lock().unwrap().as_slice(),
+            &[("sess-exit".to_string(), release)],
+            "release_session must run once on normal exit"
+        );
+
+        // Unexpected event also cleans up instead of leaking the registry entry.
+        let err_release = crate::host::HostSessionRegistry::mint_release();
+        registry
+            .register("sess-bad", "peer-alice", &err_release)
+            .expect("register bad");
+        let bad_impl = Arc::new(ExitTestHost {
+            released: Mutex::new(Vec::new()),
+            event: r#"{"ok":true,"body":{"event":"bogus"}}"#.into(),
+        });
+        let bad_host: Arc<dyn NodeHost> = bad_impl.clone();
+        assert!(
+            poll_until_end(
+                &resp,
+                &cancel,
+                &registry,
+                &bad_host,
+                "sess-bad",
+                "peer-alice",
+                &err_release,
+                Some(5_000),
+                "stdout",
+            )
+            .await
+            .is_err()
+        );
+        assert!(registry.authorize_caller("sess-bad", "peer-alice").is_err());
+        assert_eq!(bad_impl.released.lock().unwrap().len(), 1);
     }
 }

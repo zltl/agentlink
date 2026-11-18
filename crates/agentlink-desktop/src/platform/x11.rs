@@ -193,6 +193,56 @@ impl X11Desk {
         Some((reply.root_x as i32, reply.root_y as i32))
     }
 
+    /// Real compositor cursor via XFixes (name + hotspot). Never invents
+    /// `"arrow"` for an unrecognized theme cursor — returns `"unknown"`.
+    ///
+    /// Does **not** call XFixesHideCursor / hide the system pointer.
+    pub fn cursor_sample(&self) -> Option<crate::capture::CursorSample> {
+        let (x, y) = self.pointer()?;
+        // Prefer name+image so stock X cursor names (xterm, sb_v_double_arrow)
+        // classify correctly; fall back to image-only hotspot, then position.
+        if let Ok(cookie) = self.conn.xfixes_get_cursor_image_and_name() {
+            if let Ok(reply) = cookie.reply() {
+                let name = String::from_utf8_lossy(&reply.name).into_owned();
+                let shape = crate::cursor_shape::classify_shape(&name).to_string();
+                return Some(crate::capture::CursorSample {
+                    x,
+                    y,
+                    shape,
+                    hotspot_x: reply.xhot,
+                    hotspot_y: reply.yhot,
+                    bitmap_rgba: None,
+                    bitmap_w: 0,
+                    bitmap_h: 0,
+                });
+            }
+        }
+        if let Ok(cookie) = self.conn.xfixes_get_cursor_image() {
+            if let Ok(reply) = cookie.reply() {
+                return Some(crate::capture::CursorSample {
+                    x,
+                    y,
+                    shape: "unknown".into(),
+                    hotspot_x: reply.xhot,
+                    hotspot_y: reply.yhot,
+                    bitmap_rgba: None,
+                    bitmap_w: 0,
+                    bitmap_h: 0,
+                });
+            }
+        }
+        Some(crate::capture::CursorSample {
+            x,
+            y,
+            shape: "unknown".into(),
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bitmap_rgba: None,
+            bitmap_w: 0,
+            bitmap_h: 0,
+        })
+    }
+
     pub fn is_xwayland(&self) -> bool {
         self.xwayland
     }

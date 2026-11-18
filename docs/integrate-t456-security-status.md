@@ -7,12 +7,12 @@ onto this line — not Actions, not a visibility change, not a
 release, not a deploy, and not a production-machine upgrade. This
 is not a full security or platform sign-off.
 
-- Current worktree: `/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo`
+- Current worktree: `<workspace>/repo`
 - Branch: `integrate/security-main-t456` at `ea6914525566f14e1a842fb301b32ac17adfc0e6`
   (fast-forwarded from previous live `main` `f4a336ee`; 667 merge
   parents `4fef74f7` and `79f3d63b` remain ancestors)
-- Frozen 912 review tree (untouched): `/workspace/agentlink-integrate-t456` at `9122522b23846b2b6c31c640ef2928cb053dd994`
-- Historical continuation worktree (not the current tip): `/workspace/agentlink-integrate-t456-cont`
+- Frozen 912 review tree (untouched): `<workspace>/repo` at `9122522b23846b2b6c31c640ef2928cb053dd994`
+- Historical continuation worktree (not the current tip): `<workspace>/repo`
 - Baseline: `feat/controller-p2p-observe-t449` (`ebfb6f22cef5509fce923e77c5494a44a5d7d9f4`)
 - Live remote `main` re-verified 2026-11-13 13:54 CST (Asia/Shanghai) via
   `gh api repos/zltl/agentlink/git/ref/heads/main`:
@@ -21,7 +21,7 @@ is not a full security or platform sign-off.
   the live value. Earlier sealed `60288728` remains an ancestor.
 - Repo visibility re-verified the same minute: **private**. `pushed_at`
   was still `2026-11-12T16:38:15Z` (2026-11-13 00:38:15 Asia/Shanghai).
-- Frozen t452 controller bin left in place under `/workspace/agentlink-t427-recovery/20261112-1341-t452-controller-p2p/`
+- Frozen t452 controller bin left in place under `<workspace>/repo`
 - UI source repo and the 7142 Linux GUI freeze were not modified in this
   docs step; no new GUI binary was built.
 - No production machine was upgraded. No GitHub Actions. Not public. No
@@ -49,12 +49,12 @@ order was not walked; different DPI and real (non-preview) sessions
 were not tested. This is not a full GUI acceptance. Screenshots already
 went to the user. Local evidence only (not an external URL):
 
-- `/workspace/agentlink-recovery-20261112/backups/gui-7142-computeruse/files/`
+- `<workspace>/repo`
   (durable copy of 352 webp captures, 2026-11-12 22:27–23:42 Asia/Shanghai)
 - `/tmp/computer-use/` (original ephemeral path)
 - Linux freeze used for that run:
-  `/workspace/agentlink-recovery-20261112/ui-156f49ba-backup/freeze/7142d93687-linux-gui/`
-  (also under `/workspace/agentlink-recovery-20261112/t460-ui-artifacts/freeze/7142d93687-linux-gui/`)
+  `<workspace>/repo`
+  (also under `<workspace>/repo`)
 
 `/tmp/t460-ui-inspect/user-controller-screenshot.png` is an earlier
 `abf86f1` product shot, not the 7142 acceptance set.
@@ -74,7 +74,7 @@ The same command on an independent target: **1548 passed, 0 failed, 2 pre-existi
 The default rustc test-thread stack (~2 MiB) still overflows in
 `cp_progress_tests::cp_help_documents_progress` (`Cli::command` /
 long help). The 7142 product binary
-`/workspace/agentlink-recovery-20261112/ui-rebuild-target/debug/agentlink`,
+`<workspace>/repo`,
 `ulimit -s=8192` (8 MiB OS main stack), `RUST_MIN_STACK` unset:
 `agentlink --help`, `cp --help`, `help cp`, `exec --help`, and `-h`
 all exited 0 with empty stderr. Product thread stacks were not raised
@@ -213,7 +213,7 @@ Not claimed as Windows or macOS real-device verification. Android unit/source ch
 
 `cargo test -p agentlink-cli --tests` as a single process aborted in `cp_progress_tests::cp_help_documents_progress` with a stack overflow (unrelated to these security changes). The targeted suites above still passed.
 
-**Android:** JDK 17 (`/home/box/jdk/jdk-17.0.20.1+1`) and the SDK tree exist. `./gradlew testDebugUnitTest --offline` downloaded Gradle 8.11.1 but failed because Android Gradle Plugin 8.7.3 was not in the offline plugin cache. No phone or emulator was used. The Kotlin owner test is `android/app/src/test/java/app/agentlink/node/ShellSessionsOwnerTest.kt`.
+**Android:** JDK 17 (`<sdk-home>`) and the SDK tree exist. `./gradlew testDebugUnitTest --offline` downloaded Gradle 8.11.1 but failed because Android Gradle Plugin 8.7.3 was not in the offline plugin cache. No phone or emulator was used. The Kotlin owner test is `android/app/src/test/java/app/agentlink/node/ShellSessionsOwnerTest.kt`.
 
 ## Untested / honest bounds
 
@@ -241,7 +241,7 @@ Incremental work on `integrate/security-main-t456` after the second review confi
 
 ### Residual tests on this box (rustc 1.99.1, Asia/Shanghai, 2026-11-12)
 
-`CARGO_TARGET_DIR=/workspace/agentlink-integrate-t456/target`, `CARGO_INCREMENTAL=0`, `--offline`. Not a full workspace rebuild. Not a Windows or Android run of this tree.
+`CARGO_TARGET_DIR=<workspace>/repo`, `CARGO_INCREMENTAL=0`, `--offline`. Not a full workspace rebuild. Not a Windows or Android run of this tree.
 
 | Command | Result |
 | --- | --- |
@@ -265,7 +265,7 @@ Do not push `main` from this executor step. The parent will do a read-only delta
 
 Official path from `android/build-native.sh` lines 21–26, **without** the NDK `cargo ndk` half (lines 28–34). Kotlin generation does not need a phone or NDK: it is `uniffi-bindgen generate --library <host debug libagentlink_ffi.so> --language kotlin --no-format --out-dir android/app/src/main/java`. The previous bindgen attempt stopped because `cargo run -p agentlink-ffi --features cli --bin uniffi-bindgen` was interrupted after ~14s while still compiling `uniffi_bindgen` / clap; no `uniffi-bindgen` binary had been produced yet.
 
-The existing `/workspace/agentlink-integrate-t456/target/debug/libagentlink_ffi.so` (mtime 2026-11-12 21:17:03 CST, Asia/Shanghai, 273 MiB) was verified against 8143 before generate: it is linked from `/workspace/agentlink-integrate-t456-cont`, newer than all `crates/agentlink-ffi/src/*.rs` on that tree, exports `release_session`, and its UniFFI checksums were read from the `.so` (`poll_session` 44778, `close_session` 24950, `session_input` 4154, `release_session` 47851, `open_session` 63923). Those differ from the stale generated file (`poll_session` 29093, no `releaseSession`). After building only the missing `uniffi-bindgen` binary (`cargo build -p agentlink-ffi --offline --features cli --bin uniffi-bindgen`, 26s, reused `CARGO_TARGET_DIR`, no ffi lib rebuild — `.so` mtime unchanged), official generate wrote `agentlink_ffi.kt`. All 57 generated checksum comparisons match the same `.so`. The generated file was not hand-edited.
+The existing `<workspace>/repo` (mtime 2026-11-12 21:17:03 CST, Asia/Shanghai, 273 MiB) was verified against 8143 before generate: it is linked from `<workspace>/repo`, newer than all `crates/agentlink-ffi/src/*.rs` on that tree, exports `release_session`, and its UniFFI checksums were read from the `.so` (`poll_session` 44778, `close_session` 24950, `session_input` 4154, `release_session` 47851, `open_session` 63923). Those differ from the stale generated file (`poll_session` 29093, no `releaseSession`). After building only the missing `uniffi-bindgen` binary (`cargo build -p agentlink-ffi --offline --features cli --bin uniffi-bindgen`, 26s, reused `CARGO_TARGET_DIR`, no ffi lib rebuild — `.so` mtime unchanged), official generate wrote `agentlink_ffi.kt`. All 57 generated checksum comparisons match the same `.so`. The generated file was not hand-edited.
 
 Hand-written call sites already matched the new trait; no Kotlin/Rust call-site edits in this commit:
 
@@ -277,14 +277,14 @@ Hand-written call sites already matched the new trait; no Kotlin/Rust call-site 
 Typecheck / unit status (Asia/Shanghai, 2026-11-12):
 
 - Standalone `kotlinc` (Gradle 8.11.1 already-cached `kotlin-compiler-embeddable` 2.0.20 + stdlib, JDK 17) compiled an extracted `NodeHost` interface plus `AndroidHost` override stubs: exit 0. This checks signature sync only, not the full generated JNA file or Android SDK types.
-- AGP 8.7.3 and `org.jetbrains.kotlin.android` 2.0.21 are **not** in `/home/box/.gradle/caches`. `./gradlew` test/compile would need a large plugin + AndroidX/Robolectric download; that was not started (disk ~15G free). Robolectric `ShellSessionsOwnerTest` was not executed here. Android compile of the full app is therefore **untested** on this box.
+- AGP 8.7.3 and `org.jetbrains.kotlin.android` 2.0.21 are **not** in `<sdk-home>`. `./gradlew` test/compile would need a large plugin + AndroidX/Robolectric download; that was not started (disk ~15G free). Robolectric `ShellSessionsOwnerTest` was not executed here. Android compile of the full app is therefore **untested** on this box.
 - No known inevitable Kotlin compile error remains between the generated trait and hand-written implementors/tests.
 
 No Windows sources changed; the 8143 Windows retest does not need a full re-run for this commit. Controller/UI was not touched. SQLite `RUSTSEC-2026-0459` remains accurately documented; cargo-audit is still expected exit 1 (bundled `libsqlite3-sys`, lockfile `rsa`, 12 unmaintained warnings). This executor does not push `main`.
 
 ## Post-8df ConPTY resize test (this commit, not a rewrite of `8df767a` or `8143d2ee`)
 
-Windows verification of `8143d2ee` (logs at `C:\Users\liaot\src\agentlink-8143d2e-verify-logs\verify.log`) went green on the four earlier lib failures, Unicode ConPTY, exit code 9, desktop 76, ffi 26, node 89/1 fail, security 1, functional 5 (1 skip true-desktop), controller 75, and nodecfg 4. The remaining main-gate failure is `real_pty_resize_changes_child_winsize` (not skipped).
+Windows verification of `8143d2ee` (logs at `<win-workspace>\verify.log`) went green on the four earlier lib failures, Unicode ConPTY, exit code 9, desktop 76, ffi 26, node 89/1 fail, security 1, functional 5 (1 skip true-desktop), controller 75, and nodecfg 4. The remaining main-gate failure is `real_pty_resize_changes_child_winsize` (not skipped).
 
 Source diagnosis from the reported transcript, before any production change: after `READY`, the host transcript contained `ESC[8;30;100t` (ConPTY/xterm window-resize advertisement on the **host** pipe). `wait_transcript_contains(..., "30")` can return on that CSI alone. `mode con` on Chinese Windows does not print English `Lines`/`Columns`, and cmd prompt redraws (script path, a second `READY`, many `ESC[K`) are not a child size reading. Production `PtyManager::resize` already calls `portable-pty` `MasterPty::resize` → `ResizePseudoConsole` (`portable-pty` 0.8.1). This commit does **not** change that production path; Linux passing is not Windows evidence that the child window actually changed.
 

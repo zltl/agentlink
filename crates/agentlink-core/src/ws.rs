@@ -168,7 +168,10 @@ pub enum Incoming {
     Env(Envelope),
     Binary(Vec<u8>),
     Ping(Vec<u8>),
-    Closed,
+    /// Peer Close frame. `code` is the WebSocket close code when present.
+    Closed {
+        code: Option<u16>,
+    },
     Ignore,
 }
 
@@ -180,7 +183,9 @@ pub fn parse_incoming(msg: Message) -> Result<Incoming> {
             Ok(Incoming::Env(env))
         }
         Message::Ping(p) => Ok(Incoming::Ping(p.to_vec())),
-        Message::Close(_) => Ok(Incoming::Closed),
+        Message::Close(frame) => Ok(Incoming::Closed {
+            code: frame.as_ref().map(|close| u16::from(close.code)),
+        }),
         Message::Binary(bytes) => Ok(Incoming::Binary(bytes.to_vec())),
         Message::Pong(_) | Message::Frame(_) => Ok(Incoming::Ignore),
     }
@@ -364,5 +369,25 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(got, FrameWait::Shutdown));
+    }
+
+    #[test]
+    fn close_frame_preserves_whitelist_close_code() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        let msg = Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        }));
+        match parse_incoming(msg).expect("parse") {
+            Incoming::Closed { code: Some(1000) } => {}
+            Incoming::Closed { code } => panic!("expected ws close 1000, got {code:?}"),
+            _ => panic!("expected Closed"),
+        }
+        match parse_incoming(Message::Close(None)).expect("parse empty") {
+            Incoming::Closed { code: None } => {}
+            Incoming::Closed { code } => panic!("expected empty close, got {code:?}"),
+            _ => panic!("expected Closed"),
+        }
     }
 }

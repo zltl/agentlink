@@ -265,10 +265,14 @@ pub struct Overrides {
     pub node: BTreeMap<String, PolicyPatch>,
 }
 
+fn default_lock_local() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditPolicy {
     pub preset: String,
-    #[serde(default)]
+    #[serde(default = "default_lock_local")]
     pub lock_local: bool,
     pub categories: BTreeMap<String, CategoryPolicy>,
     pub capture: CapturePolicy,
@@ -469,7 +473,7 @@ impl AuditPolicy {
         patterns.extend(redact_extra);
         let mut policy = Self {
             preset: name,
-            lock_local: false,
+            lock_local: true,
             categories,
             capture,
             redact: RedactPolicy {
@@ -784,14 +788,7 @@ impl AuditPolicy {
             regex::Regex::new(pattern).map_err(|e| Error::Message(format!("redact regex: {e}")))?;
         }
         for rule in &self.alerts {
-            if rule.webhook.is_empty()
-                || !(rule.webhook.starts_with("https://") || rule.webhook.starts_with("http://"))
-            {
-                return Err(Error::Message(format!(
-                    "alert '{}' needs an http(s) webhook",
-                    rule.name
-                )));
-            }
+            validate_webhook_url(&rule.name, &rule.webhook)?;
         }
         let mut names = BTreeSet::new();
         for sink in &self.sinks {
@@ -830,6 +827,333 @@ impl AuditPolicy {
             Some(cat) if cat.enabled => cat.detail,
             _ => Detail::Off,
         }
+    }
+
+    /// Validate and apply an unauthenticated `AuditPolicyPush` received over the
+    /// relay control socket.
+    ///
+    /// Returns `Ok(None)` when `lock_local` is set. Even when an upgraded or
+    /// opted-in node explicitly sets `lock_local = false`, an unsealed relay
+    /// push is never permitted to:
+    /// - inject or modify `alerts` webhooks or `s3` sinks (outbound egress / credential read),
+    /// - remove or narrow the `local` audit sink,
+    /// - disable the hash chain or downgrade/disable locally enabled categories,
+    /// - strip baseline secret redaction or sensitive path exclusions, or narrow `paths.include`.
+    pub fn apply_untrusted_relay_push(&self, pushed_toml: &str) -> Result<Option<Self>> {
+        if self.lock_local {
+            return Ok(None);
+        }
+        let mut next = Self::parse(pushed_toml)?;
+        if next.alerts != self.alerts {
+            return Err(Error::Message(
+                "untrusted relay audit push cannot add or modify alert webhooks".into(),
+            ));
+        }
+        let self_s3: Vec<&SinkSpec> = self
+            .sinks
+            .iter()
+            .filter(|sink| sink.kind == "s3" || sink.s3.is_some())
+            .collect();
+        let next_s3: Vec<&SinkSpec> = next
+            .sinks
+            .iter()
+            .filter(|sink| sink.kind == "s3" || sink.s3.is_some())
+            .collect();
+        if next_s3 != self_s3 {
+            return Err(Error::Message(
+                "untrusted relay audit push cannot add or modify s3 sinks".into(),
+            ));
+        }
+        for cur_local in self.sinks.iter().filter(|sink| sink.kind == "local") {
+            let Some(next_local) = next
+                .sinks
+                .iter()
+                .find(|sink| sink.kind == "local" && sink.name == cur_local.name)
+            else {
+                return Err(Error::Message(
+                    "untrusted relay audit push cannot remove local audit sink".into(),
+                ));
+            };
+            for kind in ["logs", "diffs", "recordings"] {
+                if cur_local.accepts(kind) && !next_local.accepts(kind) {
+                    return Err(Error::Message(format!(
+                        "untrusted relay audit push cannot drop '{kind}' from local sink"
+                    )));
+                }
+            }
+            if let Some(cur_days) = cur_local.retention_days {
+                if next_local.retention_days.is_some_and(|d| d < cur_days) {
+                    return Err(Error::Message(
+                        "untrusted relay audit push cannot lower local sink retention".into(),
+                    ));
+                }
+            }
+            if let Some(cur_bytes) = cur_local.max_bytes {
+                if next_local.max_bytes.is_some_and(|b| b < cur_bytes) {
+                    return Err(Error::Message(
+                        "untrusted relay audit push cannot lower local sink byte cap".into(),
+                    ));
+                }
+            }
+        }
+        if self.forward.chain && !next.forward.chain {
+            return Err(Error::Message(
+                "untrusted relay audit push cannot disable hash chain".into(),
+            ));
+        }
+        if (self.retention.log_days > 0 && next.retention.log_days == 0)
+            || (self.retention.diff_days > 0 && next.retention.diff_days == 0)
+            || (self.retention.recording_days > 0 && next.retention.recording_days == 0)
+            || (self.retention.max_log_bytes > 0 && next.retention.max_log_bytes == 0)
+        {
+            return Err(Error::Message(
+                "untrusted relay audit push cannot zero local retention".into(),
+            ));
+        }
+        for (cat_name, cur_cat) in &self.categories {
+            if cur_cat.enabled {
+                let Some(next_cat) = next.categories.get(cat_name) else {
+                    return Err(Error::Message(format!(
+                        "untrusted relay audit push cannot remove category '{cat_name}'"
+                    )));
+                };
+                if !next_cat.enabled || next_cat.detail.rank() < cur_cat.detail.rank() {
+                    return Err(Error::Message(format!(
+                        "untrusted relay audit push cannot disable or downgrade category '{cat_name}'"
+                    )));
+                }
+            }
+        }
+        for pattern in &self.redact.patterns {
+            if !next.redact.patterns.contains(pattern) {
+                return Err(Error::Message(
+                    "untrusted relay audit push cannot remove redact patterns".into(),
+                ));
+            }
+        }
+        for env_key in &self.redact.env_keys {
+            if !next.redact.env_keys.contains(env_key) {
+                return Err(Error::Message(
+                    "untrusted relay audit push cannot remove redact env_keys".into(),
+                ));
+            }
+        }
+        for excluded in &self.paths.exclude {
+            if !next.paths.exclude.contains(excluded) {
+                return Err(Error::Message(
+                    "untrusted relay audit push cannot remove path exclusions".into(),
+                ));
+            }
+        }
+        if self.paths.include != next.paths.include && !next.paths.include.is_empty() {
+            return Err(Error::Message(
+                "untrusted relay audit push cannot narrow paths.include".into(),
+            ));
+        }
+        if next.overrides != self.overrides {
+            for patch in next
+                .overrides
+                .agent
+                .values()
+                .chain(next.overrides.node.values())
+            {
+                validate_untrusted_override_patch(self, patch)?;
+            }
+        }
+        next.lock_local = self.lock_local;
+        Ok(Some(next))
+    }
+}
+
+fn validate_untrusted_override_patch(base: &AuditPolicy, patch: &PolicyPatch) -> Result<()> {
+    if patch
+        .forward
+        .as_ref()
+        .is_some_and(|fwd| base.forward.chain && fwd.chain == Some(false))
+    {
+        return Err(Error::Message(
+            "untrusted relay audit override cannot disable hash chain".into(),
+        ));
+    }
+    if let Some(patterns) = &patch.redact_patterns {
+        for required in &base.redact.patterns {
+            if !patterns.contains(required) {
+                return Err(Error::Message(
+                    "untrusted relay audit override cannot remove redact patterns".into(),
+                ));
+            }
+        }
+    }
+    if let Some(excluded) = &patch.path_exclude {
+        for required in &base.paths.exclude {
+            if !excluded.contains(required) {
+                return Err(Error::Message(
+                    "untrusted relay audit override cannot remove path exclusions".into(),
+                ));
+            }
+        }
+    }
+    if patch
+        .path_include
+        .as_ref()
+        .is_some_and(|inc| !inc.is_empty() && *inc != base.paths.include)
+    {
+        return Err(Error::Message(
+            "untrusted relay audit override cannot narrow path_include".into(),
+        ));
+    }
+    for (cat_name, cat) in &patch.categories {
+        if let Some(cur) = base.categories.get(cat_name) {
+            if cur.enabled && (!cat.enabled || cat.detail.rank() < cur.detail.rank()) {
+                return Err(Error::Message(format!(
+                    "untrusted relay audit override cannot downgrade category '{cat_name}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn is_public_webhook_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_public_webhook_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            if let Some(mapped) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                return is_public_webhook_ipv4(mapped);
+            }
+            let seg0 = v6.segments()[0];
+            let seg1 = v6.segments()[1];
+            let is_unique_local = (seg0 & 0xfe00) == 0xfc00;
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+            let is_doc = seg0 == 0x2001 && seg1 == 0x0db8;
+            !(is_unique_local || is_link_local || is_doc)
+        }
+    }
+}
+
+fn is_public_webhook_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    let is_this_net = oct[0] == 0;
+    let is_cgnat = oct[0] == 100 && (64..=127).contains(&oct[1]);
+    let is_benchmark = oct[0] == 198 && (oct[1] == 18 || oct[1] == 19);
+    let is_ietf_special = oct[0] == 192 && oct[1] == 0 && oct[2] == 0;
+    let is_reserved = oct[0] >= 240;
+    !(is_this_net
+        || v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_multicast()
+        || is_cgnat
+        || is_benchmark
+        || is_ietf_special
+        || is_reserved)
+}
+
+fn is_blocked_webhook_domain(domain: &str) -> bool {
+    let host = domain.trim_end_matches('.').to_ascii_lowercase();
+    host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host == "metadata"
+        || host == "instance-data"
+}
+
+pub fn validate_webhook_url(rule_name: &str, raw_url: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(raw_url).map_err(|_| {
+        Error::Message(format!(
+            "alert '{rule_name}' needs a valid http(s) webhook URL"
+        ))
+    })?;
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err(Error::Message(format!(
+            "alert '{rule_name}' needs an http(s) webhook"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::Message(format!(
+            "alert '{rule_name}' webhook must not embed credentials"
+        )));
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if !is_public_webhook_ip(std::net::IpAddr::V4(v4)) {
+                return Err(Error::Message(format!(
+                    "alert '{rule_name}' webhook IP {v4} is not a public routable address"
+                )));
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if !is_public_webhook_ip(std::net::IpAddr::V6(v6)) {
+                return Err(Error::Message(format!(
+                    "alert '{rule_name}' webhook IP {v6} is not a public routable address"
+                )));
+            }
+        }
+        Some(url::Host::Domain(domain)) => {
+            if is_blocked_webhook_domain(domain) {
+                return Err(Error::Message(format!(
+                    "alert '{rule_name}' webhook host '{domain}' is not allowed"
+                )));
+            }
+            if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
+                if !is_public_webhook_ip(ip) {
+                    return Err(Error::Message(format!(
+                        "alert '{rule_name}' webhook IP {ip} is not a public routable address"
+                    )));
+                }
+            }
+        }
+        None => {
+            return Err(Error::Message(format!(
+                "alert '{rule_name}' webhook is missing a host"
+            )));
+        }
+    }
+    Ok(parsed)
+}
+
+fn resolve_vetted_webhook_addrs(
+    parsed: &url::Url,
+) -> Result<Option<(String, Vec<std::net::SocketAddr>)>> {
+    use std::net::ToSocketAddrs;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if !is_public_webhook_ip(std::net::IpAddr::V4(v4)) {
+                return Err(Error::Message("non-public webhook IPv4".into()));
+            }
+            Ok(None)
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if !is_public_webhook_ip(std::net::IpAddr::V6(v6)) {
+                return Err(Error::Message("non-public webhook IPv6".into()));
+            }
+            Ok(None)
+        }
+        Some(url::Host::Domain(domain)) => {
+            let resolved: Vec<std::net::SocketAddr> = (domain, port)
+                .to_socket_addrs()
+                .map_err(|e| Error::Message(format!("webhook dns resolve: {e}")))?
+                .collect();
+            if resolved.is_empty() {
+                return Err(Error::Message("webhook dns returned no addresses".into()));
+            }
+            if resolved.iter().any(|addr| !is_public_webhook_ip(addr.ip())) {
+                return Err(Error::Message(
+                    "webhook dns resolved to a non-public address".into(),
+                ));
+            }
+            Ok(Some((domain.to_string(), resolved)))
+        }
+        None => Err(Error::Message("webhook missing host".into())),
     }
 }
 
@@ -1141,14 +1465,23 @@ pub fn fire_webhook(url: &str, payload: &Value) {
     let url = url.to_string();
     let body = payload.to_string();
     std::thread::spawn(move || {
-        let Ok(client) = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        else {
+        let Ok(parsed) = validate_webhook_url("alert", &url) else {
+            return;
+        };
+        let Ok(pinned) = resolve_vetted_webhook_addrs(&parsed) else {
+            return;
+        };
+        let mut builder = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5));
+        if let Some((domain, addrs)) = pinned {
+            builder = builder.resolve_to_addrs(&domain, &addrs);
+        }
+        let Ok(client) = builder.build() else {
             return;
         };
         let _ = client
-            .post(url)
+            .post(parsed)
             .header("content-type", "application/json")
             .body(body)
             .send();
@@ -1759,12 +2092,65 @@ mod tests {
     #[test]
     fn parse_roundtrip_keeps_a_toggle() {
         let mut policy = AuditPolicy::preset("full").unwrap();
+        assert!(policy.lock_local, "presets default to lock_local = true");
         policy.set_key("forward.central", "false").unwrap();
         policy.set_key("recording.mode", "always").unwrap();
         let text = policy.to_toml().unwrap();
         let back = AuditPolicy::parse(&text).unwrap();
+        assert!(back.lock_local);
         assert!(!back.forward.central);
         assert_eq!(back.recording.mode, "always");
         assert_eq!(back.detail_for("pty"), Detail::Output);
+    }
+
+    #[test]
+    fn webhook_ssrf_and_untrusted_relay_push_guards() {
+        for blocked in [
+            "http://127.0.0.1:8080/hook",
+            "http://localhost:8080/hook",
+            "http://sub.localhost/hook",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/hook",
+            "http://[::ffff:169.254.169.254]/hook",
+            "http://[::ffff:127.0.0.1]/hook",
+            "http://10.0.0.5/hook",
+            "http://172.16.0.1/hook",
+            "http://192.168.1.1/hook",
+            "http://100.64.0.1/hook",
+            "http://0.0.0.0/hook",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "https://user:pass@93.184.216.34/hook",
+        ] {
+            assert!(
+                validate_webhook_url("r", blocked).is_err(),
+                "expected SSRF webhook rejection for {blocked}"
+            );
+        }
+        assert!(validate_webhook_url("r", "https://93.184.216.34/hook").is_ok());
+
+        // DNS loopback resolution must fail closed even if URL parser saw a hostname.
+        let localhost_url = url::Url::parse("http://localhost:80/hook").unwrap();
+        assert!(resolve_vetted_webhook_addrs(&localhost_url).is_err());
+
+        // Locked policy ignores untrusted push.
+        let locked = AuditPolicy::preset("standard").unwrap();
+        assert!(locked
+            .apply_untrusted_relay_push("preset = \"full\"\n")
+            .unwrap()
+            .is_none());
+
+        // Legacy unlocked policy blocks S3, webhook, redaction removal, path narrowing, and chain off.
+        let mut unlocked = AuditPolicy::preset("standard").unwrap();
+        unlocked.lock_local = false;
+        assert!(unlocked
+            .apply_untrusted_relay_push(
+                "preset = \"standard\"\nlock_local = false\n[paths]\ninclude = [\"/never/**\"]\n"
+            )
+            .is_err());
+        assert!(unlocked
+            .apply_untrusted_relay_push(
+                "preset = \"standard\"\nlock_local = false\n[forward]\nchain = false\n"
+            )
+            .is_err());
     }
 }

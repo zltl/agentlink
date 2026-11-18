@@ -1050,6 +1050,7 @@ async fn ensure_client(state: &mut Mcp) -> std::result::Result<&Client, String> 
         if let Some(dir) = state.identity_path.parent() {
             client.remember_node_pins(dir);
             client.remember_grants(dir);
+            client.remember_session(dir);
         }
         if let Some(warning) = agentlink_core::config::ca_only_warning(
             &state.settings.fingerprint,
@@ -1910,13 +1911,32 @@ fn obj_schema(props: &[(&str, &str)], required: &[&str]) -> Value {
     json!({"type": "object", "properties": properties, "required": required})
 }
 
+pub const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MCP_HEADER_LINES: usize = 64;
+const MAX_MCP_HEADER_LINE_BYTES: usize = 8 * 1024;
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
+    let mut raw = Vec::new();
+    let mut limited = reader.take((cap + 1) as u64);
+    let n = limited.read_until(b'\n', &mut raw).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if raw.len() > cap && !raw.ends_with(b"\n") {
+        anyhow::bail!("MCP line exceeds {cap} byte limit");
+    }
+    Ok(Some(String::from_utf8(raw).map_err(|e| anyhow::anyhow!(e))?))
+}
+
 pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Value>> {
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
+        let Some(line) = read_bounded_line(reader, MAX_MCP_MESSAGE_BYTES).await? else {
             return Ok(None);
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -1929,13 +1949,23 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Opt
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid Content-Length"))?;
+            if len > MAX_MCP_MESSAGE_BYTES {
+                anyhow::bail!(
+                    "MCP Content-Length {len} exceeds {MAX_MCP_MESSAGE_BYTES} byte limit"
+                );
+            }
+            let mut header_count = 0usize;
             loop {
-                let mut header = String::new();
-                if reader.read_line(&mut header).await? == 0 {
+                let Some(header) = read_bounded_line(reader, MAX_MCP_HEADER_LINE_BYTES).await?
+                else {
                     return Ok(None);
-                }
+                };
                 if header.trim().is_empty() {
                     break;
+                }
+                header_count += 1;
+                if header_count > MAX_MCP_HEADER_LINES {
+                    anyhow::bail!("too many MCP header lines");
                 }
             }
             let mut buf = vec![0u8; len];
@@ -7130,5 +7160,16 @@ mod tests {
         )
         .await;
         assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_message_rejects_oversized_content_length_before_allocating() {
+        let oversized = b"Content-Length: 67108864\r\n\r\n{}";
+        let mut reader = BufReader::new(&oversized[..]);
+        let err = read_message(&mut reader).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected Content-Length cap rejection, got: {err}"
+        );
     }
 }

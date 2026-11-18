@@ -403,9 +403,12 @@ pub struct AccessUnit {
     pub keyframe: bool,
 }
 
+pub const MAX_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct H264Depacketizer {
     nals: Vec<Vec<u8>>,
+    nals_bytes: usize,
     fu: Vec<u8>,
     fu_open: bool,
 }
@@ -413,6 +416,25 @@ pub struct H264Depacketizer {
 impl H264Depacketizer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn reset_corrupt(&mut self) {
+        self.nals.clear();
+        self.nals_bytes = 0;
+        self.fu.clear();
+        self.fu_open = false;
+    }
+
+    fn push_nal(&mut self, nal: Vec<u8>) {
+        let added = nal.len().saturating_add(4);
+        if self.nals_bytes.saturating_add(self.fu.len()).saturating_add(added)
+            > MAX_ACCESS_UNIT_BYTES
+        {
+            self.reset_corrupt();
+            return;
+        }
+        self.nals_bytes += added;
+        self.nals.push(nal);
     }
 
     /// Push one RTP payload. `marker` ends the access unit.
@@ -424,7 +446,7 @@ impl H264Depacketizer {
             } else if kind == 28 {
                 self.fu_a(payload);
             } else if (1..24).contains(&kind) {
-                self.nals.push(payload.to_vec());
+                self.push_nal(payload.to_vec());
             }
         }
         if marker {
@@ -442,13 +464,14 @@ impl H264Depacketizer {
             if len == 0 || offset + len > payload.len() {
                 break;
             }
-            self.nals.push(payload[offset..offset + len].to_vec());
+            self.push_nal(payload[offset..offset + len].to_vec());
             offset += len;
         }
     }
 
     fn fu_a(&mut self, payload: &[u8]) {
         if payload.len() < 2 {
+            self.reset_corrupt();
             return;
         }
         let indicator = payload[0];
@@ -463,16 +486,29 @@ impl H264Depacketizer {
         if !self.fu_open {
             return;
         }
-        self.fu.extend_from_slice(&payload[2..]);
+        let frag = &payload[2..];
+        if self
+            .nals_bytes
+            .saturating_add(self.fu.len())
+            .saturating_add(frag.len())
+            .saturating_add(4)
+            > MAX_ACCESS_UNIT_BYTES
+        {
+            self.reset_corrupt();
+            return;
+        }
+        self.fu.extend_from_slice(frag);
         if end {
             self.fu_open = false;
-            self.nals.push(std::mem::take(&mut self.fu));
+            let nal = std::mem::take(&mut self.fu);
+            self.push_nal(nal);
         }
     }
 
     fn finish(&mut self) -> Option<AccessUnit> {
         self.fu_open = false;
         self.fu.clear();
+        self.nals_bytes = 0;
         if self.nals.is_empty() {
             return None;
         }
@@ -772,5 +808,37 @@ mod tests {
         assert!(!is_screenshot_fallback(
             &serde_json::json!({"status": "ok"})
         ));
+    }
+
+    #[test]
+    fn depacketizer_caps_unbounded_fua_without_marker_and_resets_on_short_fua() {
+        let mut dep = H264Depacketizer::new();
+        // Start an IDR FU-A fragment (indicator=28 | 0x60 = 0x7c, header=0x80 | 5 = 0x85)
+        let mut first = vec![0x7c, 0x85];
+        first.extend_from_slice(&vec![0x11; 64 * 1024]);
+        assert!(dep.push(&first, false).is_none());
+
+        // Malformed 1-byte FU-A packet must abort the open fragment rather than splicing later bytes.
+        assert!(dep.push(&[0x7c], false).is_none());
+        let end_orphan = [0x7c, 0x45, 0x22, 0x33];
+        assert!(
+            dep.push(&end_orphan, true).is_none(),
+            "short malformed FU-A must discard open fragment instead of splicing"
+        );
+
+        // Unbounded FU-A continuation stream (>12 MiB without RTP marker) must cap & reset.
+        assert!(dep.push(&first, false).is_none());
+        let mut cont = vec![0x7c, 0x05];
+        cont.extend_from_slice(&vec![0xaa; 128 * 1024]);
+        for _ in 0..100 {
+            assert!(dep.push(&cont, false).is_none());
+        }
+        assert!(
+            dep.fu.len() <= 8 * 1024 * 1024,
+            "H264Depacketizer fu buffer grew unbounded to {} bytes",
+            dep.fu.len()
+        );
+        // After cap reset, ending without a fresh start yields None cleanly.
+        assert!(dep.push(&end_orphan, true).is_none());
     }
 }

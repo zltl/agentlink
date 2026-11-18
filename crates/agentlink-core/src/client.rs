@@ -84,8 +84,16 @@ pub(crate) struct ClientInner {
     pub(crate) transfers: Arc<Mutex<HashSet<String>>>,
     /// Config directory holding `grants/<node_id>.json`.
     pub(crate) grant_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// Config directory holding `config.json` (`refresh_token` / `access_expires_unix`)
+    /// so long-lived clients can rotate expiring access tokens under `lock_session`.
+    pub(crate) session_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
     resend: Notify,
     fast: AtomicBool,
+    /// Sticky first transport end cause (sanitized categories only).
+    pub(crate) transport: crate::transport_status::TransportObserver,
+    /// First-seen timestamp for transient `"node offline"` replies per request
+    /// so `take_ready` stops swallowing offline replies after `OFFLINE_GRACE`.
+    offline_since: Mutex<HashMap<String, Instant>>,
     /// Test hook: PTY writes skip E2E and land here. Production stays None.
     write_hook: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
@@ -481,8 +489,11 @@ impl PtySession {
             cursors: Mutex::new(crate::resume::Cursors::default()),
             transfers: std::sync::Arc::new(Mutex::new(HashSet::new())),
             grant_dir: std::sync::Arc::new(Mutex::new(None)),
+            session_dir: std::sync::Arc::new(Mutex::new(None)),
             resend: Notify::new(),
             fast: AtomicBool::new(false),
+            transport: crate::transport_status::TransportObserver::new(),
+            offline_since: Mutex::new(HashMap::new()),
             write_hook: Mutex::new(Some(hook_tx)),
         });
         let session_id = "pty-test".to_string();
@@ -611,8 +622,26 @@ impl Client {
         identity: crate::identity::Identity,
         use_token: bool,
     ) -> Result<Self> {
+        Self::connect_identity_observed(settings, identity, use_token)
+            .await
+            .map_err(|err| err.error)
+    }
+
+    /// Like [`Self::connect_identity`], but preserves the sticky typed transport
+    /// status when the first dial / Hello fails before a usable `Client` handle
+    /// would otherwise be returned (observer would be dropped with the inner).
+    pub async fn connect_identity_observed(
+        settings: &ClientSettings,
+        identity: crate::identity::Identity,
+        use_token: bool,
+    ) -> std::result::Result<Self, ObservedConnectError> {
         let client_id = identity.public_hex().to_string();
-        let relay = crate::relay_url::parse_relay_url(&settings.relay)?;
+        let relay = crate::relay_url::parse_relay_url(&settings.relay).map_err(|error| {
+            ObservedConnectError {
+                error,
+                status: crate::transport_status::TransportStatus::default(),
+            }
+        })?;
         let relay_addr = (relay.host.as_str(), relay.port)
             .to_socket_addrs()
             .ok()
@@ -642,8 +671,11 @@ impl Client {
             cursors: Mutex::new(crate::resume::Cursors::default()),
             transfers: Arc::new(Mutex::new(HashSet::new())),
             grant_dir: Arc::new(Mutex::new(None)),
+            session_dir: Arc::new(Mutex::new(None)),
             resend: Notify::new(),
             fast: AtomicBool::new(false),
+            transport: crate::transport_status::TransportObserver::new(),
+            offline_since: Mutex::new(HashMap::new()),
             write_hook: Mutex::new(None),
         });
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -667,8 +699,22 @@ impl Client {
                 pin_dir: Mutex::new(None),
                 pin_warnings: Mutex::new(Vec::new()),
             }),
-            Ok(Err(err)) => Err(err),
-            Err(_) => Err(Error::Message("connection closed".into())),
+            Ok(Err(error)) => {
+                let status = inner.transport.snapshot();
+                Err(ObservedConnectError { error, status })
+            }
+            Err(_) => {
+                use crate::transport_status::ClosureCategory;
+                if inner.transport.snapshot().is_empty() {
+                    let _ = inner
+                        .transport
+                        .note_first(ClosureCategory::ReadyDropped, None);
+                }
+                Err(ObservedConnectError {
+                    error: Error::Message("connection closed".into()),
+                    status: inner.transport.snapshot(),
+                })
+            }
         }
     }
 
@@ -678,6 +724,17 @@ impl Client {
 
     pub fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::SeqCst) && !self.inner.shutdown.is_cancelled()
+    }
+
+    /// First recorded transport end cause for this Client (sticky).
+    pub fn transport_status(&self) -> crate::transport_status::TransportStatus {
+        self.inner.transport.snapshot()
+    }
+
+    /// Persist first-closure events as they happen (sink runs outside the
+    /// observer mutex). Replaces any previous sink.
+    pub fn set_transport_sink(&self, sink: Option<crate::transport_status::ClosureSink>) {
+        self.inner.transport.set_sink(sink);
     }
 
     /// Pin node name → ed25519 id under `dir` (usually the config directory).
@@ -711,6 +768,15 @@ impl Client {
     /// Look for grants in `dir/grants/<node_id>.json` (usually the config dir).
     pub fn remember_grants(&self, dir: impl Into<std::path::PathBuf>) {
         if let Ok(mut slot) = self.inner.grant_dir.lock() {
+            *slot = Some(dir.into());
+        }
+    }
+
+    /// Track `dir/config.json` so a long-lived client refreshes an expiring
+    /// device access token in the background and before reconnects without
+    /// losing to concurrent CLI rotations. Revoked sessions still fail closed.
+    pub fn remember_session(&self, dir: impl Into<std::path::PathBuf>) {
+        if let Ok(mut slot) = self.inner.session_dir.lock() {
             *slot = Some(dir.into());
         }
     }
@@ -1324,7 +1390,6 @@ impl Client {
         })
     }
 
-
     /// Server-issued PTY id from the open ack. The client's `request_id` is
     /// only the stream route for later chunks; it is never the session key.
     fn pty_open_session_id(body: Option<&Value>) -> Result<String> {
@@ -1334,9 +1399,8 @@ impl Client {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::Protocol("pty open missing session_id".into()))?;
-        uuid::Uuid::parse_str(id).map_err(|_| {
-            Error::Protocol("pty open session_id is not a uuid".into())
-        })?;
+        uuid::Uuid::parse_str(id)
+            .map_err(|_| Error::Protocol("pty open session_id is not a uuid".into()))?;
         Ok(id.to_string())
     }
 
@@ -1772,7 +1836,14 @@ impl Client {
         if let Some(id) = env.request_id() {
             self.inner.note_route(id, &node_id);
         }
-        crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env)
+        match crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env) {
+            Err(Error::Protocol(msg)) if msg.contains("counter exhausted") => {
+                self.inner.e2e.forget(&node_id);
+                self.ensure_e2e(&node_id).await?;
+                crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env)
+            }
+            other => other,
+        }
     }
 
     pub(crate) async fn ensure_e2e(&self, node_id: &str) -> Result<()> {
@@ -2415,7 +2486,7 @@ mod tests {
             request_id: "dev-1".into(),
             devices: vec![crate::protocol::DeviceInfo {
                 id: "ab".repeat(32),
-                user: "ltl".into(),
+                user: "operator".into(),
                 name: "phone".into(),
                 created_unix: 1,
                 last_seen_unix: 2,
@@ -2563,10 +2634,7 @@ mod tests {
     fn pty_open_uses_the_server_uuid_and_rejects_a_request_id_standin() {
         let server = uuid::Uuid::new_v4().to_string();
         let body = serde_json::json!({"session_id": server, "rows": 24, "cols": 80});
-        assert_eq!(
-            Client::pty_open_session_id(Some(&body)).unwrap(),
-            server
-        );
+        assert_eq!(Client::pty_open_session_id(Some(&body)).unwrap(), server);
         assert!(Client::pty_open_session_id(None).is_err());
         assert!(Client::pty_open_session_id(Some(&serde_json::json!({}))).is_err());
         assert!(Client::pty_open_session_id(Some(&serde_json::json!({"session_id": ""}))).is_err());
@@ -2585,7 +2653,6 @@ mod tests {
         .is_err());
     }
 
-
     #[tokio::test]
     async fn drop_without_close_does_not_panic_inside_the_runtime() {
         let io = PtySession::test_io();
@@ -2593,22 +2660,44 @@ mod tests {
     }
 }
 
-async fn next_env<S>(stream: &mut S) -> Result<Envelope>
+async fn next_env<S>(
+    stream: &mut S,
+    transport: &crate::transport_status::TransportObserver,
+) -> Result<Envelope>
 where
     S: Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
+    use crate::transport_status::ClosureCategory;
     loop {
-        let msg = stream
-            .next()
-            .await
-            .ok_or_else(|| Error::Ws("connection closed during handshake".into()))?
-            .map_err(|e| Error::Ws(e.to_string()))?;
+        let msg = match stream.next().await {
+            None => {
+                let _ = transport.note_first(ClosureCategory::WsStreamEnd, None);
+                return Err(Error::Ws("connection closed during handshake".into()));
+            }
+            Some(Err(_)) => {
+                let _ = transport.note_first(ClosureCategory::WsStreamError, None);
+                return Err(Error::Ws("connection closed during handshake".into()));
+            }
+            Some(Ok(msg)) => msg,
+        };
         match ws::parse_incoming(msg)? {
             Incoming::Env(env) => return Ok(env),
             Incoming::Ping(_) | Incoming::Ignore | Incoming::Binary(_) => continue,
-            Incoming::Closed => return Err(Error::Ws("connection closed during handshake".into())),
+            Incoming::Closed { code } => {
+                let _ = transport.note_first(ClosureCategory::WsClose, code);
+                return Err(Error::Ws("connection closed during handshake".into()));
+            }
         }
     }
+}
+
+/// Connect failure that keeps the sticky typed transport status that lived on
+/// the discarded inner Client (so bootstrap diagnostics can persist categories
+/// without logging raw server strings).
+#[derive(Debug)]
+pub struct ObservedConnectError {
+    pub error: Error,
+    pub status: crate::transport_status::TransportStatus,
 }
 
 type ClientSocket = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -2622,30 +2711,99 @@ enum SocketEnd {
 async fn supervise(
     inner: Arc<ClientInner>,
     mut app_rx: mpsc::Receiver<Outbound>,
-    settings: ClientSettings,
+    mut settings: ClientSettings,
     identity: crate::identity::Identity,
     use_token: bool,
     mut ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
 ) {
+    use crate::transport_status::ClosureCategory;
     let mut backoff = crate::resume::Backoff::new();
     let mut connected_once = false;
     let mut down_since: Option<Instant> = None;
     let mut heartbeat = false;
+    let live_token = Arc::new(Mutex::new(settings.token.clone()));
     loop {
         if inner.shutdown.is_cancelled() {
+            let _ = inner.transport.bump_attempt();
+            inner.transport.note_first(ClosureCategory::Shutdown, None);
             if let Some(tx) = ready.take() {
                 let _ = tx.send(Err(Error::Message("connection closed".into())));
             }
             fail_waiters(&inner);
             break;
         }
-        match dial_client(&settings, &identity, use_token).await {
+        if connected_once && use_token {
+            if let Ok(latest) = live_token.lock() {
+                if !latest.is_empty() {
+                    settings.token = latest.clone();
+                }
+            }
+            let session_dir = inner.session_dir.lock().ok().and_then(|slot| slot.clone());
+            if let Some(dir) = session_dir {
+                if let Ok(Some(fresh)) =
+                    refresh_or_adopt_for_client(&dir, &identity, &settings.token, false).await
+                {
+                    settings.token = fresh.token.clone();
+                    if let Ok(mut slot) = live_token.lock() {
+                        *slot = fresh.token;
+                    }
+                }
+            }
+        }
+        let _ = inner.transport.bump_attempt();
+        let mut dial_res = dial_client(&settings, &identity, use_token, &inner.transport).await;
+        if connected_once
+            && use_token
+            && matches!(
+                &dial_res,
+                Err(Error::Auth(msg)) if msg.contains("session expired or revoked")
+            )
+        {
+            // One-shot refresh if the cached access token expired (e.g. relay
+            // dropped the socket at access_expires + skew, or clock skew hid
+            // local staleness). True revocation rejects refresh_user and falls
+            // straight through to AuthRejected below.
+            let session_dir = inner.session_dir.lock().ok().and_then(|slot| slot.clone());
+            if let Some(dir) = session_dir {
+                match refresh_or_adopt_for_client(&dir, &identity, &settings.token, true).await {
+                    Ok(Some(fresh)) => {
+                        if fresh.token != settings.token && !fresh.token.is_empty() {
+                            settings.token = fresh.token.clone();
+                            if let Ok(mut slot) = live_token.lock() {
+                                *slot = fresh.token;
+                            }
+                            let _ = inner.transport.bump_attempt();
+                            dial_res =
+                                dial_client(&settings, &identity, use_token, &inner.transport)
+                                    .await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(refresh_err) if refresh_err.is_retryable() => {
+                        // Do not kill the Client on a transient network/TLS flap while
+                        // rotating an expired access token: treat as retryable backoff.
+                        dial_res = Err(refresh_err);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        match dial_res {
             Err(err) => {
                 if !connected_once {
                     // A first-dial TLS/IO flap should not fail a CLI command
                     // outright. Retry briefly; trust and auth failures still
                     // surface immediately.
                     if !err.is_retryable() {
+                        if matches!(err, Error::Auth(_)) {
+                            inner
+                                .transport
+                                .note_first(ClosureCategory::AuthRejected, None);
+                        } else {
+                            inner
+                                .transport
+                                .note_first(ClosureCategory::InitialDialGiveUp, None);
+                        }
                         if let Some(tx) = ready.take() {
                             let _ = tx.send(Err(err));
                         }
@@ -2654,6 +2812,9 @@ async fn supervise(
                     }
                     let since = *down_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= INITIAL_CONNECT_GIVE_UP {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::InitialDialGiveUp, None);
                         if let Some(tx) = ready.take() {
                             let _ = tx.send(Err(err));
                         }
@@ -2664,6 +2825,9 @@ async fn supervise(
                     let delay = next_reconnect_delay(&inner, &mut backoff);
                     tokio::select! {
                         _ = inner.shutdown.cancelled() => {
+                            inner
+                                .transport
+                                .note_first(ClosureCategory::Shutdown, None);
                             if let Some(tx) = ready.take() {
                                 let _ = tx.send(Err(Error::Message("connection closed".into())));
                             }
@@ -2678,18 +2842,27 @@ async fn supervise(
                 // Surface it to in-flight calls instead of retrying for a minute.
                 if let Error::Auth(message) = &err {
                     tracing::warn!(error = %message, "relay rejected the session; not retrying");
+                    inner
+                        .transport
+                        .note_first(ClosureCategory::AuthRejected, None);
                     fail_waiters_with(&inner, Some(message));
                     break;
                 }
                 let since = *down_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= crate::resume::RECONNECT_GIVE_UP {
                     tracing::warn!("relay stayed down; giving up on the session");
+                    inner
+                        .transport
+                        .note_first(ClosureCategory::DialGiveUp, None);
                     fail_waiters(&inner);
                     break;
                 }
                 let delay = next_reconnect_delay(&inner, &mut backoff);
                 tokio::select! {
                     _ = inner.shutdown.cancelled() => {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::Shutdown, None);
                         fail_waiters(&inner);
                         break;
                     }
@@ -2706,6 +2879,9 @@ async fn supervise(
                     heartbeat = true;
                     let beat_tx = inner.tx.clone();
                     let beat_shutdown = inner.shutdown.clone();
+                    let beat_inner = inner.clone();
+                    let beat_identity = identity.clone();
+                    let beat_token = live_token.clone();
                     tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(Duration::from_secs(20));
                         ticker.tick().await;
@@ -2713,6 +2889,32 @@ async fn supervise(
                             tokio::select! {
                                 _ = beat_shutdown.cancelled() => break,
                                 _ = ticker.tick() => {
+                                    if use_token {
+                                        let dir = beat_inner
+                                            .session_dir
+                                            .lock()
+                                            .ok()
+                                            .and_then(|slot| slot.clone());
+                                        if let Some(dir) = dir {
+                                            let cur = beat_token
+                                                .lock()
+                                                .ok()
+                                                .map(|s| s.clone())
+                                                .unwrap_or_default();
+                                            if let Ok(Some(fresh)) = refresh_or_adopt_for_client(
+                                                &dir,
+                                                &beat_identity,
+                                                &cur,
+                                                false,
+                                            )
+                                            .await
+                                            {
+                                                if let Ok(mut slot) = beat_token.lock() {
+                                                    *slot = fresh.token;
+                                                }
+                                            }
+                                        }
+                                    }
                                     let Ok(out) = ws::encode(&Envelope::Ping) else { break };
                                     if beat_tx.send(out).await.is_err() {
                                         break;
@@ -2726,6 +2928,7 @@ async fn supervise(
                 let end = run_socket(&inner, ws, &mut app_rx).await;
                 fail_transfers(&inner);
                 if matches!(end, SocketEnd::Shutdown) || inner.shutdown.is_cancelled() {
+                    inner.transport.note_first(ClosureCategory::Shutdown, None);
                     fail_waiters(&inner);
                     break;
                 }
@@ -2734,11 +2937,15 @@ async fn supervise(
                     backoff.reset();
                 }
                 if matches!(end, SocketEnd::GoingAway) {
+                    inner.transport.note_first(ClosureCategory::GoingAway, None);
                     inner.fast.store(true, Ordering::SeqCst);
                 }
                 let delay = next_reconnect_delay(&inner, &mut backoff);
                 tokio::select! {
                     _ = inner.shutdown.cancelled() => {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::Shutdown, None);
                         fail_waiters(&inner);
                         break;
                     }
@@ -2746,6 +2953,12 @@ async fn supervise(
                 }
             }
         }
+    }
+    inner.alive.store(false, Ordering::SeqCst);
+    if ready.is_some() {
+        inner
+            .transport
+            .note_first(ClosureCategory::ReadyDropped, None);
     }
 }
 
@@ -2762,7 +2975,9 @@ async fn dial_client(
     settings: &ClientSettings,
     identity: &crate::identity::Identity,
     use_token: bool,
+    transport: &crate::transport_status::TransportObserver,
 ) -> Result<ClientSocket> {
+    use crate::transport_status::ClosureCategory;
     let relay = crate::relay_url::parse_relay_url(&settings.relay)?;
     let trust = tls::RelayTrust::parse(&settings.fingerprint, settings.trust.as_deref())?;
     let addr = relay.dial_label();
@@ -2815,7 +3030,7 @@ async fn dial_client(
     ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await
         .map_err(|e| Error::Ws(e.to_string()))?;
-    match next_env(&mut ws).await? {
+    match next_env(&mut ws, transport).await? {
         Envelope::HelloOk { .. } => Ok(ws),
         Envelope::Challenge { nonce } => {
             let signature = identity.sign_nonce(&nonce);
@@ -2824,16 +3039,23 @@ async fn dial_client(
             ))
             .await
             .map_err(|e| Error::Ws(e.to_string()))?;
-            match next_env(&mut ws).await? {
+            match next_env(&mut ws, transport).await? {
                 Envelope::HelloOk { .. } => Ok(ws),
-                Envelope::HelloErr { message, .. } => Err(Error::Auth(message)),
+                Envelope::HelloErr { message, .. } => {
+                    // Typed category only for diagnostics; UI may still see `message`.
+                    let _ = transport.note_first(ClosureCategory::AuthRejected, None);
+                    Err(Error::Auth(message))
+                }
                 other => Err(Error::Protocol(format!(
                     "expected hello_ok, got {}",
                     kind(&other)
                 ))),
             }
         }
-        Envelope::HelloErr { message, .. } => Err(Error::Auth(message)),
+        Envelope::HelloErr { message, .. } => {
+            let _ = transport.note_first(ClosureCategory::AuthRejected, None);
+            Err(Error::Auth(message))
+        }
         other => Err(Error::Protocol(format!(
             "expected hello_ok, got {}",
             kind(&other)
@@ -2846,6 +3068,7 @@ async fn run_socket(
     ws: ClientSocket,
     app_rx: &mut mpsc::Receiver<Outbound>,
 ) -> SocketEnd {
+    use crate::transport_status::ClosureCategory;
     let (sink, mut stream) = ws.split();
     let (sock_tx, sock_rx) = mpsc::channel(64);
     let writer_shutdown = inner.shutdown.clone();
@@ -2858,6 +3081,9 @@ async fn run_socket(
     for env in session_frames(inner) {
         let Ok(out) = ws::encode(&env) else { continue };
         if sock_tx.send(out).await.is_err() {
+            inner
+                .transport
+                .note_first(ClosureCategory::WsStreamEnd, None);
             return SocketEnd::Gone;
         }
     }
@@ -2877,12 +3103,26 @@ async fn run_socket(
             outgoing = app_rx.recv() => {
                 let Some(outgoing) = outgoing else { return SocketEnd::Shutdown };
                 if sock_tx.send(outgoing).await.is_err() {
+                    inner
+                        .transport
+                        .note_first(ClosureCategory::WsStreamEnd, None);
                     return SocketEnd::Gone;
                 }
             }
             msg = stream.next() => {
                 match msg {
-                    None | Some(Err(_)) => return SocketEnd::Gone,
+                    None => {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::WsStreamEnd, None);
+                        return SocketEnd::Gone;
+                    }
+                    Some(Err(_)) => {
+                        inner
+                            .transport
+                            .note_first(ClosureCategory::WsStreamError, None);
+                        return SocketEnd::Gone;
+                    }
                     Some(Ok(msg)) => match ws::parse_incoming(msg) {
                         Ok(Incoming::Env(Envelope::GoingAway { .. })) => {
                             tracing::info!("relay is going away; reconnecting");
@@ -2933,7 +3173,12 @@ async fn run_socket(
                         Ok(Incoming::Ping(payload)) => {
                             let _ = sock_tx.try_send(Outbound::Pong(payload));
                         }
-                        Ok(Incoming::Closed) => return SocketEnd::Gone,
+                        Ok(Incoming::Closed { code }) => {
+                            inner
+                                .transport
+                                .note_first(ClosureCategory::WsClose, code);
+                            return SocketEnd::Gone;
+                        }
                         Ok(Incoming::Ignore) => {}
                         Err(err) => tracing::warn!(error = %err, "ignoring malformed frame"),
                     },
@@ -3036,18 +3281,47 @@ fn take_ready(inner: &ClientInner, env: Envelope) -> Vec<Envelope> {
     } = &env
     {
         if crate::resume::is_transient_message(message) {
-            if message.to_ascii_lowercase().contains("e2e session reset") {
-                if let Some(node) = inner
-                    .routes
+            let lower = message.to_ascii_lowercase();
+            let is_offline =
+                lower.contains("node offline") || lower.contains("node disconnected");
+            if is_offline && !request_id.is_empty() {
+                let expired = inner
+                    .offline_since
                     .lock()
                     .ok()
-                    .and_then(|routes| routes.get(request_id).cloned())
-                {
-                    inner.e2e.forget(&node);
+                    .map(|mut map| {
+                        let first = *map.entry(request_id.clone()).or_insert_with(Instant::now);
+                        if first.elapsed() >= crate::resume::OFFLINE_GRACE {
+                            map.remove(request_id);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(true);
+                if !expired {
+                    inner.resend.notify_waiters();
+                    return Vec::new();
                 }
+            } else {
+                if lower.contains("e2e session reset") {
+                    if let Some(node) = inner
+                        .routes
+                        .lock()
+                        .ok()
+                        .and_then(|routes| routes.get(request_id).cloned())
+                    {
+                        inner.e2e.forget(&node);
+                    }
+                }
+                inner.resend.notify_waiters();
+                return Vec::new();
             }
-            inner.resend.notify_waiters();
-            return Vec::new();
+        }
+    }
+    if let Some(id) = env.request_id() {
+        if let Ok(mut map) = inner.offline_since.lock() {
+            map.remove(id);
         }
     }
     let ready = inner
@@ -3173,8 +3447,19 @@ pub async fn maintain_session(
     dir: &std::path::Path,
     identity: &crate::identity::Identity,
 ) -> Result<Option<crate::config::ClientSettings>> {
+    maintain_session_skew(dir, identity, 60).await
+}
+
+/// Like [`maintain_session`], with an explicit early-refresh window `skew_secs`
+/// before `access_expires_unix`. Long-lived interactive sessions pass a wider
+/// window at bootstrap so they do not open a socket on a nearly spent token.
+pub async fn maintain_session_skew(
+    dir: &std::path::Path,
+    identity: &crate::identity::Identity,
+    skew_secs: i64,
+) -> Result<Option<crate::config::ClientSettings>> {
     let identity = identity.clone();
-    maintain_session_with(dir, &identity, |req, identity| {
+    maintain_session_with_skew(dir, &identity, skew_secs, |req, identity| {
         let SessionRefreshRequest {
             relay,
             fingerprint,
@@ -3196,6 +3481,113 @@ pub async fn maintain_session(
     .await
 }
 
+fn in_process_session_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn lock_session_async(dir: &std::path::Path) -> Result<crate::config::ConfigSessionLock> {
+    let owned = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::config::lock_session(&owned))
+        .await
+        .map_err(|err| Error::Message(format!("session lock join: {err}")))?
+}
+
+/// Adopt a token rotated by a sibling CLI/GUI process sharing `dir`, or rotate
+/// the refresh token under `lock_session` when within 120s of expiry (or when
+/// `force_refresh` is set after the relay rejected `current_token` as expired).
+async fn refresh_or_adopt_for_client(
+    dir: &std::path::Path,
+    identity: &crate::identity::Identity,
+    current_token: &str,
+    force_refresh: bool,
+) -> Result<Option<crate::config::ClientSettings>> {
+    let file_probe = crate::config::load_file(dir).unwrap_or_default();
+    let now = crate::util::unix_now();
+    let probe_tok = file_probe.token.as_deref().unwrap_or("");
+    if !force_refresh
+        && probe_tok == current_token
+        && crate::config::access_token_is_fresh(&file_probe, now, 120)
+    {
+        return Ok(None);
+    }
+
+    let _async_guard = in_process_session_gate().lock().await;
+    let _lock = lock_session_async(dir).await?;
+    let file = crate::config::load_file(dir).unwrap_or_default();
+    let relay = file.relay.clone().unwrap_or_default();
+    let fingerprint = file.fingerprint.clone().unwrap_or_default();
+    let trust = file.trust.clone().filter(|value| !value.trim().is_empty());
+    if relay.is_empty() || (fingerprint.is_empty() && trust.is_none()) {
+        return Ok(None);
+    }
+    let disk_token = file.token.clone().unwrap_or_default();
+    let now = crate::util::unix_now();
+    if !disk_token.trim().is_empty()
+        && disk_token != current_token
+        && crate::config::access_token_is_fresh(&file, now, 0)
+    {
+        return Ok(Some(crate::config::ClientSettings {
+            relay,
+            token: disk_token,
+            fingerprint,
+            trust,
+        }));
+    }
+    if !force_refresh && crate::config::access_token_is_fresh(&file, now, 120) {
+        return Ok(None);
+    }
+    let Some(refresh) = file
+        .refresh_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    match refresh_user(
+        &relay,
+        &fingerprint,
+        trust.as_deref(),
+        identity,
+        &refresh,
+    )
+    .await
+    {
+        Ok(session) => {
+            let settings = crate::config::ClientSettings {
+                relay,
+                token: session.access_token.clone(),
+                fingerprint,
+                trust,
+            };
+            crate::config::save_session_unlocked(
+                dir,
+                &settings,
+                &session.user,
+                &session.refresh_token,
+                session.access_expires_unix,
+            )?;
+            Ok(Some(settings))
+        }
+        Err(err) => {
+            let again = crate::config::load_file(dir).unwrap_or_default();
+            let now = crate::util::unix_now();
+            if crate::config::access_token_is_fresh(&again, now, 0) {
+                let token = again.token.unwrap_or_default();
+                if !token.is_empty() && token != current_token {
+                    return Ok(Some(crate::config::ClientSettings {
+                        relay: again.relay.unwrap_or(relay),
+                        token,
+                        fingerprint: again.fingerprint.unwrap_or(fingerprint),
+                        trust: again.trust.filter(|v| !v.trim().is_empty()).or(trust),
+                    }));
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
 /// Like [`maintain_session`], but the refresh step is injectable for hermetic
 /// tests. Never copies a production session file.
 pub async fn maintain_session_with<F, Fut>(
@@ -3207,7 +3599,21 @@ where
     F: FnOnce(SessionRefreshRequest, &crate::identity::Identity) -> Fut,
     Fut: std::future::Future<Output = Result<UserSession>>,
 {
-    let _lock = crate::config::lock_session(dir)?;
+    maintain_session_with_skew(dir, identity, 60, refresh_fn).await
+}
+
+pub async fn maintain_session_with_skew<F, Fut>(
+    dir: &std::path::Path,
+    identity: &crate::identity::Identity,
+    skew_secs: i64,
+    refresh_fn: F,
+) -> Result<Option<crate::config::ClientSettings>>
+where
+    F: FnOnce(SessionRefreshRequest, &crate::identity::Identity) -> Fut,
+    Fut: std::future::Future<Output = Result<UserSession>>,
+{
+    let _async_guard = in_process_session_gate().lock().await;
+    let _lock = lock_session_async(dir).await?;
     let file = crate::config::load_file(dir).unwrap_or_default();
     let Some(refresh) = file
         .refresh_token
@@ -3223,7 +3629,7 @@ where
         return Ok(None);
     }
     let now = crate::util::unix_now();
-    if crate::config::access_token_is_fresh(&file, now, 60) {
+    if crate::config::access_token_is_fresh(&file, now, skew_secs) {
         return Ok(None);
     }
     let req = SessionRefreshRequest {
@@ -3328,8 +3734,11 @@ async fn finish_login(
     identity: &crate::identity::Identity,
     request_id: &str,
 ) -> Result<UserSession> {
+    // Hermetic observer: account login helpers are not Client sessions, but
+    // next_env requires a TransportObserver after sticky first-cause wiring.
+    let transport = crate::transport_status::TransportObserver::new();
     loop {
-        match next_env(ws).await? {
+        match next_env(ws, &transport).await? {
             Envelope::Challenge { nonce } => {
                 send_ws(
                     ws,
@@ -3615,5 +4024,47 @@ mod session_maintain_tests {
         let loaded = load_file(dir.path()).unwrap();
         assert_eq!(loaded.token.as_deref(), Some("access-winner"));
         assert_eq!(loaded.refresh_token.as_deref(), Some("refresh-winner"));
+    }
+
+    #[test]
+    fn take_ready_surfaces_node_offline_after_grace_instead_of_swallowing_forever() {
+        let (tx, _rx) = mpsc::channel(4);
+        let inner = ClientInner {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            binary: Arc::new(Mutex::new(HashMap::new())),
+            alive: Arc::new(AtomicBool::new(true)),
+            shutdown: CancellationToken::new(),
+            relay_addr: None,
+            direct_id: OnceLock::new(),
+            quic: Mutex::new(None),
+            e2e: crate::e2e::Endpoint::new(crate::identity::Identity::generate()),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            gates: Mutex::new(HashMap::new()),
+            session_id: "sess-1".into(),
+            inflight: Mutex::new(HashMap::new()),
+            cursors: Mutex::new(crate::resume::Cursors::default()),
+            transfers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            grant_dir: Arc::new(Mutex::new(None)),
+            session_dir: Arc::new(Mutex::new(None)),
+            resend: Notify::new(),
+            fast: AtomicBool::new(false),
+            transport: crate::transport_status::TransportObserver::new(),
+            offline_since: Mutex::new(HashMap::new()),
+            write_hook: Mutex::new(None),
+        };
+        let req = "pty-open-1";
+        let offline = Envelope::result_err(req.to_string(), "node offline: sufa");
+        // Initial offline reply within OFFLINE_GRACE is retried transiently.
+        assert!(take_ready(&inner, offline.clone()).is_empty());
+        // Once OFFLINE_GRACE has elapsed, take_ready MUST deliver the real error
+        // rather than swallowing it for 30s until Error::Timeout!
+        std::thread::sleep(crate::resume::OFFLINE_GRACE + Duration::from_millis(80));
+        let delivered = take_ready(&inner, offline);
+        assert_eq!(
+            delivered.len(),
+            1,
+            "node offline stayed swallowed past OFFLINE_GRACE, causing 30s PtyOpen timeout!"
+        );
     }
 }

@@ -6,6 +6,7 @@
 //! session. The egui view is our own (the `egui_term` crate talks to a
 //! local PTY backend we cannot use here).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -19,11 +20,15 @@ use eframe::egui::{
     self, Color32, Event as GuiEvent, ImeEvent, Key, PointerButton, Pos2, Rect, Vec2,
 };
 
+/// Maximum decoded UTF-8 byte length accepted from OSC 52 when explicitly enabled.
+pub const OSC52_MAX_BYTES: usize = 64 * 1024;
+
 /// Bytes the UI should write to the remote PTY after one frame.
 #[derive(Debug, Default)]
 pub struct TermOutput {
     pub writes: Vec<u8>,
     pub resized: Option<(u16, u16)>,
+    pub osc52_copied_chars: Option<usize>,
 }
 
 struct TermDims {
@@ -48,6 +53,8 @@ struct TermHost {
     pending: Arc<Mutex<Vec<u8>>>,
     title: Arc<Mutex<String>>,
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Default `false`: remote PTY output cannot silently overwrite the host clipboard.
+    allow_osc52: Arc<AtomicBool>,
 }
 
 impl EventListener for TermHost {
@@ -61,7 +68,13 @@ impl EventListener for TermHost {
             Event::Title(title) => *self.title.lock().expect("term host") = title,
             Event::ResetTitle => self.title.lock().expect("term host").clear(),
             Event::ClipboardStore(_, text) => {
-                *self.clipboard.lock().expect("term host") = Some(text);
+                if self.allow_osc52.load(Ordering::Relaxed)
+                    && !text.is_empty()
+                    && text.len() <= OSC52_MAX_BYTES
+                    && !text.contains('\0')
+                {
+                    *self.clipboard.lock().expect("term host") = Some(text);
+                }
             }
             _ => {}
         }
@@ -129,7 +142,22 @@ impl Emulator {
     }
 
     pub fn take_osc52_copy(&self) -> Option<String> {
+        if !self.allows_osc52() {
+            let _ = self.host.clipboard.lock().expect("term host").take();
+            return None;
+        }
         self.host.clipboard.lock().expect("term host").take()
+    }
+
+    pub fn allows_osc52(&self) -> bool {
+        self.host.allow_osc52.load(Ordering::Relaxed)
+    }
+
+    pub fn set_allow_osc52(&self, allow: bool) {
+        self.host.allow_osc52.store(allow, Ordering::Relaxed);
+        if !allow {
+            let _ = self.host.clipboard.lock().expect("term host").take();
+        }
     }
 
     pub fn title(&self) -> String {
@@ -456,81 +484,13 @@ impl Emulator {
         events: &[GuiEvent],
         modifiers: egui::Modifiers,
     ) -> (Vec<u8>, Option<String>, Option<String>, bool) {
-        let app_cursor = self.app_cursor();
-        let mut writes: Vec<u8> = Vec::new();
-        let mut copy_text: Option<String> = None;
-        let mut paste_text: Option<String> = None;
-        let mut want_paste = false;
-        let mut ime_commits: Vec<String> = Vec::new();
-        let mut preedit_active = false;
-        let mut control_key_sent = false;
-        let mut preedit = None;
-        for event in events {
-            match event {
-                GuiEvent::Copy | GuiEvent::Cut => {
-                    copy_text = self.term.selection_to_string();
-                }
-                GuiEvent::Paste(text) => {
-                    paste_text = Some(text.clone());
-                }
-                GuiEvent::Ime(ImeEvent::Enabled) => {}
-                GuiEvent::Ime(ImeEvent::Preedit(text)) => {
-                    if !text.is_empty() {
-                        preedit_active = true;
-                    }
-                    preedit = Some(text.clone());
-                }
-                GuiEvent::Ime(ImeEvent::Commit(text)) => {
-                    ime_commits.push(text.clone());
-                    writes.extend(Self::encode_text(text, false));
-                    preedit = Some(String::new());
-                }
-                GuiEvent::Ime(ImeEvent::Disabled) => {
-                    preedit = Some(String::new());
-                }
-                GuiEvent::Key {
-                    key,
-                    pressed,
-                    modifiers,
-                    ..
-                } if *pressed => {
-                    let name = key_name(*key);
-                    if modifiers.ctrl && modifiers.shift && matches!(key, Key::C) {
-                        copy_text = self.term.selection_to_string();
-                        continue;
-                    }
-                    if modifiers.ctrl && modifiers.shift && matches!(key, Key::V) {
-                        want_paste = true;
-                        continue;
-                    }
-                    if matches!(key, Key::Enter | Key::Tab) && !modifiers.ctrl {
-                        control_key_sent = true;
-                    }
-                    if let Some(bytes) = Self::encode_key(
-                        name,
-                        modifiers.ctrl,
-                        modifiers.alt,
-                        modifiers.shift,
-                        app_cursor,
-                    ) {
-                        writes.extend(bytes);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for event in events {
-            let GuiEvent::Text(text) = event else {
-                continue;
-            };
-            if modifiers.ctrl || modifiers.command {
-                continue;
-            }
-            if Self::skip_duplicate_text(text, &ime_commits, preedit_active, control_key_sent) {
-                continue;
-            }
-            writes.extend(Self::encode_text(text, modifiers.alt));
-        }
+        let selection = self.term.selection_to_string();
+        let (writes, copy_text, paste_text, want_paste, preedit) = plan_terminal_events(
+            events,
+            selection.as_deref(),
+            self.app_cursor(),
+            modifiers,
+        );
         if let Some(text) = preedit {
             self.ime_preedit = text;
         }
@@ -542,6 +502,7 @@ impl Emulator {
         let mut out = TermOutput {
             writes: self.take_writes(),
             resized: None,
+            osc52_copied_chars: None,
         };
         let font = egui::FontId::monospace(13.0);
         let (cell_w, cell_h) = ui.fonts(|fonts| {
@@ -574,15 +535,95 @@ impl Emulator {
             self.focused = true;
         }
 
+        // Scrollback and pointer selection run BEFORE `renderable_content()` so
+        // drags, double-clicks, and click-clears paint in the very same frame.
+        if response.hovered() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll > 0.5 {
+                self.term
+                    .scroll_display(Scroll::Delta(scroll as i32 / 20 + 1));
+            } else if scroll < -0.5 {
+                self.term
+                    .scroll_display(Scroll::Delta(scroll as i32 / 20 - 1));
+            }
+        }
+
+        let grid_display_offset = self.term.grid().display_offset();
+        let to_point = |pos: Pos2| -> Point {
+            let col = ((pos.x - rect.min.x) / cell_w)
+                .floor()
+                .clamp(0.0, (cols - 1) as f32) as usize;
+            let row = ((pos.y - rect.min.y) / cell_h)
+                .floor()
+                .clamp(0.0, (rows - 1) as f32) as i32;
+            let line = Line(row - grid_display_offset as i32);
+            Point::new(line, Column(col))
+        };
+
+        let drag_started = response.drag_started_by(PointerButton::Primary);
+        let dragged = response.dragged_by(PointerButton::Primary);
+        let drag_stopped = response.drag_stopped();
+
+        if drag_started {
+            let origin = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if let Some(start_pos) = origin {
+                let mut sel =
+                    Selection::new(SelectionType::Simple, to_point(start_pos), Side::Left);
+                if let Some(cur_pos) = response.interact_pointer_pos() {
+                    sel.update(to_point(cur_pos), Side::Right);
+                }
+                sel.include_all();
+                self.term.selection = Some(sel);
+                self.selecting = true;
+                ui.ctx().request_repaint();
+            }
+        } else if self.selecting && dragged {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(sel) = self.term.selection.as_mut() {
+                    sel.update(to_point(pos), Side::Right);
+                    sel.include_all();
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        if drag_stopped && self.selecting {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(sel) = self.term.selection.as_mut() {
+                    sel.update(to_point(pos), Side::Right);
+                    sel.include_all();
+                }
+            }
+            self.selecting = false;
+            ui.ctx().request_repaint();
+        }
+        if primary_click_clears_selection(
+            response.clicked_by(PointerButton::Primary),
+            dragged || drag_started || drag_stopped,
+            response.double_clicked_by(PointerButton::Primary),
+        ) {
+            if self.term.selection.take().is_some() {
+                ui.ctx().request_repaint();
+            }
+        }
+        if response.double_clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let point = to_point(pos);
+                self.term.selection =
+                    Some(Selection::new(SelectionType::Semantic, point, Side::Left));
+                ui.ctx().request_repaint();
+            }
+        }
+
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, palette_bg());
 
-        let display_offset;
         let cursor_point;
         let cursor_hidden;
         {
             let content = self.term.renderable_content();
-            display_offset = content.display_offset;
+            let display_offset = content.display_offset;
             cursor_point = content.cursor.point;
             cursor_hidden = matches!(
                 content.cursor.shape,
@@ -611,12 +652,19 @@ impl Emulator {
                 );
                 let mut fg = resolve_color(indexed.cell.fg, true);
                 let mut bg = resolve_color(indexed.cell.bg, false);
-                let inverse = indexed.cell.flags.contains(Flags::INVERSE)
-                    || selection.is_some_and(|s| s.contains(indexed.point));
-                if inverse {
+                let selected = selection.is_some_and(|s| {
+                    s.contains(indexed.point)
+                        || (wide
+                            && s.contains(Point::new(indexed.point.line, indexed.point.column + 1)))
+                });
+                if indexed.cell.flags.contains(Flags::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
-                if indexed.cell.flags.contains(Flags::DIM) {
+                if selected {
+                    bg = selection_bg();
+                    fg = Color32::WHITE;
+                }
+                if indexed.cell.flags.contains(Flags::DIM) && !selected {
                     fg = Color32::from_rgb(
                         (fg.r() as u16 * 2 / 3) as u8,
                         (fg.g() as u16 * 2 / 3) as u8,
@@ -643,7 +691,7 @@ impl Emulator {
                     let y = cell_rect.max.y - 2.0;
                     painter.line_segment(
                         [Pos2::new(cell_rect.min.x, y), Pos2::new(cell_rect.max.x, y)],
-                        egui::Stroke::new(1.0, fg),
+                        egui::Stroke::new(1.0_f32, fg),
                     );
                 }
             }
@@ -693,53 +741,6 @@ impl Emulator {
             });
         }
 
-        // Scrollback
-        if response.hovered() {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll > 0.5 {
-                self.term
-                    .scroll_display(Scroll::Delta(scroll as i32 / 20 + 1));
-            } else if scroll < -0.5 {
-                self.term
-                    .scroll_display(Scroll::Delta(scroll as i32 / 20 - 1));
-            }
-        }
-
-        let to_point = |pos: Pos2| -> Point {
-            let col = ((pos.x - rect.min.x) / cell_w)
-                .floor()
-                .clamp(0.0, (cols - 1) as f32) as usize;
-            let row = ((pos.y - rect.min.y) / cell_h)
-                .floor()
-                .clamp(0.0, (rows - 1) as f32) as i32;
-            let line = Line(row - display_offset as i32);
-            Point::new(line, Column(col))
-        };
-
-        if response.drag_started_by(PointerButton::Primary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let point = to_point(pos);
-                self.term.selection =
-                    Some(Selection::new(SelectionType::Simple, point, Side::Left));
-                self.selecting = true;
-            }
-        } else if self.selecting && response.dragged_by(PointerButton::Primary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if let Some(sel) = self.term.selection.as_mut() {
-                    sel.update(to_point(pos), Side::Right);
-                }
-            }
-        } else if response.drag_stopped() {
-            self.selecting = false;
-        }
-        if response.double_clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let point = to_point(pos);
-                self.term.selection =
-                    Some(Selection::new(SelectionType::Semantic, point, Side::Left));
-            }
-        }
-
         if (response.has_focus() || self.focused) && !self.keys_taken {
             let events = ui.input(|i| i.events.clone());
             let modifiers = ui.input(|i| i.modifiers);
@@ -769,11 +770,210 @@ impl Emulator {
         self.keys_taken = false;
 
         if let Some(osc) = self.take_osc52_copy() {
+            let chars = osc.chars().count();
             ui.ctx().copy_text(osc);
+            out.osc52_copied_chars = Some(chars);
         }
 
         out
     }
+}
+
+/// A plain click (not a drag, not a double-click) clears the terminal selection
+/// so the next Ctrl+C can interrupt instead of copying a stale range.
+pub(crate) fn primary_click_clears_selection(
+    clicked: bool,
+    dragged: bool,
+    double_clicked: bool,
+) -> bool {
+    clicked && !dragged && !double_clicked
+}
+
+fn plain_ctrl(modifiers: egui::Modifiers) -> bool {
+    (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt
+}
+
+/// Turn a frame of native egui events into PTY bytes.
+///
+/// Windows egui can emit [`GuiEvent::Copy`] for Ctrl+C without [`GuiEvent::Key`]
+/// `C`. An empty selection then has to interrupt (`^C`). A non-empty selection
+/// still copies. Copy plus Key(C) in the same frame produces one interrupt,
+/// not two. Paste text goes to the PTY, not the remote-desktop clipboard.
+pub(crate) fn plan_terminal_events(
+    events: &[GuiEvent],
+    selection: Option<&str>,
+    app_cursor: bool,
+    frame_modifiers: egui::Modifiers,
+) -> (Vec<u8>, Option<String>, Option<String>, bool, Option<String>) {
+    let selected = selection.filter(|text| !text.is_empty());
+    let mut saw_copy = false;
+    let mut saw_cut = false;
+    let mut saw_paste = false;
+    for event in events {
+        match event {
+            GuiEvent::Copy => saw_copy = true,
+            GuiEvent::Cut => saw_cut = true,
+            GuiEvent::Paste(_) => saw_paste = true,
+            _ => {}
+        }
+    }
+
+    let mut writes: Vec<u8> = Vec::new();
+    let mut copy_text: Option<String> = None;
+    let mut paste_text: Option<String> = None;
+    let mut want_paste = false;
+    let mut interrupt_from_copy = false;
+    let mut cut_from_event = false;
+    if saw_copy {
+        if let Some(text) = selected {
+            copy_text = Some(text.to_string());
+        } else if let Some(bytes) = Emulator::encode_key("c", true, false, false, app_cursor) {
+            writes.extend(bytes);
+            interrupt_from_copy = true;
+        }
+    }
+    if saw_cut {
+        if let Some(text) = selected {
+            copy_text = Some(text.to_string());
+        } else if let Some(bytes) = Emulator::encode_key("x", true, false, false, app_cursor) {
+            writes.extend(bytes);
+            cut_from_event = true;
+        }
+    }
+
+    let mut ime_commits: Vec<String> = Vec::new();
+    let mut preedit_active = false;
+    let mut control_key_sent = false;
+    let mut preedit = None;
+    for event in events {
+        match event {
+            GuiEvent::Copy | GuiEvent::Cut => {}
+            GuiEvent::Paste(text) => {
+                paste_text = Some(text.clone());
+            }
+            GuiEvent::Ime(ImeEvent::Enabled) => {}
+            GuiEvent::Ime(ImeEvent::Preedit(text)) => {
+                if !text.is_empty() {
+                    preedit_active = true;
+                }
+                preedit = Some(text.clone());
+            }
+            GuiEvent::Ime(ImeEvent::Commit(text)) => {
+                ime_commits.push(text.clone());
+                writes.extend(Emulator::encode_text(text, false));
+                preedit = Some(String::new());
+            }
+            GuiEvent::Ime(ImeEvent::Disabled) => {
+                preedit = Some(String::new());
+            }
+            GuiEvent::Key {
+                key,
+                pressed,
+                modifiers,
+                ..
+            } if *pressed => {
+                if interrupt_from_copy && plain_ctrl(*modifiers) && matches!(key, Key::C) {
+                    continue;
+                }
+                if cut_from_event && plain_ctrl(*modifiers) && matches!(key, Key::X) {
+                    continue;
+                }
+                if saw_paste && plain_ctrl(*modifiers) && matches!(key, Key::V) {
+                    continue;
+                }
+                if saw_copy && selected.is_some() && plain_ctrl(*modifiers) && matches!(key, Key::C)
+                {
+                    continue;
+                }
+                if saw_cut && selected.is_some() && plain_ctrl(*modifiers) && matches!(key, Key::X)
+                {
+                    continue;
+                }
+                let name = key_name(*key);
+                match clipboard_shortcut(*key, *modifiers, selection.map(str::to_string)) {
+                    TermClipboardShortcut::Copy(text) => {
+                        copy_text = Some(text);
+                        continue;
+                    }
+                    TermClipboardShortcut::Paste => {
+                        want_paste = true;
+                        continue;
+                    }
+                    TermClipboardShortcut::None => {}
+                }
+                if matches!(key, Key::Enter | Key::Tab) && !modifiers.ctrl {
+                    control_key_sent = true;
+                }
+                if let Some(bytes) = Emulator::encode_key(
+                    name,
+                    modifiers.ctrl,
+                    modifiers.alt,
+                    modifiers.shift,
+                    app_cursor,
+                ) {
+                    writes.extend(bytes);
+                }
+            }
+            _ => {}
+        }
+    }
+    for event in events {
+        let GuiEvent::Text(text) = event else {
+            continue;
+        };
+        if frame_modifiers.ctrl || frame_modifiers.command {
+            continue;
+        }
+        if Emulator::skip_duplicate_text(text, &ime_commits, preedit_active, control_key_sent) {
+            continue;
+        }
+        writes.extend(Emulator::encode_text(text, frame_modifiers.alt));
+    }
+    (writes, copy_text, paste_text, want_paste, preedit)
+}
+
+/// Keyboard shortcuts that should copy or paste instead of sending a control
+/// character. Ctrl+Shift+C/V always copy/paste (classic terminal). Ctrl+C
+/// copies when there is a selection, otherwise it falls through as interrupt
+/// (`^C`). Ctrl+V always pastes. Command modifiers follow the same rules on
+/// macOS when egui does not already emit Copy/Paste events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TermClipboardShortcut {
+    Copy(String),
+    Paste,
+    None,
+}
+
+pub(crate) fn clipboard_shortcut(
+    key: Key,
+    modifiers: egui::Modifiers,
+    selection: Option<String>,
+) -> TermClipboardShortcut {
+    let chord = modifiers.ctrl || modifiers.command;
+    if !chord || modifiers.alt {
+        return TermClipboardShortcut::None;
+    }
+    if modifiers.shift && matches!(key, Key::C) {
+        return TermClipboardShortcut::Copy(selection.unwrap_or_default());
+    }
+    if modifiers.shift && matches!(key, Key::V) {
+        return TermClipboardShortcut::Paste;
+    }
+    if modifiers.shift {
+        return TermClipboardShortcut::None;
+    }
+    if matches!(key, Key::C) {
+        if let Some(text) = selection {
+            if !text.is_empty() {
+                return TermClipboardShortcut::Copy(text);
+            }
+        }
+        return TermClipboardShortcut::None;
+    }
+    if matches!(key, Key::V) {
+        return TermClipboardShortcut::Paste;
+    }
+    TermClipboardShortcut::None
 }
 
 fn ctrl_byte(key: &str) -> Option<u8> {
@@ -901,6 +1101,10 @@ fn key_name(key: Key) -> &'static str {
 
 fn palette_bg() -> Color32 {
     Color32::from_rgb(0x0D, 0x0D, 0x12)
+}
+
+fn selection_bg() -> Color32 {
+    Color32::from_rgb(0x2F, 0x65, 0xB8)
 }
 
 fn palette_fg() -> Color32 {
@@ -1135,6 +1339,47 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_copies_selection_but_interrupts_when_empty() {
+        let mods = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            clipboard_shortcut(Key::C, mods, Some("copied".into())),
+            TermClipboardShortcut::Copy("copied".into())
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::C, mods, Some(String::new())),
+            TermClipboardShortcut::None
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::C, mods, None),
+            TermClipboardShortcut::None
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::V, mods, None),
+            TermClipboardShortcut::Paste
+        );
+        let shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            clipboard_shortcut(Key::C, shift, Some("sel".into())),
+            TermClipboardShortcut::Copy("sel".into())
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::V, shift, None),
+            TermClipboardShortcut::Paste
+        );
+        assert_eq!(
+            clipboard_shortcut(Key::C, egui::Modifiers::NONE, Some("sel".into())),
+            TermClipboardShortcut::None
+        );
+    }
+
+    #[test]
     fn enter_and_arrows_are_captured_keyboard_events() {
         assert!(Emulator::is_captured_event(&GuiEvent::Key {
             key: Key::Enter,
@@ -1157,5 +1402,321 @@ mod tests {
             pressed: true,
             modifiers: egui::Modifiers::NONE,
         }));
+    }
+
+    fn key_c(mods: egui::Modifiers) -> GuiEvent {
+        GuiEvent::Key {
+            key: Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        }
+    }
+
+    fn ctrl_mods() -> egui::Modifiers {
+        egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        }
+    }
+
+    #[test]
+    fn copy_event_without_selection_interrupts_once() {
+        let (bytes, copy, paste, want_paste, _) =
+            plan_terminal_events(&[GuiEvent::Copy], None, false, egui::Modifiers::NONE);
+        assert_eq!(bytes, vec![0x03], "native Copy with no selection must be ^C");
+        assert!(copy.is_none());
+        assert!(paste.is_none());
+        assert!(!want_paste);
+    }
+
+    #[test]
+    fn copy_event_with_selection_copies_and_does_not_interrupt() {
+        let (bytes, copy, _, _, _) =
+            plan_terminal_events(&[GuiEvent::Copy], Some("_COPY_OK"), false, egui::Modifiers::NONE);
+        assert!(bytes.is_empty());
+        assert_eq!(copy.as_deref(), Some("_COPY_OK"));
+    }
+
+    #[test]
+    fn copy_event_plus_key_c_interrupts_only_once() {
+        let events = [GuiEvent::Copy, key_c(ctrl_mods())];
+        let (bytes, copy, _, _, _) =
+            plan_terminal_events(&events, None, false, ctrl_mods());
+        assert_eq!(bytes, vec![0x03]);
+        assert!(copy.is_none());
+    }
+
+    #[test]
+    fn key_c_without_copy_event_still_interrupts_when_empty() {
+        let (bytes, copy, _, _, _) =
+            plan_terminal_events(&[key_c(ctrl_mods())], Some(""), false, ctrl_mods());
+        assert_eq!(bytes, vec![0x03]);
+        assert!(copy.is_none());
+    }
+
+    #[test]
+    fn key_c_with_selection_copies_instead_of_interrupting() {
+        let (bytes, copy, _, _, _) =
+            plan_terminal_events(&[key_c(ctrl_mods())], Some("sel"), false, ctrl_mods());
+        assert!(bytes.is_empty());
+        assert_eq!(copy.as_deref(), Some("sel"));
+    }
+
+    #[test]
+    fn cut_event_without_selection_sends_ctrl_x_once() {
+        let key_x = GuiEvent::Key {
+            key: Key::X,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: ctrl_mods(),
+        };
+        let (alone, _, _, _, _) =
+            plan_terminal_events(&[GuiEvent::Cut], None, false, egui::Modifiers::NONE);
+        assert_eq!(alone, vec![0x18]);
+        let (both, _, _, _, _) =
+            plan_terminal_events(&[GuiEvent::Cut, key_x], None, false, ctrl_mods());
+        assert_eq!(both, vec![0x18]);
+    }
+
+    #[test]
+    fn paste_event_is_pty_text_and_does_not_request_a_second_paste() {
+        let key_v = GuiEvent::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: ctrl_mods(),
+        };
+        let (bytes, copy, paste, want_paste, _) = plan_terminal_events(
+            &[GuiEvent::Paste("echo ok".into()), key_v],
+            None,
+            false,
+            ctrl_mods(),
+        );
+        assert!(bytes.is_empty(), "paste must not also inject key bytes: {bytes:?}");
+        assert!(copy.is_none());
+        assert_eq!(paste.as_deref(), Some("echo ok"));
+        assert!(!want_paste, "Paste event already carries the text");
+    }
+
+    #[test]
+    fn ctrl_shift_c_still_copies_without_a_copy_event() {
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        let event = GuiEvent::Key {
+            key: Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        };
+        let (bytes, copy, _, want_paste, _) =
+            plan_terminal_events(&[event], Some("sel"), false, mods);
+        assert!(bytes.is_empty());
+        assert_eq!(copy.as_deref(), Some("sel"));
+        assert!(!want_paste);
+    }
+
+    #[test]
+    fn plain_click_clears_selection_and_a_drag_does_not() {
+        assert!(primary_click_clears_selection(true, false, false));
+        assert!(!primary_click_clears_selection(true, true, false));
+        assert!(!primary_click_clears_selection(true, false, true));
+        assert!(!primary_click_clears_selection(false, false, false));
+    }
+
+    #[test]
+    fn osc52_clipboard_is_denied_by_default_and_bounded_when_opted_in() {
+        let mut term = Emulator::new(24, 80);
+        assert!(!term.allows_osc52(), "OSC 52 must be disabled by default");
+        // Base64("secret-clip") = "c2VjcmV0LWNsaXA="
+        term.feed(b"\x1b]52;c;c2VjcmV0LWNsaXA=\x07");
+        assert_eq!(
+            term.take_osc52_copy(),
+            None,
+            "default-deny must drop remote OSC 52 clipboard writes"
+        );
+
+        term.set_allow_osc52(true);
+        term.feed(b"\x1b]52;c;c2VjcmV0LWNsaXA=\x07");
+        assert_eq!(term.take_osc52_copy().as_deref(), Some("secret-clip"));
+
+        // Oversized OSC 52 (> 64 KiB decoded) must be rejected even when opted in.
+        let huge = vec![b'A'; OSC52_MAX_BYTES + 16];
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&huge);
+        let seq = format!("\x1b]52;c;{b64}\x07");
+        term.feed(seq.as_bytes());
+        assert_eq!(
+            term.take_osc52_copy(),
+            None,
+            "OSC 52 payload exceeding OSC52_MAX_BYTES must be dropped"
+        );
+
+        // Turning opt-in back off clears any queued value.
+        term.feed(b"\x1b]52;c;c2VjcmV0LWNsaXA=\x07");
+        term.set_allow_osc52(false);
+        assert_eq!(term.take_osc52_copy(), None);
+    }
+
+    fn count_selection_rects(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(shape: &egui::epaint::Shape) -> usize {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == selection_bg() => 1,
+                egui::epaint::Shape::Vec(items) => items.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
+    #[test]
+    fn real_egui_three_frame_drag_highlights_copies_and_plain_click_clears() {
+        let ctx = egui::Context::default();
+        let mut term = Emulator::new(24, 80);
+        term.focused = true;
+        term.feed(b"echo COPY_OK_99 done\r\n");
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 480.0));
+        let mut time = 0.0_f64;
+        let mut step = |term: &mut Emulator, events: Vec<GuiEvent>| -> (TermOutput, egui::FullOutput) {
+            let mut out = TermOutput::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                predicted_dt: 1.0 / 60.0,
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            time += 0.1;
+            let full = ctx.run(raw, |ctx| {
+                term.consume_focused_keys(ctx);
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        out = term.show(ui);
+                    });
+            });
+            (out, full)
+        };
+
+        // Warm-up frame so fonts and cell metrics settle.
+        let _ = step(&mut term, Vec::new());
+        let font = egui::FontId::monospace(13.0);
+        let (cell_w, cell_h) = ctx.fonts(|fonts| {
+            let galley = fonts.layout_no_wrap("W".to_owned(), font.clone(), Color32::WHITE);
+            (galley.size().x.max(7.0), galley.size().y.max(font.size * 1.25))
+        });
+        let cell_center = |col: usize, row: usize| -> Pos2 {
+            Pos2::new((col as f32 + 0.5) * cell_w, (row as f32 + 0.5) * cell_h)
+        };
+
+        // Columns 5..=14 on row 0 are "COPY_OK_99".
+        // Reproduce the exact 3-frame VNC/GUI drag: Down(5,0) -> Move(14,0) -> Up(14,0).
+        let start = cell_center(5, 0);
+        let end = cell_center(14, 0);
+        let _ = step(
+            &mut term,
+            vec![
+                GuiEvent::PointerMoved(start),
+                GuiEvent::PointerButton {
+                    pos: start,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, move_frame) = step(&mut term, vec![GuiEvent::PointerMoved(end)]);
+        assert_eq!(
+            count_selection_rects(&move_frame.shapes),
+            10,
+            "same-frame drag must paint 10 highlighted selection cells"
+        );
+        let (_, up_frame) = step(
+            &mut term,
+            vec![GuiEvent::PointerButton {
+                pos: end,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(term.selection_text().as_deref(), Some("COPY_OK_99"));
+        assert_eq!(count_selection_rects(&up_frame.shapes), 10);
+
+        // Native Copy (`Ctrl+C`) copies the selection and does NOT send `^C`.
+        let (copy_out, copy_full) = step(&mut term, vec![GuiEvent::Copy]);
+        assert!(copy_out.writes.is_empty(), "selected Ctrl+C must not send ^C");
+        let copied = copy_full
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            });
+        assert_eq!(copied.as_deref(), Some("COPY_OK_99"));
+
+        // Plain primary click clears selection, and the next Copy sends `^C` (`0x03`).
+        let click_pt = cell_center(1, 0);
+        let _ = step(
+            &mut term,
+            vec![
+                GuiEvent::PointerMoved(click_pt),
+                GuiEvent::PointerButton {
+                    pos: click_pt,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, clear_frame) = step(
+            &mut term,
+            vec![GuiEvent::PointerButton {
+                pos: click_pt,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(term.selection_text(), None);
+        assert_eq!(count_selection_rects(&clear_frame.shapes), 0);
+
+        let (intr_out, _) = step(&mut term, vec![GuiEvent::Copy]);
+        assert_eq!(intr_out.writes, vec![0x03]);
+
+        // Right-to-left drag (col 14 -> col 5) also selects all 10 characters.
+        let _ = step(
+            &mut term,
+            vec![
+                GuiEvent::PointerMoved(end),
+                GuiEvent::PointerButton {
+                    pos: end,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = step(&mut term, vec![GuiEvent::PointerMoved(start)]);
+        let _ = step(
+            &mut term,
+            vec![GuiEvent::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(term.selection_text().as_deref(), Some("COPY_OK_99"));
     }
 }

@@ -29,6 +29,7 @@ use futures_util::StreamExt;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy};
 
+use super::mutter_session::{remote_desktop_close_action, RemoteDesktopClose};
 use crate::capture::{crop_frame, CaptureTarget, Frame, MonitorInfo};
 use crate::error::{msg, Result};
 use crate::stream::pipewire::PwCapture;
@@ -56,11 +57,7 @@ type ModeState = (
     Vec<f64>,
     HashMap<String, OwnedValue>,
 );
-type MonitorState = (
-    MonitorSpec,
-    Vec<ModeState>,
-    HashMap<String, OwnedValue>,
-);
+type MonitorState = (MonitorSpec, Vec<ModeState>, HashMap<String, OwnedValue>);
 type LogicalState = (
     i32,
     i32,
@@ -179,12 +176,7 @@ impl MutterDesk {
     }
 
     /// One-shot `RecordWindow` capture. Runs on the caller's tokio runtime.
-    pub async fn capture_window(
-        &self,
-        query: &str,
-        wait_ms: i32,
-        max_width: u32,
-    ) -> Result<Frame> {
+    pub async fn capture_window(&self, query: &str, wait_ms: i32, max_width: u32) -> Result<Frame> {
         record_window_frame(&self.conn, query, wait_ms.max(500), max_width).await
     }
 
@@ -232,9 +224,7 @@ impl MutterDesk {
                         return Ok(Some(previous));
                     }
                     if attempt + 1 == attempts {
-                        return Err(msg(
-                            "Mutter ScreenCast has not delivered a frame yet",
-                        ));
+                        return Err(msg("Mutter ScreenCast has not delivered a frame yet"));
                     }
                 }
             }
@@ -242,6 +232,152 @@ impl MutterDesk {
         Err(msg("Mutter ScreenCast has not delivered a frame yet"))
     }
 
+    /// Open a **separate** ScreenCast session with Mutter cursor-mode=2
+    /// (metadata). Does not alter the shared embedded desk stream (mode 1), so
+    /// concurrent legacy clients keep their video cursor and this peer gets
+    /// exclusion + `SPA_META_Cursor` without a double pointer.
+    ///
+    /// Returns `(screencast_session_path, pipewire_node)`. Caller owns Stop.
+    pub async fn open_metadata_monitor(&self) -> Result<(String, u32)> {
+        open_metadata_monitor(&self.conn, &self.connector).await
+    }
+
+    /// Drop the PipeWire consumer and stop the RemoteDesktop session.
+    pub async fn stop(&mut self) -> Result<()> {
+        self.capture = None;
+        self.last = None;
+        let session = std::mem::take(&mut self.session);
+        if session.is_empty() {
+            return Ok(());
+        }
+        stop_remote_desktop_session(&self.conn, &session).await
+    }
+}
+
+impl Drop for MutterDesk {
+    fn drop(&mut self) {
+        self.capture = None;
+        self.last = None;
+        let session = std::mem::take(&mut self.session);
+        if session.is_empty() {
+            return;
+        }
+        stop_remote_desktop_session_blocking(&self.conn, &session);
+    }
+}
+
+/// Stop a ScreenCast session previously opened for metadata capture.
+pub async fn stop_screencast_session(conn: &Connection, session_path: &str) -> Result<()> {
+    let session = Proxy::new(conn, MUTTER_SC, session_path, SC_SESSION_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter ScreenCast session: {err}")))?;
+    session
+        .call::<_, _, ()>("Stop", &())
+        .await
+        .map_err(|err| msg(format!("ScreenCast.Stop: {err}")))
+}
+
+/// Stop a RemoteDesktop session created by this connection, including ones
+/// that never reached `Start`. Associated ScreenCast streams stop with it.
+pub async fn stop_remote_desktop_session(conn: &Connection, session_path: &str) -> Result<()> {
+    let session = Proxy::new(conn, MUTTER_RD, session_path, RD_SESSION_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter RemoteDesktop session: {err}")))?;
+    match session.call::<_, _, ()>("Stop", &()).await {
+        Ok(()) => Ok(()),
+        Err(err)
+            if remote_desktop_close_action(Some(&err.to_string()))
+                == RemoteDesktopClose::StartThenStop =>
+        {
+            // Brief Start is required to make Stop succeed on this Mutter.
+            let _ = session.call::<_, _, ()>("Start", &()).await;
+            session
+                .call::<_, _, ()>("Stop", &())
+                .await
+                .map_err(|err| msg(format!("RemoteDesktop.Stop: {err}")))
+        }
+        Err(err) => Err(msg(format!("RemoteDesktop.Stop: {err}"))),
+    }
+}
+
+fn stop_remote_desktop_session_blocking(conn: &Connection, session_path: &str) {
+    let conn = conn.clone();
+    let session_path = session_path.to_string();
+    let join = std::thread::Builder::new()
+        .name("mutter-rd-stop".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let _ = rt.block_on(stop_remote_desktop_session(&conn, &session_path));
+        });
+    if let Ok(handle) = join {
+        let _ = handle.join();
+    }
+}
+
+/// Dedicated metadata RecordMonitor (Mutter cursor-mode=2). Not bound to the
+/// RemoteDesktop input session — video-only exclusion for one WebRTC peer.
+/// Records the same `connector` as the shared desk (not always primary).
+///
+/// Every error/timeout after CreateSession stops the session to avoid leaks.
+async fn open_metadata_monitor(conn: &Connection, connector: &str) -> Result<(String, u32)> {
+    let screencast = Proxy::new(conn, MUTTER_SC, SC_PATH, SC_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter ScreenCast: {err}")))?;
+    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let screencast_path: OwnedObjectPath = screencast
+        .call("CreateSession", &(options,))
+        .await
+        .map_err(|err| msg(format!("ScreenCast.CreateSession (metadata): {err}")))?;
+    let path = screencast_path.to_string();
+    let result = open_metadata_monitor_inner(conn, connector, &screencast_path).await;
+    if result.is_err() {
+        let _ = stop_screencast_session(conn, &path).await;
+    }
+    result.map(|node| (path, node))
+}
+
+async fn open_metadata_monitor_inner(
+    conn: &Connection,
+    connector: &str,
+    screencast_path: &OwnedObjectPath,
+) -> Result<u32> {
+    let screencast_session =
+        Proxy::new(conn, MUTTER_SC, screencast_path.as_str(), SC_SESSION_IFACE)
+            .await
+            .map_err(|err| msg(format!("Mutter ScreenCast session: {err}")))?;
+    let mut props: HashMap<&str, Value<'_>> = HashMap::new();
+    // Mutter ScreenCast cursor-mode (NOT portal bits): 0=hidden 1=embedded
+    // 2=metadata. Metadata excludes the OS pointer from the framebuffer and
+    // attaches spa_meta_cursor on PipeWire buffers.
+    props.insert("cursor-mode", Value::from(2u32));
+    let stream_path: OwnedObjectPath = screencast_session
+        .call("RecordMonitor", &(connector, props))
+        .await
+        .map_err(|err| msg(format!("RecordMonitor({connector}) metadata: {err}")))?;
+    let stream = Proxy::new(conn, MUTTER_SC, stream_path.as_str(), SC_STREAM_IFACE)
+        .await
+        .map_err(|err| msg(format!("Mutter ScreenCast stream: {err}")))?;
+    let mut signals = stream
+        .receive_signal("PipeWireStreamAdded")
+        .await
+        .map_err(|err| msg(format!("PipeWireStreamAdded: {err}")))?;
+    screencast_session
+        .call::<_, _, ()>("Start", &())
+        .await
+        .map_err(|err| msg(format!("ScreenCast.Start (metadata): {err}")))?;
+    let message = tokio::time::timeout(Duration::from_secs(10), signals.next())
+        .await
+        .map_err(|_| msg("Mutter did not add a metadata PipeWire stream within 10s"))?
+        .ok_or_else(|| msg("Mutter closed the metadata ScreenCast stream"))?;
+    message
+        .body()
+        .deserialize()
+        .map_err(|err| msg(format!("PipeWireStreamAdded node: {err}")))
 }
 
 async fn record_window_frame(
@@ -263,12 +399,33 @@ async fn record_window_frame(
         .call("CreateSession", &(options,))
         .await
         .map_err(|err| msg(format!("ScreenCast.CreateSession (window): {err}")))?;
+    let path = screencast_path.to_string();
+    match record_window_frame_inner(conn, window_id, &screencast_path, wait_ms, max_width).await {
+        Ok(frame) => Ok(frame),
+        Err(err) => {
+            let _ = stop_screencast_session(conn, &path).await;
+            Err(err)
+        }
+    }
+}
+
+async fn record_window_frame_inner(
+    conn: &Connection,
+    window_id: u64,
+    screencast_path: &OwnedObjectPath,
+    wait_ms: i32,
+    max_width: u32,
+) -> Result<Frame> {
     let screencast_session =
         Proxy::new(conn, MUTTER_SC, screencast_path.as_str(), SC_SESSION_IFACE)
             .await
             .map_err(|err| msg(format!("Mutter ScreenCast session: {err}")))?;
     let mut props: HashMap<&str, Value<'_>> = HashMap::new();
     props.insert("window-id", Value::U64(window_id));
+    // Mutter ScreenCast cursor-mode (NOT portal bits): 0=hidden 1=embedded
+    // 2=metadata. Keep embedded by default so old/shared clients retain a
+    // visible cursor. Do not flip to hidden/metadata without per-session
+    // negotiation (and never via global XFixesHideCursor).
     props.insert("cursor-mode", Value::from(1u32));
     let stream_path: OwnedObjectPath = screencast_session
         .call("RecordWindow", &(props,))
@@ -334,10 +491,8 @@ async fn list_shell_windows(conn: &Connection) -> Result<Vec<super::shell_window
             "window capture capability missing: GNOME Shell Introspect unreachable ({err})"
         ))
     })?;
-    let reply: HashMap<u64, HashMap<String, OwnedValue>> = introspect
-        .call("GetWindows", &())
-        .await
-        .map_err(|err| {
+    let reply: HashMap<u64, HashMap<String, OwnedValue>> =
+        introspect.call("GetWindows", &()).await.map_err(|err| {
             msg(format!(
                 "window capture capability missing: Shell.GetWindows failed ({err})"
             ))
@@ -369,6 +524,21 @@ async fn open_screencast(conn: &Connection, connector: &str) -> Result<(String, 
         .call("CreateSession", &())
         .await
         .map_err(|err| msg(format!("RemoteDesktop.CreateSession: {err}")))?;
+    let remote_path_str = remote_path.to_string();
+    match open_screencast_inner(conn, connector, &remote_path).await {
+        Ok((stream_path, node)) => Ok((remote_path_str, stream_path, node)),
+        Err(err) => {
+            let _ = stop_remote_desktop_session(conn, &remote_path_str).await;
+            Err(err)
+        }
+    }
+}
+
+async fn open_screencast_inner(
+    conn: &Connection,
+    connector: &str,
+    remote_path: &OwnedObjectPath,
+) -> Result<(String, u32)> {
     let remote_session = Proxy::new(conn, MUTTER_RD, remote_path.as_str(), RD_SESSION_IFACE)
         .await
         .map_err(|err| msg(format!("Mutter RemoteDesktop session: {err}")))?;
@@ -389,10 +559,32 @@ async fn open_screencast(conn: &Connection, connector: &str) -> Result<(String, 
         .call("CreateSession", &(options,))
         .await
         .map_err(|err| msg(format!("ScreenCast.CreateSession: {err}")))?;
-    let screencast_session = Proxy::new(conn, MUTTER_SC, screencast_path.as_str(), SC_SESSION_IFACE)
-        .await
-        .map_err(|err| msg(format!("Mutter ScreenCast session: {err}")))?;
+    let sc_path_str = screencast_path.to_string();
+    match attach_screencast_stream(conn, connector, &remote_session, &screencast_path).await {
+        Ok(out) => Ok(out),
+        Err(err) => {
+            if let Some(path) =
+                super::mutter_session::screencast_path_to_stop_on_error(Some(&sc_path_str))
+            {
+                let _ = stop_screencast_session(conn, path).await;
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn attach_screencast_stream(
+    conn: &Connection,
+    connector: &str,
+    remote_session: &Proxy<'_>,
+    screencast_path: &OwnedObjectPath,
+) -> Result<(String, u32)> {
+    let screencast_session =
+        Proxy::new(conn, MUTTER_SC, screencast_path.as_str(), SC_SESSION_IFACE)
+            .await
+            .map_err(|err| msg(format!("Mutter ScreenCast session: {err}")))?;
     let mut props: HashMap<&str, Value<'_>> = HashMap::new();
+    // Embedded (1) by default — see RecordWindow note above.
     props.insert("cursor-mode", Value::from(1u32));
     let stream_path: OwnedObjectPath = screencast_session
         .call("RecordMonitor", &(connector, props))
@@ -418,11 +610,7 @@ async fn open_screencast(conn: &Connection, connector: &str) -> Result<(String, 
         .body()
         .deserialize()
         .map_err(|err| msg(format!("PipeWireStreamAdded node: {err}")))?;
-    Ok((
-        remote_path.to_string(),
-        stream_path.to_string(),
-        node,
-    ))
+    Ok((stream_path.to_string(), node))
 }
 
 async fn display_monitors(conn: &Connection) -> Result<Vec<MonitorInfo>> {
@@ -444,9 +632,7 @@ async fn display_monitors(conn: &Connection) -> Result<Vec<MonitorInfo>> {
         .map_err(|err| msg(format!("DisplayConfig state: {err}")))?;
 
     let mut out = Vec::new();
-    for (index, (x, y, _scale, _transform, primary, specs, _props)) in
-        logicals.iter().enumerate()
-    {
+    for (index, (x, y, _scale, _transform, primary, specs, _props)) in logicals.iter().enumerate() {
         let Some(spec) = specs.first() else {
             continue;
         };
@@ -512,10 +698,7 @@ pub async fn notify_motion(
 ) -> Result<()> {
     remote_session(conn, session)
         .await?
-        .call::<_, _, ()>(
-            "NotifyPointerMotionAbsolute",
-            &(stream, x as f64, y as f64),
-        )
+        .call::<_, _, ()>("NotifyPointerMotionAbsolute", &(stream, x as f64, y as f64))
         .await
         .map_err(|err| msg(format!("pointer motion: {err}")))
 }
@@ -533,12 +716,7 @@ pub async fn notify_button(
         .map_err(|err| msg(format!("pointer button: {err}")))
 }
 
-pub async fn notify_axis(
-    conn: &Connection,
-    session: &str,
-    dx: f64,
-    dy: f64,
-) -> Result<()> {
+pub async fn notify_axis(conn: &Connection, session: &str, dx: f64, dy: f64) -> Result<()> {
     remote_session(conn, session)
         .await?
         .call::<_, _, ()>("NotifyPointerAxis", &(dx, dy, 0u32))
@@ -558,4 +736,3 @@ pub async fn notify_keysym(
         .await
         .map_err(|err| msg(format!("keysym: {err}")))
 }
-

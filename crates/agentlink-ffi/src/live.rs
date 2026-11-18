@@ -22,7 +22,10 @@ pub struct LiveInfo {
     pub hardware: bool,
     pub width: u32,
     pub height: u32,
+    pub src_width: u32,
+    pub src_height: u32,
     pub control: bool,
+    pub cursor_presentation: String,
 }
 
 #[derive(uniffi::Record)]
@@ -39,6 +42,9 @@ pub struct LiveCursor {
     pub x: i32,
     pub y: i32,
     pub shape: String,
+    pub visible: bool,
+    pub hotspot_x: u16,
+    pub hotspot_y: u16,
 }
 
 #[derive(uniffi::Record)]
@@ -151,6 +157,9 @@ impl DesktopLive {
                 x: cursor.x,
                 y: cursor.y,
                 shape: cursor.shape,
+                visible: cursor.visible,
+                hotspot_x: cursor.hotspot_x,
+                hotspot_y: cursor.hotspot_y,
             })
         })
         .flatten()
@@ -229,7 +238,10 @@ fn info_of(info: agentlink_view::LiveInfo) -> LiveInfo {
         hardware: info.hardware,
         width: info.width,
         height: info.height,
+        src_width: info.src_width,
+        src_height: info.src_height,
         control: info.control,
+        cursor_presentation: info.cursor_presentation,
     }
 }
 
@@ -241,6 +253,9 @@ fn empty_info() -> LiveInfo {
         hardware: false,
         width: 0,
         height: 0,
+        src_width: 0,
+        src_height: 0,
         control: false,
+        cursor_presentation: "legacy".into(),
     }
 }

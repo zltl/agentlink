@@ -21,6 +21,54 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Bound matches Rust MAX_CURSOR_BITMAP_EDGE. */
+#define AL_PW_CURSOR_EDGE 128
+#define AL_PW_MAX_DIM 16384
+#define AL_PW_MAX_FRAME_BYTES (64u * 1024u * 1024u)
+
+int al_pw_validate_frame_copy(
+    int width,
+    int height,
+    int chunk_stride,
+    uint32_t chunk_offset,
+    uint32_t chunk_size,
+    uint32_t maxsize,
+    size_t *out_stride,
+    size_t *out_alloc_bytes,
+    size_t *out_copy_bytes
+) {
+    uint64_t min_row;
+    uint64_t stride64;
+    uint64_t alloc64;
+    uint64_t min_valid64;
+    uint64_t copy64;
+
+    if (width <= 0 || height <= 0 || width > AL_PW_MAX_DIM || height > AL_PW_MAX_DIM) {
+        return 0;
+    }
+    min_row = (uint64_t)(uint32_t)width * 4ULL;
+    stride64 = chunk_stride > 0 ? (uint64_t)(uint32_t)chunk_stride : min_row;
+    if (stride64 < min_row || stride64 > (uint64_t)AL_PW_MAX_FRAME_BYTES) {
+        return 0;
+    }
+    alloc64 = stride64 * (uint64_t)(uint32_t)height;
+    if (alloc64 == 0 || alloc64 > (uint64_t)AL_PW_MAX_FRAME_BYTES) {
+        return 0;
+    }
+    min_valid64 = (uint64_t)(uint32_t)(height - 1) * stride64 + min_row;
+    if ((uint64_t)chunk_size < min_valid64) {
+        return 0;
+    }
+    copy64 = (uint64_t)chunk_size < alloc64 ? (uint64_t)chunk_size : alloc64;
+    if ((uint64_t)maxsize < copy64 || (uint64_t)chunk_offset > (uint64_t)maxsize - copy64) {
+        return 0;
+    }
+    if (out_stride) *out_stride = (size_t)stride64;
+    if (out_alloc_bytes) *out_alloc_bytes = (size_t)alloc64;
+    if (out_copy_bytes) *out_copy_bytes = (size_t)copy64;
+    return 1;
+}
+
 typedef struct PwCapture {
     struct pw_thread_loop *loop;
     struct pw_context *context;
@@ -41,6 +89,18 @@ typedef struct PwCapture {
     int crop_y;
     int crop_w;
     int crop_h;
+    /* SPA_META_Cursor — updated on every process callback; readable without take(). */
+    int cursor_valid;
+    int cursor_visible;
+    int cursor_x;
+    int cursor_y;
+    int cursor_hotspot_x;
+    int cursor_hotspot_y;
+    int cursor_w;
+    int cursor_h;
+    int cursor_seq;
+    int cursor_has_bitmap;
+    uint8_t cursor_rgba[AL_PW_CURSOR_EDGE * AL_PW_CURSOR_EDGE * 4];
     uint8_t *bgra;
     int bgra_size;
     int failed;
@@ -95,12 +155,168 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
         return;
     }
     pthread_mutex_lock(&cap->mu);
-    cap->width = (int)info.info.raw.size.width;
-    cap->height = (int)info.info.raw.size.height;
+    if (info.info.raw.size.width > 0 && info.info.raw.size.width <= AL_PW_MAX_DIM
+        && info.info.raw.size.height > 0 && info.info.raw.size.height <= AL_PW_MAX_DIM) {
+        cap->width = (int)info.info.raw.size.width;
+        cap->height = (int)info.info.raw.size.height;
+    } else {
+        cap->width = 0;
+        cap->height = 0;
+    }
     cap->src_width = cap->width;
     cap->src_height = cap->height;
     cap->format = (int)info.info.raw.format;
     pthread_mutex_unlock(&cap->mu);
+}
+
+/*
+ * SPA_META_Cursor / SPA_META_VideoCrop are enum members, not macros — never
+ * `#ifdef` them (that compiles the parser OUT on real spa headers). Under
+ * HAVE_PIPEWIRE, spa/buffer/meta.h is included and the enum values exist.
+ *
+ * Semantics (PipeWire docs + Mutter unset):
+ * - Absent meta: keep prior cursor (not a new hide).
+ * - id == 0: Mutter explicit unset → hidden / outside stream.
+ * - bitmap_offset == 0: no NEW bitmap (keep sprite); position may update.
+ * - format == 0: no new bitmap info.
+ * - inner bitmap.offset == 0: no image pixels → invisible.
+ * Mutter cursor pixels are premultiplied BGRA; we un-premultiply to straight
+ * RGBA for the wire so egui ColorImage::from_rgba_unmultiplied is correct.
+ */
+static int cursor_format_supported(uint32_t format) {
+    return format == SPA_VIDEO_FORMAT_BGRA
+        || format == SPA_VIDEO_FORMAT_BGRx
+        || format == SPA_VIDEO_FORMAT_RGBA
+        || format == SPA_VIDEO_FORMAT_RGBx;
+}
+
+static void apply_cursor_meta(PwCapture *cap, struct spa_buffer *spa_buf) {
+    struct spa_meta *meta = spa_buffer_find_meta(spa_buf, SPA_META_Cursor);
+    struct spa_meta_cursor *cur;
+    if (!meta || !meta->data || meta->size < sizeof(struct spa_meta_cursor)) {
+        return; /* absent — do not hide */
+    }
+    cur = meta->data;
+    if (cur->id == 0) {
+        cap->cursor_valid = 1;
+        cap->cursor_visible = 0;
+        cap->cursor_seq++;
+        return;
+    }
+    cap->cursor_valid = 1;
+    cap->cursor_x = cur->position.x;
+    cap->cursor_y = cur->position.y;
+    cap->cursor_hotspot_x = cur->hotspot.x;
+    cap->cursor_hotspot_y = cur->hotspot.y;
+    cap->cursor_visible = 1;
+    if (cur->bitmap_offset == 0) {
+        /* Position-only; keep prior sprite. */
+        cap->cursor_seq++;
+        return;
+    }
+    if (cur->bitmap_offset < sizeof(struct spa_meta_cursor)) {
+        cap->cursor_seq++;
+        return;
+    }
+    if ((size_t)cur->bitmap_offset + sizeof(struct spa_meta_bitmap) > meta->size) {
+        cap->cursor_seq++;
+        return;
+    }
+    {
+        struct spa_meta_bitmap *bm =
+            SPA_PTROFF(cur, cur->bitmap_offset, struct spa_meta_bitmap);
+        uint32_t bw_u = bm->size.width;
+        uint32_t bh_u = bm->size.height;
+        if (bm->format == 0) {
+            cap->cursor_seq++;
+            return;
+        }
+        if (bm->offset == 0) {
+            cap->cursor_visible = 0;
+            cap->cursor_has_bitmap = 0;
+            cap->cursor_w = 0;
+            cap->cursor_h = 0;
+            cap->cursor_seq++;
+            return;
+        }
+        if (!cursor_format_supported(bm->format)
+            || bw_u == 0 || bh_u == 0
+            || bw_u > (uint32_t)AL_PW_CURSOR_EDGE
+            || bh_u > (uint32_t)AL_PW_CURSOR_EDGE
+            || bm->stride < 0
+            || (uint32_t)bm->stride < bw_u * 4u
+            || bm->offset < sizeof(struct spa_meta_bitmap)) {
+            /* Unsupported / bad geometry — keep prior bitmap, pos already set. */
+            cap->cursor_seq++;
+            return;
+        }
+        {
+            size_t pix_base = (size_t)cur->bitmap_offset + (size_t)bm->offset;
+            size_t last = pix_base
+                + (size_t)(bh_u - 1u) * (size_t)bm->stride
+                + (size_t)bw_u * 4u;
+            if (last > meta->size || pix_base + (size_t)bw_u * 4u > meta->size) {
+                cap->cursor_seq++;
+                return;
+            }
+            {
+                const uint8_t *src = SPA_PTROFF(bm, bm->offset, const uint8_t);
+                int bw = (int)bw_u;
+                int bh = (int)bh_u;
+                int row;
+                int is_bgr = bm->format == SPA_VIDEO_FORMAT_BGRA
+                    || bm->format == SPA_VIDEO_FORMAT_BGRx;
+                int force_opaque = bm->format == SPA_VIDEO_FORMAT_BGRx
+                    || bm->format == SPA_VIDEO_FORMAT_RGBx;
+                for (row = 0; row < bh; row++) {
+                    const uint8_t *srow = src + (size_t)row * (size_t)bm->stride;
+                    uint8_t *drow = cap->cursor_rgba + (size_t)row * (size_t)bw * 4u;
+                    int col;
+                    for (col = 0; col < bw; col++) {
+                        const uint8_t *px = srow + (size_t)col * 4u;
+                        uint8_t r = is_bgr ? px[2] : px[0];
+                        uint8_t g = px[1];
+                        uint8_t b = is_bgr ? px[0] : px[2];
+                        uint8_t a = force_opaque ? 255 : px[3];
+                        /* Un-premultiply Mutter premul → straight RGBA for wire. */
+                        if (!force_opaque && a > 0 && a < 255) {
+                            r = (uint8_t)(((unsigned)r * 255u) / (unsigned)a);
+                            g = (uint8_t)(((unsigned)g * 255u) / (unsigned)a);
+                            b = (uint8_t)(((unsigned)b * 255u) / (unsigned)a);
+                        }
+                        drow[col * 4 + 0] = r;
+                        drow[col * 4 + 1] = g;
+                        drow[col * 4 + 2] = b;
+                        drow[col * 4 + 3] = a;
+                    }
+                }
+                cap->cursor_w = bw;
+                cap->cursor_h = bh;
+                cap->cursor_has_bitmap = 1;
+            }
+        }
+    }
+    cap->cursor_seq++;
+}
+
+static void apply_videocrop_meta(PwCapture *cap, struct spa_buffer *spa_buf) {
+    struct spa_meta *meta = spa_buffer_find_meta(spa_buf, SPA_META_VideoCrop);
+    if (meta && meta->data && meta->size >= sizeof(struct spa_region)) {
+        struct spa_region *region = meta->data;
+        int cx = region->position.x;
+        int cy = region->position.y;
+        int cw = (int)region->size.width;
+        int ch = (int)region->size.height;
+        if (cw > 0 && ch > 0 && cx >= 0 && cy >= 0
+            && cx + cw <= cap->width && cy + ch <= cap->height
+            && (cw < cap->width || ch < cap->height)) {
+            cap->crop_valid = 1;
+            cap->crop_x = cx;
+            cap->crop_y = cy;
+            cap->crop_w = cw;
+            cap->crop_h = ch;
+        }
+    }
 }
 
 static void on_process(void *userdata) {
@@ -112,78 +328,65 @@ static void on_process(void *userdata) {
     int stride;
     int height;
     uint8_t *dst;
+    int have_video = 0;
 
     buffer = pw_stream_dequeue_buffer(cap->stream);
     if (buffer == NULL) {
         return;
     }
     spa_buf = buffer->buffer;
-    if (spa_buf->n_datas < 1) {
-        pw_stream_queue_buffer(cap->stream, buffer);
-        return;
-    }
-    data = &spa_buf->datas[0];
-    if (data->data == NULL || data->chunk == NULL) {
-        pw_stream_queue_buffer(cap->stream, buffer);
-        return;
-    }
+
     pthread_mutex_lock(&cap->mu);
-    height = cap->height;
-    stride = data->chunk->stride > 0 ? data->chunk->stride : cap->width * 4;
-    if (height <= 0 || cap->width <= 0 || !is_bgra((uint32_t)cap->format)) {
-        pthread_mutex_unlock(&cap->mu);
-        pw_stream_queue_buffer(cap->stream, buffer);
-        return;
-    }
-    size = stride * height;
-    if (size <= 0 || size > 64 * 1024 * 1024) {
-        pthread_mutex_unlock(&cap->mu);
-        pw_stream_queue_buffer(cap->stream, buffer);
-        return;
-    }
-    if (cap->bgra_size < size) {
-        uint8_t *grown = (uint8_t *)realloc(cap->bgra, (size_t)size);
-        if (!grown) {
-            pthread_mutex_unlock(&cap->mu);
-            pw_stream_queue_buffer(cap->stream, buffer);
-            return;
-        }
-        cap->bgra = grown;
-        cap->bgra_size = size;
-    }
-    dst = cap->bgra;
-    if (data->chunk->size > 0 && (int)data->chunk->size < size) {
-        size = (int)data->chunk->size;
-    }
-    memcpy(dst, data->data, (size_t)size);
-    cap->stride = stride;
-    cap->src_width = cap->width;
-    cap->src_height = cap->height;
-    cap->dma_buf = data->type == SPA_DATA_DmaBuf;
+    /* Cursor / crop first — metadata-only buffers must not wait on pixels. */
+    apply_cursor_meta(cap, spa_buf);
     cap->crop_valid = 0;
     cap->crop_x = cap->crop_y = cap->crop_w = cap->crop_h = 0;
-#ifdef SPA_META_VideoCrop
-    {
-        struct spa_meta *meta = spa_buffer_find_meta(spa_buf, SPA_META_VideoCrop);
-        if (meta && meta->data && meta->size >= sizeof(struct spa_region)) {
-            struct spa_region *region = meta->data;
-            int cx = region->position.x;
-            int cy = region->position.y;
-            int cw = (int)region->size.width;
-            int ch = (int)region->size.height;
-            if (cw > 0 && ch > 0 && cx >= 0 && cy >= 0
-                && cx + cw <= cap->width && cy + ch <= cap->height
-                && (cw < cap->width || ch < cap->height)) {
-                cap->crop_valid = 1;
-                cap->crop_x = cx;
-                cap->crop_y = cy;
-                cap->crop_w = cw;
-                cap->crop_h = ch;
+    apply_videocrop_meta(cap, spa_buf);
+
+    if (spa_buf->n_datas >= 1) {
+        data = &spa_buf->datas[0];
+        if (data->data != NULL && data->chunk != NULL && is_bgra((uint32_t)cap->format)) {
+            size_t valid_stride = 0;
+            size_t alloc_bytes = 0;
+            size_t copy_bytes = 0;
+            if (al_pw_validate_frame_copy(
+                    cap->width,
+                    cap->height,
+                    data->chunk->stride,
+                    data->chunk->offset,
+                    data->chunk->size,
+                    data->maxsize,
+                    &valid_stride,
+                    &alloc_bytes,
+                    &copy_bytes)) {
+                size = (int)alloc_bytes;
+                if (cap->bgra_size < size) {
+                    uint8_t *grown = (uint8_t *)realloc(cap->bgra, alloc_bytes);
+                    if (grown) {
+                        cap->bgra = grown;
+                        cap->bgra_size = size;
+                    }
+                }
+                if (cap->bgra && (size_t)cap->bgra_size >= alloc_bytes) {
+                    const void *src_ptr = SPA_PTROFF(data->data, data->chunk->offset, const void);
+                    dst = cap->bgra;
+                    memcpy(dst, src_ptr, copy_bytes);
+                    if (alloc_bytes > copy_bytes) {
+                        memset(dst + copy_bytes, 0, alloc_bytes - copy_bytes);
+                    }
+                    cap->stride = (int)valid_stride;
+                    cap->src_width = cap->width;
+                    cap->src_height = cap->height;
+                    cap->dma_buf = data->type == SPA_DATA_DmaBuf;
+                    have_video = 1;
+                }
             }
         }
     }
-#endif
-    cap->seq++;
+    /* Only bump video seq when a real frame was copied. */
+    if (have_video) {
+        cap->seq++;
+    }
     pthread_mutex_unlock(&cap->mu);
     pw_stream_queue_buffer(cap->stream, buffer);
 }
@@ -239,18 +442,21 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
     pthread_mutex_init(&cap->mu, NULL);
     cap->loop = pw_thread_loop_new("agentlink-pw", NULL);
     if (!cap->loop) {
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
     cap->context = pw_context_new(pw_thread_loop_get_loop(cap->loop), NULL, 0);
     if (!cap->context) {
         pw_thread_loop_destroy(cap->loop);
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
     if (pw_thread_loop_start(cap->loop) < 0) {
         pw_context_destroy(cap->context);
         pw_thread_loop_destroy(cap->loop);
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
@@ -266,6 +472,7 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
         pw_thread_loop_stop(cap->loop);
         pw_context_destroy(cap->context);
         pw_thread_loop_destroy(cap->loop);
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
@@ -295,6 +502,7 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
                 pw_thread_loop_stop(cap->loop);
                 pw_context_destroy(cap->context);
                 pw_thread_loop_destroy(cap->loop);
+                pthread_mutex_destroy(&cap->mu);
                 free(cap);
                 return NULL;
             }
@@ -321,19 +529,22 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
         pw_thread_loop_stop(cap->loop);
         pw_context_destroy(cap->context);
         pw_thread_loop_destroy(cap->loop);
+        pthread_mutex_destroy(&cap->mu);
         free(cap);
         return NULL;
     }
     /*
      * Without an EnumFormat the consumer port never negotiates and
      * param_changed/process never fire. Mutter offers BGRx/BGRA on memfd or
-     * dma-buf; both are copied out by on_process().
+     * dma-buf; both are copied out by on_process(). Request Cursor (+ optional
+     * VideoCrop) meta so metadata-mode producers attach spa_meta_cursor.
      */
     {
-        uint8_t fmt[1024];
+        uint8_t fmt[2048];
         struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(fmt, sizeof(fmt));
-        const struct spa_pod *params[1];
-        params[0] = spa_pod_builder_add_object(
+        const struct spa_pod *params[4];
+        uint32_t n_params = 0;
+        params[n_params++] = spa_pod_builder_add_object(
             &builder,
             SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
             SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
@@ -344,18 +555,35 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
                 SPA_VIDEO_FORMAT_BGRx,
                 SPA_VIDEO_FORMAT_BGRA),
             0);
+        /* Enum values — not macros; always request when HAVE_PIPEWIRE. */
+        params[n_params++] = spa_pod_builder_add_object(
+            &builder,
+            SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Cursor),
+            SPA_PARAM_META_size, SPA_POD_Int(
+                (int)sizeof(struct spa_meta_cursor) +
+                (int)sizeof(struct spa_meta_bitmap) +
+                AL_PW_CURSOR_EDGE * AL_PW_CURSOR_EDGE * 4),
+            0);
+        params[n_params++] = spa_pod_builder_add_object(
+            &builder,
+            SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoCrop),
+            SPA_PARAM_META_size, SPA_POD_Int((int)sizeof(struct spa_meta_region)),
+            0);
         if (pw_stream_connect(
                 cap->stream,
                 PW_DIRECTION_INPUT,
                 node_id,
                 PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
                 params,
-                1) < 0) {
+                n_params) < 0) {
             pw_stream_destroy(cap->stream);
             pw_thread_loop_unlock(cap->loop);
             pw_thread_loop_stop(cap->loop);
             pw_context_destroy(cap->context);
             pw_thread_loop_destroy(cap->loop);
+            pthread_mutex_destroy(&cap->mu);
             free(cap);
             return NULL;
         }
@@ -376,7 +604,7 @@ int al_pw_take(
 ) {
     int spins;
     int step_us = 5000;
-    if (!cap || !dst) {
+    if (!cap || !dst || dst_cap < 0) {
         return -1;
     }
     spins = wait_ms <= 0 ? 1 : (wait_ms * 1000) / step_us;
@@ -385,12 +613,15 @@ int al_pw_take(
     }
     for (int i = 0; i < spins; i++) {
         int seq;
-        int size;
         pthread_mutex_lock(&cap->mu);
         seq = cap->seq;
-        if (seq != cap->last_taken && cap->bgra && cap->width > 0 && cap->height > 0) {
-            size = cap->stride * cap->height;
-            if (size > dst_cap) {
+        if (seq != cap->last_taken && cap->bgra && cap->width > 0 && cap->height > 0 && cap->stride > 0) {
+            uint64_t size64 = (uint64_t)(uint32_t)cap->stride * (uint64_t)(uint32_t)cap->height;
+            if (size64 > (uint64_t)AL_PW_MAX_FRAME_BYTES || (size_t)size64 > (size_t)cap->bgra_size) {
+                pthread_mutex_unlock(&cap->mu);
+                return -1;
+            }
+            if (size64 > (uint64_t)(uint32_t)dst_cap) {
                 /* Report the real geometry so the caller can resize. */
                 *width = cap->width;
                 *height = cap->height;
@@ -402,26 +633,26 @@ int al_pw_take(
             if (cap->target_width > 0 && cap->target_width < cap->width) {
                 int out_w = cap->target_width;
                 int out_h = (int)(((int64_t)cap->height * (int64_t)out_w + cap->width / 2) / cap->width);
-                int out_stride;
-                int out_size;
+                uint64_t out_stride64;
+                uint64_t out_size64;
                 if (out_h < 1) out_h = 1;
-                out_stride = out_w * 4;
-                out_size = out_stride * out_h;
-                if (out_size > dst_cap) {
+                out_stride64 = (uint64_t)(uint32_t)out_w * 4ULL;
+                out_size64 = out_stride64 * (uint64_t)(uint32_t)out_h;
+                if (out_size64 > (uint64_t)(uint32_t)dst_cap) {
                     *width = out_w;
                     *height = out_h;
-                    *stride = out_stride;
+                    *stride = (int)out_stride64;
                     *dma_buf = cap->dma_buf;
                     pthread_mutex_unlock(&cap->mu);
                     return -2;
                 }
                 downsample_nn(cap->bgra, cap->width, cap->height, cap->stride,
-                              dst, out_w, out_h, out_stride);
+                              dst, out_w, out_h, (int)out_stride64);
                 *width = out_w;
                 *height = out_h;
-                *stride = out_stride;
+                *stride = (int)out_stride64;
             } else {
-                memcpy(dst, cap->bgra, (size_t)size);
+                memcpy(dst, cap->bgra, (size_t)size64);
                 *width = cap->width;
                 *height = cap->height;
                 *stride = cap->stride;
@@ -491,6 +722,50 @@ int al_pw_videocrop(PwCapture *cap, int *x, int *y, int *w, int *h) {
     }
     pthread_mutex_unlock(&cap->mu);
     return ok;
+}
+
+/*
+ * Latest SPA_META_Cursor without waiting on al_pw_take / encode.
+ * Returns 1 when a sample is available, 0 when none yet, -1 on error.
+ * rgba_out may be NULL to skip bitmap copy; *has_bitmap reports presence.
+ */
+int al_pw_cursor(
+    PwCapture *cap,
+    int *x,
+    int *y,
+    int *hotspot_x,
+    int *hotspot_y,
+    int *visible,
+    int *width,
+    int *height,
+    int *has_bitmap,
+    unsigned char *rgba_out,
+    int rgba_cap
+) {
+    if (!cap) return -1;
+    pthread_mutex_lock(&cap->mu);
+    if (!cap->cursor_valid) {
+        pthread_mutex_unlock(&cap->mu);
+        return 0;
+    }
+    if (x) *x = cap->cursor_x;
+    if (y) *y = cap->cursor_y;
+    if (hotspot_x) *hotspot_x = cap->cursor_hotspot_x;
+    if (hotspot_y) *hotspot_y = cap->cursor_hotspot_y;
+    if (visible) *visible = cap->cursor_visible ? 1 : 0;
+    if (width) *width = cap->cursor_w;
+    if (height) *height = cap->cursor_h;
+    if (has_bitmap) *has_bitmap = cap->cursor_has_bitmap ? 1 : 0;
+    if (rgba_out && cap->cursor_has_bitmap && cap->cursor_w > 0 && cap->cursor_h > 0) {
+        int need = cap->cursor_w * cap->cursor_h * 4;
+        if (need > rgba_cap) {
+            pthread_mutex_unlock(&cap->mu);
+            return -2;
+        }
+        memcpy(rgba_out, cap->cursor_rgba, (size_t)need);
+    }
+    pthread_mutex_unlock(&cap->mu);
+    return 1;
 }
 
 void al_pw_close(PwCapture *cap) {

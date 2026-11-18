@@ -132,6 +132,42 @@ pub fn parse_combo(spec: &str) -> Result<Vec<String>> {
     parts.into_iter().map(canonical).collect()
 }
 
+/// Windows Ctrl+Alt+Del is the secure attention sequence. `SendInput` and
+/// the portal key path cannot open the security screen. A chord matches only
+/// when ctrl, alt, and delete are all present.
+pub fn is_secure_attention_sequence<S: AsRef<str>>(keys: &[S]) -> bool {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut delete = false;
+    for key in keys {
+        match key.as_ref() {
+            "ctrl" | "lctrl" | "rctrl" | "control" => ctrl = true,
+            "alt" | "lalt" | "ralt" | "option" | "opt" => alt = true,
+            "delete" | "del" => delete = true,
+            _ => {}
+        }
+    }
+    ctrl && alt && delete
+}
+
+/// Whether `SendInput` must set `KEYEVENTF_EXTENDEDKEY` (`0xE0` scan prefix)
+/// for a Win32 virtual-key code so navigation, Win/Apps, right-side modifiers,
+/// and numpad `/` are distinguished from numpad digits and main-block keys.
+pub fn is_windows_extended_vk(vk: u16) -> bool {
+    matches!(
+        vk,
+        0x03 // VK_CANCEL (Ctrl+Break)
+        | 0x21..=0x28 // PageUp, PageDown, End, Home, Left, Up, Right, Down
+        | 0x2c..=0x2e // PrintScreen, Insert, Delete
+        | 0x5b..=0x5d // LWin, RWin, Apps
+        | 0x6f // VK_DIVIDE (numpad /)
+        | 0x90 // VK_NUMLOCK
+        | 0xa3 // VK_RCONTROL
+        | 0xa5 // VK_RMENU (Right Alt / AltGr)
+        | 0xa6..=0xb7 // Browser & media keys
+    )
+}
+
 pub fn key_info(name: &str) -> Option<KeyInfo> {
     if let Some(info) = NAMED.iter().find(|item| item.name == name).copied() {
         return Some(info);
@@ -482,6 +518,78 @@ const NAMED: &[KeyInfo] = &[
         keysym: 0xffc9,
         vk: 0x7b,
         mac: 0x6f,
+    },
+    KeyInfo {
+        name: "f13",
+        keysym: 0xffca,
+        vk: 0x7c,
+        mac: 0x69,
+    },
+    KeyInfo {
+        name: "f14",
+        keysym: 0xffcb,
+        vk: 0x7d,
+        mac: 0x6b,
+    },
+    KeyInfo {
+        name: "f15",
+        keysym: 0xffcc,
+        vk: 0x7e,
+        mac: 0x71,
+    },
+    KeyInfo {
+        name: "f16",
+        keysym: 0xffcd,
+        vk: 0x7f,
+        mac: 0x6a,
+    },
+    KeyInfo {
+        name: "f17",
+        keysym: 0xffce,
+        vk: 0x80,
+        mac: 0x40,
+    },
+    KeyInfo {
+        name: "f18",
+        keysym: 0xffcf,
+        vk: 0x81,
+        mac: 0x4f,
+    },
+    KeyInfo {
+        name: "f19",
+        keysym: 0xffd0,
+        vk: 0x82,
+        mac: 0x50,
+    },
+    KeyInfo {
+        name: "f20",
+        keysym: 0xffd1,
+        vk: 0x83,
+        mac: 0x5a,
+    },
+    KeyInfo {
+        name: "f21",
+        keysym: 0xffd2,
+        vk: 0x84,
+        mac: 0,
+    },
+    KeyInfo {
+        name: "f22",
+        keysym: 0xffd3,
+        vk: 0x85,
+        mac: 0,
+    },
+    KeyInfo {
+        name: "f23",
+        keysym: 0xffd4,
+        vk: 0x86,
+        mac: 0,
+    },
+    KeyInfo {
+        name: "f24",
+        keysym: 0xffd5,
+        vk: 0x87,
+        mac: 0,
     },
     // Unshifted punctuation (US ANSI). Shift variants share the physical VK;
     // X11 keysyms use the produced character so temporary mapping can type them.
@@ -938,6 +1046,44 @@ mod tests {
             assert_eq!(info.keysym, keysym, "keysym for {name}");
             // mac field is always present (0 for keys without a CGKeyCode).
             let _ = info.mac;
+        }
+    }
+
+    #[test]
+    fn secure_attention_is_only_ctrl_alt_delete() {
+        assert!(is_secure_attention_sequence(&["ctrl", "alt", "delete"]));
+        assert!(is_secure_attention_sequence(&[
+            "lctrl".to_string(),
+            "ralt".into(),
+            "del".into()
+        ]));
+        assert!(!is_secure_attention_sequence(&["ctrl", "c"]));
+        assert!(!is_secure_attention_sequence(&["delete"]));
+        assert!(!is_secure_attention_sequence(&["ctrl", "alt", "tab"]));
+        assert!(!is_secure_attention_sequence(&["alt", "f4"]));
+        assert!(!is_secure_attention_sequence::<&str>(&[]));
+    }
+
+    #[test]
+    fn windows_extended_vk_flags_navigation_win_and_right_modifiers() {
+        for ext in [
+            "up", "down", "left", "right", "home", "end", "pageup", "pagedown", "insert",
+            "delete", "prtsc", "meta", "lgui", "rgui", "apps", "rctrl", "ralt", "kp/", "volup",
+        ] {
+            let vk = key_info(ext).unwrap_or_else(|| panic!("missing {ext}")).vk;
+            assert!(
+                is_windows_extended_vk(vk),
+                "{ext} (vk={vk:#x}) must carry KEYEVENTF_EXTENDEDKEY"
+            );
+        }
+        for main_block in ["a", "0", "enter", "tab", "escape", "backspace", "ctrl", "lctrl", "shift", "lalt", "f1", "f24"] {
+            let vk = key_info(main_block)
+                .unwrap_or_else(|| panic!("missing {main_block}"))
+                .vk;
+            assert!(
+                !is_windows_extended_vk(vk),
+                "{main_block} (vk={vk:#x}) must not carry KEYEVENTF_EXTENDEDKEY"
+            );
         }
     }
 }

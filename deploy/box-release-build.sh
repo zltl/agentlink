@@ -9,20 +9,20 @@
 #   deploy/box-release-build.sh --skip-sync     # build the tip already on box
 #   deploy/box-release-build.sh --dry-run       # bundle locally, print commands
 #   deploy/box-release-build.sh --version 0.1.136
-#   SUFA_BASE=<sha-on-box> deploy/box-release-build.sh
+#   TARGET_BASE=<sha-on-box> deploy/box-release-build.sh
 #
 # Version: exact tag on HEAD, else the tag from `git describe --tags` with the
 # `-<n>-g<sha>` suffix and leading `v` stripped (so `0.1.137-2-gaffb434`
 # becomes `0.1.137`). --version overrides it (also `v`-stripped). The value
 # is exported on the node as AGENTLINK_RELEASE_VERSION.
 #
-# Environment: REPO_DIR, SUFA_NODE, SUFA_CHECKOUT, SUFA_BASE.
+# Environment: REPO_DIR, TARGET_NODE, TARGET_CHECKOUT, TARGET_BASE.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=${REPO_DIR:-$(CDPATH= cd -- "$script_dir/.." && pwd)}
-SUFA_NODE=${SUFA_NODE:-}
-SUFA_CHECKOUT=${SUFA_CHECKOUT:-}
+TARGET_NODE=${TARGET_NODE:-}
+TARGET_CHECKOUT=${TARGET_CHECKOUT:-}
 VERSION_OVERRIDE=
 DRY_RUN=0
 SKIP_SYNC=0
@@ -37,7 +37,7 @@ Usage:
   deploy/box-release-build.sh --skip-sync     # build the tip already on box
   deploy/box-release-build.sh --dry-run       # bundle locally, print commands
   deploy/box-release-build.sh --version 0.1.136
-  SUFA_BASE=<sha-on-box> deploy/box-release-build.sh
+  TARGET_BASE=<sha-on-box> deploy/box-release-build.sh
 
 Flags:
   --dry-run        Create the bundle, print the sync/build commands, change nothing
@@ -47,7 +47,7 @@ Flags:
   --node NAME      agentlink node name (default: box)
   --checkout PATH  Remote checkout (default: /var/lib/agentlink/src)
 
-Environment: REPO_DIR, SUFA_NODE, SUFA_CHECKOUT, SUFA_BASE.
+Environment: REPO_DIR, TARGET_NODE, TARGET_CHECKOUT, TARGET_BASE.
 EOF
 }
 
@@ -62,8 +62,8 @@ while [ $# -gt 0 ]; do
         --skip-sync) SKIP_SYNC=1 ;;
         --version) VERSION_OVERRIDE=${2:?--version needs a value}; shift ;;
         --repo) REPO_DIR=${2:?--repo needs a directory}; shift ;;
-        --node) SUFA_NODE=${2:?--node needs a name}; shift ;;
-        --checkout) SUFA_CHECKOUT=${2:?--checkout needs a path}; shift ;;
+        --node) TARGET_NODE=${2:?--node needs a name}; shift ;;
+        --checkout) TARGET_CHECKOUT=${2:?--checkout needs a path}; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
@@ -107,7 +107,7 @@ cargo build -p agentlink-cli --release
 ls -lh ./target/release/agentlink
 '
 
-EXEC_CMD=(agentlink exec --timeout-secs "$BUILD_TIMEOUT" "$SUFA_NODE" sh -c "$REMOTE_SCRIPT" sh "$SUFA_CHECKOUT" "$VERSION")
+EXEC_CMD=(agentlink exec --timeout-secs "$BUILD_TIMEOUT" "$TARGET_NODE" sh -c "$REMOTE_SCRIPT" sh "$TARGET_CHECKOUT" "$VERSION")
 SYNC_SCRIPT="$script_dir/sync-box-bundle.sh"
 
 printf 'version: %s\n' "$VERSION"
@@ -118,7 +118,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     else
         [ -x "$SYNC_SCRIPT" ] || die "sync helper is missing or not executable: $SYNC_SCRIPT"
         printf '\n# sync (dry run)\n'
-        "$SYNC_SCRIPT" --repo "$REPO_DIR" --node "$SUFA_NODE" --checkout "$SUFA_CHECKOUT" --dry-run
+        "$SYNC_SCRIPT" --repo "$REPO_DIR" --node "$TARGET_NODE" --checkout "$TARGET_CHECKOUT" --dry-run
     fi
     printf '\n# release build (dry run); would run:\n  '
     printf '%q ' "${EXEC_CMD[@]}"
@@ -130,16 +130,16 @@ command -v agentlink >/dev/null 2>&1 || die "agentlink not found on PATH"
 
 if [ "$SKIP_SYNC" -eq 0 ]; then
     [ -x "$SYNC_SCRIPT" ] || die "sync helper is missing or not executable: $SYNC_SCRIPT"
-    printf 'syncing tip to %s ...\n' "$SUFA_NODE"
-    "$SYNC_SCRIPT" --repo "$REPO_DIR" --node "$SUFA_NODE" --checkout "$SUFA_CHECKOUT" \
-        || die "sync to '$SUFA_NODE' failed; fix the sync before building"
+    printf 'syncing tip to %s ...\n' "$TARGET_NODE"
+    "$SYNC_SCRIPT" --repo "$REPO_DIR" --node "$TARGET_NODE" --checkout "$TARGET_CHECKOUT" \
+        || die "sync to '$TARGET_NODE' failed; fix the sync before building"
 fi
 
-agentlink exec --timeout-secs 20 "$SUFA_NODE" true >/dev/null 2>&1 \
-    || die "node '$SUFA_NODE' is unreachable; check \`agentlink nodes\` and that the node is online"
+agentlink exec --timeout-secs 20 "$TARGET_NODE" true >/dev/null 2>&1 \
+    || die "node '$TARGET_NODE' is unreachable; check \`agentlink nodes\` and that the node is online"
 
-printf 'building release on %s ...\n' "$SUFA_NODE"
+printf 'building release on %s ...\n' "$TARGET_NODE"
 if ! "${EXEC_CMD[@]}"; then
-    die "release build failed on '$SUFA_NODE'; see the output above"
+    die "release build failed on '$TARGET_NODE'; see the output above"
 fi
-printf 'done: %s %s -> %s/target/release/agentlink\n' "$SUFA_NODE" "$VERSION" "$SUFA_CHECKOUT"
+printf 'done: %s %s -> %s/target/release/agentlink\n' "$TARGET_NODE" "$VERSION" "$TARGET_CHECKOUT"
