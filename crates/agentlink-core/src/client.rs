@@ -2460,7 +2460,7 @@ mod tests {
             request_id: "dev-1".into(),
             devices: vec![crate::protocol::DeviceInfo {
                 id: "ab".repeat(32),
-                user: "ltl".into(),
+                user: "operator".into(),
                 name: "phone".into(),
                 created_unix: 1,
                 last_seen_unix: 2,

@@ -1,5 +1,5 @@
 //! Read-only diagnostic: send webrtc list_monitors / offer to an existing
-//! node (default: sufa) with the already-authorized client identity.
+//! node (default: workstation) with the already-authorized client identity.
 //! Does not create an identity or grant, does not print tokens, and closes
 //! the session after a timed wait for a selected ICE pair and decoded frames.
 //!
@@ -164,7 +164,7 @@ fn log_unit(n: u32) -> bool {
 
 #[tokio::main]
 async fn main() {
-    let node = env::args().nth(1).unwrap_or_else(|| "sufa".to_string());
+    let node = env::args().nth(1).unwrap_or_else(|| "workstation".to_string());
     let config_dir = env::var("AGENTLINK_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| config::default_config_dir().expect("config dir"));

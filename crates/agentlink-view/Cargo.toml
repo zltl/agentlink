@@ -18,5 +18,5 @@ rtc = { version = "0.21.1", default-features = false, features = ["crypto-ring"]
 
 [dev-dependencies]
 agentlink-desktop = { workspace = true }
-# Example-only: t449_sufa_stage dimension probe (same crate as Controller H264Decoder).
+# Example-only: webrtc_stage_probe dimension probe (same crate as Controller H264Decoder).
 openh264 = "0.8"

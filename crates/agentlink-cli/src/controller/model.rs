@@ -589,7 +589,7 @@ pub fn innermost_content_width(
 /// 0133 used a two-column `Grid` once the list was ≥ 860 px. In the
 /// maximized retest the first cell inherited the leftover panel width,
 /// so cards stretched across the window, metadata overlapped, and the
-/// second column (sufa, tc-external, probe) overflowed off the right
+/// second column (workstation, node-external, probe) overflowed off the right
 /// edge. A compact single column that truncates long hostnames/ids and
 /// wraps whole action buttons is the maintainable layout.
 pub fn machine_card_columns(_available_width: f32) -> usize {

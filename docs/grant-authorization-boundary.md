@@ -20,7 +20,7 @@
 
 ## 隔离节点上的实测（非生产）
 
-时间均为 Asia/Shanghai (UTC+8)。候选二进制 `agentlink-c83a5ca`，隔离节点用户 `ltl` uid 1000，issuer 模式 600、属主 ltl。生产节点与生产 issuer 未改。
+时间均为 Asia/Shanghai (UTC+8)。候选二进制 `agentlink-c83a5ca`，隔离节点用户 `operator` uid 1000，issuer 模式 600、属主 operator。生产节点与生产 issuer 未改。
 
 | 编号 | 操作 | 期望（诚实） | 实际 |
 | --- | --- | --- | --- |

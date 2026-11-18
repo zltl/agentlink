@@ -345,14 +345,14 @@ Do not leave `bootstrap.password` on disk after the admin password is set. Tip u
 ```sh
 deploy/sync-box-bundle.sh --dry-run   # create the bundle, print cp/exec commands
 deploy/sync-box-bundle.sh             # copy and fast-forward box
-SUFA_BASE=<sha-on-box> deploy/sync-box-bundle.sh   # incremental bundle
+TARGET_BASE=<sha-on-box> deploy/sync-box-bundle.sh   # incremental bundle
 ```
 
 The working tree may be dirty; the bundle always records HEAD. Add `--require-clean` to refuse that. A merge that is not fast-forward fails instead of creating a merge commit. The bundle stays in `/tmp/agentlink-bundle/` on box and is overwritten on the next run.
 
 ## Build a release on box
 
-`deploy/box-release-build.sh` chains the sync with a release build: it calls `deploy/sync-box-bundle.sh` (same `--repo`/`--node`/`--checkout`/`--dry-run` flags, `SUFA_BASE` passed through) and then runs `cargo build -p agentlink-cli --release` on box with `AGENTLINK_RELEASE_VERSION` exported. The version comes from an exact tag on HEAD, else the nearest `git describe --tags` with the `-<n>-g<sha>` suffix and leading `v` stripped (so `0.1.137-2-gaffb434` becomes `0.1.137`); pass `--version` to override it. The build runs through `agentlink exec --timeout-secs 600` and prints `./target/release/agentlink --version` plus the binary size. This is an ops helper only: it does not tag, push, or publish `/dl`.
+`deploy/box-release-build.sh` chains the sync with a release build: it calls `deploy/sync-box-bundle.sh` (same `--repo`/`--node`/`--checkout`/`--dry-run` flags, `TARGET_BASE` passed through) and then runs `cargo build -p agentlink-cli --release` on box with `AGENTLINK_RELEASE_VERSION` exported. The version comes from an exact tag on HEAD, else the nearest `git describe --tags` with the `-<n>-g<sha>` suffix and leading `v` stripped (so `0.1.137-2-gaffb434` becomes `0.1.137`); pass `--version` to override it. The build runs through `agentlink exec --timeout-secs 600` and prints `./target/release/agentlink --version` plus the binary size. This is an ops helper only: it does not tag, push, or publish `/dl`.
 
 ```sh
 deploy/box-release-build.sh              # sync the tip, then release-build on box

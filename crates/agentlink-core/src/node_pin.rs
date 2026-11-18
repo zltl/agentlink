@@ -170,10 +170,10 @@ mod tests {
     fn id_for_name_returns_pinned_id() {
         let dir = tempfile::tempdir().unwrap();
         let id = "ab".repeat(32);
-        observe(dir.path(), "sufa-t417-9bf95e3-test", &id).unwrap();
-        assert_eq!(id_for_name(dir.path(), "sufa-t417-9bf95e3-test").unwrap(), Some(id.clone()));
+        observe(dir.path(), "workstation-iso", &id).unwrap();
+        assert_eq!(id_for_name(dir.path(), "workstation-iso").unwrap(), Some(id.clone()));
         assert_eq!(
-            id_for_name(dir.path(), "SUFA-T417-9BF95E3-TEST").unwrap(),
+            id_for_name(dir.path(), "WORKSTATION-ISO").unwrap(),
             Some(id)
         );
         assert_eq!(id_for_name(dir.path(), "missing").unwrap(), None);

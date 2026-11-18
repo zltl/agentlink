@@ -3248,7 +3248,7 @@ mod worker_client_recovery_tests {
         let connects_ensure = Arc::clone(&connects);
         let out = list_monitors_with_once_rebootstrap(
             &mut slot,
-            "sufa",
+            "workstation",
             |slot, force| {
                 let connects = Arc::clone(&connects_ensure);
                 Box::pin(async move {
@@ -3283,7 +3283,7 @@ mod worker_client_recovery_tests {
         let connects_ensure = Arc::clone(&connects);
         let err = list_monitors_with_once_rebootstrap(
             &mut slot,
-            "sufa",
+            "workstation",
             |slot, force| {
                 let connects = Arc::clone(&connects_ensure);
                 Box::pin(async move {
@@ -3313,7 +3313,7 @@ mod worker_client_recovery_tests {
         let connects_ensure = Arc::clone(&connects);
         let err = list_monitors_with_once_rebootstrap(
             &mut slot,
-            "sufa",
+            "workstation",
             |slot, force| {
                 let connects = Arc::clone(&connects_ensure);
                 Box::pin(async move {

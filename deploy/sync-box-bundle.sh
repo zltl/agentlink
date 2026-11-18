@@ -2,7 +2,7 @@
 # Push the current tip to box over agentlink when `git pull` on box→GitHub
 # hangs. Runs on the box (or any host with one checkout and a logged-in
 # `agentlink` CLI). The box keeps the single checkout
-# /workspace/agentlink-src; box keeps its own checkout.
+# <workspace>/repo; box keeps its own checkout.
 #
 # How it works: `git bundle create` records the branch tip locally, `agentlink
 # cp` copies the bundle to `/tmp/agentlink-bundle/` on the node, and
@@ -13,20 +13,20 @@
 #   deploy/sync-box-bundle.sh                  # complete bundle, apply on box
 #   deploy/sync-box-bundle.sh --dry-run        # bundle locally, print commands
 #   deploy/sync-box-bundle.sh --node box --checkout /var/lib/agentlink/src
-#   SUFA_BASE=<sha> deploy/sync-box-bundle.sh  # incremental bundle (base must exist on box)
+#   TARGET_BASE=<sha> deploy/sync-box-bundle.sh  # incremental bundle (base must exist on box)
 #
 # Complete bundles need a full clone (`git fetch --unshallow`); incremental
-# bundles with SUFA_BASE work on a shallow clone as long as the base is present.
+# bundles with TARGET_BASE work on a shallow clone as long as the base is present.
 #
-# Environment: REPO_DIR, SUFA_NODE, SUFA_CHECKOUT, SUFA_STAGE, SUFA_BASE.
+# Environment: REPO_DIR, TARGET_NODE, TARGET_CHECKOUT, TARGET_STAGE, TARGET_BASE.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=${REPO_DIR:-$(CDPATH= cd -- "$script_dir/.." && pwd)}
-SUFA_NODE=${SUFA_NODE:-}
-SUFA_CHECKOUT=${SUFA_CHECKOUT:-}
-SUFA_STAGE=${SUFA_STAGE:-/tmp/agentlink-bundle}
-SUFA_BASE=${SUFA_BASE:-}
+TARGET_NODE=${TARGET_NODE:-}
+TARGET_CHECKOUT=${TARGET_CHECKOUT:-}
+TARGET_STAGE=${TARGET_STAGE:-/tmp/agentlink-bundle}
+TARGET_BASE=${TARGET_BASE:-}
 DRY_RUN=0
 REQUIRE_CLEAN=0
 
@@ -38,10 +38,10 @@ Usage:
   deploy/sync-box-bundle.sh                  # complete bundle, apply on box
   deploy/sync-box-bundle.sh --dry-run        # bundle locally, print commands
   deploy/sync-box-bundle.sh --repo DIR --node NAME --checkout REMOTE_PATH
-  SUFA_BASE=<sha> deploy/sync-box-bundle.sh  # incremental bundle (base must exist on box)
+  TARGET_BASE=<sha> deploy/sync-box-bundle.sh  # incremental bundle (base must exist on box)
 
 Complete bundles need a full clone (`git fetch --unshallow`); incremental
-bundles with SUFA_BASE work on a shallow clone as long as the base is present.
+bundles with TARGET_BASE work on a shallow clone as long as the base is present.
 
 Flags:
   --dry-run        Create the bundle, print the cp/exec commands, change nothing
@@ -51,7 +51,7 @@ Flags:
   --require-clean  Refuse to bundle when the working tree is dirty
   --force-dirty    Bundle HEAD even when dirty (the default)
 
-Environment: REPO_DIR, SUFA_NODE, SUFA_CHECKOUT, SUFA_STAGE, SUFA_BASE.
+Environment: REPO_DIR, TARGET_NODE, TARGET_CHECKOUT, TARGET_STAGE, TARGET_BASE.
 EOF
 }
 
@@ -64,8 +64,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --repo) REPO_DIR=${2:?--repo needs a directory}; shift ;;
-        --node) SUFA_NODE=${2:?--node needs a name}; shift ;;
-        --checkout) SUFA_CHECKOUT=${2:?--checkout needs a path}; shift ;;
+        --node) TARGET_NODE=${2:?--node needs a name}; shift ;;
+        --checkout) TARGET_CHECKOUT=${2:?--checkout needs a path}; shift ;;
         --require-clean) REQUIRE_CLEAN=1 ;;
         --force-dirty) REQUIRE_CLEAN=0 ;;
         -h|--help) usage; exit 0 ;;
@@ -74,21 +74,21 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-[ -n "$SUFA_NODE" ] || die "pass --node or set SUFA_NODE"
-[ -n "$SUFA_CHECKOUT" ] || die "pass --checkout or set SUFA_CHECKOUT"
+[ -n "$TARGET_NODE" ] || die "pass --node or set TARGET_NODE"
+[ -n "$TARGET_CHECKOUT" ] || die "pass --checkout or set TARGET_CHECKOUT"
 
-SUFA_STAGE=${SUFA_STAGE%/}
-case "$SUFA_STAGE" in
+TARGET_STAGE=${TARGET_STAGE%/}
+case "$TARGET_STAGE" in
     /*) ;;
-    *) SUFA_STAGE="/$SUFA_STAGE" ;;
+    *) TARGET_STAGE="/$TARGET_STAGE" ;;
 esac
-REMOTE_BUNDLE="$SUFA_STAGE/tip.bundle"
+REMOTE_BUNDLE="$TARGET_STAGE/tip.bundle"
 
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
     || die "not a git checkout: $REPO_DIR"
 IS_SHALLOW=$(git -C "$REPO_DIR" rev-parse --is-shallow-repository)
-if [ "$IS_SHALLOW" = true ] && [ -z "$SUFA_BASE" ]; then
-    die "$REPO_DIR is a shallow clone; complete bundles need full history (git fetch --unshallow), or set SUFA_BASE=<sha> for an incremental bundle (e.g. SUFA_BASE=\$(agentlink exec $SUFA_NODE --shell 'git -C $SUFA_CHECKOUT rev-parse HEAD'))"
+if [ "$IS_SHALLOW" = true ] && [ -z "$TARGET_BASE" ]; then
+    die "$REPO_DIR is a shallow clone; complete bundles need full history (git fetch --unshallow), or set TARGET_BASE=<sha> for an incremental bundle (e.g. TARGET_BASE=\$(agentlink exec $TARGET_NODE --shell 'git -C $TARGET_CHECKOUT rev-parse HEAD'))"
 fi
 
 BRANCH=$(git -C "$REPO_DIR" symbolic-ref --short -q HEAD) \
@@ -106,14 +106,14 @@ if [ "$DIRTY_COUNT" -gt 0 ]; then
         "$REPO_DIR" "$DIRTY_COUNT" "$HEAD_DESC"
 fi
 
-if [ -n "$SUFA_BASE" ]; then
-    git -C "$REPO_DIR" rev-parse --verify --quiet "$SUFA_BASE^{commit}" >/dev/null \
-        || die "SUFA_BASE=$SUFA_BASE is not a commit in $REPO_DIR"
-    git -C "$REPO_DIR" merge-base --is-ancestor "$SUFA_BASE" "$HEAD_SHA" \
-        || die "SUFA_BASE=$SUFA_BASE is not an ancestor of $BRANCH ($HEAD_SHORT)"
-    if [ "$(git -C "$REPO_DIR" rev-list --count "$SUFA_BASE..$HEAD_SHA")" -eq 0 ]; then
+if [ -n "$TARGET_BASE" ]; then
+    git -C "$REPO_DIR" rev-parse --verify --quiet "$TARGET_BASE^{commit}" >/dev/null \
+        || die "TARGET_BASE=$TARGET_BASE is not a commit in $REPO_DIR"
+    git -C "$REPO_DIR" merge-base --is-ancestor "$TARGET_BASE" "$HEAD_SHA" \
+        || die "TARGET_BASE=$TARGET_BASE is not an ancestor of $BRANCH ($HEAD_SHORT)"
+    if [ "$(git -C "$REPO_DIR" rev-list --count "$TARGET_BASE..$HEAD_SHA")" -eq 0 ]; then
         printf 'already up to date: %s is %s (no commits after %s)\n' \
-            "$BRANCH" "$HEAD_DESC" "$SUFA_BASE"
+            "$BRANCH" "$HEAD_DESC" "$TARGET_BASE"
         exit 0
     fi
 fi
@@ -125,9 +125,9 @@ BUNDLE=$(mktemp "${TMPDIR:-/tmp}/agentlink-sync-XXXXXX.bundle")
 cleanup() { [ "$DRY_RUN" -eq 1 ] || rm -f -- "$BUNDLE"; }
 trap cleanup EXIT
 
-if [ -n "$SUFA_BASE" ]; then
-    git -C "$REPO_DIR" bundle create "$BUNDLE" "refs/heads/$BRANCH" "^$SUFA_BASE"
-    MODE="incremental ($SUFA_BASE..$HEAD_SHORT)"
+if [ -n "$TARGET_BASE" ]; then
+    git -C "$REPO_DIR" bundle create "$BUNDLE" "refs/heads/$BRANCH" "^$TARGET_BASE"
+    MODE="incremental ($TARGET_BASE..$HEAD_SHORT)"
 else
     git -C "$REPO_DIR" bundle create "$BUNDLE" "refs/heads/$BRANCH"
     MODE="complete"
@@ -153,9 +153,9 @@ echo "remote after:  $(git rev-parse --short HEAD) $(describe)"
 git rev-parse HEAD
 '
 
-CP_CMD=(agentlink cp "$BUNDLE" "node://$SUFA_NODE$REMOTE_BUNDLE")
-EXEC_CMD=(agentlink exec --timeout-secs 300 "$SUFA_NODE" sh -c "$REMOTE_SCRIPT" sh "$SUFA_CHECKOUT" "$BRANCH" "$REMOTE_BUNDLE")
-MKDIR_CMD=(agentlink exec --timeout-secs 30 "$SUFA_NODE" mkdir -p "$SUFA_STAGE")
+CP_CMD=(agentlink cp "$BUNDLE" "node://$TARGET_NODE$REMOTE_BUNDLE")
+EXEC_CMD=(agentlink exec --timeout-secs 300 "$TARGET_NODE" sh -c "$REMOTE_SCRIPT" sh "$TARGET_CHECKOUT" "$BRANCH" "$REMOTE_BUNDLE")
+MKDIR_CMD=(agentlink exec --timeout-secs 30 "$TARGET_NODE" mkdir -p "$TARGET_STAGE")
 
 if [ "$DRY_RUN" -eq 1 ]; then
     printf '\ndry run; would run:\n'
@@ -166,8 +166,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
-agentlink exec --timeout-secs 20 "$SUFA_NODE" true >/dev/null 2>&1 \
-    || die "node '$SUFA_NODE' is unreachable; check \`agentlink nodes\` and that the node is online"
+agentlink exec --timeout-secs 20 "$TARGET_NODE" true >/dev/null 2>&1 \
+    || die "node '$TARGET_NODE' is unreachable; check \`agentlink nodes\` and that the node is online"
 
 "${MKDIR_CMD[@]}"
 "${CP_CMD[@]}"
@@ -176,4 +176,4 @@ REMOTE_OUT=$("${EXEC_CMD[@]}")
 printf '%s\n' "$REMOTE_OUT"
 AFTER_SHA=$(printf '%s\n' "$REMOTE_OUT" | tail -n 1)
 [ -n "$AFTER_SHA" ] || die "remote apply produced no SHA; check the output above"
-printf 'synced %s: %s -> %s\n' "$SUFA_NODE" "$HEAD_SHORT" "$(printf '%s' "$AFTER_SHA" | cut -c1-12)"
+printf 'synced %s: %s -> %s\n' "$TARGET_NODE" "$HEAD_SHORT" "$(printf '%s' "$AFTER_SHA" | cut -c1-12)"

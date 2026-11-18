@@ -18083,7 +18083,7 @@ mod grant_ttl_tests {
             "approve",
             "allow",
             "hold-1",
-            "sufa",
+            "workstation",
         ]);
         assert!(approve.is_ok(), "{approve:?}");
         match approve.unwrap().command {
@@ -18103,17 +18103,17 @@ mod grant_ttl_tests {
         .unwrap();
         std::fs::write(
             dir.path().join("node.json"),
-            serde_json::json!({"name": "sufa-iso"}).to_string(),
+            serde_json::json!({"name": "workstation-iso"}).to_string(),
         )
         .unwrap();
         assert_eq!(
-            local_issuer_node_id(dir.path(), "sufa-iso").as_deref(),
+            local_issuer_node_id(dir.path(), "workstation-iso").as_deref(),
             Some(id.as_str())
         );
         assert!(local_issuer_node_id(dir.path(), "other-node").is_none());
         assert!(local_issuer_node_id(dir.path(), id.as_str()).is_none());
         let empty = tempfile::tempdir().unwrap();
-        assert!(local_issuer_node_id(empty.path(), "sufa-iso").is_none());
+        assert!(local_issuer_node_id(empty.path(), "workstation-iso").is_none());
     }
 
     fn store_grant(dir: &Path, node_id: &str) {

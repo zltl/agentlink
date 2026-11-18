@@ -28,22 +28,22 @@ Date: 2026-11-10 (Asia/Shanghai). Branch: `fix/desktop-input-a11y-window-t417` (
 - `crates/agentlink-desktop/src/platform/mod.rs` — module wiring
 - `crates/agentlink-cli/src/main.rs` — tip needles for new capability errors
 
-## How to retest (live node on sufa / GNOME)
+## How to retest (live node on workstation / GNOME)
 
-Rebuild/install the node binary from this branch, restart `agentlink-node.service` as user `ltl` with the usual session env (`DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY`).
+Rebuild/install the node binary from this branch, restart `agentlink-node.service` as user `operator` with the usual session env (`DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY`).
 
 1. **type / IME**  
    Leave Chinese IME on (toolbar "中"). Focus an isolated gnome-text-editor window.  
-   `agentlink type sufa 'T416-ISO-INPUT-OK-fd0d09a3'`  
+   `agentlink type workstation 'T416-ISO-INPUT-OK-fd0d09a3'`  
    Expect the file contents to match the marker literally. Also try a short Chinese string and a newline.
 
 2. **ui-tree**  
-   `agentlink ui-tree sufa`  
+   `agentlink ui-tree workstation`  
    Expect a JSON tree (not `GetDesktop` / `UnknownMethod`). If a11y is truly down, expect `AT-SPI capability missing: …`.
 
 3. **window screenshot**  
    Discover a title via ui-tree (or a Mutter window id).  
-   `agentlink screenshot sufa --target window --window-id '<title substring>'`  
+   `agentlink screenshot workstation --target window --window-id '<title substring>'`  
    Expect a PNG whose size matches that window (not 2736×1824 full desktop). Full-screen capture should still work.
 
 ## Tests run here
@@ -67,9 +67,9 @@ Rebuild/install the node binary from this branch, restart `agentlink-node.servic
 - X11 window fallback does not show Wayland-native occlusion over that window.
 - Invite behavior unchanged: invite enrolls only; control still requires a node-local grant.
 
-## Follow-up after live sufa retest (21:00–21:03 Asia/Shanghai)
+## Follow-up after live workstation retest (21:00–21:03 Asia/Shanghai)
 
-Live isolated node `sufa-t417-9bf95e3-test` on 127.0.0.1:18443, binary
+Live isolated node `workstation-iso` on 127.0.0.1:18443, binary
 `0.1.0 (9bf95e332fb97b275e2e8e405d59f7166826da4d)` linked to libpipewire-0.3
 (sha256 ea70ef3f73e30f4ed0901637f5daf57c1b7b13daa6d0e44eff8dc71e050d1d61).
 
@@ -93,7 +93,7 @@ Live isolated node `sufa-t417-9bf95e3-test` on 127.0.0.1:18443, binary
   No GNOME desktop policy was loosened. Error text now also reports the failed
   X11 fallback.
 
-`cargo test --release -p agentlink-desktop --lib` on sufa (PipeWire): 69 passed.
+`cargo test --release -p agentlink-desktop --lib` on workstation (PipeWire): 69 passed.
 
 ## Follow-up: CJK still missing after length fix (21:14 Asia/Shanghai)
 
@@ -195,7 +195,7 @@ PipeWire frame consumer. Fallback order for `--target window`:
   come only from the window the user authorized. Empty `window_id` also returns
   only that portal-selected window (logged explicitly).
 
-#### How to retest portal window capture (sufa iso)
+#### How to retest portal window capture (workstation iso)
 
 Isolated node only (`runtime-iso`, relay `127.0.0.1:18443`). Production
 `abf86f1` / `:17443` untouched.
@@ -213,16 +213,16 @@ is not a test failure — cancel path must release the session.
 window matcher/cleanup/no-monitor-fallback tests; CJK byte-length + landed-text
 + no-editable classifier tests remain).
 
-## Live portal WINDOW picker (sufa iso, 22:42–22:44 Asia/Shanghai)
+## Live portal WINDOW picker (workstation iso, 22:42–22:44 Asia/Shanghai)
 
 Isolated node only: `agentlink-b976f64` →
 `0.1.0 (b976f648fceb7d5027da99f0b28e4c3b9d0fa229)`, PipeWire linked,
 sha256 `9007207ecd9d6105490a2c772d90b83dca7d7a061ece73243206dc2cec015b0d`.
-Relay `127.0.0.1:18443`, name `sufa-t417-9bf95e3-test`. Production
-`/home/ltl/.local/bin/agentlink` still `abf86f1` (PID 725567) untouched.
+Relay `127.0.0.1:18443`, name `workstation-iso`. Production
+`/home/operator/.local/bin/agentlink` still `abf86f1` (PID 725567) untouched.
 Leftover `:17443` iso untouched.
 
-`cargo test --release -p agentlink-desktop --lib` on sufa: **85 passed**.
+`cargo test --release -p agentlink-desktop --lib` on workstation: **85 passed**.
 
 ### What happened
 
@@ -239,7 +239,7 @@ Leftover `:17443` iso untouched.
    cancelled Request + released Session; **no** `window.png` was written.
    **Window screenshot success is not claimed.**
 
-### One step for the operator on sufa
+### One step for the operator on workstation
 
 In the **共享屏幕** dialog: select
 `t417-iso-editor-wMn95K.txt (/tmp) - Text Editor`, then **Share / 共享**.
@@ -247,7 +247,7 @@ Re-run:
 
 ```bash
 # from the iso client flags in runtime-iso (do not print tokens)
-agentlink screenshot sufa-t417-9bf95e3-test --target window --window-id t417-iso-editor
+agentlink screenshot workstation-iso --target window --window-id t417-iso-editor
 ```
 
 Optional longer wait: start the iso node with

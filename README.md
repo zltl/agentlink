@@ -20,11 +20,11 @@ Accounts, device login, sharing, and the browser Add-machine page are described 
 - Background processes: start, list, incremental output, status, and kill.
 - System info: OS, CPU, memory, disks, user, shell, a filtered environment, and detected tools.
 - An interactive PTY (`portable-pty`, including Windows ConPTY). `agentlink shell` uses raw mode and resize when the local stdin is a terminal.
-- Pairing with an ed25519 node key and a one-time token.
-- TLS with a pinned self-signed certificate. There is no unauthenticated mode.
-- A signed-in owner, admin, or sharee has full access: files, shell, and desktop. Presets are not a cap.
+- Pairing with an ed25519 node key and a one-time token or `agentlink-invite:v1:` string.
+- TLS with a pinned self-signed certificate (or public-root trust). There is no unauthenticated mode.
+- End-to-end sealed authorization: a relay login discovers and enrolls machines, while every file, shell, or desktop operation on a node requires an ed25519 `SignedGrant` verified against that node's local `owner-keys.json` and intersected with its `--max-access` ceiling.
 - A tamper-evident JSONL audit log on the node, with optional relay and S3 sinks. Handlers call `audit::submit(AuditEvent)`.
-- `agentlink mcp` on stdio for Cursor and Claude Desktop.
+- `agentlink mcp` on stdio or localhost Bearer HTTP for Cursor and Claude Desktop.
 
 Phase 2 is screenshots, pointer and keyboard input, and the accessibility tree. A sealed client can use them after the node has a grant for that client's key. An account login is not that grant.
 
@@ -92,9 +92,9 @@ AGENTLINK_TURN_SECRET=replace-with-the-coturn-static-auth-secret
 AGENTLINK_TURN_TTL_SECS=600
 ```
 
-`GET /view/config.json` is unauthenticated and lists STUN plus TURN URLs only. `POST /api/ice` mints a TURN REST credential (`username` is `<expiry unix>:<user>`, `credential` is base64 HMAC-SHA1 of the secret) for a logged-in dashboard session or a valid view ticket, and refuses everyone else. The browser sends those servers on the offer. The node uses the same list when an offer arrives without ICE servers. The phone viewer gathers host candidates plus the default public STUN list, or `AGENTLINK_STUN_URLS` when that variable is set. It does not yet read `/view/config.json`, so a phone off the LAN needs its own short-lived TURN credentials when STUN cannot punch through. The page Connection menu is Auto or Relay only. Auto tries host, then each STUN server, then TURN UDP, then TURN TCP, and gives up on a server that does not answer within a few seconds. Relay only gathers TURN candidates (`iceTransportPolicy: relay`, the Force TURN path). The banner shows the path that connected (`via host`, `via STUN`, `via TURN udp`, `via TURN tcp`). If every path fails, or the node refuses the offer, the page polls a JPEG screenshot about once a second. That fallback is the sealed `screenshot` invoke, not an RTP frame. A screenshot the node denies stays as that error instead of a black video element.
+`GET /view/config.json` is unauthenticated and lists STUN plus TURN URLs only. `POST /api/ice` mints a TURN REST credential (`username` is `<expiry unix>:<user>`, `credential` is base64 HMAC-SHA1 of the secret) for a logged-in dashboard session or a valid view ticket, and refuses everyone else. The desktop `agentlink controller` and the phone viewer gather host candidates plus the default public STUN list, or `AGENTLINK_STUN_URLS` when that variable is set; the node uses the same STUN list when an offer arrives without ICE servers. Neither native viewer automatically fetches TURN credentials from `/view/config.json` yet, so cross-NAT sessions behind symmetric NAT need explicit TURN configuration when STUN cannot punch through. On LANs with VPN overlays, the ICE layer prefers on-link physical host candidates without dropping fallback candidates. While WebRTC negotiates—or if ICE fails or drops—the native controller displays JPEG stills over the sealed `screenshot` invoke (`jpeg · relay`) and switches to `h264` only after a frame is decoded.
 
-Live video and audio are WebRTC media: DTLS-SRTP between the browser (or the phone viewer) and the node. That is not the agentlink end-to-end payload cipher. Signaling, input when it goes through the relay, and the JPEG fallback stay on the sealed invoke path.
+Live video and audio are WebRTC media: DTLS-SRTP between the native viewer (`agentlink controller` or Android) and the node. Browser desktop viewing is disabled (`GET /view` serves a static notice). Signaling, input when it goes through the relay, and the JPEG fallback stay on the sealed invoke path.
 
 ### Audio
 
@@ -122,82 +122,98 @@ Classic RDP remotes drawing orders, glyph and bitmap caches, and dirty rectangle
 
 ## Build
 
-Rust 1.99 or newer.
+Rust 1.99.1 (pinned in `rust-toolchain.toml`). On Linux, install `pkg-config` and `libpipewire-0.3-dev` before building if you want PipeWire / GNOME Mutter ScreenCast streaming instead of the screenshot portal fallback.
 
 ```bash
-cargo build
-cargo test
+cargo build --locked
+cargo test --locked
 ```
 
 The release binary is the one to copy onto machines:
 
 ```bash
-cargo build --release
+cargo build --locked --release -p agentlink-cli
 # target/release/agentlink
 ```
 
-Tests run locally with `cargo test`. This repository does not include GitHub Actions workflows.
+Note on dependencies: `Cargo.toml` pins `launchbadge/sqlx` to the official PR #4502 merge commit (`10462fa4414c6c7f1ed1d39bb31678e3b726878c`) so `libsqlite3-sys =0.39.1` (bundled SQLite `3.54.1`, fixing `RUSTSEC-2026-0459`) can be linked before the next crates.io `sqlx` release. Offline builds should run `cargo vendor` beforehand. This repository does not include GitHub Actions workflows.
 
-## Run a relay
+## Self-host quickstart (end-to-end)
+
+### 1. Start the relay and rotate the bootstrap password
 
 On a host that clients and nodes can reach:
 
 ```bash
-agentlink relay --bind 0.0.0.0:7443
+agentlink relay --bind 0.0.0.0:7443 --data-dir /var/lib/agentlink
 ```
 
-The process prints the listen address and certificate fingerprint, and stores them under the relay data directory (by default the OS data dir, `agentlink/relay`). The admin token is printed only on the start that creates it. Later starts print the path of `admin.token` instead of the secret, so a restart does not copy the token into the journal. `--print-admin-token` prints it again.
+First start generates `cert.pem`, `key.pem`, `fingerprint.txt`, and—when the user database is empty—a one-time `bootstrap.password` (mode `0600`) for the `admin` account. Rotate that password immediately; doing so deletes `bootstrap.password`:
 
-Keep the admin token private. A self-signed relay is pinned with `sha256:…`. That pin is not a secret: clients refuse any certificate that does not match it. The generated certificate is reused, so the pin stays stable. A public certificate (Let's Encrypt rotates the leaf every 60–90 days) should be verified with `--trust webpki` or `--fingerprint system` instead of a leaf pin. See [docs/deploy.md](docs/deploy.md).
+```bash
+agentlink relay --data-dir /var/lib/agentlink user passwd admin
+```
 
-Open the relay port on that host only. Nodes do not listen.
+(Legacy `admin.token` bearer auth is disabled by default unless `AGENTLINK_LEGACY_ADMIN=1` and `AGENTLINK_LEGACY_ADMIN_TTL_SECS` are explicitly set; prefer account login + TOTP.)
 
-The same relay runs in a container. `docker-compose.yml` publishes port 7443 and keeps the certificate and admin token in the `relay-data` volume:
+A self-signed relay is pinned with `sha256:…` from `fingerprint.txt`. That pin is not a secret: clients refuse any certificate that does not match it. A public certificate (for example Let's Encrypt behind nginx) should be verified with `--trust webpki` or `--fingerprint system`; see [docs/deploy.md](docs/deploy.md).
+
+The same relay runs in Docker (`docker-compose.yml` publishes `7443` and mounts the `relay-data` volume at `/var/lib/agentlink`):
 
 ```bash
 docker compose up -d
-docker compose logs relay
+docker compose exec relay agentlink relay --data-dir /var/lib/agentlink user passwd admin
 ```
 
-The image listens on `0.0.0.0:7443` and stores its state at `/var/lib/agentlink`. The process runs as the non-root user `agentlink`. A named volume is created with that user's ownership. A bind mount that is owned by root is not writable by the container. This image is a glibc Debian build. Linux release archives are separate static musl binaries.
+On a host without Docker, `deploy/agentlink-relay.service` is a systemd unit for the same command. There is no built-in relay URL; pass `--relay` or `AGENTLINK_RELAY`.
 
-On a host without Docker, `deploy/agentlink-relay.service` is a systemd unit for the same command. The comments in that file list the `useradd`, directory, and `systemctl enable` steps. The first start prints the fingerprint and admin token. Later starts print the path of `admin.token`. Putting the relay behind nginx on port 443 is described in [docs/deploy.md](docs/deploy.md): `wss://host` dials 443, and `wss://host:7443` still dials 7443.
+### 2. Sign in and pair a node
 
-There is no built-in relay. Pass `--relay` or set `AGENTLINK_RELAY`, plus `--fingerprint` or `--trust`. A saved `config.json` relay URL is kept and still dials. Installs that used to omit `--relay` because a host was compiled in must set the relay explicitly; this build does not substitute one. A relay restart is a blip: nodes, CLI commands, MCP calls, shells, watches, and copies reconnect without pairing again. See [docs/deploy.md](docs/deploy.md).
-
-## Pair a machine
-
-From a client that has the relay URL, token, and fingerprint:
+From your operator/controller machine:
 
 ```bash
+FP=$(cat /path/to/fingerprint.txt)   # or copy sha256:... from relay startup output
 agentlink login \
   --relay wss://relay.example:7443 \
-  --token "$AGENTLINK_TOKEN" \
-  --fingerprint "$AGENTLINK_FINGERPRINT"
+  --fingerprint "$FP" \
+  --user admin
 
-agentlink pair --name laptop --access exec
+# Mint a one-time invite (bundles relay URL, trust/pin, and one-time pairing token):
+agentlink pair --name laptop --access full
 ```
 
-`access` is `read-only` (the CLI default), `read-write`, `exec`, `desktop`, `remote-view`, `remote-control`, or `full`. `exec` includes read and write and leaves screenshots and the stream off. `desktop` adds screenshots, input, and the accessibility tree on top of `exec`. It does not enable `allow_desktop_stream`. `full` is shell, files, and remote desktop together. The browser form defaults to `exec` for a machine whose screen is not known yet.
-
-A signed grant is full use only up to the node's own `--max-access` ceiling. `agentlink node --max-access exec` still refuses screenshots and desktop input after a grant. The relay pairing preset does not authorize the machine and cannot raise that ceiling.
-
-On the machine you want to control:
+On the machine you want to control (`laptop`):
 
 ```bash
-agentlink node \
-  --relay wss://relay.example:7443 \
-  --fingerprint "$AGENTLINK_FINGERPRINT" \
-  --pairing-token "$TOKEN" \
-  --name laptop
+agentlink node --invite 'agentlink-invite:v1:...' --name laptop
 ```
 
-The node writes an ed25519 key into its data directory and reconnects with that key. Later starts do not need the pairing token. The token works once.
+The node writes its ed25519 identity into its data directory (`~/.local/share/agentlink/node` on Linux) and bootstraps `grant-issuer.json` + `owner-keys.json`. Later starts reconnect without the invite.
+
+### 3. Issue a node-local `SignedGrant`
+
+Signing in to the relay **does not** authorize commands or desktop access on the node. Authorize your controller's ed25519 identity on the node:
+
+```bash
+# On the controller machine, print its public identity hex (`public_id`):
+agentlink identity show
+
+# On the node host (`laptop`), trust that controller key once (applied live, no restart):
+agentlink grant trust-owner <controller-public-id-hex>
+
+# Back on the controller machine, sign and store a time-bounded grant:
+agentlink grant issue --node laptop --policy exec --ttl 1h
+
+# Verify end-to-end execution:
+agentlink exec laptop -- uname -a
+```
+
+(Alternatively, when controller and node run under the same local account during testing, `agentlink grant issue --node laptop --policy exec --ttl 1h --issuer-data-dir <node-data-dir>` signs directly with the node's issuer. For interactive desktop approval without trusting the controller as an issuer, run `agentlink grant offer` on the controller and `agentlink grant paste` / `grant allow` on the node; see [docs/e2e-auth.md](docs/e2e-auth.md) and [docs/grant-authorization-boundary.md](docs/grant-authorization-boundary.md).)
 
 Optional limits on the node:
 
-- `--max-access read-only` is the node's ceiling. A signed grant is intersected with it. The relay cannot raise it.
-- `--root /path` confines file operations to that directory, including a check that symlinks do not escape it. The same root is the default working directory for exec, background processes, and PTY sessions, and an explicit cwd is resolved inside it. It is not an OS sandbox: a program still runs as the user who launched the node.
+- `--max-access read-only` is the node's local ceiling (`read-only`, `read-write`, `exec`, `desktop`, `remote-view`, `remote-control`, or `full`). A signed grant is intersected with it; the relay cannot raise it.
+- `--root /path` confines file operations to that directory, including symlink escape checks, and sets the default working directory for exec, background processes, and PTY sessions. It is not an OS sandbox: once `exec` or `full` is granted, commands run with the full privileges of the OS user running the node (including access to same-UID node files).
 
 `agentlink perm laptop read-only` changes only the relay's routing preset. It does not change what the node will run.
 
@@ -311,7 +327,7 @@ cargo build -p agentlink-cli
 
 On a glibc Linux desktop, closing the window leaves a status icon when the session has a StatusNotifier tray. Open and Quit are on that icon. `--background` starts hidden, and the window comes back if the icon cannot start. Start on login writes `~/.config/autostart/agentlink-controller.desktop`. That entry opens the controller. It does not replace the node service. The Windows tray (`agentlink tray`) is unchanged and still starts the node for the signed-in user. On Windows, Start on login in this window is that same tray entry.
 
-Live H.264 decode uses the OpenH264 decoder compiled into the glibc, macOS, and Windows builds. If that decoder does not start, the window stays on JPEG. `agentlink controller --check` prints `controller: ready` when the window is compiled in, and exits without opening it.
+Live H.264 decode uses the OpenH264 decoder compiled from source (`BSD-2-Clause` copyright; see `NOTICE` and `THIRD_PARTY.md` regarding AVC/H.264 patent considerations when redistributing binaries) into the glibc, macOS, and Windows builds. If that decoder does not start, the window stays on JPEG. `agentlink controller --check` prints `controller: ready` when the window is compiled in, and exits without opening it.
 
 ## Update this binary
 
@@ -411,23 +427,20 @@ The MCP tool `copy_path` takes `direction` (`upload`, `download`, or `peer`), `n
 
 `agentlink mcp` speaks newline-delimited JSON-RPC on stdin/stdout. It also accepts a `Content-Length` header on input. Logs go to stderr. `agentlink mcp --http 127.0.0.1:7337 --mcp-token "$AGENTLINK_MCP_TOKEN"` serves the same messages on `POST /mcp`, with `GET /mcp` as an SSE keepalive and `DELETE /mcp` ending the session. Bearer auth is required. An `Origin` header must be localhost.
 
-Cursor (`~/.cursor/mcp.json` or `.cursor/mcp.json`):
+Cursor (`~/.cursor/mcp.json` or `.cursor/mcp.json`, after running `agentlink login --user ...` and `agentlink grant issue ...` on this machine):
 
 ```json
 {
   "mcpServers": {
     "agentlink": {
       "command": "/absolute/path/to/agentlink",
-      "args": ["mcp"],
-      "env": {
-        "AGENTLINK_RELAY": "wss://relay.example:7443",
-        "AGENTLINK_TOKEN": "paste-admin-token",
-        "AGENTLINK_FINGERPRINT": "sha256:paste-fingerprint"
-      }
+      "args": ["mcp"]
     }
   }
 }
 ```
+
+(If you use an explicit config directory or registered agent identity instead of the default user config, pass `"AGENTLINK_CONFIG_DIR"` or `"AGENTLINK_RELAY"` + `"AGENTLINK_FINGERPRINT"` + `"AGENTLINK_IDENTITY"` in `"env"`.)
 
 Claude Desktop uses the same shape. The file is:
 
@@ -681,7 +694,8 @@ On this phone:
 - `AGENTLINK_DESKTOP=mock` forces the in-memory desktop. It is for tests, not a security boundary.
 - `agentlink view` puts a short-lived ticket in the URL fragment. The link is view-only unless `--control` is passed, and input still requires remote control on the underlying grant. The page does not receive the admin token or the agent private key. A saved admin-token fragment still authenticates as admin if someone pastes it, while legacy admin tokens are enabled.
 - Bitrate adapts. Resolution does not change mid-session.
-- The cursor channel sends a shape name, not a cursor bitmap.
+- Negotiated cursor metadata sends stock cursor shape names and bounded RGBA cursor sprites (up to 128×128) with hotspot coordinates; legacy peers keep embedded cursors.
+- Platform maturity: Linux (`glibc` and `musl`) and Windows (`msvc`) are the primary targets. macOS desktop/controller support and the Android app (`android/`) build in-tree as experimental targets and require native platform SDK/NDK toolchains (`./android/build-native.sh` before packaging a device APK).
 - ffmpeg restarts the process to emit a keyframe or to apply a large bitrate step, which drops a frame.
 - WebRTC loopback latency through a browser was not measured. The table above is damage plus minih264 on synthetic frames.
 - A user-session service is the one that can reach the desktop. A systemd system unit, a LaunchDaemon, and the Windows service (session 0) start at boot and cannot drive the GUI. `--headless` on Linux is the same kind of opt-out: it does not join `graphical-session.target`.

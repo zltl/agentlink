@@ -40,7 +40,7 @@ no tags (`list_tags` returned an empty page).
 ## Current local candidate (SQLite `ea69145` reviewed, t461 authorized onto main)
 
 Local branch `integrate/security-main-t456` in
-`/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo` was
+`<workspace>/repo` was
 fast-forwarded (`merge --ff-only`, after a normal fetch of the
 reconnect worktree) from `7142d936874484b15a543d99b0ac105f317fb7dd`
 to merge tip `6674388027224441327d771e1d3e3adab0ec42f8`. The
@@ -90,7 +90,7 @@ still does not allow 0.39; this tip uses the unpublished official
 
 ## Cached `origin/*` not on the live remote — do not merge
 
-These refs exist only in the local cache (`/workspace/agentlink-control-plane/.git`).
+These refs exist only in the local cache (`<workspace>/repo`).
 `get_branch` for `cursor/owner-full-access-c6ef` returns 404. Each has
 merge-base **NONE** with live `origin/main` (old history). Keep the
 original ref; do not reattach it onto main. **Never restore same-account
@@ -148,15 +148,15 @@ Security repairs from the t454 review (notification injection, grant-flag overwr
 ## Integration candidate (this step)
 
 The historical continuation worktree
-`/workspace/agentlink-integrate-t456-cont` and the frozen 9122522 tree
+`<workspace>/repo` and the frozen 9122522 tree
 were not rewritten. Current integrate work is
-`/workspace/agentlink-recovery-20261112/unpacked/40f551c/repo` at
+`<workspace>/repo` at
 `6674388` (see the current-candidate section above). See
 `docs/integrate-t456-security-status.md`.
 
 ## Post-cd30 residual (local, not pushed)
 
-The continuation worktree `/workspace/agentlink-integrate-t456-cont` on `integrate/security-main-t456` adds one incremental commit after frozen `cd30c9ed5233764567ea88da102776cbb67c69b2`. The 912 tree and `cd30c9e` are not rewritten. Windows probe of `cd30c9e` stays on its own tree and target; this delta is a later source package the Windows worker can build against the existing target. Live remote `main` remains `602887281932d254d3d8ee1d57f8e3a305ab9bd6` until the parent pushes. Cached `origin/cursor/owner-full-access-c6ef` (`4f115731`) stays excluded.
+The continuation worktree `<workspace>/repo` on `integrate/security-main-t456` adds one incremental commit after frozen `cd30c9ed5233764567ea88da102776cbb67c69b2`. The 912 tree and `cd30c9e` are not rewritten. Windows probe of `cd30c9e` stays on its own tree and target; this delta is a later source package the Windows worker can build against the existing target. Live remote `main` remains `602887281932d254d3d8ee1d57f8e3a305ab9bd6` until the parent pushes. Cached `origin/cursor/owner-full-access-c6ef` (`4f115731`) stays excluded.
 
 ## Post-8143 UniFFI Kotlin regenerate (local, not pushed)
 

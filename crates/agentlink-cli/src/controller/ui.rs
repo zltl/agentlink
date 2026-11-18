@@ -1069,7 +1069,7 @@ impl ControllerApp {
             }
             // Do not touch `window_title` here — `sync_window_title` owns the
             // cache vs ViewportCommand::Title compare. Updating the cache first
-            // suppressed the native Title command (stale "sufa" after Back).
+            // suppressed the native Title command (stale "workstation" after Back).
             return;
         }
         self.link = if control {
@@ -5182,7 +5182,7 @@ mod geometry_tests {
             if !preview_ui {
                 app.user = Some("debug".into());
                 // Realistic session rail: exec-only + full-capability desktop node
-                // (sufa) so "View desktop" is present for clip regressions.
+                // (workstation) so "View desktop" is present for clip regressions.
                 app.nodes = realistic_nodes();
                 for node in &app.nodes {
                     app.control.insert(node.id.clone(), true);
@@ -5288,9 +5288,9 @@ mod geometry_tests {
                 .app
                 .nodes
                 .iter()
-                .find(|n| n.id == "sufa")
+                .find(|n| n.id == "workstation")
                 .cloned()
-                .expect("sufa");
+                .expect("workstation");
             self.app.open_desktop(&desk, false);
         }
 
@@ -5398,18 +5398,18 @@ mod geometry_tests {
         quant.effective = NodePolicy::exec();
         quant.access = "exec".into();
 
-        let mut sufa = mock_node("sufa");
-        sufa.has_display = Some(true);
-        sufa.policy = NodePolicy::full();
-        sufa.effective = NodePolicy::full();
-        sufa.access = "full".into();
+        let mut workstation = mock_node("workstation");
+        workstation.has_display = Some(true);
+        workstation.policy = NodePolicy::full();
+        workstation.effective = NodePolicy::full();
+        workstation.access = "full".into();
 
         let mut tccn = mock_node("tc-cn");
         tccn.has_display = Some(false);
         tccn.policy = NodePolicy::exec();
         tccn.effective = NodePolicy::exec();
 
-        vec![quant, sufa, tccn]
+        vec![quant, workstation, tccn]
     }
 
     fn item_rect(layout: &DebugLayout, id: &str) -> Option<[f32; 4]> {
@@ -5582,7 +5582,7 @@ mod geometry_tests {
         } else {
             1920.0
         };
-        assert_action_fully_visible(layout, "action_btn:sufa:View desktop", w);
+        assert_action_fully_visible(layout, "action_btn:workstation:View desktop", w);
     }
 
     #[test]
@@ -5634,7 +5634,7 @@ mod geometry_tests {
                 .app
                 .nodes
                 .iter()
-                .find(|n| n.id == "sufa")
+                .find(|n| n.id == "workstation")
                 .cloned()
                 .unwrap();
             harn.app.open_desktop(&desk, true);
@@ -5649,7 +5649,7 @@ mod geometry_tests {
     #[test]
     fn rail_view_desktop_label_fully_visible_when_rail_shown() {
         let mut harn = Harness::new(1280.0, 800.0);
-        harn.app.selected_id = Some("sufa".into());
+        harn.app.selected_id = Some("workstation".into());
         harn.app.screen = Screen::Machines;
         harn.pass();
         harn.pass();
@@ -5657,23 +5657,23 @@ mod geometry_tests {
         assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
         assert_action_fully_visible(
             &harn.app.debug_layout,
-            "action_btn:sufa:Control desktop",
+            "action_btn:workstation:Control desktop",
             1280.0,
         );
-        let sufa = harn
+        let workstation = harn
             .app
             .nodes
             .iter()
-            .find(|n| n.id == "sufa")
+            .find(|n| n.id == "workstation")
             .cloned()
             .unwrap();
-        harn.app.open_terminal(&sufa);
+        harn.app.open_terminal(&workstation);
         harn.pass();
         harn.pass();
         assert_view_desktop_fully_in_clip(&harn.app.debug_layout);
         assert_action_fully_visible(
             &harn.app.debug_layout,
-            "action_btn:sufa:Control desktop",
+            "action_btn:workstation:Control desktop",
             1280.0,
         );
     }
@@ -5793,8 +5793,8 @@ mod geometry_tests {
         );
     }
 
-    /// Parent GUI: readonly sufa Desktop → Back → quant67 Terminal left the
-    /// native title stuck on "sufa — …". Transitions used to assign
+    /// Parent GUI: readonly workstation Desktop → Back → quant67 Terminal left the
+    /// native title stuck on "workstation — …". Transitions used to assign
     /// `window_title` before `sync_window_title`, so the compare suppressed
     /// ViewportCommand::Title. Assert the *outgoing* Title commands.
     #[test]
@@ -5807,17 +5807,17 @@ mod geometry_tests {
         let out = harn.pass_output();
         let titles = Harness::titles_from(&out);
         assert!(
-            titles.iter().any(|t| t.starts_with("sufa —")),
-            "expected Title for sufa desktop, got {titles:?}; cache={}",
+            titles.iter().any(|t| t.starts_with("workstation —")),
+            "expected Title for workstation desktop, got {titles:?}; cache={}",
             harn.app.window_title
         );
         assert!(
-            harn.app.window_title.starts_with("sufa —"),
+            harn.app.window_title.starts_with("workstation —"),
             "cache should match desktop: {}",
             harn.app.window_title
         );
 
-        // No-session: Back must emit the default title (not leave native on sufa).
+        // No-session: Back must emit the default title (not leave native on workstation).
         harn.app.back_to_machines();
         let out = harn.pass_output();
         let titles = Harness::titles_from(&out);
@@ -5862,18 +5862,18 @@ mod geometry_tests {
         );
 
         // Files → different node Terminal.
-        let sufa = harn
+        let workstation = harn
             .app
             .nodes
             .iter()
-            .find(|n| n.id == "sufa")
+            .find(|n| n.id == "workstation")
             .cloned()
             .unwrap();
-        harn.app.open_terminal(&sufa);
+        harn.app.open_terminal(&workstation);
         let out = harn.pass_output();
         assert_eq!(
             Harness::titles_from(&out),
-            vec!["sufa — terminal — agentlink".to_string()]
+            vec!["workstation — terminal — agentlink".to_string()]
         );
 
         harn.app.back_to_machines();
@@ -6054,7 +6054,7 @@ mod geometry_tests {
         ] {
             let mut harn = Harness::new(w, h);
             harn.app.screen = Screen::Machines;
-            harn.app.selected_id = Some("sufa".into());
+            harn.app.selected_id = Some("workstation".into());
             harn.pass();
             harn.pass();
             assert_eq!(model::machine_rail_visible(w), expect_rail);
@@ -6111,30 +6111,30 @@ mod geometry_tests {
             .app
             .nodes
             .iter()
-            .find(|n| n.id == "sufa")
+            .find(|n| n.id == "workstation")
             .cloned()
-            .expect("sufa");
+            .expect("workstation");
         node.effective = NodePolicy::remote_view();
         node.policy = NodePolicy::remote_view();
         node.access = "remote-view".into();
         node.has_display = Some(true);
-        if let Some(existing) = harn.app.nodes.iter_mut().find(|n| n.id == "sufa") {
+        if let Some(existing) = harn.app.nodes.iter_mut().find(|n| n.id == "workstation") {
             *existing = node;
         }
-        harn.app.selected_id = Some("sufa".into());
+        harn.app.selected_id = Some("workstation".into());
         harn.app.screen = Screen::Machines;
         harn.pass();
         harn.pass();
         let layout = &harn.app.debug_layout;
-        assert_action_fully_visible(layout, "action_btn:sufa:View desktop", 1024.0);
-        let raw = item_rect(layout, "action_btn:sufa:Control desktop:raw")
+        assert_action_fully_visible(layout, "action_btn:workstation:View desktop", 1024.0);
+        let raw = item_rect(layout, "action_btn:workstation:Control desktop:raw")
             .expect("Control desktop should stay visible (disabled, not hidden)");
-        let vis = item_rect(layout, "action_btn:sufa:Control desktop:vis").expect("control vis");
+        let vis = item_rect(layout, "action_btn:workstation:Control desktop:vis").expect("control vis");
         assert!(
             (vis[2] - raw[2]).abs() <= 1.0,
             "Control clipped: {raw:?} {vis:?}"
         );
-        let reason = item_rect(layout, "action_reason:sufa:Control desktop");
+        let reason = item_rect(layout, "action_reason:workstation:Control desktop");
         assert!(reason.is_some(), "disabled Control needs an inline reason");
     }
 
@@ -6252,7 +6252,7 @@ mod geometry_tests {
         ] {
             let mut harn = Harness::new(w, h);
             harn.app.screen = Screen::Machines;
-            harn.app.selected_id = Some("sufa".into());
+            harn.app.selected_id = Some("workstation".into());
             harn.pass();
             harn.pass();
             assert!(item_rect(&harn.app.debug_layout, "header_settings").is_some());
@@ -6272,14 +6272,14 @@ mod geometry_tests {
     #[test]
     fn hash_and_version_are_not_primary_machine_meta() {
         let mut harn = Harness::new(1024.0, 756.0);
-        if let Some(node) = harn.app.nodes.iter_mut().find(|n| n.id == "sufa") {
+        if let Some(node) = harn.app.nodes.iter_mut().find(|n| n.id == "workstation") {
             node.version = "cd30c9ed52337645".into();
         }
-        harn.app.selected_id = Some("sufa".into());
+        harn.app.selected_id = Some("workstation".into());
         harn.app.screen = Screen::Machines;
         harn.pass();
         harn.pass();
-        assert!(item_rect(&harn.app.debug_layout, "nav_row:sufa").is_some());
+        assert!(item_rect(&harn.app.debug_layout, "nav_row:workstation").is_some());
         assert!(
             item_rect(&harn.app.debug_layout, "detail_node_id").is_none(),
             "collapsed Details must not push the node id into the primary column"
@@ -6428,7 +6428,7 @@ mod geometry_tests {
         const WIN_H: f32 = 759.0;
         let mut harn = Harness::new(WIN_W, WIN_H);
         harn.app.screen = Screen::Machines;
-        harn.app.selected_id = Some("sufa".into());
+        harn.app.selected_id = Some("workstation".into());
         harn.pass();
         harn.pass();
         assert!(
@@ -6600,7 +6600,7 @@ mod geometry_tests {
         for (w, h) in [(1026.0, 759.0), (1080.0, 760.0), (1920.0, 1135.0)] {
             let mut harn = Harness::new(w, h);
             harn.app.screen = Screen::Machines;
-            harn.app.selected_id = Some("sufa".into());
+            harn.app.selected_id = Some("workstation".into());
             harn.pass();
             harn.pass();
             let selected = harn.app.selected_id.clone().expect("selection");
@@ -6883,7 +6883,7 @@ mod geometry_tests {
         for (w, h) in [(1080.0_f32, 760.0_f32), (1026.0, 759.0), (721.0, 759.0)] {
             let mut harn = Harness::new(w, h);
             harn.app.screen = Screen::Machines;
-            harn.app.selected_id = Some("sufa".into());
+            harn.app.selected_id = Some("workstation".into());
             harn.pass();
             harn.pass();
             if w >= model::MACHINE_RAIL_SHOW_AT {
@@ -6992,9 +6992,9 @@ mod geometry_tests {
             .app
             .nodes
             .iter()
-            .find(|n| n.id == "sufa")
+            .find(|n| n.id == "workstation")
             .cloned()
-            .expect("sufa");
+            .expect("workstation");
         harn.app.open_desktop(&desk, true);
         harn.pass();
         harn.pass();
@@ -7045,9 +7045,9 @@ mod geometry_tests {
             .app
             .nodes
             .iter()
-            .find(|n| n.id == "sufa")
+            .find(|n| n.id == "workstation")
             .cloned()
-            .expect("sufa");
+            .expect("workstation");
         harn.app.open_desktop(&desk, true);
         harn.pass();
         harn.pass();
@@ -7076,9 +7076,9 @@ mod geometry_tests {
             .app
             .nodes
             .iter()
-            .find(|n| n.id == "sufa")
+            .find(|n| n.id == "workstation")
             .cloned()
-            .expect("sufa");
+            .expect("workstation");
         harn.app.open_desktop(&desk, false);
         harn.pass();
         harn.pass();
@@ -7149,7 +7149,7 @@ mod geometry_tests {
             .app
             .nodes
             .iter()
-            .find(|n| n.id == "sufa")
+            .find(|n| n.id == "workstation")
             .cloned()
             .expect("desktop fixture");
         harn.app.open_desktop(&desk, true);
