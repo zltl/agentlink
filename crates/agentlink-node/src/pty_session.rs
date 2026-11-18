@@ -66,6 +66,18 @@ impl PtyManager {
         grant_jti: &str,
         grant_exp_unix: Option<i64>,
     ) -> Result<String> {
+        pub const MAX_PTY_SESSIONS: usize = 32;
+        {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| Error::Message("pty map poisoned".into()))?;
+            if sessions.len() >= MAX_PTY_SESSIONS {
+                return Err(Error::Message(format!(
+                    "too many concurrent pty sessions (limit {MAX_PTY_SESSIONS})"
+                )));
+            }
+        }
         let session_id = uuid::Uuid::new_v4().to_string();
         let owner_peer = owner_peer.to_string();
         let grant_jti = grant_jti.trim().to_string();
@@ -141,6 +153,17 @@ impl PtyManager {
                 .sessions
                 .lock()
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
+            if sessions.len() >= MAX_PTY_SESSIONS {
+                drop(sessions);
+                let mut killer = killer;
+                let _ = killer.kill();
+                tokio::task::spawn_blocking(move || {
+                    let _ = child.wait();
+                });
+                return Err(Error::Message(format!(
+                    "too many concurrent pty sessions (limit {MAX_PTY_SESSIONS})"
+                )));
+            }
             sessions.insert(
                 session_id.to_string(),
                 LivePty {
@@ -1163,5 +1186,54 @@ printf 'AL_DONE\\n'\n",
             "PTY child exit code must be reported, transcript={:?}",
             pty_transcript(&resp)
         );
+    }
+
+    #[tokio::test]
+    async fn pty_manager_enforces_max_concurrent_sessions() {
+        let mgr = PtyManager::default();
+        let (resp, dir) = test_responder();
+        let service = crate::pipeline::AuditService::open_quiet(dir.path(), "node", "box");
+        let sleep_cmd = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >nul".to_string()
+        } else {
+            "sleep 30".to_string()
+        };
+        let mut opened = Vec::new();
+        let mut capped_err = None;
+        for idx in 0..40 {
+            let origin = crate::audit::Origin {
+                path: dir.path().join("audit.log"),
+                node: "box".into(),
+                node_id: "node".into(),
+            };
+            match mgr
+                .open(
+                    Some(sleep_cmd.clone()),
+                    None,
+                    24,
+                    80,
+                    resp.clone(),
+                    origin,
+                    Some("alice".into()),
+                    service.clone(),
+                    "alice",
+                    &format!("jti-{idx}"),
+                    None,
+                )
+                .await
+            {
+                Ok(sid) => opened.push(sid),
+                Err(err) => {
+                    capped_err = Some(err.to_string());
+                    break;
+                }
+            }
+        }
+        for sid in &opened {
+            let _ = mgr.close(sid, Some("alice"));
+        }
+        assert_eq!(opened.len(), 32, "expected cap at 32 live PTY sessions");
+        let msg = capped_err.expect("33rd concurrent PTY session must be refused");
+        assert!(msg.contains("too many"), "unexpected error: {msg}");
     }
 }

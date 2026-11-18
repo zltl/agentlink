@@ -140,14 +140,23 @@ impl Direction {
 
     /// Seal a plaintext with this session's send counter.
     pub fn seal(&self, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
-        let n = self
-            .send_n
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                (cur <= MAX_SESSION_COUNTER).then_some(cur + 1)
-            })
-            .map_err(|_| {
-                Error::Protocol("e2e session counter exhausted; re-handshake required".into())
-            })?;
+        let mut cur = self.send_n.load(Ordering::Relaxed);
+        let n = loop {
+            if cur > MAX_SESSION_COUNTER {
+                return Err(Error::Protocol(
+                    "e2e session counter exhausted; re-handshake required".into(),
+                ));
+            }
+            match self.send_n.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(prev) => break prev,
+                Err(actual) => cur = actual,
+            }
+        };
         let out = aead_seal(&self.encrypt, n, aad, plain)?;
         self.touch();
         Ok(out)

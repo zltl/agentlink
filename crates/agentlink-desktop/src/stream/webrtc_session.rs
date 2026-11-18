@@ -47,6 +47,9 @@ use super::pipeline::{Pump, PumpControl};
 use super::tap::{self, StreamTapEvent};
 use super::StreamShared;
 
+pub const MAX_LIVE_STREAMS: usize = 4;
+pub const MAX_INPUT_DC_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
 pub struct SessionManager {
     desktop: Arc<Desktop>,
     shared: Arc<StreamShared>,
@@ -57,7 +60,7 @@ struct LiveSession {
     id: String,
     stop: Arc<AtomicBool>,
     control: PumpControl,
-    peer: Mutex<Option<Arc<dyn IcePeer>>>,
+    peer: Arc<Mutex<Option<Arc<dyn IcePeer>>>>,
     started: Instant,
     viewer: String,
     peer_id: String,
@@ -437,7 +440,7 @@ impl SessionManager {
             id: id.to_string(),
             stop: Arc::new(AtomicBool::new(false)),
             control: crate::stream::pipeline::PumpControl::default(),
-            peer: Mutex::new(None),
+            peer: Arc::new(Mutex::new(None)),
             started: std::time::Instant::now(),
             viewer: "viewer".into(),
             peer_id: peer.to_string(),
@@ -488,6 +491,15 @@ impl SessionManager {
             .map_err(|_| "node policy is unavailable".to_string())?;
         if !policy.allows_remote_view() {
             return Err("remote_view is not allowed on this node".into());
+        }
+        let _ = self.started_cleanup();
+        {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if sessions.len() >= MAX_LIVE_STREAMS {
+                return Err(format!(
+                    "too many concurrent desktop stream sessions (limit {MAX_LIVE_STREAMS})"
+                ));
+            }
         }
         let viewer = payload
             .get("viewer")
@@ -571,14 +583,31 @@ impl SessionManager {
                 }
             });
         }
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(LiveSession {
+        {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.retain(|session| {
+                let alive = !session.stop.load(Ordering::Relaxed);
+                if !alive && session.control_held.swap(false, Ordering::SeqCst) {
+                    control_indicator::note_control_session(false);
+                }
+                alive
+            });
+            if sessions.len() >= MAX_LIVE_STREAMS {
+                built.stop.store(true, Ordering::Relaxed);
+                if control_held.swap(false, Ordering::SeqCst) {
+                    control_indicator::note_control_session(false);
+                }
+                drop(sessions);
+                built.peer.close().await;
+                return Err(format!(
+                    "too many concurrent desktop stream sessions (limit {MAX_LIVE_STREAMS})"
+                ));
+            }
+            sessions.push(LiveSession {
                 id,
                 stop: built.stop,
                 control: built.control,
-                peer: Mutex::new(Some(built.peer)),
+                peer: Arc::new(Mutex::new(Some(built.peer))),
                 started: built.started,
                 viewer,
                 peer_id: peer.to_string(),
@@ -589,6 +618,7 @@ impl SessionManager {
                 grant_jti: payload_grant_jti(payload),
                 grant_exp_unix: payload_grant_exp(payload),
             });
+        }
         // Re-check after insert: a revoke/expiry that landed while the answer
         // was being built must still tear the session down.
         if let Some(err) = grant_still_active(
@@ -871,12 +901,14 @@ impl SessionManager {
             if session.control_held.swap(false, Ordering::SeqCst) {
                 control_indicator::note_control_session(false);
             }
-            if let Some(peer) = session
-                .peer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-            {
+            let peer_to_close = {
+                session
+                    .peer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+            };
+            if let Some(peer) = peer_to_close {
                 peer.close().await;
             }
             let duration_ms = session.started.elapsed().as_millis() as u64;
@@ -2135,7 +2167,7 @@ impl PeerConnectionEventHandler for Handler {
                 }
                 match channel.poll().await {
                     Some(DataChannelEvent::OnMessage(message)) => {
-                        if !input {
+                        if !input || message.data.len() > MAX_INPUT_DC_MESSAGE_BYTES {
                             continue;
                         }
                         let text = String::from_utf8_lossy(&message.data).to_string();
@@ -2974,7 +3006,7 @@ mod tests {
             id: id.to_string(),
             stop: Arc::new(AtomicBool::new(false)),
             control: dummy_control(),
-            peer: Mutex::new(None),
+            peer: Arc::new(Mutex::new(None)),
             started: std::time::Instant::now(),
             viewer: "viewer".into(),
             peer_id: peer.to_string(),
@@ -3202,5 +3234,74 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.block_on(mgr.close_all_sessions()), 2);
         assert!(mgr.sessions.lock().unwrap().is_empty());
+    }
+
+    struct LockProbePeer {
+        unlocked_during_close: Arc<AtomicBool>,
+        slot: Arc<Mutex<Option<Arc<dyn super::IcePeer>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::IcePeer for LockProbePeer {
+        async fn add_ice_candidate(
+            &self,
+            _candidate: rtc::peer_connection::transport::RTCIceCandidateInit,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        async fn renegotiate(
+            &self,
+            _offer_sdp: &str,
+        ) -> std::result::Result<(String, Vec<Value>), String> {
+            Ok((String::new(), Vec::new()))
+        }
+        fn gathered_candidates(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn gather_done(&self) -> bool {
+            true
+        }
+        fn push_gathered_candidate(&self, _candidate: Value) {}
+        async fn close(&self) {
+            tokio::task::yield_now().await;
+            if self.slot.try_lock().is_ok() {
+                self.unlocked_during_close.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn close_owned_drops_peer_mutex_before_await_and_offer_enforces_live_stream_cap() {
+        let mgr = test_manager();
+        let session = dummy_session("probe-close", "alice", "jti-1", None);
+        let probe_flag = Arc::new(AtomicBool::new(false));
+        let peer_obj: Arc<dyn super::IcePeer> = Arc::new(LockProbePeer {
+            unlocked_during_close: probe_flag.clone(),
+            slot: session.peer.clone(),
+        });
+        *session.peer.lock().unwrap() = Some(peer_obj);
+        mgr.sessions.lock().unwrap().push(session);
+        mgr.close_owned(&json!({"session_id": "probe-close"}), Some("alice"))
+            .await
+            .expect("close_owned");
+        assert!(probe_flag.load(Ordering::SeqCst));
+
+        // Fill active live stream slots to capacity (4) and verify a 5th concurrent offer is refused.
+        for idx in 0..4 {
+            mgr.sessions.lock().unwrap().push(dummy_session(
+                &format!("live-{idx}"),
+                "alice",
+                &format!("jti-{idx}"),
+                None,
+            ));
+        }
+        let fifth = mgr
+            .offer("alice", &json!({"sdp": "v=0\r\n", "viewer": "alice"}))
+            .await;
+        let err = fifth.expect_err("5th concurrent stream offer must be refused");
+        assert!(
+            err.contains("too many") || err.contains("stream"),
+            "expected stream cap error, got: {err}"
+        );
     }
 }
