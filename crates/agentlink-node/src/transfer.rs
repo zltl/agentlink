@@ -150,7 +150,8 @@ pub async fn on_transfer(
                 let outcome = async {
                     ensure(&host, policy, true)?;
                     let dest = paths::resolve_lexical(host.root.as_deref(), &path)?;
-                    engine::serve_push(
+                    engine::serve_push_confined(
+                        host.root.as_deref(),
                         &dest,
                         Path::new(&path),
                         size,
@@ -181,7 +182,7 @@ pub async fn on_transfer(
             tokio::spawn(async move {
                 let outcome = async {
                     ensure(&host, policy, false)?;
-                    let src = paths::resolve_lexical(host.root.as_deref(), &path)?;
+                    let src = paths::resolve_path(host.root.as_deref(), &path)?;
                     let opts = xfer_opts(chunk_size, 8, 4, compress, "relay");
                     engine::serve_pull(
                         &src,
@@ -226,7 +227,7 @@ pub async fn on_transfer(
             tokio::spawn(async move {
                 let outcome = async {
                     ensure(&host, policy, false)?;
-                    let src = paths::resolve_lexical(host.root.as_deref(), &path)?;
+                    let src = paths::resolve_path(host.root.as_deref(), &path)?;
                     let opts = xfer_opts(chunk_size, 8, 4, compress, "relay");
                     engine::serve_pull_dir(&src, have, &mut link, &request_id, &opts).await
                 }
@@ -245,7 +246,7 @@ pub async fn on_transfer(
                         )));
                     }
                     let dest = paths::resolve_lexical(host.root.as_deref(), &path)?;
-                    engine::serve_push_stream(&dest, &mut link, "relay").await
+                    engine::serve_push_stream_confined(host.root.as_deref(), &dest, &mut link, "relay").await
                 }
                 .await;
                 finish(&host, &client_id, "push_stream", &path, outcome, &mut link).await;
@@ -263,7 +264,7 @@ pub async fn on_transfer(
             tokio::spawn(async move {
                 let outcome = async {
                     ensure(&host, policy, false)?;
-                    let src = paths::resolve_lexical(host.root.as_deref(), &path)?;
+                    let src = paths::resolve_path(host.root.as_deref(), &path)?;
                     engine::serve_pull_stream(
                         &src,
                         offset,
@@ -860,7 +861,7 @@ async fn peer_copy(
     policy: Option<NodePolicy>,
 ) -> Result<TransferStats> {
     ensure(host, policy, false)?;
-    let src = paths::resolve_lexical(host.root.as_deref(), src_path)?;
+    let src = paths::resolve_path(host.root.as_deref(), src_path)?;
     let dir = src.is_dir();
     // Directories stay allowed; a FIFO/socket/device would block perform_push
     // (or std::fs::copy for same-node) forever on open/read.
@@ -872,7 +873,7 @@ async fn peer_copy(
     if dst_node == host.node_id {
         ensure(host, policy, true)?;
         let dest = paths::resolve_lexical(host.root.as_deref(), dst_path)?;
-        return local_fs_copy(&src, &dest);
+        return local_fs_copy_confined(host.root.as_deref(), &src, &dest);
     }
     let _direct = direct;
     let request_id = Uuid::new_v4().to_string();
@@ -901,8 +902,13 @@ async fn peer_copy(
     }
 }
 
+#[cfg(test)]
 fn local_fs_copy(src: &Path, dest: &Path) -> Result<TransferStats> {
-    let (logical, files) = copy_tree(src, dest)?;
+    local_fs_copy_confined(None, src, dest)
+}
+
+fn local_fs_copy_confined(root: Option<&Path>, src: &Path, dest: &Path) -> Result<TransferStats> {
+    let (logical, files) = copy_tree(root, src, dest)?;
     Ok(TransferStats {
         logical_bytes: logical,
         payload_bytes: logical,
@@ -916,24 +922,28 @@ fn local_fs_copy(src: &Path, dest: &Path) -> Result<TransferStats> {
     })
 }
 
-fn copy_tree(src: &Path, dest: &Path) -> Result<(u64, u32)> {
-    if src.is_dir() {
-        agentlink_core::util::create_dir_all_as_dir(dest)?;
+fn copy_tree(root: Option<&Path>, src: &Path, dest: &Path) -> Result<(u64, u32)> {
+    let src_checked = paths::ensure_path_stays_in_sandbox_at_sink(root, src)?;
+    let dst_checked = paths::ensure_path_stays_in_sandbox_at_sink(root, dest)?;
+    if src_checked.is_dir() {
+        agentlink_core::util::create_dir_all_as_dir(&dst_checked)?;
         let mut logical = 0u64;
         let mut files = 0u32;
-        for entry in std::fs::read_dir(src)? {
+        for entry in std::fs::read_dir(&src_checked)? {
             let entry = entry?;
-            let (b, f) = copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
+            let (b, f) = copy_tree(root, &entry.path(), &dst_checked.join(entry.file_name()))?;
             logical = logical.saturating_add(b);
             files = files.saturating_add(f);
         }
         Ok((logical, files))
     } else {
-        engine::ensure_pullable_file(src)?;
-        if let Some(parent) = dest.parent() {
+        engine::ensure_pullable_file(&src_checked)?;
+        if let Some(parent) = dst_checked.parent() {
             agentlink_core::util::create_dir_all_parent(parent)?;
         }
-        let n = std::fs::copy(src, dest)?;
+        let mut src_f = std::fs::File::open(&src_checked)?;
+        let mut dst_f = paths::open_write_file(&dst_checked, true, true, root.is_some())?;
+        let n = std::io::copy(&mut src_f, &mut dst_f)?;
         Ok((n, 1))
     }
 }
@@ -1060,7 +1070,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let err = copy_tree(&src, &dir.path().join("dest"))
+        let err = copy_tree(None, &src, &dir.path().join("dest"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a regular file"), "{err}");

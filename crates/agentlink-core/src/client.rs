@@ -41,13 +41,31 @@ const INITIAL_CONNECT_GIVE_UP: Duration = Duration::from_secs(5);
 
 struct PendingGuard {
     map: Arc<Mutex<HashMap<String, PendingSender>>>,
+    routes: Arc<Mutex<HashMap<String, String>>>,
     id: String,
+}
+
+impl PendingGuard {
+    /// Track a pending request id until this guard drops, also clearing any
+    /// unary `routes` entry noted during seal/protect.
+    fn new(inner: &ClientInner, id: String) -> Self {
+        Self {
+            map: inner.pending.clone(),
+            routes: inner.routes.clone(),
+            id,
+        }
+    }
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if let Ok(mut map) = self.map.lock() {
             map.remove(&self.id);
+        }
+        // Unary invoke routes were noted in `protect` / `seal_now` and must
+        // not accumulate across tens of thousands of short requests.
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.remove(&self.id);
         }
     }
 }
@@ -621,6 +639,7 @@ impl PtySession {
             .lock()
             .expect("pending test map")
             .insert(session_id.clone(), wait_tx.clone());
+        let routes = inner.routes.clone();
         let session = PtySession {
             session_id: session_id.clone(),
             node_id: "test-node".into(),
@@ -631,6 +650,7 @@ impl PtySession {
             close_sent: false,
             _guard: PendingGuard {
                 map: pending,
+                routes,
                 id: session_id,
             },
         };
@@ -711,10 +731,7 @@ impl PtyWriter {
                     .map_err(|_| Error::Message("client lock poisoned".into()))?;
                 map.insert(request_id.clone(), wait_tx);
             }
-            let _guard = PendingGuard {
-                map: self.inner.pending.clone(),
-                id: request_id.clone(),
-            };
+            let _guard = PendingGuard::new(&self.inner, request_id.clone());
             let env = Envelope::Invoke {
                 request_id,
                 node_id: self.node_id.clone(),
@@ -1648,10 +1665,7 @@ impl Client {
                 .map_err(|_| Error::Message("client lock poisoned".into()))?;
             map.insert(request_id.clone(), wait_tx);
         }
-        let guard = PendingGuard {
-            map: self.inner.pending.clone(),
-            id: request_id.clone(),
-        };
+        let guard = PendingGuard::new(&self.inner, request_id.clone());
         self.send(&Envelope::Invoke {
             request_id: request_id.clone(),
             node_id: node_id.clone(),
@@ -1828,10 +1842,7 @@ impl Client {
                 .map_err(|_| Error::Message("client lock poisoned".into()))?;
             map.insert(request_id.clone(), wait_tx);
         }
-        let _guard = PendingGuard {
-            map: self.inner.pending.clone(),
-            id: request_id.clone(),
-        };
+        let _guard = PendingGuard::new(&self.inner, request_id.clone());
         self.send(&Envelope::Invoke {
             request_id: request_id.clone(),
             node_id: node_id.clone(),
@@ -1908,10 +1919,7 @@ impl Client {
                 .map_err(|_| Error::Message("client lock poisoned".into()))?;
             map.insert(request_id.clone(), wait_tx);
         }
-        let _guard = PendingGuard {
-            map: self.inner.pending.clone(),
-            id: request_id.clone(),
-        };
+        let _guard = PendingGuard::new(&self.inner, request_id.clone());
         self.send(&Envelope::Invoke {
             request_id: request_id.clone(),
             node_id: node_id.to_string(),
@@ -2022,10 +2030,7 @@ impl Client {
                 .map_err(|_| Error::Message("client lock poisoned".into()))?;
             map.insert(request_id.clone(), wait_tx);
         }
-        let _guard = PendingGuard {
-            map: self.inner.pending.clone(),
-            id: request_id.clone(),
-        };
+        let _guard = PendingGuard::new(&self.inner, request_id.clone());
         self.send(&build(request_id)).await?;
         timeout(limit, rx.recv())
             .await
@@ -2548,10 +2553,7 @@ pub(crate) async fn ensure_e2e(
             .map_err(|_| Error::Message("client lock poisoned".into()))?;
         map.insert(request_id.clone(), wait_tx);
     }
-    let _drop = PendingGuard {
-        map: inner.pending.clone(),
-        id: request_id.clone(),
-    };
+    let _drop = PendingGuard::new(inner, request_id.clone());
     let hello = Envelope::E2eHello {
         request_id: request_id.clone(),
         node_id: node_id.to_string(),
@@ -2678,6 +2680,33 @@ fn dispatch_binary(
 mod tests {
     use super::*;
     use crate::protocol::TransferMsg;
+
+    #[test]
+    fn pending_guard_drop_clears_unary_routes() {
+        let pending: Arc<Mutex<HashMap<String, PendingSender>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let routes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let id = "req-unary".to_string();
+        {
+            let (tx, _rx) = pending::channel();
+            pending.lock().unwrap().insert(id.clone(), tx);
+            routes
+                .lock()
+                .unwrap()
+                .insert(id.clone(), "node-a".into());
+            let _guard = PendingGuard {
+                map: pending.clone(),
+                routes: routes.clone(),
+                id: id.clone(),
+            };
+            assert!(routes.lock().unwrap().contains_key(&id));
+        }
+        assert!(
+            !routes.lock().unwrap().contains_key(&id),
+            "unary route must be removed when PendingGuard drops"
+        );
+        assert!(!pending.lock().unwrap().contains_key(&id));
+    }
 
     #[tokio::test]
     async fn transfer_inbox_keeps_stream_ready_ahead_of_its_chunk() {

@@ -11,7 +11,12 @@ COPY . .
 RUN cargo build --locked --release -p agentlink-cli
 
 FROM debian:bookworm-slim
-RUN useradd --system --create-home --home-dir /var/lib/agentlink --shell /usr/sbin/nologin agentlink \
+# libstdc++6: openh264-sys2 links libstdc++.so.6 at runtime.
+# ca-certificates: HTTPS egress (S3, webhooks, GitHub) needs the system CA bundle.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --home-dir /var/lib/agentlink --shell /usr/sbin/nologin agentlink \
     && mkdir -p /var/lib/agentlink \
     && chown agentlink:agentlink /var/lib/agentlink
 COPY --from=build /src/target/release/agentlink /usr/local/bin/agentlink

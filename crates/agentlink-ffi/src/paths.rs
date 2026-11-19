@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentlink_core::paths::{resolve_lexical, resolve_path};
+use agentlink_core::paths::{resolve_lexical, resolve_path, resolve_path_no_follow};
 use agentlink_core::{Error, Result};
 
 #[derive(Clone)]
@@ -30,6 +30,46 @@ pub enum GuestTarget {
 }
 
 pub fn classify(roots: &Roots, guest: &str, write: bool) -> Result<GuestTarget> {
+    classify_inner(roots, guest, write, true).map(|(target, _)| target)
+}
+
+/// Like [`classify`], but keeps a final symlink un-dereferenced (used by
+/// `remove_guest` and `rename_guest` source/destination entry lookup) and
+/// also returns the enclosing sandbox root for relative-symlink move checks.
+pub fn classify_entry_with_root(
+    roots: &Roots,
+    guest: &str,
+    write: bool,
+    follow_final: bool,
+) -> Result<(GuestTarget, Option<PathBuf>)> {
+    classify_inner(roots, guest, write, follow_final)
+}
+
+/// Return the sandbox root directory that confines `guest`, when `guest` maps
+/// to a real filesystem root (`app:/files`, `app:/cache`, or `storage:/`).
+pub fn sandbox_root_for_guest(roots: &Roots, guest: &str) -> Option<PathBuf> {
+    let path = normalize(guest);
+    if strip_root(&path, "app:/files").is_some() {
+        return Some(roots.files.clone());
+    }
+    if strip_root(&path, "app:/cache").is_some() {
+        return Some(roots.cache.clone());
+    }
+    if strip_root(&path, "storage:").is_some() {
+        return roots.storage.clone();
+    }
+    if !path.starts_with('/') && !path.contains(':') && path != "app:" && path != "app:/" {
+        return Some(roots.files.clone());
+    }
+    None
+}
+
+fn classify_inner(
+    roots: &Roots,
+    guest: &str,
+    write: bool,
+    follow_final: bool,
+) -> Result<(GuestTarget, Option<PathBuf>)> {
     let path = normalize(guest);
     if path.contains('\0') {
         return Err(Error::Message("path contains NUL".into()));
@@ -47,22 +87,28 @@ pub fn classify(roots: &Roots, guest: &str, write: bool) -> Result<GuestTarget> 
         if write {
             return Err(Error::Message("app:/ is not a writable directory".into()));
         }
-        return Ok(GuestTarget::AppRoot);
+        return Ok((GuestTarget::AppRoot, None));
     }
     if path == "app:/audit.log" {
-        return Ok(GuestTarget::Audit);
+        return Ok((GuestTarget::Audit, None));
     }
     if path == "app:/device.json" {
-        return Ok(GuestTarget::Device);
+        return Ok((GuestTarget::Device, None));
     }
     if path.starts_with("saf:/") || path == "saf:" {
-        return Ok(GuestTarget::Saf(path));
+        return Ok((GuestTarget::Saf(path), None));
     }
     if let Some(rel) = strip_root(&path, "app:/files") {
-        return Ok(GuestTarget::Real(under(&roots.files, rel)?));
+        return Ok((
+            GuestTarget::Real(under(&roots.files, rel, follow_final)?),
+            Some(roots.files.clone()),
+        ));
     }
     if let Some(rel) = strip_root(&path, "app:/cache") {
-        return Ok(GuestTarget::Real(under(&roots.cache, rel)?));
+        return Ok((
+            GuestTarget::Real(under(&roots.cache, rel, follow_final)?),
+            Some(roots.cache.clone()),
+        ));
     }
     if let Some(rel) = strip_root(&path, "storage:") {
         let root = roots.storage.as_ref().ok_or_else(|| {
@@ -70,14 +116,20 @@ pub fn classify(roots: &Roots, guest: &str, write: bool) -> Result<GuestTarget> 
                 "all-files access is not granted; pick a folder or allow storage".into(),
             )
         })?;
-        return Ok(GuestTarget::Real(under(root, rel)?));
+        return Ok((
+            GuestTarget::Real(under(root, rel, follow_final)?),
+            Some(root.clone()),
+        ));
     }
     if path.starts_with('/') || path.contains(':') {
         return Err(Error::Message(format!(
             "path is outside the granted roots ({path})"
         )));
     }
-    Ok(GuestTarget::Real(under(&roots.files, &path)?))
+    Ok((
+        GuestTarget::Real(under(&roots.files, &path, follow_final)?),
+        Some(roots.files.clone()),
+    ))
 }
 
 /// A real path the transfer engine can open. SAF paths are not handled here.
@@ -125,16 +177,19 @@ fn strip_root<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     path.strip_prefix(&with_slash)
 }
 
-fn under(root: &Path, rel: &str) -> Result<PathBuf> {
+fn under(root: &Path, rel: &str, follow_final: bool) -> Result<PathBuf> {
     if rel.is_empty() {
         return Ok(root.to_path_buf());
     }
     if Path::new(rel).is_absolute() {
         return Err(Error::Message("path escapes the granted root".into()));
     }
-    // Existing files are canonicalized, so a symlink cannot leave the root.
-    // mkdir -p uses the lexical form when the leaf does not exist yet.
-    if root.join(rel).exists() {
+    if !follow_final {
+        return resolve_path_no_follow(Some(root), rel);
+    }
+    // `resolve_lexical` resolves all existing and dangling symlinks along the
+    // prefix and final leaf while permitting not-yet-created intermediate dirs.
+    if std::fs::symlink_metadata(root.join(rel)).is_ok() {
         resolve_path(Some(root), rel)
     } else {
         resolve_lexical(Some(root), rel)
@@ -145,9 +200,6 @@ pub fn ensure_inside(roots: &Roots, candidate: &Path) -> Result<()> {
     let mut allowed: Vec<&Path> = vec![&roots.files, &roots.cache];
     if let Some(storage) = &roots.storage {
         allowed.push(storage.as_path());
-    }
-    if let Some(parent) = roots.audit.parent() {
-        allowed.push(parent);
     }
     for root in allowed {
         if inside(root, candidate)? {
@@ -160,21 +212,7 @@ pub fn ensure_inside(roots: &Roots, candidate: &Path) -> Result<()> {
 }
 
 fn inside(root: &Path, candidate: &Path) -> Result<bool> {
-    let Ok(root_c) = std::fs::canonicalize(root) else {
-        return Ok(false);
-    };
-    let probe = if candidate.exists() {
-        std::fs::canonicalize(candidate)?
-    } else {
-        let parent = candidate.parent().unwrap_or(candidate);
-        if !parent.exists() {
-            return Ok(false);
-        }
-        let parent_c = std::fs::canonicalize(parent)?;
-        let name = candidate.file_name().unwrap_or_default();
-        parent_c.join(name)
-    };
-    Ok(probe.starts_with(&root_c))
+    Ok(agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), candidate).is_ok())
 }
 
 #[cfg(test)]
@@ -220,6 +258,15 @@ mod tests {
             assert!(
                 err.to_string().contains("escapes") || err.to_string().contains("sandbox"),
                 "{err}"
+            );
+            // J-01 Android `app:/files` dangling symlink escape must ALSO be denied!
+            std::os::unix::fs::symlink("../escaped_app_data.txt", roots.files.join("dangling"))
+                .unwrap();
+            let err_dangling = real_target(&roots, "app:/files/dangling", true).unwrap_err();
+            assert!(
+                err_dangling.to_string().contains("escapes")
+                    || err_dangling.to_string().contains("sandbox"),
+                "{err_dangling}"
             );
         }
     }

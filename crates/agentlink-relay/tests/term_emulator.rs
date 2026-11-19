@@ -1,38 +1,22 @@
-//! Dashboard terminal emulator regressions (Node harness).
+//! Former dashboard terminal emulator is retired with browser control (t544).
 //!
-//! `top` under TERM=xterm-256color emits ESC ( B before attribute resets. The
-//! web terminal used to treat that as a printable B and scramble the layout.
-
-use std::path::PathBuf;
-use std::process::Command;
+//! The Node harness that exercised `createTerm` no longer applies: the
+//! dashboard must not ship a PTY/term client. Sealed clients use the native
+//! alacritty-based Controller instead.
 
 #[test]
-fn dashboard_term_does_not_print_charset_designators() {
-    let node = which("node");
-    let Some(node) = node else {
-        eprintln!("skipping: node not on PATH");
-        return;
-    };
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/term_emulator.mjs");
-    let out = Command::new(node)
-        .arg(&script)
-        .output()
-        .expect("spawn node term_emulator.mjs");
+fn dashboard_does_not_ship_browser_term_emulator() {
+    let html = include_str!("../src/dashboard.html");
     assert!(
-        out.status.success(),
-        "term_emulator.mjs failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        !html.contains("createTerm"),
+        "dashboard must not embed a browser terminal emulator"
     );
-}
-
-fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    assert!(
+        !html.contains("/v1/web"),
+        "dashboard must not open the retired control websocket"
+    );
+    assert!(
+        html.contains("not available in the browser"),
+        "dashboard should still explain the sealed-client boundary"
+    );
 }

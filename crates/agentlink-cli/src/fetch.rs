@@ -68,12 +68,10 @@ async fn https_get_redirects(
         let next = parsed
             .join(&location)
             .with_context(|| format!("redirect location {location}"))?;
-        // Keep the token on GitHub hosts only; CDN/asset hosts use signed URLs.
-        let next_auth = match next.host_str() {
-            Some("api.github.com") | Some("github.com") => authorization,
-            Some(host) if host.ends_with(".githubusercontent.com") => authorization,
-            _ => None,
-        };
+        // Keep the token on GitHub API/origin only. CDN hosts
+        // (*.githubusercontent.com) use signed URLs; forwarding Authorization
+        // there conflicts with the pre-signed query and can yield 400/401.
+        let next_auth = redirect_authorization(next.host_str(), authorization);
         return Box::pin(https_get_redirects(next.as_str(), accept, next_auth, left - 1)).await;
     }
     if !(200..300).contains(&response.status) {
@@ -86,6 +84,13 @@ async fn https_get_redirects(
         body: response.body,
         final_url: url.to_string(),
     })
+}
+
+fn redirect_authorization<'a>(host: Option<&str>, authorization: Option<&'a str>) -> Option<&'a str> {
+    match host {
+        Some("api.github.com") | Some("github.com") => authorization,
+        _ => None,
+    }
 }
 
 struct RawResponse {
@@ -338,5 +343,26 @@ mod tests {
     fn finds_header_terminator() {
         let buf = b"HTTP/1.1 200 OK\r\n\r\nhello";
         assert_eq!(find_header_end(buf), Some(19));
+    }
+
+    #[test]
+    fn redirect_keeps_authorization_only_on_github_origin() {
+        let auth = Some("Bearer ghp_test");
+        assert_eq!(
+            redirect_authorization(Some("api.github.com"), auth),
+            auth
+        );
+        assert_eq!(redirect_authorization(Some("github.com"), auth), auth);
+        assert_eq!(
+            redirect_authorization(Some("objects.githubusercontent.com"), auth),
+            None,
+            "CDN redirects must drop Authorization"
+        );
+        assert_eq!(
+            redirect_authorization(Some("release-assets.githubusercontent.com"), auth),
+            None
+        );
+        assert_eq!(redirect_authorization(Some("example.com"), auth), None);
+        assert_eq!(redirect_authorization(None, auth), None);
     }
 }

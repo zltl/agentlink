@@ -1994,6 +1994,14 @@ async fn close_pty(pty: &mut Option<UnboundedSender<PtyCmd>>) {
     let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
 }
 
+// =============================================================================
+// Local PTY drive loop (J-06 fairness)
+//
+// Responsibility: bridge `PtySession` output to UI events and apply local
+// PtyCmd (write/resize/probe/close). The biased select MUST poll `rx` (local
+// commands) before `session.recv()` so Ctrl+C/Close stay responsive under an
+// always-ready remote flood (`yes`). See `pty_fairness_tests`.
+// =============================================================================
 const PTY_WRITE_COALESCE_CAP: usize = 16 * 1024;
 const PTY_SOCKET_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const PTY_IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(300);
@@ -2030,8 +2038,11 @@ fn spawn_pty(
                         None => std::future::pending::<()>().await,
                     }
                 };
+                // Prefer local commands (Ctrl+C / Close / resize) over a flood
+                // of remote PTY chunks so interrupt stays responsive under `yes`.
                 tokio::select! {
                     biased;
+                    cmd = rx.recv() => cmd,
                     event = session.recv() => {
                         match event {
                             Ok(PtyEvent::Data(bytes)) => {
@@ -2060,7 +2071,6 @@ fn spawn_pty(
                         }
                         continue;
                     }
-                    cmd = rx.recv() => cmd,
                     _ = heal_sleep => {
                         echo_heal_at = None;
                         if last_rebind_at
@@ -4777,5 +4787,108 @@ mod worker_client_recovery_tests {
         let _ = worker_thread.join();
         node_stop_2.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), node_task_2).await;
+    }
+}
+
+#[cfg(test)]
+mod pty_fairness_tests {
+    use super::{spawn_pty, PtyCmd, Shared, UiEvent};
+    use agentlink_core::protocol::Envelope;
+    use agentlink_core::{util, PtySession};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Production-path J-06 regression: drive the real [`spawn_pty`] loop with a
+    /// [`PtySession::test_io`] flood of `Envelope::Chunk` and assert `PtyCmd::Close`
+    /// completes promptly (the Stage J starvation failure mode).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_pty_close_beats_chunk_flood() {
+        let io = PtySession::test_io();
+        let shared = Arc::new(Shared::new());
+        let cmd_tx = spawn_pty(io.session, Arc::clone(&shared), 42, (24, 80));
+
+        let flood_tx = io.tx.clone();
+        let flood = tokio::spawn(async move {
+            let mut seq = 0u64;
+            loop {
+                seq = seq.saturating_add(1);
+                let env = Envelope::Chunk {
+                    request_id: "pty-test".into(),
+                    stream: "pty".into(),
+                    data_b64: util::b64_encode(b"Y"),
+                    seq,
+                };
+                if flood_tx.send(env).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Let the pending queue and spawn_pty select arm see continuous output.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(PtyCmd::Close(Some(done)))
+            .expect("pty cmd channel open");
+        let closed = tokio::time::timeout(Duration::from_millis(750), done_rx).await;
+        flood.abort();
+        assert!(
+            closed.is_ok() && closed.unwrap().is_ok(),
+            "spawn_pty must apply Close under an always-ready Chunk flood"
+        );
+
+        // Optional: confirm the loop observed some output (flood was real).
+        let saw_data = shared.drain().into_iter().any(|ev| {
+            matches!(ev, UiEvent::Pty { gen: 42, .. })
+        });
+        let _ = saw_data; // flood may race Close before first push; Close success is the gate
+    }
+
+    /// Same production path as Close: `PtyCmd::Write([0x03])` (Ctrl+C) shares the
+    /// biased cmd-before-recv arm. Assert the write hook sees `^C` promptly under
+    /// an always-ready Chunk flood (Stage J R3 residual).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_pty_ctrl_c_beats_chunk_flood() {
+        let io = PtySession::test_io();
+        let mut writes = io.writes;
+        let shared = Arc::new(Shared::new());
+        let cmd_tx = spawn_pty(io.session, Arc::clone(&shared), 43, (24, 80));
+
+        let flood_tx = io.tx.clone();
+        let flood = tokio::spawn(async move {
+            let mut seq = 0u64;
+            loop {
+                seq = seq.saturating_add(1);
+                let env = Envelope::Chunk {
+                    request_id: "pty-test".into(),
+                    stream: "pty".into(),
+                    data_b64: util::b64_encode(b"Y"),
+                    seq,
+                };
+                if flood_tx.send(env).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        cmd_tx
+            .send(PtyCmd::Write(vec![0x03]))
+            .expect("pty cmd channel open");
+        let written = tokio::time::timeout(Duration::from_millis(750), writes.recv()).await;
+        flood.abort();
+        let bytes = written
+            .expect("Ctrl+C Write must complete under Chunk flood")
+            .expect("write hook open");
+        assert!(
+            bytes.contains(&0x03),
+            "spawn_pty must deliver Ctrl+C bytes under flood, got {bytes:?}"
+        );
+
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        let _ = cmd_tx.send(PtyCmd::Close(Some(done)));
+        let _ = tokio::time::timeout(Duration::from_millis(750), done_rx).await;
     }
 }

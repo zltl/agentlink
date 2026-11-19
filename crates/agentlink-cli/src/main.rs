@@ -221,7 +221,8 @@ struct NodeArgs {
     #[arg(long)]
     name: Option<String>,
     /// One-time token from `agentlink pair`.
-    #[arg(long)]
+    /// Prefer `AGENTLINK_PAIRING_TOKEN` so the secret is not visible in `ps` argv.
+    #[arg(long, env = "AGENTLINK_PAIRING_TOKEN")]
     pairing_token: Option<String>,
     /// Invite string from `agentlink pair` (`agentlink-invite:v1:...`).
     /// It carries the relay URL, trust mode, and pairing token.

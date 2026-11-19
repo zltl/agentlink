@@ -978,6 +978,7 @@ impl ControllerApp {
         let gen = self.term_gen;
         self.term_node_id = Some(node.id.clone());
         self.terminal = Emulator::new(self.term_size.0, self.term_size.1);
+        self.terminal.reset_local_echo(gen);
         self.terminal.focused = true;
         self.term_got_output = false;
         self.term_open = Some(Instant::now());

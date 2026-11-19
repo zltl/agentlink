@@ -609,9 +609,15 @@ async fn push_file(
     mtime_unix: Option<u64>,
 ) -> Result<TransferStats> {
     let real = staged.real.clone();
+    let sandbox_root = if staged.publish {
+        Some(paths.roots.cache.clone())
+    } else {
+        paths::sandbox_root_for_guest(&paths.roots, &staged.guest)
+    };
     let label = PathBuf::from(guest);
     if !staged.publish {
-        return engine::serve_push(
+        return engine::serve_push_confined(
+            sandbox_root.as_deref(),
             &real,
             &label,
             size,
@@ -627,7 +633,8 @@ async fn push_file(
         .await;
     }
     let (mut engine, hold) = hold_done(link);
-    let served = engine::serve_push(
+    let served = engine::serve_push_confined(
+        sandbox_root.as_deref(),
         &real,
         &label,
         size,
@@ -669,11 +676,19 @@ async fn push_stream(
     transport: &str,
 ) -> Result<TransferStats> {
     let real = staged.real.clone();
+    let sandbox_root = if staged.publish {
+        Some(paths.roots.cache.clone())
+    } else {
+        paths::sandbox_root_for_guest(&paths.roots, &staged.guest)
+    };
     if !staged.publish {
-        return engine::serve_push_stream(&real, link, transport).await;
+        return engine::serve_push_stream_confined(sandbox_root.as_deref(), &real, link, transport)
+            .await;
     }
     let (mut engine, hold) = hold_done(link);
-    let served = engine::serve_push_stream(&real, &mut engine, transport).await;
+    let served =
+        engine::serve_push_stream_confined(sandbox_root.as_deref(), &real, &mut engine, transport)
+            .await;
     drop(engine);
     publish_then_release(paths, staged, hold, served).await
 }

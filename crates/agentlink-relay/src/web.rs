@@ -1,10 +1,11 @@
-//! Browser login, the machine dashboard, and enrollment.
+//! Browser login, machine dashboard (info), and enrollment.
 //!
-//! `GET /` is the management UI. `GET /view` stays the desktop viewer.
-//! `GET /v1/web` upgrades a dashboard session into a file and terminal socket.
-//! Both pages use the same local accounts as the CLI and the Android app. The
-//! browser keeps an HttpOnly session cookie; device-bound access and refresh
-//! tokens stay on the CLI and the phone. Nothing on the page is loaded from a CDN.
+//! `GET /` is the management UI: account session, machine list, enroll tokens,
+//! install links, and documentation deep-links. It is **not** a controller —
+//! shell / files / desktop / PTY are sealed-client only. `GET /v1/web` and
+//! view-ticket minting are retired (410). `GET /view` serves a notice page.
+//! The browser keeps an HttpOnly session cookie; device-bound access and
+//! refresh tokens stay on the CLI and the phone. Nothing is loaded from a CDN.
 
 use agentlink_core::accounts::WEB_TTL_SECS;
 use agentlink_core::util::{self, unix_now};
@@ -69,7 +70,7 @@ pub async fn handle(
     path: &str,
     headers: &[(String, String)],
     body: &[u8],
-    peer: std::net::SocketAddr,
+    audit_ip: std::net::IpAddr,
 ) -> Result<Option<WebOutcome>> {
     // HEAD shares GET routing for idempotent reads (install scripts, /dl/*,
     // dashboard, APIs). Caller encodes with encode_for_method so the body is
@@ -78,7 +79,7 @@ pub async fn handle(
     let method = if head { "GET" } else { method };
     match (method, path) {
         ("POST", "/auth/login") => Ok(Some(WebOutcome::Reply(
-            login(hub, headers, body, peer).await?,
+            login(hub, headers, body, audit_ip).await?,
         ))),
         ("POST", "/auth/logout") => Ok(Some(WebOutcome::Reply(logout(hub, headers).await?))),
         ("GET", "/auth/session") => Ok(Some(WebOutcome::Reply(session_info(hub, headers).await?))),
@@ -90,14 +91,15 @@ pub async fn handle(
         ("POST", "/api/tokens/revoke") => Ok(Some(WebOutcome::Reply(
             revoke_token(hub, headers, body).await?,
         ))),
-        ("POST", "/api/view-ticket") => Ok(Some(WebOutcome::Reply(
-            view_ticket(hub, headers, body, peer).await?,
-        ))),
-        ("POST", "/api/view-ticket/revoke") => Ok(Some(WebOutcome::Reply(
-            revoke_view_ticket(hub, headers, body).await?,
-        ))),
+        ("POST", "/api/view-ticket") | ("POST", "/api/view-ticket/revoke") => {
+            Ok(Some(WebOutcome::Reply(text(
+                410,
+                "Gone",
+                "browser view tickets are disabled; use a sealed client with a node-local grant",
+            ))))
+        }
         ("POST", "/api/ice") => Ok(Some(WebOutcome::Reply(
-            ice_config(hub, headers, body, peer).await?,
+            ice_config(hub, headers, body, audit_ip).await?,
         ))),
         ("POST", "/api/qr") => Ok(Some(WebOutcome::Reply(qr(hub, headers, body).await?))),
         ("GET", "/view/events") => {
@@ -119,9 +121,9 @@ pub async fn handle(
             Ok(Some(WebOutcome::Reply(dashboard_page())))
         }
         ("GET", WS_WEB_PATH) => Ok(Some(WebOutcome::Reply(text(
-            426,
-            "Upgrade Required",
-            "terminal and files use a websocket",
+            410,
+            "Gone",
+            "browser control is disabled; use a sealed client with a node-local grant",
         )))),
         ("GET", path) if path.starts_with("/dl/") => Ok(Some(download(hub, path, headers, head))),
         _ => Ok(None),
@@ -205,12 +207,12 @@ async fn login(
     hub: &Hub,
     headers: &[(String, String)],
     body: &[u8],
-    peer: std::net::SocketAddr,
+    audit_ip: std::net::IpAddr,
 ) -> Result<HttpReply> {
     if let Some(reply) = login_origin_rejected(headers) {
         return Ok(reply);
     }
-    if !server::login_allowed(hub, peer) {
+    if !server::login_allowed(hub, audit_ip) {
         return Ok(text(429, "Too Many Requests", "too many login attempts"));
     }
     let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
@@ -400,13 +402,14 @@ async fn revoke_token(hub: &Hub, headers: &[(String, String)], body: &[u8]) -> R
     }
 }
 
+#[allow(dead_code)] // retired: route returns 410 before calling
 async fn view_ticket(
     hub: &Hub,
     headers: &[(String, String)],
     body: &[u8],
-    peer: std::net::SocketAddr,
+    audit_ip: std::net::IpAddr,
 ) -> Result<HttpReply> {
-    if !server::rate_allow(hub, "ticket", peer.ip(), 30, 60) {
+    if !server::rate_allow(hub, "ticket", audit_ip, 30, 60) {
         let mut reply = text(429, "Too Many Requests", "too many view tickets");
         reply.headers.push(("Retry-After".into(), "60".into()));
         return Ok(reply);
@@ -434,6 +437,7 @@ async fn view_ticket(
     }
 }
 
+#[allow(dead_code)] // retired: route returns 410 before calling
 async fn revoke_view_ticket(
     hub: &Hub,
     headers: &[(String, String)],
@@ -467,9 +471,9 @@ async fn ice_config(
     hub: &Hub,
     headers: &[(String, String)],
     body: &[u8],
-    peer: std::net::SocketAddr,
+    audit_ip: std::net::IpAddr,
 ) -> Result<HttpReply> {
-    if !server::rate_allow(hub, "ice", peer.ip(), 60, 60) {
+    if !server::rate_allow(hub, "ice", audit_ip, 60, 60) {
         return Ok(text(429, "Too Many Requests", "too many ice requests"));
     }
     let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
@@ -919,8 +923,10 @@ fn enroll_target(host: &str, leaf_fingerprint: &str) -> EnrollTarget {
 }
 
 fn unix_install_command(origin: &str, token: &str, name: &str, access: &str) -> String {
+    // Pass the admin token via the environment so it does not appear in the
+    // installer's argv (visible to other users via `ps` on shared hosts).
     format!(
-        "curl -fsSL {origin}/install.sh | sh -s -- --token {} --name {} --access {} --max-access {}",
+        "curl -fsSL {origin}/install.sh | env AGENTLINK_TOKEN={} sh -s -- --name {} --access {} --max-access {}",
         shell_single(token),
         shell_single(name),
         shell_single(access),
@@ -930,7 +936,7 @@ fn unix_install_command(origin: &str, token: &str, name: &str, access: &str) -> 
 
 fn windows_install_command(origin: &str, token: &str, name: &str, access: &str) -> String {
     format!(
-        "& ([scriptblock]::Create((irm {origin}/install.ps1))) -Token {} -Name {} -Access {} -MaxAccess {}",
+        "$env:AGENTLINK_TOKEN={}; & ([scriptblock]::Create((irm {origin}/install.ps1))) -Name {} -Access {} -MaxAccess {}",
         ps_single(token),
         ps_single(name),
         ps_single(access),
@@ -1163,12 +1169,6 @@ mod tests {
         assert!(!text.contains("data-mode"));
         assert!(!text.contains(">View<"));
         assert!(!text.contains(">Control<"));
-        assert!(text.contains("control: false"));
-        assert!(text.contains("start=watch"));
-        assert!(text.contains("View only"));
-        assert!(text.contains("仅观看"));
-        assert!(text.contains("Screenshots only"));
-        assert!(text.contains("aria-pressed"));
         assert!(!text.contains("type = \"checkbox\""));
         assert!(!text.contains("type=\"checkbox\""));
         assert!(text.contains("has_display"));
@@ -1177,16 +1177,12 @@ mod tests {
         assert!(!text.contains("id=\"term-screen\""));
         assert!(!text.contains("id=\"term-input\""));
         assert!(!text.contains("id=\"files-pane\""));
-        assert!(text.contains("/v1/web"));
-        assert!(text.contains("overscroll-behavior: contain"));
-        assert!(text.contains("touch-action: pan-x pan-y"));
-        assert!(text.contains("const SCROLLBACK = 1000"));
-        // Dashboard term must consume charset designators (ESC ( B); otherwise
-        // procps `top` prints a literal B on every attribute reset and looks broken.
-        assert!(text.contains("esc-int"));
-        assert!(text.contains("()*+-.%/"));
-        assert!(text.contains("view.reverse"));
-        assert!(text.contains(r#"code === "7""#));
+        // t544: no shipped browser controller client.
+        assert!(!text.contains("/v1/web"));
+        assert!(!text.contains("/api/view-ticket"));
+        assert!(!text.contains("createTerm"));
+        assert!(!text.contains("new WebSocket"));
+        assert!(text.contains("openGuide"));
         assert!(text.contains("/download/agentlink.apk"));
         assert!(text.contains("viewport-fit=cover"));
         assert!(text.contains("safe-area-inset"));
@@ -1257,7 +1253,7 @@ mod tests {
         let command = unix_install_command(&public.origin, "abc", "lab top", "desktop");
         assert_eq!(
             command,
-            "curl -fsSL https://relay.example.com/install.sh | sh -s -- --token 'abc' --name 'lab top' --access 'desktop' --max-access 'desktop'"
+            "curl -fsSL https://relay.example.com/install.sh | env AGENTLINK_TOKEN='abc' sh -s -- --name 'lab top' --access 'desktop' --max-access 'desktop'"
         );
         let quoted = unix_install_command(&public.origin, "abc", "o'brien", "read-only");
         assert!(quoted.contains("--name 'o'\\''brien'"), "{quoted}");

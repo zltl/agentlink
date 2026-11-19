@@ -4,7 +4,7 @@
 //! back the fast-transfer engine. SAF folders and live device info go through
 //! the Android host.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -130,6 +130,9 @@ pub fn write_guest(
                 .unwrap_or(data.len() as u64))
         }
         GuestTarget::Real(path) => {
+            let root = paths::sandbox_root_for_guest(roots, guest);
+            let path =
+                agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(root.as_deref(), &path)?;
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() && !parent.exists() {
                     return Err(Error::NotFound(format!(
@@ -138,15 +141,7 @@ pub fn write_guest(
                     )));
                 }
             }
-            let mut file = if truncate {
-                OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&path)?
-            } else {
-                OpenOptions::new().create(true).write(true).open(&path)?
-            };
+            let mut file = agentlink_core::paths::open_write_file(&path, true, truncate, true)?;
             if !truncate || offset > 0 {
                 file.seek(SeekFrom::Start(offset))?;
             }
@@ -193,7 +188,7 @@ pub fn remove_guest(
     guest: &str,
     recursive: bool,
 ) -> Result<()> {
-    match paths::classify(roots, guest, true)? {
+    match paths::classify_entry_with_root(roots, guest, true, false)?.0 {
         GuestTarget::Saf(path) => {
             host_blocking(
                 host,
@@ -204,7 +199,9 @@ pub fn remove_guest(
         }
         GuestTarget::Real(path) => {
             let meta = fs::symlink_metadata(&path)?;
-            if meta.is_dir() && !meta.file_type().is_symlink() {
+            if agentlink_core::paths::is_link_entry(&meta) {
+                agentlink_core::paths::remove_link_entry(&path, &meta)?;
+            } else if meta.is_dir() {
                 if recursive {
                     fs::remove_dir_all(&path)?;
                 } else {
@@ -220,9 +217,13 @@ pub fn remove_guest(
 }
 
 pub fn rename_guest(roots: &Roots, host: &Arc<dyn NodeHost>, from: &str, to: &str) -> Result<()> {
-    let left_saf = matches!(paths::classify(roots, from, true)?, GuestTarget::Saf(_));
-    let right = paths::classify(roots, to, true)?;
-    let right_saf = matches!(right, GuestTarget::Saf(_));
+    let (left_target, _left_root) = paths::classify_entry_with_root(roots, from, true, false)?;
+    let left_saf = matches!(left_target, GuestTarget::Saf(_));
+    let trailing = agentlink_core::paths::path_trailing_sep(to);
+    let to_trimmed = agentlink_core::paths::trim_trailing_sep(to);
+    let (right_no_follow, dst_root) =
+        paths::classify_entry_with_root(roots, to_trimmed, true, false)?;
+    let right_saf = matches!(right_no_follow, GuestTarget::Saf(_));
     if left_saf || right_saf {
         if !(left_saf && right_saf) {
             return Err(Error::Message("cross-store rename is not supported".into()));
@@ -230,18 +231,22 @@ pub fn rename_guest(roots: &Roots, host: &Arc<dyn NodeHost>, from: &str, to: &st
         host_blocking(host, "rename", serde_json::json!({"from": from, "to": to}))?;
         return Ok(());
     }
-    let from_real = match paths::classify(roots, from, true)? {
+    let from_real = match left_target {
         GuestTarget::Real(path) => path,
         _ => return Err(Error::Message("that path is not writable".into())),
     };
-    let trailing = agentlink_core::paths::path_trailing_sep(to);
-    let to_trimmed = agentlink_core::paths::trim_trailing_sep(to);
-    let to_base = match paths::classify(roots, to_trimmed, true)? {
-        GuestTarget::Real(path) => path,
-        _ => return Err(Error::Message("that path is not writable".into())),
+    let to_base = match paths::classify(roots, to_trimmed, true) {
+        Ok(GuestTarget::Real(resolved)) if resolved.is_dir() => resolved,
+        _ => match right_no_follow {
+            GuestTarget::Real(path) => path,
+            _ => return Err(Error::Message("that path is not writable".into())),
+        },
     };
     let to_real = agentlink_core::paths::rename_destination(&from_real, &to_base, trailing)?;
-    fs::rename(&from_real, &to_real)?;
+    // Same fail-closed rename as the desktop node: pre×2 + postcheck +
+    // non-destructive rollback so a raced relative-link retarget cannot leave
+    // a durable escape under `app:/files`.
+    agentlink_core::paths::rename_within_sandbox(dst_root.as_deref(), &from_real, &to_real)?;
     Ok(())
 }
 
@@ -404,4 +409,93 @@ fn unix_mode(meta: &fs::Metadata) -> Option<u32> {
 #[cfg(not(unix))]
 fn unix_mode(_meta: &fs::Metadata) -> Option<u32> {
     None
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    struct DummyHost;
+
+    impl NodeHost for DummyHost {
+        fn unary(&self, _kind: String, _payload_json: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn open_session(&self, _kind: String, _payload_json: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn poll_session(&self, _session_id: String, _caller: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn session_input(&self, _session_id: String, _data_b64: String, _caller: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn close_session(&self, _session_id: String, _caller: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn release_session(&self, _session_id: String, _release: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn prepare_path(&self, _guest_path: String, _write: bool) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn publish_path(&self, _guest_path: String, _real_path: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn on_status(&self, _status_json: String) {}
+    }
+
+    #[test]
+    fn guest_files_reject_dangling_symlink_escape_and_rm_unlinks_only_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&files).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        let roots = Roots {
+            files: files.clone(),
+            cache,
+            storage: None,
+            audit: dir.path().join("audit.log"),
+        };
+        let host: Arc<dyn NodeHost> = Arc::new(DummyHost);
+
+        // 1. Dangling relative symlink inside deep subdir cannot be moved to `app:/files` root.
+        let deep = files.join("d1").join("d2").join("d3");
+        fs::create_dir_all(&deep).unwrap();
+        std::os::unix::fs::symlink("../../escaped_app_data.txt", deep.join("sym")).unwrap();
+        assert!(rename_guest(&roots, &host, "app:/files/d1/d2/d3/sym", "app:/files/sym").is_err());
+
+        // 1b. Deterministic TOCTOU: precheck would pass for an in-sandbox link, then
+        // retarget before rename. `rename_within_sandbox` must not leave an escape.
+        let race_from = deep.join("race_sym");
+        std::os::unix::fs::symlink("ok.txt", &race_from).unwrap();
+        agentlink_core::paths::ensure_moved_symlinks_stay_inside(
+            Some(files.as_path()),
+            &race_from,
+            &files.join("race_top"),
+        )
+        .unwrap();
+        fs::remove_file(&race_from).unwrap();
+        std::os::unix::fs::symlink("../../escaped_via_ffi_race.txt", &race_from).unwrap();
+        let raced = rename_guest(&roots, &host, "app:/files/d1/d2/d3/race_sym", "app:/files/race_top");
+        assert!(raced.is_err(), "raced retarget must fail closed: {raced:?}");
+        assert!(
+            fs::symlink_metadata(files.join("race_top")).is_err(),
+            "no durable escape after FFI rename race"
+        );
+
+        // 2. Pre-existing dangling symlink escaping `app:/files` cannot be written through.
+        std::os::unix::fs::symlink("../escaped_app_data.txt", files.join("pre_dangling")).unwrap();
+        assert!(write_guest(&roots, &host, "app:/files/pre_dangling", 0, b"nope", true).is_err());
+        assert!(!dir.path().join("escaped_app_data.txt").exists());
+
+        // 3. `remove_guest` with `recursive = true` on a symlink-to-dir unlinks ONLY the symlink!
+        fs::create_dir_all(files.join("real_dir")).unwrap();
+        fs::write(files.join("real_dir").join("keep.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink("real_dir", files.join("dir_link")).unwrap();
+        remove_guest(&roots, &host, "app:/files/dir_link", true).unwrap();
+        assert!(files.join("real_dir").join("keep.txt").exists());
+        assert!(fs::symlink_metadata(files.join("dir_link")).is_err());
+    }
 }

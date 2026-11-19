@@ -139,61 +139,114 @@ pub fn partial_paths(dest: &Path) -> (PathBuf, PathBuf) {
 ///
 /// Unix writers follow a symbolic link and overwrite the target. Replacing
 /// `dest` with `remove_file` + `rename` would delete the link itself and leave
-/// the old target untouched. Resolve one hop so the symlink stays.
-fn finalize_dest_path(dest: &Path) -> Result<PathBuf> {
-    let meta = match fs::symlink_metadata(dest) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(dest.to_path_buf()),
-        Err(err) => return Err(err.into()),
-    };
-    if !meta.file_type().is_symlink() {
-        return Ok(dest.to_path_buf());
+/// the old target untouched. Resolve symlinks (bounded by `MAX_SYMLINK_HOPS`)
+/// and, when `sandbox_root` is set, re-verify the resolved path stays inside
+/// the sandbox right at commit time.
+fn finalize_dest_path_in_sandbox(dest: &Path, sandbox_root: Option<&Path>) -> Result<PathBuf> {
+    if let Some(root) = sandbox_root {
+        let resolved = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), dest)?;
+        if resolved.is_dir() {
+            return Err(Error::Message(format!(
+                "{} resolves to a directory",
+                dest.display()
+            )));
+        }
+        return Ok(resolved);
     }
-    let target = fs::read_link(dest)?;
-    let resolved = if target.is_absolute() {
-        target
-    } else {
-        dest.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(target)
-    };
-    if resolved.is_dir() {
+    let mut current = dest.to_path_buf();
+    for _ in 0..crate::paths::MAX_SYMLINK_HOPS {
+        let meta = match fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == ErrorKind::NotFound => break,
+            Err(err) => return Err(err.into()),
+        };
+        if !meta.file_type().is_symlink() {
+            break;
+        }
+        let target = fs::read_link(&current)?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+    }
+    if fs::symlink_metadata(&current)
+        .ok()
+        .is_some_and(|m| m.file_type().is_symlink())
+    {
+        return Err(Error::Message(format!(
+            "too many levels of symbolic links: {}",
+            dest.display()
+        )));
+    }
+    if current.is_dir() {
         return Err(Error::Message(format!(
             "{} is a symbolic link to a directory",
             dest.display()
         )));
     }
-    Ok(resolved)
+    Ok(current)
 }
 
-/// Atomically install `partial` at `dest`, following a symlink destination.
+#[cfg(test)]
+fn finalize_dest_path(dest: &Path) -> Result<PathBuf> {
+    finalize_dest_path_in_sandbox(dest, None)
+}
+
+/// Atomically install `partial` at `dest`, following a symlink destination only
+/// when it stays inside `sandbox_root`.
 ///
 /// When `dest` (or its symlink target) already exists, require that it is
-/// writable — same gate as `OpenOptions::write(true).open` — before unlinking
+/// writable — same gate as `OpenOptions::write(true).open` — before replacing
 /// it. Unix `remove_file` only needs directory write permission, so skipping
 /// this check let `write`/`cp` replace mode `0444` files and drop their mode
 /// bits. After a successful replace, restore the previous permissions.
-fn install_partial_at_dest(partial: &Path, dest: &Path) -> Result<()> {
-    let final_path = finalize_dest_path(dest)?;
+fn install_partial_at_dest_in_sandbox(
+    partial: &Path,
+    dest: &Path,
+    sandbox_root: Option<&Path>,
+) -> Result<()> {
+    let final_path = finalize_dest_path_in_sandbox(dest, sandbox_root)?;
     if let Some(parent) = final_path.parent() {
+        if let Some(root) = sandbox_root {
+            let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+        }
         util::create_dir_all_parent(parent)?;
+        if let Some(root) = sandbox_root {
+            let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+        }
     }
-    let prev_perms = match fs::metadata(&final_path) {
+    let nofollow = sandbox_root.is_some();
+    let prev_perms = match fs::symlink_metadata(&final_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Error::PermissionDenied(format!(
+                "refusing to write through unvalidated symbolic link: {}",
+                final_path.display()
+            )));
+        }
         Ok(meta) => {
-            OpenOptions::new().write(true).open(&final_path)?;
+            crate::paths::open_write_file(&final_path, false, false, nofollow)?;
             Some(meta.permissions())
         }
         Err(err) if err.kind() == ErrorKind::NotFound => None,
         Err(err) => return Err(err.into()),
     };
-    if final_path.exists() {
-        fs::remove_file(&final_path)?;
-    }
     match fs::rename(partial, &final_path) {
         Ok(()) => {}
         Err(err) if err.kind() == ErrorKind::CrossesDevices || is_exdev(&err) => {
-            fs::copy(partial, &final_path)?;
+            let mut src = File::open(partial)?;
+            let mut dst = crate::paths::open_write_file(&final_path, true, true, nofollow)?;
+            io::copy(&mut src, &mut dst)?;
+            dst.flush()?;
+            drop(dst);
             let _ = fs::remove_file(partial);
+        }
+        Err(_) if final_path.exists() => {
+            fs::remove_file(&final_path)?;
+            fs::rename(partial, &final_path)?;
         }
         Err(err) => return Err(err.into()),
     }
@@ -201,6 +254,11 @@ fn install_partial_at_dest(partial: &Path, dest: &Path) -> Result<()> {
         fs::set_permissions(&final_path, perms)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn install_partial_at_dest(partial: &Path, dest: &Path) -> Result<()> {
+    install_partial_at_dest_in_sandbox(partial, dest, None)
 }
 
 fn is_exdev(err: &io::Error) -> bool {
@@ -619,25 +677,26 @@ fn ensure_link_target_inside(root: &Path, link: &Path, raw: &Path) -> Result<()>
 }
 
 fn ensure_unpacked_stays_inside(root: &Path, target: &Path) -> Result<()> {
-    let root_c = fs::canonicalize(root)?;
+    let root_c = crate::paths::strip_verbatim_prefix(&fs::canonicalize(root)?);
     let rel = target.strip_prefix(root).map_err(|_| {
         Error::PermissionDenied(format!("path escapes directory: {}", target.display()))
     })?;
     let mut cursor = root.to_path_buf();
     for component in rel.components() {
         cursor.push(component);
-        if !cursor.exists() {
-            break;
-        }
-        let meta = fs::symlink_metadata(&cursor)?;
+        let meta = match fs::symlink_metadata(&cursor) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == ErrorKind::NotFound => break,
+            Err(err) => return Err(err.into()),
+        };
         if meta.file_type().is_symlink() {
             return Err(Error::PermissionDenied(format!(
                 "refusing to follow a symlink while unpacking: {}",
                 target.display()
             )));
         }
-        let canon = fs::canonicalize(&cursor)?;
-        if canon != root_c && !canon.starts_with(&root_c) {
+        let canon = crate::paths::strip_verbatim_prefix(&fs::canonicalize(&cursor)?);
+        if !crate::paths::is_inside_root(&root_c, &canon) {
             return Err(Error::PermissionDenied(format!(
                 "path escapes directory: {}",
                 target.display()
@@ -867,7 +926,13 @@ pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
                 util::create_dir_all_parent(parent)?;
                 ensure_unpacked_stays_inside(dest, parent)?;
             }
-            let mut file = File::create(&out)?;
+            if fs::symlink_metadata(&out)
+                .ok()
+                .is_some_and(|m| m.file_type().is_symlink())
+            {
+                fs::remove_file(&out)?;
+            }
+            let mut file = crate::paths::open_write_file(&out, true, true, true)?;
             std::io::copy(&mut entry, &mut file)?;
             drop(file);
             apply_mode_mtime(&out, mode, mtime);
@@ -1155,8 +1220,36 @@ async fn recv_blob(
     journal_path: &Path,
     size: u64,
     expect_hash: &str,
+    have: Vec<ByteRange>,
+    final_dest: &Path,
+    tar: bool,
+    progress: &Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
+) -> Result<(u64, bool)> {
+    recv_blob_in_sandbox(
+        link,
+        partial,
+        journal_path,
+        size,
+        expect_hash,
+        have,
+        final_dest,
+        None,
+        tar,
+        progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recv_blob_in_sandbox(
+    link: &mut Link,
+    partial: &Path,
+    journal_path: &Path,
+    size: u64,
+    expect_hash: &str,
     mut have: Vec<ByteRange>,
     final_dest: &Path,
+    sandbox_root: Option<&Path>,
     tar: bool,
     progress: &Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
 ) -> Result<(u64, bool)> {
@@ -1319,7 +1412,7 @@ async fn recv_blob(
                     let _ = final_dest;
                     return Ok((payload, compressed));
                 }
-                install_partial_at_dest(partial, final_dest)?;
+                install_partial_at_dest_in_sandbox(partial, final_dest, sandbox_root)?;
                 fs::remove_file(journal_path).ok();
                 return Ok((payload, compressed));
             }
@@ -1519,6 +1612,7 @@ async fn respond_as_source(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_push(
     dest: &Path,
     remote_label: &Path,
@@ -1532,7 +1626,41 @@ pub async fn serve_push(
     mode: Option<u32>,
     mtime_unix: Option<u64>,
 ) -> Result<TransferStats> {
+    serve_push_confined(
+        None,
+        dest,
+        remote_label,
+        size,
+        hash,
+        chunk_hint,
+        compress,
+        resume,
+        link,
+        transport,
+        mode,
+        mtime_unix,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_push_confined(
+    sandbox_root: Option<&Path>,
+    dest: &Path,
+    remote_label: &Path,
+    size: u64,
+    hash: String,
+    chunk_hint: u32,
+    compress: CompressPref,
+    resume: bool,
+    link: &mut Link,
+    transport: &str,
+    mode: Option<u32>,
+    mtime_unix: Option<u64>,
+) -> Result<TransferStats> {
     let _ = (chunk_hint, compress);
+    let dest_checked = crate::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, dest)?;
+    let dest = dest_checked.as_path();
     if dest.is_file() {
         let existing = if dest.metadata()?.len() == 0 {
             delta::hash_bytes(b"")
@@ -1593,7 +1721,7 @@ pub async fn serve_push(
                         ranges: ranges.clone(),
                     },
                 )?;
-                let (payload, compressed) = recv_blob(
+                let (payload, compressed) = recv_blob_in_sandbox(
                     link,
                     &partial,
                     &journal_path,
@@ -1601,6 +1729,7 @@ pub async fn serve_push(
                     &out_hash,
                     ranges,
                     dest,
+                    sandbox_root,
                     false,
                     &None,
                 )
@@ -1625,7 +1754,7 @@ pub async fn serve_push(
         mode: AcceptMode::Full { missing },
     })
     .await?;
-    let (payload, compressed) = recv_blob(
+    let (payload, compressed) = recv_blob_in_sandbox(
         link,
         &partial,
         &journal_path,
@@ -1633,6 +1762,7 @@ pub async fn serve_push(
         &hash,
         have,
         dest,
+        sandbox_root,
         false,
         &None,
     )
@@ -2728,11 +2858,25 @@ pub async fn serve_push_stream(
     link: &mut Link,
     transport: &str,
 ) -> Result<TransferStats> {
+    serve_push_stream_confined(None, dest, link, transport).await
+}
+
+pub async fn serve_push_stream_confined(
+    sandbox_root: Option<&Path>,
+    dest: &Path,
+    link: &mut Link,
+    transport: &str,
+) -> Result<TransferStats> {
+    let dest_checked = crate::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, dest)?;
+    let dest = dest_checked.as_path();
     if dest.is_dir() {
         return Err(Error::Message(format!("{} is a directory", dest.display())));
     }
     let (partial, journal) = partial_paths(dest);
     if let Some(parent) = partial.parent() {
+        if let Some(root) = sandbox_root {
+            let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+        }
         util::create_dir_all_parent(parent)?;
     }
     let _ = fs::remove_file(&journal);
@@ -2748,7 +2892,7 @@ pub async fn serve_push_stream(
     })
     .await?;
     let (size, payload, compressed) = recv_file_stream(link, &partial).await?;
-    install_partial_at_dest(&partial, dest)?;
+    install_partial_at_dest_in_sandbox(&partial, dest, sandbox_root)?;
     let _ = fs::remove_file(&journal);
     cleanup.armed = false;
     let stats = done_stats(size, payload, false, 1, 0, compressed, transport, 0, 0);

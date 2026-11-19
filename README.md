@@ -231,10 +231,9 @@ Release archives, when you build them yourself, are named:
 Linux and macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zltl/agentlink/main/install.sh | sh -s -- \
+curl -fsSL https://raw.githubusercontent.com/zltl/agentlink/main/install.sh | \
+  env AGENTLINK_TOKEN="..." AGENTLINK_FINGERPRINT="sha256:..." sh -s -- \
   --relay wss://relay.example:7443 \
-  --fingerprint "$AGENTLINK_FINGERPRINT" \
-  --token "$AGENTLINK_TOKEN" \
   --name laptop
 ```
 
@@ -247,7 +246,7 @@ $env:AGENTLINK_TOKEN = "..."
 irm https://raw.githubusercontent.com/zltl/agentlink/main/install.ps1 | iex
 ```
 
-`--token` is the relay admin token. The installer uses it to mint a one-time pairing token and writes that token into the node data directory. The service definition does not contain it. After the node enrolls, the token is removed from `node.json`. Pass `--pairing-token` when `agentlink pair` already minted one. The relay preset defaults to `read-only`.
+`AGENTLINK_TOKEN` is the relay admin token (CLI `--token` still works for compatibility, but prefer the environment so the secret is not visible in `ps` argv). The installer uses it to mint a one-time pairing token and writes that token into the node data directory. The service definition does not contain it. After the node enrolls, the token is removed from `node.json`. Pass `AGENTLINK_PAIRING_TOKEN` (or `--pairing-token`) when `agentlink pair` already minted one. The relay preset and node `--max-access` ceiling default to `full`.
 
 The script always checks `SHA256SUMS` and `SHA256SUMS.minisig`. The public key is the copy pinned in the script (the same material as `deploy/minisign.pub`). It is not downloaded from the release host. `AGENTLINK_UPDATE_PUBKEY` may point at a local file or paste the key text. The install scripts call `minisign` and stop if it is missing or the signature does not verify. `AGENTLINK_CHECKSUM_ONLY=1` is the only way to skip the signature. `agentlink update` verifies the signature itself with the key embedded at build time and does not need the `minisign` program.
 
@@ -258,10 +257,9 @@ User scope installs the binary under `~/.local/bin`, or `%LOCALAPPDATA%\agentlin
 ## Background service
 
 ```bash
-agentlink service install \
+env AGENTLINK_TOKEN="$AGENTLINK_TOKEN" agentlink service install \
   --relay wss://relay.example:7443 \
   --fingerprint "$AGENTLINK_FINGERPRINT" \
-  --token "$AGENTLINK_TOKEN" \
   --name laptop
 
 agentlink service status
@@ -577,7 +575,7 @@ Stdio is still newline-delimited JSON-RPC, and a `Content-Length` header is acce
 - Desktop is denied unless the relay preset and the node ceiling both allow it. `desktop` turns on `allow_desktop` and also grants exec. `allow_desktop_stream` and the remote-view flags stay off, so that preset does not open a stream. A stream needs `remote-view`, `remote-control`, or `full` on both the agent grant and the node ceiling. `remote-control` implies view, screenshots, and input (`allow_desktop`) without write or exec. `full` sets every flag, including write and exec. An older stored grant that left `allow_desktop` off is read that way. Naming the `full` preset does not rewrite a policy that was already saved. View-only allows screenshots and a stream, not pointer, keyboard, scroll, or clipboard text. View-only feedback and keyframe requests are still accepted. A remote-control session shares Unicode clipboard text both ways (local copy pastes on the node, remote copy pastes locally). Image and HTML formats are not redirected. Sharing stops when the session ends or the grant is no longer a control grant.
 - CLI and MCP connect with a saved ed25519 identity (`--identity` or `identity.json` in the config directory). The audit `client_id` is that public key. The labels `cli` and `mcp` are not written.
 - The node records operations through `audit::submit` and the audit policy, and still appends the legacy `audit.log` line. Screenshot lines record the target and format, not the image bytes. Typed text is a character count and at most 12 characters of preview. Stream start, stream stop, and remote-control input use the same path (`desktop_stream` and `gui_input`). Those lines do not include SDP. Clipboard text is a character count, not the pasted string. An audit write failure is logged and does not block the operation.
-- `agentlink view` uses the saved login session when present (same as `screenshot` / `exec`), or a registered agent identity when no token is saved, and receives a short-lived ticket. The browser sends the ticket on `/v1/webrtc`. It can signal `webrtc_signal` or request `screenshot` on the one node named in the ticket, under the caller's grant intersected with the node policy. A view-only grant cannot drive input. The admin token is not placed in the viewer URL.
+- Browser desktop viewing is disabled (`GET /view` serves a static notice; browser view tickets are not issued). Native viewers use `agentlink controller` / `agentlink view` / the Android client over the sealed invoke path and WebRTC media directly to the node. A view-only grant cannot drive input.
 - The relay terminates TLS. It is trusted for enrollment and for the coarse class on a sealed message. It can see approval text and forwarded audit records. Run the relay on a machine you trust. Pin the node id. It cannot forge a signature, and it cannot read a sealed path, command, or file payload. WebRTC media does not pass through the relay.
 
 ## Layout
@@ -591,7 +589,7 @@ Stdio is still newline-delimited JSON-RPC, and a `Content-Length` header is acce
 | `agentlink-cli` | The `agentlink` binary |
 | `agentlink-ffi` | UniFFI node and client used by the Android app |
 
-Control messages are JSON text frames on `wss://<relay>/v1/connect`. Protocol version is 2. `/v1/webrtc` is the same JSON envelope protocol, used by the browser viewer. Bulk file bytes are binary WebSocket frames on the control socket, or QUIC on a direct path. Picture bytes are WebRTC RTP and do not use those binary frames. The relay learns candidate addresses from a UDP punch on the relay’s TCP port; it does not see bytes once QUIC connects.
+Control messages are JSON text frames on `wss://<relay>/v1/connect`. Protocol version is 2. `/v1/webrtc` remains a WebSocket upgrade path in the protocol surface but browser desktop viewing is disabled; native viewers use `/v1/connect` plus WebRTC media. Bulk file bytes are binary WebSocket frames on the control socket, or QUIC on a direct path. Picture bytes are WebRTC RTP and do not use those binary frames. The relay learns candidate addresses from a UDP punch on the relay’s TCP port; it does not see bytes once QUIC connects.
 
 Search, edit, watch, background process, system info, and PTY operations are first-class protocol messages. Phase 2 and phase 3 use `Op::Extension` plus [`NodeExtension`](crates/agentlink-core/src/extensions.rs). Known names are `screenshot`, `inject_input` (phase 2) and `webrtc_signal` (phase 3). The node registers all three. A node with no handler for a known name returns "not enabled". Accessibility is an `inject_input` action (`ui_tree`, `act`), so it uses the same desktop permission. `webrtc_signal` uses `allow_remote_view` for an offer and `allow_remote_control` for input.
 
@@ -692,7 +690,7 @@ On this phone:
 - macOS shows two permission prompts for the process that launches the node (the terminal, app, or parent), not for the remote client. Screen Recording is required for images. Accessibility is required for `CGEvent` and the accessibility tree. Without them, images are empty and events are dropped. Grant both, then restart the node.
 - Encoded screenshots are capped at 8 MiB. WebSocket text frames are capped at 16 MiB so the base64 JSON fits. A large PNG can still be rejected; use jpeg or a scale below 1.
 - `AGENTLINK_DESKTOP=mock` forces the in-memory desktop. It is for tests, not a security boundary.
-- `agentlink view` puts a short-lived ticket in the URL fragment. The link is view-only unless `--control` is passed, and input still requires remote control on the underlying grant. The page does not receive the admin token or the agent private key. A saved admin-token fragment still authenticates as admin if someone pastes it, while legacy admin tokens are enabled.
+- Browser desktop viewing is disabled; `GET /view` serves a static notice and does not open a desktop. Native `agentlink controller` / Android viewers do not place the admin token or agent private key in a browser URL.
 - Bitrate adapts. Resolution does not change mid-session.
 - Negotiated cursor metadata sends stock cursor shape names and bounded RGBA cursor sprites (up to 128×128) with hotspot coordinates; legacy peers keep embedded cursors.
 - Platform maturity: Linux (`glibc` and `musl`) and Windows (`msvc`) are the primary targets. macOS desktop/controller support and the Android app (`android/`) build in-tree as experimental targets and require native platform SDK/NDK toolchains (`./android/build-native.sh` before packaging a device APK).
@@ -701,7 +699,7 @@ On this phone:
 - A user-session service is the one that can reach the desktop. A systemd system unit, a LaunchDaemon, and the Windows service (session 0) start at boot and cannot drive the GUI. `--headless` on Linux is the same kind of opt-out: it does not join `graphical-session.target`.
 - The Linux user unit receives the GUI variables only after they have been imported into the systemd user manager. Install does that when the shell has them. Otherwise the XDG autostart entry does it at the next graphical login and restarts the node. The user service also stays down until the user service manager is up.
 - Release archives are checked with SHA-256. A minisign signature is published only when `AGENTLINK_SIGNING_KEY` is set. A configured public key fails closed. The key file attached to the release is not a trust root.
-- `install.sh` and `install.ps1` verify a signature only when `minisign` is on `PATH`. `agentlink update` verifies it in-process.
+- `install.sh` and `install.ps1` require `minisign` on `PATH` and fail closed on a missing or bad signature unless `AGENTLINK_CHECKSUM_ONLY=1`. `agentlink update` verifies the signature in-process with the build-time public key.
 - Linux release binaries are musl. The Docker relay image is a glibc Debian build.
 - On Windows, replacing the binary finishes after this process exits. A failed helper leaves `agentlink.exe.new`.
 - Auto-update is a daily timer. It replaces the binary it is running and restarts an active node service. It does not migrate config.

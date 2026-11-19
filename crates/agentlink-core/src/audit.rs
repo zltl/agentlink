@@ -4,8 +4,14 @@
 //! [`AuditEvent`] and pass it to [`crate`] consumers through
 //! `agentlink_node::audit::submit`. This module decides what is stored. It does
 //! not open files; the node and the relay do.
+//!
+//! **JSONL reads:** prefer [`page_from_jsonl`] / [`select_from_jsonl`] /
+//! [`chain_tip_from_jsonl`] so callers never buffer an entire `audit.jsonl`.
+//! Filter predicates run during the scan (before paging) for correct pages and
+//! bounded memory. Webhook delivery is a separate bounded queue (`fire_webhook`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -1734,32 +1740,61 @@ pub fn select(records: &[AuditRecord], filter: &AuditFilter) -> Vec<AuditRecord>
     out
 }
 
+pub use crate::audit_jsonl::{
+    chain_tip_from_jsonl, for_each_bounded_line, page_from_jsonl, select_from_jsonl,
+    tail_bounded_lines, MAX_AUDIT_LINE_BYTES,
+};
+
+const WEBHOOK_QUEUE_CAP: usize = 64;
+
 /// POST an alert without blocking the operation that produced it.
+///
+/// Dispatches through a single worker and a bounded queue so a slow or
+/// unreachable webhook cannot spawn unbounded threads under alert floods.
+/// When the queue is full, the newest alert is dropped (fail-open for the
+/// audited operation; alerts are best-effort).
 pub fn fire_webhook(url: &str, payload: &Value) {
-    let url = url.to_string();
-    let body = payload.to_string();
-    std::thread::spawn(move || {
-        let Ok(parsed) = validate_local_webhook_url("alert", &url) else {
-            return;
-        };
-        let Ok(pinned) = resolve_vetted_local_webhook_addrs(&parsed) else {
-            return;
-        };
-        let mut builder = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5));
-        if let Some((domain, addrs)) = pinned {
-            builder = builder.resolve_to_addrs(&domain, &addrs);
-        }
-        let Ok(client) = builder.build() else {
-            return;
-        };
-        let _ = client
-            .post(parsed)
-            .header("content-type", "application/json")
-            .body(body)
-            .send();
-    });
+    let _ = webhook_queue().try_send((url.to_string(), payload.to_string()));
+}
+
+fn webhook_queue() -> &'static mpsc::SyncSender<(String, String)> {
+    static QUEUE: OnceLock<mpsc::SyncSender<(String, String)>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel(WEBHOOK_QUEUE_CAP);
+        let _ = std::thread::Builder::new()
+            .name("agentlink-audit-webhook".into())
+            .spawn(move || webhook_worker(rx));
+        tx
+    })
+}
+
+fn webhook_worker(rx: mpsc::Receiver<(String, String)>) {
+    while let Ok((url, body)) = rx.recv() {
+        deliver_webhook(&url, &body);
+    }
+}
+
+fn deliver_webhook(url: &str, body: &str) {
+    let Ok(parsed) = validate_local_webhook_url("alert", url) else {
+        return;
+    };
+    let Ok(pinned) = resolve_vetted_local_webhook_addrs(&parsed) else {
+        return;
+    };
+    let mut builder = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5));
+    if let Some((domain, addrs)) = pinned {
+        builder = builder.resolve_to_addrs(&domain, &addrs);
+    }
+    let Ok(client) = builder.build() else {
+        return;
+    };
+    let _ = client
+        .post(parsed)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send();
 }
 
 impl AuditFilter {
@@ -2523,5 +2558,59 @@ mod tests {
                 "preset = \"standard\"\nlock_local = false\n[retention]\nmax_log_bytes = 1073741824\n"
             )
             .is_err());
+    }
+
+    #[test]
+    fn page_from_jsonl_filters_before_paging_and_chain_tip_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut body = String::new();
+        for i in 0..30u64 {
+            let user = if i % 3 == 0 { "alice" } else { "bob" };
+            body.push_str(&format!(
+                "{{\"seq\":{i},\"ts\":\"t{i}\",\"node_id\":\"n\",\"node_name\":\"n\",\"client_id\":\"c\",\"category\":\"op\",\"op\":\"op{i}\",\"result\":\"ok\",\"duration_ms\":0,\"prev_hash\":\"0\",\"hash\":\"{i:064x}\",\"user\":\"{user}\"}}\n"
+            ));
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        let alice = page_from_jsonl(&path, 4, 0, |r| r.user.as_deref() == Some("alice"));
+        assert_eq!(alice.len(), 4);
+        assert_eq!(
+            alice.iter().map(|r| r.op.as_str()).collect::<Vec<_>>(),
+            vec!["op18", "op21", "op24", "op27"]
+        );
+
+        let filter = AuditFilter {
+            user: Some("bob".into()),
+            limit: 3,
+            ..AuditFilter::default()
+        };
+        let bob = select_from_jsonl(&path, &filter);
+        assert_eq!(bob.len(), 3);
+        assert!(bob.iter().all(|r| r.user.as_deref() == Some("bob")));
+        assert_eq!(bob[2].op, "op29");
+
+        let (seq, hash) = chain_tip_from_jsonl(&path);
+        assert_eq!(seq, 29);
+        assert_eq!(hash, format!("{:064x}", 29));
+    }
+
+    #[test]
+    fn oversized_jsonl_line_is_skipped_without_huge_alloc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // One hostile line larger than the cap, then a normal record.
+        let mut body = vec![b'x'; MAX_AUDIT_LINE_BYTES + 64];
+        body.push(b'\n');
+        body.extend_from_slice(
+            br#"{"seq":1,"ts":"t","node_id":"n","node_name":"n","client_id":"c","category":"op","op":"ok","result":"ok","duration_ms":0,"prev_hash":"0","hash":"1"}
+"#,
+        );
+        std::fs::write(&path, &body).unwrap();
+        let page = page_from_jsonl(&path, 10, 0, |_| true);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].op, "ok");
+        // Reader buffer never retained the oversized line as a String.
+        assert!(MAX_AUDIT_LINE_BYTES < body.len());
     }
 }

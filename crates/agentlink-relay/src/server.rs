@@ -21,7 +21,7 @@ use agentlink_core::{Error, NodePolicy, Op, Result, PHASE3_WEBRTC_SIGNAL};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{
@@ -30,13 +30,21 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
+use crate::audit_http::{
+    append_audit, audit_page, audit_records_json, audit_records_json_for_session,
+    note_legacy_use,
+};
+pub(crate) use crate::audit_http::audit_auth;
 use crate::db::{Database, OpenOptions};
 use crate::models::{self, Caller, EnrolledNode, NodeMeta};
 
 const STALE_AFTER: Duration = agentlink_core::ws::RELAY_STALE_AFTER;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
+/// Cap concurrent TLS connections (handshakes + live sessions) so Slowloris /
+/// accept floods cannot exhaust FDs or tasks. Excess accepts wait for a slot.
+const MAX_CONCURRENT_CONNECTIONS: usize = 1_024;
 static STALE_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+static MAX_CONN_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 
 /// Shorten the stale-socket reaper for tests. `None` restores 75s.
 ///
@@ -48,6 +56,19 @@ pub fn set_stale_after_for_test(stale: Option<Duration>) {
         stale.map(|d| d.as_millis() as u64).unwrap_or(0),
         Ordering::SeqCst,
     );
+}
+
+/// Override [`MAX_CONCURRENT_CONNECTIONS`] for tests. `None` restores 1024.
+#[doc(hidden)]
+pub fn set_max_concurrent_connections_for_test(max: Option<usize>) {
+    MAX_CONN_OVERRIDE.store(max.map(|n| n as u64).unwrap_or(0), Ordering::SeqCst);
+}
+
+fn max_concurrent_connections() -> usize {
+    match MAX_CONN_OVERRIDE.load(Ordering::SeqCst) {
+        0 => MAX_CONCURRENT_CONNECTIONS,
+        n => n as usize,
+    }
 }
 
 fn stale_after() -> Duration {
@@ -537,8 +558,7 @@ impl Callback for Router {
                 if !self.authorized(request) {
                     return Err(plain(401, "admin token required"));
                 }
-                let records = read_audit_values(&self.audit_path);
-                let body = serde_json::to_string(&records).unwrap_or_else(|_| "[]".into());
+                let body = audit_records_json(&self.audit_path, request.uri().query().unwrap_or(""));
                 Err(Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
@@ -552,31 +572,22 @@ impl Callback for Router {
 
 impl Router {
     fn authorized(&self, request: &Request) -> bool {
-        if let Some(header) = request
+        // Bearer only — query `?token=` is rejected so credentials never land
+        // in access logs, Referer headers, or browser history.
+        let Some(header) = request
             .headers()
             .get("authorization")
             .and_then(|value| value.to_str().ok())
-        {
-            if let Some(token) = header
-                .strip_prefix("Bearer ")
-                .or_else(|| header.strip_prefix("bearer "))
-            {
-                if self.accept_legacy(token.trim()) {
-                    return true;
-                }
-            }
-        }
-        let Some(query) = request.uri().query() else {
+        else {
             return false;
         };
-        for pair in query.split('&') {
-            if let Some(value) = pair.strip_prefix("token=") {
-                if self.accept_legacy(value) {
-                    return true;
-                }
-            }
-        }
-        false
+        let Some(token) = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+        else {
+            return false;
+        };
+        self.accept_legacy(token.trim())
     }
 
     fn accept_legacy(&self, presented: &str) -> bool {
@@ -808,7 +819,12 @@ where
     }
 }
 
-async fn serve_plain_http<S>(stream: &mut S, head: &[u8], hub: &Hub, peer: SocketAddr) -> Result<()>
+async fn serve_plain_http<S>(
+    stream: &mut S,
+    head: &[u8],
+    hub: &Hub,
+    audit_ip: IpAddr,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -849,15 +865,16 @@ where
     if body_bytes.len() < length {
         let start = body_bytes.len();
         body_bytes.resize(length, 0);
-        stream
-            .read_exact(&mut body_bytes[start..])
+        // Bound body reads so a Slowloris POST cannot hold the TLS task forever.
+        timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut body_bytes[start..]))
             .await
+            .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Ws(e.to_string()))?;
     } else {
         body_bytes.truncate(length);
     }
     if let Some(outcome) =
-        crate::web::handle(hub, method, path, &headers, &body_bytes, peer).await?
+        crate::web::handle(hub, method, path, &headers, &body_bytes, audit_ip).await?
     {
         match outcome {
             crate::web::WebOutcome::Reply(reply) => {
@@ -899,31 +916,19 @@ where
             "webrtc signaling is a websocket".into(),
         ),
         ("GET", "/audit/records") => {
-            let records = read_audit_values(&hub.audit_path);
-            if http_authorized(hub, &headers, query) {
+            if http_authorized(hub, &headers) {
                 (
                     200,
                     "OK",
                     "application/json",
-                    serde_json::to_string(&records).unwrap_or_else(|_| "[]".into()),
+                    audit_records_json(&hub.audit_path, query),
                 )
             } else if let Some(session) = web_session.as_ref() {
-                let visible: Vec<_> = if session.role == "admin" {
-                    records
-                } else {
-                    let user = session.user.as_str();
-                    records
-                        .into_iter()
-                        .filter(|row| {
-                            row.get("user").and_then(|value| value.as_str()) == Some(user)
-                        })
-                        .collect()
-                };
                 (
                     200,
                     "OK",
                     "application/json",
-                    serde_json::to_string(&visible).unwrap_or_else(|_| "[]".into()),
+                    audit_records_json_for_session(&hub.audit_path, query, session),
                 )
             } else {
                 (
@@ -959,22 +964,18 @@ where
     Ok(())
 }
 
-fn http_authorized(hub: &Hub, headers: &[(String, String)], query: &str) -> bool {
-    if let Some((_, value)) = headers.iter().find(|(name, _)| name == "authorization") {
-        if let Some(got) = value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "))
-        {
-            if presented_legacy(hub, got.trim()) {
-                return true;
-            }
-        }
-    }
-    query.split('&').any(|pair| {
-        pair.strip_prefix("token=")
-            .map(|value| presented_legacy(hub, value))
-            .unwrap_or(false)
-    })
+fn http_authorized(hub: &Hub, headers: &[(String, String)]) -> bool {
+    // Bearer only — never accept credentials from the URL query string.
+    let Some((_, value)) = headers.iter().find(|(name, _)| name == "authorization") else {
+        return false;
+    };
+    let Some(got) = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+    else {
+        return false;
+    };
+    presented_legacy(hub, got.trim())
 }
 
 fn presented_legacy(hub: &Hub, presented: &str) -> bool {
@@ -1040,16 +1041,28 @@ async fn accept_loop(
     hub: Arc<Hub>,
     shutdown: CancellationToken,
 ) {
+    let slots = Arc::new(Semaphore::new(max_concurrent_connections()));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
                 let Ok((tcp, peer)) = accepted else { continue };
+                // Wait for a free slot before spawning so accept cannot runaway.
+                let permit = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    permit = slots.clone().acquire_owned() => {
+                        match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break, // semaphore closed
+                        }
+                    }
+                };
                 tcp.set_nodelay(true).ok();
                 agentlink_core::ws::arm_tcp_liveness(&tcp);
                 let acceptor = acceptor.clone();
                 let hub = hub.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(err) = handle_connection(tcp, peer, acceptor, hub).await {
                         tracing::debug!(%peer, error = %err, "connection closed");
                     }
@@ -1082,14 +1095,19 @@ async fn handle_connection(
     let preview = head_text.to_ascii_lowercase();
     let (_, path, _) = request_line(&head_text);
     if path == WS_WEB_PATH && preview.contains("upgrade: websocket") {
-        if !rate_allow(&hub, "ws", audit_ip, 300, 60) {
-            return reject_upgrade(&mut tls, 429, "Too Many Requests", "too many connections")
-                .await;
-        }
-        return serve_web_socket(tls, head, &head_text, hub, peer, audit_ip).await;
+        // t544: browser controller socket is retired. Do not mint a web principal
+        // (operator:true) even for a valid dashboard cookie — info/account stay
+        // on HTTP; sealed clients use /v1/connect.
+        return reject_upgrade(
+            &mut tls,
+            410,
+            "Gone",
+            "browser control is disabled; use a sealed client with a node-local grant",
+        )
+        .await;
     }
     if !preview.contains("upgrade: websocket") {
-        return serve_plain_http(&mut tls, &head, &hub, peer).await;
+        return serve_plain_http(&mut tls, &head, &hub, audit_ip).await;
     }
     if !rate_allow(&hub, "ws", audit_ip, 300, 60) {
         return reject_upgrade(&mut tls, 429, "Too Many Requests", "too many connections").await;
@@ -1417,9 +1435,9 @@ where
     Ok(())
 }
 
-/// Dashboard socket. The browser has no device key; the session cookie is the
-/// credential, and the CSRF value travels in the query because a browser
-/// WebSocket cannot set `X-CSRF-Token`.
+/// Former dashboard control socket. Kept for reference / tests; production
+/// admission refuses `/v1/web` upgrades with 410 before this runs.
+#[allow(dead_code)]
 async fn serve_web_socket(
     mut tls: tokio_rustls::server::TlsStream<TcpStream>,
     head: Vec<u8>,
@@ -2617,8 +2635,11 @@ async fn handle_client(
             }
             let parsed: agentlink_core::audit::AuditFilter =
                 serde_json::from_value(filter).unwrap_or_default();
-            let mut records = agentlink_core::audit::select(&read_audit(&hub.audit_path), &parsed);
-            if !principal.admin {
+            // Visibility sets are resolved first so the JSONL scan can filter
+            // before retaining — never load the whole audit file into memory.
+            let visibility = if principal.admin {
+                None
+            } else {
                 let visible = hub
                     .db
                     .visible(&caller_of(principal))
@@ -2632,16 +2653,25 @@ async fn handle_client(
                     .await
                     .unwrap_or_default();
                 let agent_ids: Vec<String> = agents.into_iter().map(|client| client.id).collect();
-                records.retain(|record| {
-                    record_visible(
-                        record,
-                        &principal.user,
-                        &node_ids,
-                        &agent_ids,
-                        &principal.device_id,
-                    )
-                });
-            }
+                Some((principal.user.clone(), node_ids, agent_ids, principal.device_id.clone()))
+            };
+            let limit = if parsed.limit == 0 { 200 } else { parsed.limit };
+            let records = agentlink_core::audit::page_from_jsonl(
+                &hub.audit_path,
+                limit,
+                0,
+                |record| {
+                    if !parsed.matches(record) {
+                        return false;
+                    }
+                    match &visibility {
+                        None => true,
+                        Some((user, node_ids, agent_ids, device_id)) => {
+                            record_visible(record, user, node_ids, agent_ids, device_id)
+                        }
+                    }
+                },
+            );
             let records = records
                 .into_iter()
                 .filter_map(|record| serde_json::to_value(record).ok())
@@ -3252,97 +3282,6 @@ async fn fanout_admins(hub: &Hub, env: &Envelope) {
     }
 }
 
-fn read_audit(path: &std::path::Path) -> Vec<agentlink_core::audit::AuditRecord> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
-}
-
-fn read_audit_values(path: &std::path::Path) -> Vec<serde_json::Value> {
-    read_audit(path)
-        .into_iter()
-        .filter_map(|record| serde_json::to_value(record).ok())
-        .collect()
-}
-
-fn append_chained_auth(
-    path: &std::path::Path,
-    op: &str,
-    user: &str,
-    device: &str,
-    ok: bool,
-    error: &str,
-) {
-    use agentlink_core::audit::{assign_chain, AuditRecord};
-    static CHAIN: Mutex<()> = Mutex::new(());
-    let Ok(_guard) = CHAIN.lock() else {
-        return;
-    };
-    let prior = read_audit(path);
-    let mut seq = 0u64;
-    let mut prev = "0".repeat(64);
-    for record in &prior {
-        if record.hash == "off" {
-            continue;
-        }
-        seq = record.seq;
-        prev = record.hash.clone();
-    }
-    let mut record = AuditRecord {
-        seq: 0,
-        ts: chrono_now(),
-        node_id: "relay".into(),
-        node_name: "relay".into(),
-        client_id: device.into(),
-        client_name: None,
-        session_id: None,
-        category: "auth".into(),
-        op: op.into(),
-        args: serde_json::json!({"user": user}),
-        result: if ok { "ok" } else { "error" }.into(),
-        error: if error.is_empty() {
-            None
-        } else {
-            Some(error.into())
-        },
-        duration_ms: 0,
-        transfer: None,
-        before_hash: None,
-        after_hash: None,
-        diff_ref: None,
-        output_ref: None,
-        exit_code: None,
-        prev_hash: String::new(),
-        hash: String::new(),
-        user: Some(user.into()),
-        device_id: Some(device.into()),
-    };
-    assign_chain(&mut record, seq.saturating_add(1), &prev, true);
-    if let Ok(value) = serde_json::to_value(&record) {
-        append_audit(path, &[value]);
-    }
-}
-
-fn append_audit(path: &std::path::Path, records: &[serde_json::Value]) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    for record in records {
-        let _ = std::io::Write::write_all(&mut file, record.to_string().as_bytes());
-        let _ = std::io::Write::write_all(&mut file, b"\n");
-    }
-}
-
 fn remember(hub: &Hub, env: &Envelope) {
     let Some(capture) = &hub.capture else {
         return;
@@ -3352,81 +3291,6 @@ fn remember(hub: &Hub, env: &Envelope) {
             guard.push(bytes);
         }
     }
-}
-
-fn audit_page() -> String {
-    r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>agentlink audit</title>
-<style>
-body { font: 14px/1.4 ui-sans-serif, sans-serif; margin: 24px; color: #1c1917; background: #fafaf9; }
-h1 { font-size: 20px; }
-label { margin-right: 12px; }
-input { margin-right: 8px; }
-table { border-collapse: collapse; width: 100%; background: white; }
-th, td { border: 1px solid #e7e5e4; padding: 6px 8px; text-align: left; vertical-align: top; }
-th { background: #f5f5f4; }
-code { font-size: 12px; }
-</style>
-</head>
-<body>
-<h1>agentlink audit</h1>
-<p>Read-only view of records the nodes uploaded to this relay. End-to-end payloads are not on this page.</p>
-<form id="filters">
-<label>token <input id="token" type="password" autocomplete="current-password"></label>
-<label>node <input id="node"></label>
-<label>agent <input id="agent"></label>
-<label>op <input id="op"></label>
-<label>text <input id="text"></label>
-<button type="submit">load</button>
-</form>
-<p id="status"></p>
-<table>
-<thead><tr><th>time</th><th>node</th><th>agent</th><th>op</th><th>result</th><th>hash</th></tr></thead>
-<tbody id="rows"></tbody>
-</table>
-<script>
-const tokenBox = document.getElementById("token");
-tokenBox.value = sessionStorage.getItem("agentlink-audit-token") || "";
-document.getElementById("filters").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  sessionStorage.setItem("agentlink-audit-token", tokenBox.value);
-  const status = document.getElementById("status");
-  status.textContent = "loading";
-  const response = await fetch("/audit/records?token=" + encodeURIComponent(tokenBox.value));
-  if (!response.ok) { status.textContent = "rejected (" + response.status + ")"; return; }
-  const records = await response.json();
-  const node = document.getElementById("node").value.trim();
-  const agent = document.getElementById("agent").value.trim();
-  const op = document.getElementById("op").value.trim();
-  const text = document.getElementById("text").value.trim().toLowerCase();
-  const rows = document.getElementById("rows");
-  rows.innerHTML = "";
-  let shown = 0;
-  for (const record of records) {
-    const blob = JSON.stringify(record).toLowerCase();
-    if (node && record.node_id !== node && record.node_name !== node) continue;
-    if (agent && record.client_id !== agent && record.client_name !== agent) continue;
-    if (op && record.op !== op && record.category !== op) continue;
-    if (text && !blob.includes(text)) continue;
-    const tr = document.createElement("tr");
-    for (const value of [record.ts, record.node_name || record.node_id, record.client_id, record.op, record.result, (record.hash || "").slice(0, 12)]) {
-      const td = document.createElement("td");
-      td.textContent = value || "";
-      tr.appendChild(td);
-    }
-    rows.appendChild(tr);
-    shown += 1;
-  }
-  status.textContent = shown + " records";
-});
-</script>
-</body>
-</html>
-"#
-    .to_string()
 }
 
 async fn open_or_forward(
@@ -4141,8 +4005,8 @@ fn operator_principal(
     }
 }
 
-pub(crate) fn login_allowed(hub: &Hub, peer: SocketAddr) -> bool {
-    rate_allow(hub, "login", peer.ip(), 30, 60)
+pub(crate) fn login_allowed(hub: &Hub, ip: IpAddr) -> bool {
+    rate_allow(hub, "login", ip, 30, 60)
 }
 
 fn rate_bucket_ip_key(ip: IpAddr) -> String {
@@ -4224,42 +4088,6 @@ fn legacy_gate_at(
         return Err("legacy admin token expired");
     }
     Ok(())
-}
-
-fn note_legacy_use(path: &std::path::Path, ok: bool, error: &str) {
-    append_chained_auth(path, "legacy.admin", "admin", "token", ok, error);
-}
-
-pub(crate) fn audit_auth(
-    path: &std::path::Path,
-    op: &str,
-    user: &str,
-    device: &str,
-    ok: bool,
-    error: &str,
-) {
-    let record = serde_json::json!({
-        "seq": 0,
-        "ts": chrono_now(),
-        "node_id": "relay",
-        "node_name": "relay",
-        "client_id": device,
-        "category": "auth",
-        "op": op,
-        "args": {"user": user},
-        "result": if ok { "ok" } else { "error" },
-        "error": if error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(error.into()) },
-        "duration_ms": 0,
-        "prev_hash": "off",
-        "hash": "off",
-        "user": user,
-        "device_id": device,
-    });
-    append_audit(path, &[record]);
-}
-
-fn chrono_now() -> String {
-    agentlink_core::util::unix_now().to_string()
 }
 
 fn record_visible(
@@ -4477,7 +4305,7 @@ async fn login_and_enter(
     device_name: String,
     already_checked: bool,
 ) -> Result<()> {
-    if !login_allowed(hub, peer) {
+    if !login_allowed(hub, audit_ip) {
         audit_auth(
             &hub.audit_path,
             "login",
@@ -5379,7 +5207,7 @@ mod view_ticket_tests {
         let path = dir.path().join("audit.jsonl");
         note_legacy_use(&path, true, "");
         note_legacy_use(&path, false, "legacy admin token is disabled");
-        let records = read_audit(&path);
+        let records = agentlink_core::audit::page_from_jsonl(&path, 10, 0, |_| true);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].op, "legacy.admin");
         assert_eq!(records[1].op, "legacy.admin");
@@ -5452,7 +5280,6 @@ mod proxy_tests {
         assert!(parse_proxy_cidr("not-a-cidr").is_err());
     }
 }
-
 
 #[cfg(test)]
 mod peer_authz_tests {

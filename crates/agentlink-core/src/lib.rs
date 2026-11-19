@@ -9,6 +9,7 @@
 
 pub mod accounts;
 pub mod audit;
+mod audit_jsonl;
 pub mod client;
 pub mod compress;
 pub mod config;

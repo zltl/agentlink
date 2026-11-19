@@ -5,6 +5,10 @@
 //! Bytes come from the agentlink PTY; we never spawn a local tty or SSH
 //! session. The egui view is our own (the `egui_term` crate talks to a
 //! local PTY backend we cannot use here).
+//!
+//! Local-echo bookkeeping lives in [`super::term_local_echo`]. The shipped
+//! safe default **never paints** unconfirmed glyphs (no speculative overlay);
+//! the UI waits for remote echo. See that module’s privacy docs.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +23,8 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use eframe::egui::{
     self, Color32, Event as GuiEvent, ImeEvent, Key, PointerButton, Pos2, Rect, Vec2,
 };
+
+use super::term_local_echo::{self, SpeculativeEcho};
 
 /// Maximum decoded UTF-8 byte length accepted from OSC 52 when explicitly enabled.
 pub const OSC52_MAX_BYTES: usize = 64 * 1024;
@@ -49,7 +55,7 @@ impl Dimensions for TermDims {
 }
 
 #[derive(Clone, Default)]
-struct TermHost {
+pub(super) struct TermHost {
     pending: Arc<Mutex<Vec<u8>>>,
     title: Arc<Mutex<String>>,
     clipboard: Arc<Mutex<Option<String>>>,
@@ -93,6 +99,8 @@ pub struct Emulator {
     /// GUI keystrokes already taken this frame (so show() does not double-read).
     keys_taken: bool,
     pending_gui_writes: Vec<u8>,
+    /// Local-echo expects (safe default: never painted; remote grid authoritative).
+    local_echo: SpeculativeEcho,
 }
 
 impl Default for Emulator {
@@ -124,6 +132,7 @@ impl Emulator {
             selecting: false,
             keys_taken: false,
             pending_gui_writes: Vec::new(),
+            local_echo: SpeculativeEcho::new(0),
         }
     }
 
@@ -131,10 +140,57 @@ impl Emulator {
         (self.rows, self.cols)
     }
 
+    /// Reset speculative echo for a new PTY generation (reconnect / reopen).
+    pub fn reset_local_echo(&mut self, generation: u64) {
+        self.local_echo.reset(generation);
+    }
+
+    pub fn local_echo(&self) -> &SpeculativeEcho {
+        &self.local_echo
+    }
+
+    pub fn local_echo_mut(&mut self) -> &mut SpeculativeEcho {
+        &mut self.local_echo
+    }
+
+    pub(super) fn term_ref(&self) -> &Term<TermHost> {
+        &self.term
+    }
+
+    /// Record outbound PTY bytes for speculative echo (paint is local-only).
+    pub fn note_local_echo_outbound(&mut self, bytes: &[u8]) -> bool {
+        self.local_echo.note_outbound(&self.term, bytes)
+    }
+
+    pub fn reconcile_local_echo(&mut self) {
+        self.local_echo.reconcile(&self.term, false);
+    }
+
+    /// UI-frame tick: expire painted blanks / TTL without waiting on remote feed.
+    pub fn tick_local_echo(&mut self) -> bool {
+        self.local_echo.tick(&self.term)
+    }
+
+    #[cfg(test)]
+    pub(super) fn age_local_echo_front(&mut self, age: std::time::Duration) {
+        if let Some(p) = self.local_echo.pending_front_mut() {
+            p.created = std::time::Instant::now()
+                .checked_sub(age)
+                .unwrap_or_else(std::time::Instant::now);
+        }
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
             self.parser.advance(&mut self.term, bytes);
+            self.local_echo.reconcile(&self.term, true);
         }
+    }
+
+    /// Alias used by local-echo tests (same as [`Self::feed`]).
+    #[cfg(test)]
+    pub(super) fn feed_raw(&mut self, bytes: &[u8]) {
+        self.feed(bytes);
     }
 
     pub fn take_writes(&self) -> Vec<u8> {
@@ -176,6 +232,8 @@ impl Emulator {
             cols: cols as usize,
             rows: rows as usize,
         });
+        // Grid geometry changed — drop overlay rather than misplace glyphs.
+        self.local_echo.clear();
         true
     }
 
@@ -712,7 +770,53 @@ impl Emulator {
             }
         } // drop renderable_content before mutating the term
 
+        // Active expiry even when the remote is silent (E1b — no feed required).
+        if self.tick_local_echo() {
+            ui.ctx().request_repaint();
+        }
+
+        // Speculative local echo: faint overlay on top of remote cells. Never
+        // mutates the alacritty grid; confirmed glyphs are cleared in reconcile.
+        {
+            let overlay = self.local_echo.overlay_cells(&self.term);
+            let faint = term_local_echo::faint_fg();
+            for cell in overlay {
+                let cell_rect = Rect::from_min_size(
+                    Pos2::new(
+                        rect.min.x + cell.col as f32 * cell_w,
+                        rect.min.y + cell.row as f32 * cell_h,
+                    ),
+                    Vec2::new(cell_w * cell.cells as f32, cell_h),
+                );
+                painter.text(
+                    cell_rect.min + Vec2::new(0.0, (cell_h - font.size) * 0.2),
+                    egui::Align2::LEFT_TOP,
+                    cell.ch,
+                    font.clone(),
+                    faint,
+                );
+            }
+            if let Some((row, col)) = self.local_echo.speculative_cursor(&self.term) {
+                if self.focused && row < rows as usize && col < cols as usize {
+                    let cursor_rect = Rect::from_min_size(
+                        Pos2::new(
+                            rect.min.x + col as f32 * cell_w,
+                            rect.min.y + row as f32 * cell_h,
+                        ),
+                        Vec2::new(2.0, cell_h),
+                    );
+                    painter.rect_filled(
+                        cursor_rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(0xE6, 0xE6, 0xE6, 0x90),
+                    );
+                }
+            }
+        }
+
         if self.focused && !self.ime_preedit.is_empty() {
+            // IME preedit stays a separate tint; never mixed into speculative echo.
+            self.local_echo.clear();
             let (row, col) = self.cursor_pos();
             let pos = Pos2::new(
                 rect.min.x + col as f32 * cell_w,
@@ -741,6 +845,7 @@ impl Emulator {
             });
         }
 
+        let mut gui_writes: Vec<u8> = Vec::new();
         if (response.has_focus() || self.focused) && !self.keys_taken {
             let events = ui.input(|i| i.events.clone());
             let modifiers = ui.input(|i| i.modifiers);
@@ -750,7 +855,7 @@ impl Emulator {
                 ui.ctx().copy_text(text);
             }
             if let Some(text) = paste_text {
-                out.writes.extend(Self::wrap_paste(
+                gui_writes.extend(Self::wrap_paste(
                     text.as_bytes(),
                     self.term.mode().contains(TermMode::BRACKETED_PASTE),
                 ));
@@ -763,11 +868,21 @@ impl Emulator {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
-            out.writes.extend(writes);
+            gui_writes.extend(writes);
         }
-        out.writes
-            .extend(std::mem::take(&mut self.pending_gui_writes));
+        gui_writes.extend(std::mem::take(&mut self.pending_gui_writes));
         self.keys_taken = false;
+
+        // Speculative echo is local paint only — GUI bytes still go to the remote
+        // PTY exactly once (no duplication, no auth change). Host PtyWrite replies
+        // are excluded so DA/DSR answers never enter the overlay.
+        if !gui_writes.is_empty() {
+            let painted = self.note_local_echo_outbound(&gui_writes);
+            if painted {
+                ui.ctx().request_repaint();
+            }
+            out.writes.extend(gui_writes);
+        }
 
         if let Some(osc) = self.take_osc52_copy() {
             let chars = osc.chars().count();

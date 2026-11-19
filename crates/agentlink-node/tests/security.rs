@@ -870,3 +870,213 @@ async fn wait_online(admin: &Client, name: &str) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_root_blocks_j01_dangling_symlink_escape_and_j03_rm_preserves_linked_dir() {
+    use agentlink_core::engine::XferOpts;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let relay = RelayHandle::spawn(RelayConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        data_dir: tmp.path().join("relay"),
+        capture: None,
+        database_url: None,
+        allow_signup: false,
+        bootstrap_admin: false,
+        db_schema: None,
+        trust_proxy: Vec::new(),
+        print_admin_token: false,
+        legacy_admin_override: Some((true, Some(3600))),
+    })
+    .await
+    .expect("spawn relay");
+    let relay_url = format!("wss://{}/v1/connect", relay.local_addr);
+    let admin = Client::connect(&ClientSettings {
+        relay: relay_url.clone(),
+        token: relay.admin_token.clone(),
+        fingerprint: relay.fingerprint.clone(),
+        trust: None,
+    })
+    .await
+    .expect("admin");
+    let pair = admin
+        .create_pairing_token("jailed-rw", NodePolicy::read_write(), 300)
+        .await
+        .expect("pair");
+
+    let outer = tmp.path().join("outer");
+    let sandbox = outer.join("inner").join("sandbox");
+    std::fs::create_dir_all(&sandbox).expect("sandbox");
+    let node_dir = tmp.path().join("node");
+    std::fs::create_dir_all(&node_dir).expect("node dir");
+    let stop = CancellationToken::new();
+    let node_task = tokio::spawn(agentlink_node::run(
+        NodeConfig {
+            relay_url: relay_url.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+            data_dir: node_dir.clone(),
+            name: "jailed-rw".into(),
+            pairing_token: Some(pair.token),
+            root: Some(sandbox.clone()),
+            max_policy: NodePolicy::read_write(),
+            version: "test".into(),
+            extensions: Vec::new(),
+            policy_hook: None,
+            capture: None,
+        },
+        stop.clone(),
+    ));
+    wait_online(&admin, "jailed-rw").await;
+    let node_id = admin
+        .list_nodes()
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|n| n.name == "jailed-rw")
+        .expect("node")
+        .id;
+
+    let agent_id = agentlink_core::Identity::generate();
+    admin
+        .register_client("rw-agent", agent_id.public_hex())
+        .await
+        .expect("reg");
+    admin
+        .set_client_grant(agent_id.public_hex(), "jailed-rw", NodePolicy::read_write())
+        .await
+        .expect("relay grant");
+    let grant_dir = tmp.path().join("grants-cfg");
+    std::fs::create_dir_all(&grant_dir).expect("grant dir");
+    let issuer = agentlink_core::grant::load_issuer(&node_dir)
+        .expect("load issuer")
+        .expect("issuer");
+    let now = agentlink_core::util::unix_now();
+    let signed = agentlink_core::grant::SignedGrant::sign(
+        &issuer,
+        agent_id.public_hex(),
+        &node_id,
+        NodePolicy::read_write(),
+        now - 30,
+        now + 3600,
+        "jti-j01-j03",
+    )
+    .expect("sign");
+    agentlink_core::grant::save_grant(&grant_dir, &signed).expect("save grant");
+
+    let rw_client = Client::connect_agent(
+        &ClientSettings {
+            relay: relay_url,
+            token: String::new(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        },
+        agent_id,
+    )
+    .await
+    .expect("rw client");
+    rw_client.remember_grants(&grant_dir);
+
+    // --- J-01 PoC reproduction: upload relative symlink inside deep subdir, attempt `mv` & `write` ---
+    let upload_src = tmp.path().join("upload_src");
+    std::fs::create_dir_all(upload_src.join("d1").join("d2").join("d3")).unwrap();
+    std::os::unix::fs::symlink(
+        "../../escaped_outside_root.txt",
+        upload_src.join("d1").join("d2").join("d3").join("sym"),
+    )
+    .unwrap();
+    let up_remote = format!("{}/up", sandbox.display());
+    rw_client
+        .copy_upload(
+            "jailed-rw",
+            &up_remote,
+            &upload_src,
+            &XferOpts::default(),
+            None,
+        )
+        .await
+        .expect("upload intra-dir symlink");
+
+    // Step 2: Moving the relative symlink to sandbox root MUST be denied!
+    let mv_err = rw_client
+        .rename("jailed-rw", "up/d1/d2/d3/sym", "sym")
+        .await
+        .expect_err("mv making relative symlink escape --root must fail");
+    assert!(
+        mv_err.to_string().contains("escapes"),
+        "unexpected mv error: {mv_err}"
+    );
+    // Moving parent directory `up/d1/d2/d3` to `d3_top` (making `d3_top/sym` -> `../../` escape) MUST ALSO be denied!
+    assert!(rw_client
+        .rename("jailed-rw", "up/d1/d2/d3", "d3_top")
+        .await
+        .is_err());
+
+    // Even if an external dangling symlink already existed inside `sandbox`, unary
+    // `Op::WriteFile`, streamed `write_file`, and fast-path `copy_upload` MUST ALL refuse!
+    std::os::unix::fs::symlink("../../preexisting_escape.txt", sandbox.join("bad_link")).unwrap();
+    assert!(rw_client
+        .call_op(
+            "jailed-rw",
+            agentlink_core::Op::WriteFile {
+                path: "bad_link".into(),
+                offset: 0,
+                data_b64: agentlink_core::util::b64_encode(b"nope"),
+                truncate: true,
+            },
+        )
+        .await
+        .is_err());
+    assert!(rw_client
+        .write_file("jailed-rw", "bad_link", b"nope")
+        .await
+        .is_err());
+    let local_payload = tmp.path().join("payload.txt");
+    std::fs::write(&local_payload, b"nope").unwrap();
+    assert!(rw_client
+        .copy_upload(
+            "jailed-rw",
+            &format!("{}/bad_link", sandbox.display()),
+            &local_payload,
+            &XferOpts::default(),
+            None,
+        )
+        .await
+        .is_err());
+    assert!(!outer.join("escaped_outside_root.txt").exists());
+    assert!(!outer.join("preexisting_escape.txt").exists());
+
+    // Normal functionality preserved: mkdir -p missing parents + intra-sandbox symlink write!
+    rw_client
+        .mkdir("jailed-rw", "nested/a/b", true)
+        .await
+        .expect("mkdir -p");
+    std::os::unix::fs::symlink("nested/a/b/good.txt", sandbox.join("good_link")).unwrap();
+    rw_client
+        .write_file("jailed-rw", "good_link", b"inside-ok")
+        .await
+        .expect("write through intra-sandbox symlink");
+    assert_eq!(
+        std::fs::read(sandbox.join("nested/a/b/good.txt")).unwrap(),
+        b"inside-ok"
+    );
+
+    // --- J-03 PoC reproduction: `rm --recursive` on symlink-to-dir unlinks ONLY the link ---
+    std::os::unix::fs::symlink("nested", sandbox.join("link_to_nested")).unwrap();
+    rw_client
+        .remove("jailed-rw", "link_to_nested", true)
+        .await
+        .expect("rm symlink-to-dir");
+    assert!(
+        sandbox.join("nested/a/b/good.txt").exists(),
+        "J-03 regression: rm --recursive on symlink wiped real target directory!"
+    );
+    assert!(
+        std::fs::symlink_metadata(sandbox.join("link_to_nested")).is_err(),
+        "rm did not remove the symlink itself!"
+    );
+
+    stop.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), node_task).await;
+}
