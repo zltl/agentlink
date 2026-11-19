@@ -217,8 +217,21 @@ pub enum UiEvent {
     Failed(String),
     TotpRequired(String),
     Notice(String),
-    Pty(Vec<u8>),
-    PtyDone,
+    Pty {
+        gen: u64,
+        bytes: Vec<u8>,
+    },
+    PtyExited {
+        gen: u64,
+        code: i32,
+    },
+    PtyFailed {
+        gen: u64,
+        message: String,
+    },
+    PtyDone {
+        gen: u64,
+    },
     Dir {
         path: String,
         entries: Vec<DirEntry>,
@@ -252,6 +265,7 @@ pub enum Cmd {
         node: String,
         rows: u16,
         cols: u16,
+        gen: u64,
     },
     PtyWrite {
         data: Vec<u8>,
@@ -260,6 +274,7 @@ pub enum Cmd {
         rows: u16,
         cols: u16,
     },
+    PtyProbe,
     PtyClose,
     List {
         node: String,
@@ -327,6 +342,7 @@ pub enum Cmd {
 enum PtyCmd {
     Write(Vec<u8>),
     Resize(u16, u16),
+    Probe,
     Close(Option<tokio::sync::oneshot::Sender<()>>),
 }
 
@@ -639,6 +655,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
     runtime.block_on(async move {
         let mut client: Option<Arc<Client>> = None;
         let mut pty: Option<UnboundedSender<PtyCmd>> = None;
+        let mut active_pty_gen: u64 = 0;
         let mut live: Option<Live> = None;
         let mut shots: Option<tokio::task::JoinHandle<()>> = None;
         loop {
@@ -720,6 +737,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 },
                 Cmd::Logout => {
                     stop_live(&mut live, &mut shots);
+                    active_pty_gen = 0;
                     close_pty(&mut pty).await;
                     client = None;
                     if let Err(err) = crate::tray::sign_out(&config_dir).await {
@@ -729,14 +747,23 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     shared.push(UiEvent::Notice("Signed out".into()));
                 }
                 Cmd::Refresh => {
+                    if client.as_ref().is_some_and(|cur| !cur.is_alive()) {
+                        close_pty(&mut pty).await;
+                    }
                     if let Err(err) = ensure_worker_client(&mut client, &config_dir, false).await {
                         shared.push(UiEvent::Failed(err));
                     } else {
                         refresh(client.as_ref(), &shared).await;
                     }
                 }
-                Cmd::PtyOpen { node, rows, cols } => {
+                Cmd::PtyOpen {
+                    node,
+                    rows,
+                    cols,
+                    gen,
+                } => {
                     close_pty(&mut pty).await;
+                    active_pty_gen = gen;
                     let node_arg = node;
                     match run_non_idempotent_with_live_worker_client(
                         &mut client,
@@ -755,14 +782,37 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     .await
                     {
                         Ok(session) => {
-                            pty = Some(spawn_pty(session, Arc::clone(&shared)));
+                            pty = Some(spawn_pty(
+                                session,
+                                Arc::clone(&shared),
+                                gen,
+                                (rows, cols),
+                            ));
                         }
-                        Err(err) => shared.push(UiEvent::Failed(err)),
+                        Err(err) => {
+                            shared.push(UiEvent::PtyFailed { gen, message: err });
+                            shared.push(UiEvent::PtyDone { gen });
+                        }
                     }
                 }
                 Cmd::PtyWrite { data } => {
-                    if let Some(tx) = &pty {
-                        let _ = tx.send(PtyCmd::Write(data));
+                    let closed = match &pty {
+                        Some(tx) => tx.send(PtyCmd::Write(data)).is_err(),
+                        None => false,
+                    };
+                    if closed {
+                        pty = None;
+                        if active_pty_gen != 0 {
+                            shared.push(UiEvent::PtyFailed {
+                                gen: active_pty_gen,
+                                message:
+                                    "Shell session is no longer active; reopen shell to continue."
+                                        .into(),
+                            });
+                            shared.push(UiEvent::PtyDone {
+                                gen: active_pty_gen,
+                            });
+                        }
                     }
                 }
                 Cmd::PtyResize { rows, cols } => {
@@ -770,7 +820,15 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         let _ = tx.send(PtyCmd::Resize(rows, cols));
                     }
                 }
-                Cmd::PtyClose => close_pty(&mut pty).await,
+                Cmd::PtyProbe => {
+                    if let Some(tx) = &pty {
+                        let _ = tx.send(PtyCmd::Probe);
+                    }
+                }
+                Cmd::PtyClose => {
+                    active_pty_gen = 0;
+                    close_pty(&mut pty).await;
+                }
                 Cmd::List { node, path } => {
                     let node_arg = node;
                     let path_arg = path.clone();
@@ -1936,58 +1994,235 @@ async fn close_pty(pty: &mut Option<UnboundedSender<PtyCmd>>) {
     let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
 }
 
-fn spawn_pty(mut session: PtySession, shared: Arc<Shared>) -> UnboundedSender<PtyCmd> {
+const PTY_WRITE_COALESCE_CAP: usize = 16 * 1024;
+const PTY_SOCKET_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const PTY_IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(300);
+const PTY_SILENT_WRITE_HEAL_DELAY: Duration = Duration::from_millis(450);
+const PTY_REBIND_COOLDOWN: Duration = Duration::from_secs(10);
+const PTY_MANUAL_PROBE_COOLDOWN: Duration = Duration::from_secs(2);
+
+fn spawn_pty(
+    mut session: PtySession,
+    shared: Arc<Shared>,
+    gen: u64,
+    initial_size: (u16, u16),
+) -> UnboundedSender<PtyCmd> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
+        let mut cur_size = (initial_size.0.max(1), initial_size.1.max(1));
+        let mut last_sock_gen = session.socket_generation();
+        let mut last_verified_at = Instant::now();
+        let mut last_rebind_at: Option<Instant> = None;
+        let mut last_probe_at: Option<Instant> = None;
+        let mut echo_heal_at: Option<tokio::time::Instant> = None;
+        let mut buffered_cmd: Option<PtyCmd> = None;
+        let mut watch_tick = tokio::time::interval(PTY_SOCKET_CHECK_INTERVAL);
+        watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        watch_tick.tick().await;
+
         loop {
-            tokio::select! {
-                event = session.recv() => {
-                    match event {
-                        Ok(PtyEvent::Data(bytes)) => shared.push(UiEvent::Pty(bytes)),
-                        Ok(PtyEvent::Exit(code)) => {
-                            shared.push(UiEvent::Notice(format!("Shell exited ({code})")));
-                            shared.push(UiEvent::PtyDone);
+            let next_cmd = if let Some(ready) = buffered_cmd.take() {
+                Some(ready)
+            } else {
+                let heal_sleep = async {
+                    match echo_heal_at {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    event = session.recv() => {
+                        match event {
+                            Ok(PtyEvent::Data(bytes)) => {
+                                last_verified_at = Instant::now();
+                                echo_heal_at = None;
+                                shared.push(UiEvent::Pty { gen, bytes });
+                            }
+                            Ok(PtyEvent::Exit(code)) => {
+                                shared.push(UiEvent::PtyExited { gen, code });
+                                shared.push(UiEvent::PtyDone { gen });
+                                break;
+                            }
+                            Ok(PtyEvent::Error(message)) => {
+                                shared.push(UiEvent::PtyFailed { gen, message });
+                                shared.push(UiEvent::PtyDone { gen });
+                                break;
+                            }
+                            Err(err) => {
+                                shared.push(UiEvent::PtyFailed {
+                                    gen,
+                                    message: err.to_string(),
+                                });
+                                shared.push(UiEvent::PtyDone { gen });
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    cmd = rx.recv() => cmd,
+                    _ = heal_sleep => {
+                        echo_heal_at = None;
+                        if last_rebind_at
+                            .map(|t| t.elapsed() >= PTY_REBIND_COOLDOWN)
+                            .unwrap_or(true)
+                        {
+                            last_rebind_at = Some(Instant::now());
+                            if let Err(err) = session.rebind_stream().await {
+                                shared.push(UiEvent::PtyFailed {
+                                    gen,
+                                    message: err.to_string(),
+                                });
+                                shared.push(UiEvent::PtyDone { gen });
+                                break;
+                            }
+                            if let Err(err) = session.probe_alive(cur_size.0, cur_size.1).await {
+                                shared.push(UiEvent::PtyFailed {
+                                    gen,
+                                    message: err.to_string(),
+                                });
+                                shared.push(UiEvent::PtyDone { gen });
+                                break;
+                            }
+                            last_verified_at = Instant::now();
+                            last_probe_at = Some(Instant::now());
+                        }
+                        continue;
+                    }
+                    _ = watch_tick.tick() => {
+                        if !session.is_client_alive() {
+                            shared.push(UiEvent::PtyFailed {
+                                gen,
+                                message:
+                                    "Terminal connection closed; reopen shell to start a new session."
+                                        .into(),
+                            });
+                            shared.push(UiEvent::PtyDone { gen });
                             break;
                         }
-                        Ok(PtyEvent::Error(message)) => {
-                            shared.push(UiEvent::Failed(message));
-                            shared.push(UiEvent::PtyDone);
-                            break;
+                        let now_gen = session.socket_generation();
+                        let rotated = now_gen != last_sock_gen;
+                        if rotated {
+                            last_sock_gen = now_gen;
+                            // Give `run_socket`'s `resend_inflight` a brief moment to
+                            // re-announce the stream before probing session liveness.
+                            tokio::time::sleep(Duration::from_millis(150)).await;
                         }
-                        Err(err) => {
-                            shared.push(UiEvent::Failed(err.to_string()));
-                            shared.push(UiEvent::PtyDone);
-                            break;
+                        if rotated || last_verified_at.elapsed() >= PTY_IDLE_PROBE_INTERVAL {
+                            if let Err(err) = session.probe_alive(cur_size.0, cur_size.1).await {
+                                shared.push(UiEvent::PtyFailed {
+                                    gen,
+                                    message: err.to_string(),
+                                });
+                                shared.push(UiEvent::PtyDone { gen });
+                                break;
+                            }
+                            last_verified_at = Instant::now();
+                            last_probe_at = Some(Instant::now());
                         }
+                        continue;
                     }
                 }
-                cmd = rx.recv() => {
-                    match cmd {
-                        Some(PtyCmd::Write(bytes)) => {
-                            if let Err(err) = session.write(&bytes).await {
-                                shared.push(UiEvent::Failed(err.to_string()));
+            };
+
+            match next_cmd {
+                Some(PtyCmd::Write(mut bytes)) => {
+                    while bytes.len() < PTY_WRITE_COALESCE_CAP {
+                        match rx.try_recv() {
+                            Ok(PtyCmd::Write(more)) => bytes.extend_from_slice(&more),
+                            Ok(other) => {
+                                buffered_cmd = Some(other);
+                                break;
                             }
-                        }
-                        Some(PtyCmd::Resize(rows, cols)) => {
-                            let _ = session.resize(rows, cols).await;
-                        }
-                        Some(PtyCmd::Close(ack)) => {
-                            let _ = session.close().await;
-                            if let Some(ack) = ack {
-                                let _ = ack.send(());
-                            }
-                            break;
-                        }
-                        None => {
-                            let _ = session.close().await;
-                            break;
+                            Err(_) => break,
                         }
                     }
+                    if let Err(err) = session.write(&bytes).await {
+                        shared.push(UiEvent::PtyFailed {
+                            gen,
+                            message: err.to_string(),
+                        });
+                        shared.push(UiEvent::PtyDone { gen });
+                        break;
+                    }
+                    // If the remote PTY is alive behind an un-upgraded relay whose
+                    // node-side `detach()` dropped the stream route while our socket
+                    // stayed open, `write()` succeeds (`ok: true`) while echoed
+                    // chunks vanish on the relay. Arm a short post-write check so
+                    // silent streams rebind and flush missed chunks automatically.
+                    if echo_heal_at.is_none() {
+                        echo_heal_at = Some(tokio::time::Instant::now() + PTY_SILENT_WRITE_HEAL_DELAY);
+                    }
+                }
+                Some(PtyCmd::Resize(rows, cols)) => {
+                    cur_size = (rows.max(1), cols.max(1));
+                    if let Err(err) = session.resize(cur_size.0, cur_size.1).await {
+                        if !session.is_client_alive()
+                            || pty_error_means_session_dead(&err.to_string())
+                        {
+                            shared.push(UiEvent::PtyFailed {
+                                gen,
+                                message: err.to_string(),
+                            });
+                            shared.push(UiEvent::PtyDone { gen });
+                            break;
+                        }
+                    } else {
+                        last_verified_at = Instant::now();
+                    }
+                }
+                Some(PtyCmd::Probe) => {
+                    if last_probe_at
+                        .map(|t| t.elapsed() >= PTY_MANUAL_PROBE_COOLDOWN)
+                        .unwrap_or(true)
+                    {
+                        last_probe_at = Some(Instant::now());
+                        last_rebind_at = Some(Instant::now());
+                        if let Err(err) = session.rebind_stream().await {
+                            shared.push(UiEvent::PtyFailed {
+                                gen,
+                                message: err.to_string(),
+                            });
+                            shared.push(UiEvent::PtyDone { gen });
+                            break;
+                        }
+                        if let Err(err) = session.probe_alive(cur_size.0, cur_size.1).await {
+                            shared.push(UiEvent::PtyFailed {
+                                gen,
+                                message: err.to_string(),
+                            });
+                            shared.push(UiEvent::PtyDone { gen });
+                            break;
+                        }
+                        last_verified_at = Instant::now();
+                    }
+                }
+                Some(PtyCmd::Close(ack)) => {
+                    let _ = session.close().await;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
+                    break;
+                }
+                None => {
+                    let _ = session.close().await;
+                    break;
                 }
             }
         }
     });
     tx
+}
+
+fn pty_error_means_session_dead(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not found")
+        || lower.contains("pty session")
+        || lower.contains("grant")
+        || lower.contains("revoked")
+        || lower.contains("expired")
+        || lower.contains("connection closed")
+        || lower.contains("replay slot")
 }
 
 async fn refresh(client: Option<&Arc<Client>>, shared: &Shared) {
@@ -3729,6 +3964,7 @@ mod worker_client_recovery_tests {
                 node: box_id.clone(),
                 rows: 24,
                 cols: 80,
+                gen: 1,
             })
             .expect("pty open 1");
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -3743,9 +3979,13 @@ mod worker_client_recovery_tests {
         while !(pty1_out.contains("PTY1_MARKER") && pty1_done) {
             for ev in shared.drain() {
                 match ev {
-                    UiEvent::Pty(bytes) => pty1_out.push_str(&String::from_utf8_lossy(&bytes)),
-                    UiEvent::PtyDone => pty1_done = true,
-                    UiEvent::Failed(err) => panic!("PTY #1 failed unexpectedly: {err}"),
+                    UiEvent::Pty { gen: 1, bytes } => {
+                        pty1_out.push_str(&String::from_utf8_lossy(&bytes))
+                    }
+                    UiEvent::PtyDone { gen: 1 } => pty1_done = true,
+                    UiEvent::Failed(err) | UiEvent::PtyFailed { message: err, .. } => {
+                        panic!("PTY #1 failed unexpectedly: {err}")
+                    }
                     _ => {}
                 }
             }
@@ -3821,6 +4061,7 @@ mod worker_client_recovery_tests {
                 node: box_id,
                 rows: 24,
                 cols: 80,
+                gen: 2,
             })
             .expect("send pty open 2");
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -3834,8 +4075,10 @@ mod worker_client_recovery_tests {
         while !pty2_out.contains("PTY2_RECOVERED") {
             for ev in shared.drain() {
                 match ev {
-                    UiEvent::Pty(bytes) => pty2_out.push_str(&String::from_utf8_lossy(&bytes)),
-                    UiEvent::Failed(err) => {
+                    UiEvent::Pty { gen: 2, bytes } => {
+                        pty2_out.push_str(&String::from_utf8_lossy(&bytes))
+                    }
+                    UiEvent::Failed(err) | UiEvent::PtyFailed { message: err, .. } => {
                         panic!("Cmd::PtyOpen #2 failed instead of rebootstrapping: {err}");
                     }
                     _ => {}
@@ -4159,5 +4402,380 @@ mod worker_client_recovery_tests {
         assert_eq!(connects2.load(AtomicOrdering::SeqCst), 0, "must not force-rebootstrap mid-mutation");
         assert!(slot2.is_none(), "dead slot must be cleared for next command");
         assert!(err.contains("outcome is unknown") && err.contains("not automatically retried"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_worker_pty_survives_four_token_rotations_bc97_node_detach_and_recovers_after_node_restart() {
+        use agentlink_core::{NodePolicy, Identity};
+        use agentlink_node::{run as run_node, NodeConfig};
+        use agentlink_relay::{RelayConfig, RelayHandle};
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let relay = RelayHandle::spawn(RelayConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            data_dir: tmp.path().join("relay"),
+            capture: None,
+            database_url: None,
+            allow_signup: false,
+            bootstrap_admin: true,
+            db_schema: None,
+            trust_proxy: Vec::new(),
+            print_admin_token: false,
+            legacy_admin_override: Some((true, Some(86_400))),
+        })
+        .await
+        .expect("spawn relay");
+        let admin_pw = relay.bootstrap_password.clone().expect("bootstrap pw");
+        let relay_url = format!("wss://{}/v1/connect", relay.local_addr);
+
+        let setup_client = Client::connect(&ClientSettings {
+            relay: relay_url.clone(),
+            token: relay.admin_token.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        })
+        .await
+        .expect("setup client");
+        let pair = setup_client
+            .create_pairing_token("sufa-sim", NodePolicy::full(), 600)
+            .await
+            .expect("pairing");
+
+        let node_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&node_dir).expect("node dir");
+        let node_stop = CancellationToken::new();
+        let node_task = tokio::spawn(run_node(
+            NodeConfig {
+                relay_url: relay_url.clone(),
+                fingerprint: relay.fingerprint.clone(),
+                trust: None,
+                data_dir: node_dir.clone(),
+                name: "sufa-sim".into(),
+                pairing_token: Some(pair.token),
+                root: Some(tmp.path().to_path_buf()),
+                max_policy: NodePolicy::full(),
+                version: "bc97-compat".into(),
+                extensions: Vec::new(),
+                policy_hook: None,
+                capture: None,
+            },
+            node_stop.clone(),
+        ));
+
+        let sufa_id = loop {
+            if let Ok(nodes) = setup_client.list_nodes().await {
+                if let Some(n) = nodes.into_iter().find(|n| n.name == "sufa-sim" && n.online) {
+                    break n.id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        };
+
+        let config_dir = tmp.path().join("box-ctrl");
+        std::fs::create_dir_all(&config_dir).expect("box cfg");
+        let ctrl_id = Identity::load_or_create(&config_dir.join("identity.json")).expect("id");
+        let grant =
+            agentlink_core::grant::issue_local_grant(&node_dir, &sufa_id, ctrl_id.public_hex())
+                .expect("grant");
+        agentlink_core::grant::save_grant(&config_dir, &grant).expect("save grant");
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::new());
+        let shared_worker = Arc::clone(&shared);
+        let cfg_worker = config_dir.clone();
+        let worker_thread = std::thread::spawn(move || {
+            super::run(cmd_rx, shared_worker, cfg_worker);
+        });
+
+        cmd_tx
+            .send(Cmd::Login {
+                username: "admin".into(),
+                password: admin_pw,
+                totp: String::new(),
+                relay: relay_url.clone(),
+                pin: relay.fingerprint.clone(),
+                trust: String::new(),
+            })
+            .expect("login");
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if shared
+                .drain()
+                .iter()
+                .any(|ev| matches!(ev, UiEvent::Ready { user: Some(_) }))
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "login timed out");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Open PTY gen 1 and record the live shell PID (`$$`).
+        cmd_tx
+            .send(Cmd::PtyOpen {
+                node: sufa_id.clone(),
+                rows: 24,
+                cols: 80,
+                gen: 1,
+            })
+            .expect("open gen 1");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cmd_tx
+            .send(Cmd::PtyWrite {
+                data: b"printf 'BOOT_%s:%s:END\\n' 'PID' \"$$\"\n".to_vec(),
+            })
+            .expect("write boot pid");
+        let mut out = String::new();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let boot_pid = loop {
+            for ev in shared.drain() {
+                match ev {
+                    UiEvent::Pty { gen: 1, bytes } => out.push_str(&String::from_utf8_lossy(&bytes)),
+                    UiEvent::PtyFailed { gen: 1, message } => {
+                        panic!("gen 1 failed at boot: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(start) = out.find("BOOT_PID:") {
+                let rest = &out[start + "BOOT_PID:".len()..];
+                if let Some(end) = rest.find(":END") {
+                    let cand = &rest[..end];
+                    if !cand.is_empty() && cand.chars().all(|c| c.is_ascii_digit()) {
+                        break cand.to_string();
+                    }
+                }
+            }
+            assert!(std::time::Instant::now() < until, "boot pid timed out: {out:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        // Phase A: Simulate 4 consecutive 20-minute bc97 relay token-expiry kicks
+        // (~80m of controller uptime): age `access_expires_unix` into the refresh
+        // window and drop the client socket (`release_client` wipes `hub.routes`).
+        for cycle in 1..=4 {
+            let mut file = agentlink_core::config::load_file(&config_dir).expect("load cfg");
+            let cur_settings = settings_of(&file).expect("settings");
+            let cur_user = file.user.take().unwrap_or_else(|| "admin".into());
+            let cur_refresh = file.refresh_token.take().expect("refresh token");
+            agentlink_core::config::save_session(
+                &config_dir,
+                &cur_settings,
+                &cur_user,
+                &cur_refresh,
+                agentlink_core::util::unix_now() + 30,
+            )
+            .expect("age access_expires_unix");
+
+            relay.disconnect_clients();
+            tokio::time::sleep(Duration::from_millis(450)).await;
+
+            let marker = format!("ROTATION_OK_{cycle}_");
+            let cmd_line = format!("printf 'ROTATION_%s_{cycle}_%s:END\\n' 'OK' \"$$\"\n");
+            cmd_tx
+                .send(Cmd::PtyWrite {
+                    data: cmd_line.into_bytes(),
+                })
+                .expect("write after rotation");
+            let want = format!("{marker}{boot_pid}:END");
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while !out.contains(&want) {
+                for ev in shared.drain() {
+                    match ev {
+                        UiEvent::Pty { gen: 1, bytes } => {
+                            out.push_str(&String::from_utf8_lossy(&bytes))
+                        }
+                        UiEvent::PtyFailed { gen: 1, message } => {
+                            panic!("PTY died on rotation cycle {cycle}: {message}");
+                        }
+                        UiEvent::PtyDone { gen: 1 } => {
+                            panic!("PTY unexpectedly ended on rotation cycle {cycle}");
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "cycle {cycle} did not echo {want:?}; got tail={:?}",
+                    &out[out.len().saturating_sub(200)..]
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        // Phase B1: Un-upgraded bc97 relay route loss while remote PTY remains alive
+        // (e.g. bc97 node brief link flap where bc97 kept `live.pty` open while relay
+        // `detach()` wiped `hub.routes[R_open]`, or relay route eviction). Typing into
+        // the PTY triggers `rebind_stream()` after 450ms of stream silence and delivers
+        // the echoed output from the SAME shell PID (`boot_pid`)!
+        relay.testing_clear_routes();
+        cmd_tx
+            .send(Cmd::PtyWrite {
+                data: b"printf 'NODE_%s:%s:END\\n' 'DETACH_HEALED' \"$$\"\n".to_vec(),
+            })
+            .expect("write after route clear");
+        let want_detach = format!("NODE_DETACH_HEALED:{boot_pid}:END");
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !out.contains(&want_detach) {
+            for ev in shared.drain() {
+                match ev {
+                    UiEvent::Pty { gen: 1, bytes } => out.push_str(&String::from_utf8_lossy(&bytes)),
+                    UiEvent::PtyFailed { gen: 1, message } => {
+                        panic!("PTY failed instead of healing cleared relay route: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "post-route-clear output never arrived (silent keystroke black hole!): tail={:?}",
+                &out[out.len().saturating_sub(200)..]
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        // Phase B2: Node WebSocket drop on a `cd30c9ed+` node (`stop_live_sessions`
+        // closes `live.pty` while `live.socket` is detached so `End` could not cross
+        // the wire, while Controller's WebSocket stayed open). Previously left the
+        // Controller GUI permanently stuck at a fake live prompt swallowing every key!
+        // Now `PtyProbe` / `PtyWrite` immediately detects `not found: pty session` and
+        // transitions `gen: 1` cleanly to `PtyDone` so `Reopen shell` is available.
+        relay.disconnect_nodes();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(nodes) = setup_client.list_nodes().await {
+                if nodes.iter().any(|n| n.id == sufa_id && n.online) {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < until, "node did not reconnect");
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        cmd_tx.send(Cmd::PtyProbe).expect("probe after node drop");
+        let mut saw_b2_failed = false;
+        let mut saw_b2_done = false;
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !(saw_b2_failed && saw_b2_done) {
+            for ev in shared.drain() {
+                match ev {
+                    UiEvent::PtyFailed { gen: 1, .. } => saw_b2_failed = true,
+                    UiEvent::PtyDone { gen: 1 } => saw_b2_done = true,
+                    _ => {}
+                }
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "detached node PTY close was not detected by PtyProbe!"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Reopen (`gen: 2`) before Phase C so we also verify full daemon restart + E2E reset!
+        cmd_tx
+            .send(Cmd::PtyOpen {
+                node: sufa_id.clone(),
+                rows: 24,
+                cols: 80,
+                gen: 2,
+            })
+            .expect("open gen 2");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Phase C: Full remote node daemon restart (`e2e session reset` + vanished PTY)
+        // while Controller stays running. `PtyWrite` re-handshakes E2E automatically,
+        // detects `not found: pty session` -> `PtyDone { gen: 2 }`, and `gen: 3` Reopen
+        // creates a fresh live shell!
+        node_stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), node_task).await;
+
+        let node_stop_2 = CancellationToken::new();
+        let node_task_2 = tokio::spawn(run_node(
+            NodeConfig {
+                relay_url: relay_url.clone(),
+                fingerprint: relay.fingerprint.clone(),
+                trust: None,
+                data_dir: node_dir.clone(),
+                name: "sufa-sim".into(),
+                pairing_token: None,
+                root: Some(tmp.path().to_path_buf()),
+                max_policy: NodePolicy::full(),
+                version: "bc97-compat".into(),
+                extensions: Vec::new(),
+                policy_hook: None,
+                capture: None,
+            },
+            node_stop_2.clone(),
+        ));
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(nodes) = setup_client.list_nodes().await {
+                if nodes.iter().any(|n| n.id == sufa_id && n.online) {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < until, "restarted node not online");
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        cmd_tx
+            .send(Cmd::PtyWrite {
+                data: b"printf 'SHOULD_FAIL'\n".to_vec(),
+            })
+            .expect("write to dead remote pty");
+        let mut saw_failed_2 = false;
+        let mut saw_done_2 = false;
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !(saw_failed_2 && saw_done_2) {
+            for ev in shared.drain() {
+                match ev {
+                    UiEvent::PtyFailed { gen: 2, .. } => saw_failed_2 = true,
+                    UiEvent::PtyDone { gen: 2 } => saw_done_2 = true,
+                    _ => {}
+                }
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "vanished remote PTY stayed in fake-alive state! failed={saw_failed_2} done={saw_done_2}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Now 1-click Reopen (`gen: 3`) on the SAME Controller worker creates a real new shell!
+        cmd_tx
+            .send(Cmd::PtyOpen {
+                node: sufa_id,
+                rows: 24,
+                cols: 80,
+                gen: 3,
+            })
+            .expect("reopen gen 3");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cmd_tx
+            .send(Cmd::PtyWrite {
+                data: b"printf 'FRESH_%s:%s:END\\n' 'GEN3_OK' \"$$\"\n".to_vec(),
+            })
+            .expect("write gen 3");
+        let mut out3 = String::new();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !out3.contains("FRESH_GEN3_OK:") || !out3.contains(":END") {
+            for ev in shared.drain() {
+                match ev {
+                    UiEvent::Pty { gen: 3, bytes } => out3.push_str(&String::from_utf8_lossy(&bytes)),
+                    UiEvent::PtyFailed { gen: 3, message } => {
+                        panic!("reopened gen 3 failed: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(std::time::Instant::now() < until, "gen 3 timed out: {out3:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        drop(cmd_tx);
+        let _ = worker_thread.join();
+        node_stop_2.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), node_task_2).await;
     }
 }
