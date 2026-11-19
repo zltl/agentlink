@@ -69,7 +69,7 @@ pub async fn handle(
     path: &str,
     headers: &[(String, String)],
     body: &[u8],
-    peer: std::net::SocketAddr,
+    audit_ip: std::net::IpAddr,
 ) -> Result<Option<WebOutcome>> {
     // HEAD shares GET routing for idempotent reads (install scripts, /dl/*,
     // dashboard, APIs). Caller encodes with encode_for_method so the body is
@@ -78,7 +78,7 @@ pub async fn handle(
     let method = if head { "GET" } else { method };
     match (method, path) {
         ("POST", "/auth/login") => Ok(Some(WebOutcome::Reply(
-            login(hub, headers, body, peer).await?,
+            login(hub, headers, body, audit_ip).await?,
         ))),
         ("POST", "/auth/logout") => Ok(Some(WebOutcome::Reply(logout(hub, headers).await?))),
         ("GET", "/auth/session") => Ok(Some(WebOutcome::Reply(session_info(hub, headers).await?))),
@@ -91,13 +91,13 @@ pub async fn handle(
             revoke_token(hub, headers, body).await?,
         ))),
         ("POST", "/api/view-ticket") => Ok(Some(WebOutcome::Reply(
-            view_ticket(hub, headers, body, peer).await?,
+            view_ticket(hub, headers, body, audit_ip).await?,
         ))),
         ("POST", "/api/view-ticket/revoke") => Ok(Some(WebOutcome::Reply(
             revoke_view_ticket(hub, headers, body).await?,
         ))),
         ("POST", "/api/ice") => Ok(Some(WebOutcome::Reply(
-            ice_config(hub, headers, body, peer).await?,
+            ice_config(hub, headers, body, audit_ip).await?,
         ))),
         ("POST", "/api/qr") => Ok(Some(WebOutcome::Reply(qr(hub, headers, body).await?))),
         ("GET", "/view/events") => {
@@ -205,12 +205,12 @@ async fn login(
     hub: &Hub,
     headers: &[(String, String)],
     body: &[u8],
-    peer: std::net::SocketAddr,
+    audit_ip: std::net::IpAddr,
 ) -> Result<HttpReply> {
     if let Some(reply) = login_origin_rejected(headers) {
         return Ok(reply);
     }
-    if !server::login_allowed(hub, peer) {
+    if !server::login_allowed(hub, audit_ip) {
         return Ok(text(429, "Too Many Requests", "too many login attempts"));
     }
     let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
@@ -404,9 +404,9 @@ async fn view_ticket(
     hub: &Hub,
     headers: &[(String, String)],
     body: &[u8],
-    peer: std::net::SocketAddr,
+    audit_ip: std::net::IpAddr,
 ) -> Result<HttpReply> {
-    if !server::rate_allow(hub, "ticket", peer.ip(), 30, 60) {
+    if !server::rate_allow(hub, "ticket", audit_ip, 30, 60) {
         let mut reply = text(429, "Too Many Requests", "too many view tickets");
         reply.headers.push(("Retry-After".into(), "60".into()));
         return Ok(reply);
@@ -467,9 +467,9 @@ async fn ice_config(
     hub: &Hub,
     headers: &[(String, String)],
     body: &[u8],
-    peer: std::net::SocketAddr,
+    audit_ip: std::net::IpAddr,
 ) -> Result<HttpReply> {
-    if !server::rate_allow(hub, "ice", peer.ip(), 60, 60) {
+    if !server::rate_allow(hub, "ice", audit_ip, 60, 60) {
         return Ok(text(429, "Too Many Requests", "too many ice requests"));
     }
     let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);

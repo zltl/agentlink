@@ -21,7 +21,7 @@ use agentlink_core::{Error, NodePolicy, Op, Result, PHASE3_WEBRTC_SIGNAL};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{
@@ -35,6 +35,12 @@ use crate::models::{self, Caller, EnrolledNode, NodeMeta};
 
 const STALE_AFTER: Duration = agentlink_core::ws::RELAY_STALE_AFTER;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap concurrent TLS connections (handshakes + live sessions) so Slowloris /
+/// accept floods cannot exhaust FDs or tasks. Excess accepts wait for a slot.
+const MAX_CONCURRENT_CONNECTIONS: usize = 1_024;
+/// Default / hard ceiling for HTTP `GET /audit/records` pages.
+const AUDIT_RECORDS_DEFAULT_LIMIT: usize = 200;
+const AUDIT_RECORDS_MAX_LIMIT: usize = 1_000;
 
 static STALE_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -537,7 +543,8 @@ impl Callback for Router {
                 if !self.authorized(request) {
                     return Err(plain(401, "admin token required"));
                 }
-                let records = read_audit_values(&self.audit_path);
+                let (limit, offset) = audit_page_bounds(request.uri().query().unwrap_or(""));
+                let records = read_audit_values_page(&self.audit_path, limit, offset);
                 let body = serde_json::to_string(&records).unwrap_or_else(|_| "[]".into());
                 Err(Response::builder()
                     .status(200)
@@ -552,31 +559,22 @@ impl Callback for Router {
 
 impl Router {
     fn authorized(&self, request: &Request) -> bool {
-        if let Some(header) = request
+        // Bearer only — query `?token=` is rejected so credentials never land
+        // in access logs, Referer headers, or browser history.
+        let Some(header) = request
             .headers()
             .get("authorization")
             .and_then(|value| value.to_str().ok())
-        {
-            if let Some(token) = header
-                .strip_prefix("Bearer ")
-                .or_else(|| header.strip_prefix("bearer "))
-            {
-                if self.accept_legacy(token.trim()) {
-                    return true;
-                }
-            }
-        }
-        let Some(query) = request.uri().query() else {
+        else {
             return false;
         };
-        for pair in query.split('&') {
-            if let Some(value) = pair.strip_prefix("token=") {
-                if self.accept_legacy(value) {
-                    return true;
-                }
-            }
-        }
-        false
+        let Some(token) = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+        else {
+            return false;
+        };
+        self.accept_legacy(token.trim())
     }
 
     fn accept_legacy(&self, presented: &str) -> bool {
@@ -808,7 +806,12 @@ where
     }
 }
 
-async fn serve_plain_http<S>(stream: &mut S, head: &[u8], hub: &Hub, peer: SocketAddr) -> Result<()>
+async fn serve_plain_http<S>(
+    stream: &mut S,
+    head: &[u8],
+    hub: &Hub,
+    audit_ip: IpAddr,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -849,15 +852,16 @@ where
     if body_bytes.len() < length {
         let start = body_bytes.len();
         body_bytes.resize(length, 0);
-        stream
-            .read_exact(&mut body_bytes[start..])
+        // Bound body reads so a Slowloris POST cannot hold the TLS task forever.
+        timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut body_bytes[start..]))
             .await
+            .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Ws(e.to_string()))?;
     } else {
         body_bytes.truncate(length);
     }
     if let Some(outcome) =
-        crate::web::handle(hub, method, path, &headers, &body_bytes, peer).await?
+        crate::web::handle(hub, method, path, &headers, &body_bytes, audit_ip).await?
     {
         match outcome {
             crate::web::WebOutcome::Reply(reply) => {
@@ -899,8 +903,9 @@ where
             "webrtc signaling is a websocket".into(),
         ),
         ("GET", "/audit/records") => {
-            let records = read_audit_values(&hub.audit_path);
-            if http_authorized(hub, &headers, query) {
+            let (limit, offset) = audit_page_bounds(query);
+            let records = read_audit_values_page(&hub.audit_path, limit, offset);
+            if http_authorized(hub, &headers) {
                 (
                     200,
                     "OK",
@@ -959,22 +964,18 @@ where
     Ok(())
 }
 
-fn http_authorized(hub: &Hub, headers: &[(String, String)], query: &str) -> bool {
-    if let Some((_, value)) = headers.iter().find(|(name, _)| name == "authorization") {
-        if let Some(got) = value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "))
-        {
-            if presented_legacy(hub, got.trim()) {
-                return true;
-            }
-        }
-    }
-    query.split('&').any(|pair| {
-        pair.strip_prefix("token=")
-            .map(|value| presented_legacy(hub, value))
-            .unwrap_or(false)
-    })
+fn http_authorized(hub: &Hub, headers: &[(String, String)]) -> bool {
+    // Bearer only — never accept credentials from the URL query string.
+    let Some((_, value)) = headers.iter().find(|(name, _)| name == "authorization") else {
+        return false;
+    };
+    let Some(got) = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+    else {
+        return false;
+    };
+    presented_legacy(hub, got.trim())
 }
 
 fn presented_legacy(hub: &Hub, presented: &str) -> bool {
@@ -1040,16 +1041,28 @@ async fn accept_loop(
     hub: Arc<Hub>,
     shutdown: CancellationToken,
 ) {
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
                 let Ok((tcp, peer)) = accepted else { continue };
+                // Wait for a free slot before spawning so accept cannot runaway.
+                let permit = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    permit = slots.clone().acquire_owned() => {
+                        match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break, // semaphore closed
+                        }
+                    }
+                };
                 tcp.set_nodelay(true).ok();
                 agentlink_core::ws::arm_tcp_liveness(&tcp);
                 let acceptor = acceptor.clone();
                 let hub = hub.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(err) = handle_connection(tcp, peer, acceptor, hub).await {
                         tracing::debug!(%peer, error = %err, "connection closed");
                     }
@@ -1089,7 +1102,7 @@ async fn handle_connection(
         return serve_web_socket(tls, head, &head_text, hub, peer, audit_ip).await;
     }
     if !preview.contains("upgrade: websocket") {
-        return serve_plain_http(&mut tls, &head, &hub, peer).await;
+        return serve_plain_http(&mut tls, &head, &hub, audit_ip).await;
     }
     if !rate_allow(&hub, "ws", audit_ip, 300, 60) {
         return reject_upgrade(&mut tls, 429, "Too Many Requests", "too many connections").await;
@@ -3261,11 +3274,50 @@ fn read_audit(path: &std::path::Path) -> Vec<agentlink_core::audit::AuditRecord>
         .collect()
 }
 
-fn read_audit_values(path: &std::path::Path) -> Vec<serde_json::Value> {
-    read_audit(path)
+/// Parse `limit` / `offset` query params for `/audit/records`. Unknown keys
+/// (including the removed `token=`) are ignored. Limit is clamped to
+/// `[1, AUDIT_RECORDS_MAX_LIMIT]` with default `AUDIT_RECORDS_DEFAULT_LIMIT`.
+fn audit_page_bounds(query: &str) -> (usize, usize) {
+    let mut limit = AUDIT_RECORDS_DEFAULT_LIMIT;
+    let mut offset = 0usize;
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "limit" => {
+                if let Ok(parsed) = value.parse::<usize>() {
+                    limit = parsed.clamp(1, AUDIT_RECORDS_MAX_LIMIT);
+                }
+            }
+            "offset" => {
+                if let Ok(parsed) = value.parse::<usize>() {
+                    offset = parsed;
+                }
+            }
+            _ => {}
+        }
+    }
+    (limit, offset)
+}
+
+/// Newest-last page of audit JSON values. `offset` skips the newest records
+/// (so `offset=0` is the latest page); older pages use larger offsets.
+fn read_audit_values_page(
+    path: &std::path::Path,
+    limit: usize,
+    offset: usize,
+) -> Vec<serde_json::Value> {
+    let mut records: Vec<_> = read_audit(path)
         .into_iter()
         .filter_map(|record| serde_json::to_value(record).ok())
-        .collect()
+        .collect();
+    let end = records.len().saturating_sub(offset);
+    let start = end.saturating_sub(limit);
+    records.drain(..start);
+    records.truncate(end - start);
+    records
 }
 
 fn append_chained_auth(
@@ -3395,7 +3447,9 @@ document.getElementById("filters").addEventListener("submit", async (event) => {
   sessionStorage.setItem("agentlink-audit-token", tokenBox.value);
   const status = document.getElementById("status");
   status.textContent = "loading";
-  const response = await fetch("/audit/records?token=" + encodeURIComponent(tokenBox.value));
+  const response = await fetch("/audit/records?limit=200", {
+    headers: { "Authorization": "Bearer " + tokenBox.value }
+  });
   if (!response.ok) { status.textContent = "rejected (" + response.status + ")"; return; }
   const records = await response.json();
   const node = document.getElementById("node").value.trim();
@@ -4141,8 +4195,8 @@ fn operator_principal(
     }
 }
 
-pub(crate) fn login_allowed(hub: &Hub, peer: SocketAddr) -> bool {
-    rate_allow(hub, "login", peer.ip(), 30, 60)
+pub(crate) fn login_allowed(hub: &Hub, ip: IpAddr) -> bool {
+    rate_allow(hub, "login", ip, 30, 60)
 }
 
 fn rate_bucket_ip_key(ip: IpAddr) -> String {
@@ -4477,7 +4531,7 @@ async fn login_and_enter(
     device_name: String,
     already_checked: bool,
 ) -> Result<()> {
-    if !login_allowed(hub, peer) {
+    if !login_allowed(hub, audit_ip) {
         audit_auth(
             &hub.audit_path,
             "login",
@@ -5450,6 +5504,41 @@ mod proxy_tests {
         assert!(net.contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
         assert!(!net.contains(&"127.0.0.2".parse::<IpAddr>().unwrap()));
         assert!(parse_proxy_cidr("not-a-cidr").is_err());
+    }
+
+    #[test]
+    fn audit_page_bounds_clamps_limit_and_ignores_token() {
+        assert_eq!(
+            audit_page_bounds(""),
+            (AUDIT_RECORDS_DEFAULT_LIMIT, 0)
+        );
+        assert_eq!(audit_page_bounds("limit=50&offset=10"), (50, 10));
+        assert_eq!(
+            audit_page_bounds("limit=99999&token=secret"),
+            (AUDIT_RECORDS_MAX_LIMIT, 0)
+        );
+        assert_eq!(audit_page_bounds("limit=0"), (1, 0));
+        assert_eq!(audit_page_bounds("offset=abc&limit=25"), (25, 0));
+    }
+
+    #[test]
+    fn audit_records_page_returns_newest_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut body = String::new();
+        for i in 0..10 {
+            body.push_str(&format!(
+                "{{\"seq\":{i},\"ts\":\"t{i}\",\"node_id\":\"n\",\"node_name\":\"n\",\"client_id\":\"c\",\"category\":\"op\",\"op\":\"op{i}\",\"result\":\"ok\",\"duration_ms\":0,\"prev_hash\":\"0\",\"hash\":\"{i}\"}}\n"
+            ));
+        }
+        std::fs::write(&path, body).unwrap();
+        let page = read_audit_values_page(&path, 3, 0);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0]["op"], "op7");
+        assert_eq!(page[2]["op"], "op9");
+        let older = read_audit_values_page(&path, 3, 3);
+        assert_eq!(older[0]["op"], "op4");
+        assert_eq!(older[2]["op"], "op6");
     }
 }
 
