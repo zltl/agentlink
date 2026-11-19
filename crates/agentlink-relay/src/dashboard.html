@@ -499,89 +499,16 @@
     flex-direction: column;
     padding-bottom: max(8px, env(safe-area-inset-bottom));
   }
-  body.in-session main {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-  }
-  .session {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    min-height: 0;
-    min-width: 0;
-  }
-  #term-pane, #files-pane {
-    flex: 1 1 auto;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .session-bar {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    min-width: 0;
-  }
-  .session-bar h2 {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .session-bar .ghost { width: auto; flex: none; }
-  .session-status { margin: 0; }
-  .term-screen {
-    flex: 1 1 0px;
-    min-height: 0;
-    overflow: auto;
-    overscroll-behavior: contain;
-    touch-action: pan-x pan-y;
-    background: var(--ink);
-    color: var(--cyan-soft);
-    border: 2px solid var(--ink);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow);
-    padding: 10px 12px;
-    font: 14px/1.35 var(--mono);
-    cursor: text;
-    scrollbar-color: var(--cyan) var(--ink);
-    -webkit-overflow-scrolling: touch;
-  }
-  .term-screen * { touch-action: pan-x pan-y; }
-  .term-line { white-space: pre; min-height: 1.35em; }
-  .term-cursor {
-    background: var(--cyan);
-    color: var(--ink);
-  }
-  .term-probe {
-    position: absolute;
-    visibility: hidden;
-    pointer-events: none;
-    font: 14px/1.35 var(--mono);
-  }
-  .composer, .path-form, .file-tools {
-    display: flex;
-    gap: 8px;
-    align-items: stretch;
-    min-width: 0;
-  }
-  .composer input, .path-form input { flex: 1 1 auto; min-width: 0; }
-  .composer button, .path-form button, .file-tools button { width: auto; flex: 0 0 auto; }
-  .composer button[aria-pressed="true"] { background: var(--cyan); }
-  .file-list {
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow: auto;
-    display: grid;
-    gap: 8px;
-    align-content: start;
-    -webkit-overflow-scrolling: touch;
-  }
+
+
+
+
+
+
+
+
+
+
   .file-tools { flex-wrap: wrap; }
   .file-row {
     display: flex;
@@ -624,7 +551,7 @@
     font: 0.92rem/1.45 var(--mono);
   }
   @media (prefers-reduced-motion: reduce) {
-    .term-cursor { outline: 2px solid var(--cyan); background: transparent; color: inherit; }
+  
   }
   body:has(#login-view:not([hidden])) .shell {
     min-height: 100dvh;
@@ -877,44 +804,20 @@
   const ZH = (navigator.language || "").toLowerCase().startsWith("zh");
   const COPY = {
     en: {
-      "card.desktop": "Desktop",
-      "card.viewOnly": "View only",
       "card.headless": "Headless",
       "card.headlessNote": "Headless · shell & files only.",
-      "card.screenshotsOnly": "Screenshots only · no live screen.",
-      "card.screenNoAccess": "Screen detected · desktop access is off.",
-      "card.noAccessUnknown": "Desktop access is off.",
       "card.offline": "Offline · last seen {time}.",
-      "card.opening": "Opening…",
-      "card.forbidden": "Desktop is off for this account.",
-      "card.rate": "Too many attempts. Try again in {seconds}s.",
-      "card.error": "Couldn't open the desktop.",
-      "card.terminal": "Terminal",
-      "card.files": "Files",
       "card.guide": "Guide",
       "card.guideCopied": "Copied",
       "aria.guide": "Open the documentation-only guide for {node}.",
-      "aria.desktop": "Open desktop for {node}. Starts watching."
     },
     zh: {
-      "card.desktop": "桌面",
-      "card.viewOnly": "仅观看",
       "card.headless": "无屏幕",
       "card.headlessNote": "无屏幕 · 仅终端和文件。",
-      "card.screenshotsOnly": "仅支持截图，没有实时画面。",
-      "card.screenNoAccess": "检测到屏幕 · 桌面访问未开启。",
-      "card.noAccessUnknown": "桌面访问未开启。",
       "card.offline": "离线 · 最后在线 {time}。",
-      "card.opening": "正在打开…",
-      "card.forbidden": "此账号未开启桌面。",
-      "card.rate": "尝试次数过多，请 {seconds} 秒后再试。",
-      "card.error": "无法打开桌面。",
-      "card.terminal": "终端",
-      "card.files": "文件",
       "card.guide": "指南",
       "card.guideCopied": "已复制",
       "aria.guide": "打开 {node} 的使用指南（仅文档）。",
-      "aria.desktop": "打开 {node} 的桌面。进入观看。"
     }
   };
   function t(key, vars) {
