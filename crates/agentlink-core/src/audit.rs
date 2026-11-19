@@ -1752,12 +1752,17 @@ pub fn select_from_jsonl(path: &Path, filter: &AuditFilter) -> Vec<AuditRecord> 
     page_from_jsonl(path, limit, 0, |record| filter.matches(record))
 }
 
+/// Hard ceiling for a single `audit.jsonl` line. Oversized lines are skipped
+/// so a hostile/corrupt multi-megabyte record cannot force an unbounded alloc
+/// through `BufRead::lines()`.
+pub const MAX_AUDIT_LINE_BYTES: usize = 1024 * 1024;
+
 /// Newest-last page over a streamed `audit.jsonl`.
 ///
 /// Records are scanned oldest→newest. Only rows that pass `keep` enter a ring
 /// of capacity `limit + offset`. The newest `offset` matches are then dropped,
-/// leaving at most `limit` rows. Memory is `O(limit + offset)`, independent of
-/// file length — callers must clamp `offset` themselves for DoS control.
+/// leaving at most `limit` rows. Memory is `O(limit + offset + MAX_AUDIT_LINE_BYTES)`,
+/// independent of file length — callers must clamp `offset` themselves for DoS control.
 pub fn page_from_jsonl(
     path: &Path,
     limit: usize,
@@ -1772,24 +1777,18 @@ pub fn page_from_jsonl(
     };
     let cap = limit.saturating_add(offset);
     let mut ring: VecDeque<AuditRecord> = VecDeque::with_capacity(cap.min(4_096));
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<AuditRecord>(&line) else {
-            continue;
+    for_each_bounded_jsonl_line(file, |line| {
+        let Ok(record) = serde_json::from_str::<AuditRecord>(line) else {
+            return;
         };
         if !keep(&record) {
-            continue;
+            return;
         }
         if ring.len() == cap {
             ring.pop_front();
         }
         ring.push_back(record);
-    }
+    });
     for _ in 0..offset {
         if ring.pop_back().is_none() {
             break;
@@ -1806,23 +1805,101 @@ pub fn chain_tip_from_jsonl(path: &Path) -> (u64, String) {
     let Ok(file) = File::open(path) else {
         return (seq, hash);
     };
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<AuditRecord>(&line) else {
-            continue;
+    for_each_bounded_jsonl_line(file, |line| {
+        let Ok(record) = serde_json::from_str::<AuditRecord>(line) else {
+            return;
         };
         if record.hash == "off" {
-            continue;
+            return;
         }
         seq = record.seq;
-        hash = record.hash;
-    }
+        hash = record.hash.clone();
+    });
     (seq, hash)
+}
+
+/// Invoke `on_line` for each UTF-8 JSONL record whose encoded size is at most
+/// [`MAX_AUDIT_LINE_BYTES`]. Larger lines are discarded without retaining them.
+fn for_each_bounded_jsonl_line(file: File, mut on_line: impl FnMut(&str)) {
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::with_capacity(4_096);
+    loop {
+        buf.clear();
+        match read_bounded_line(&mut reader, &mut buf, MAX_AUDIT_LINE_BYTES) {
+            Ok(BoundedLine::Eof) => break,
+            Ok(BoundedLine::SkippedOversized) => continue,
+            Ok(BoundedLine::Line) => {
+                let text = match std::str::from_utf8(&buf) {
+                    Ok(text) => text.trim_end_matches(['\r', '\n']),
+                    Err(_) => continue,
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                on_line(text);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+enum BoundedLine {
+    Line,
+    SkippedOversized,
+    Eof,
+}
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<BoundedLine> {
+    loop {
+        let available = {
+            let data = reader.fill_buf()?;
+            if data.is_empty() {
+                return Ok(if buf.is_empty() {
+                    BoundedLine::Eof
+                } else if buf.len() > max {
+                    BoundedLine::SkippedOversized
+                } else {
+                    BoundedLine::Line
+                });
+            }
+            data
+        };
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if buf.len() + pos > max {
+                reader.consume(take);
+                buf.clear();
+                return Ok(BoundedLine::SkippedOversized);
+            }
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            return Ok(BoundedLine::Line);
+        }
+        if buf.len() + available.len() > max {
+            // Drop this chunk and keep discarding until the newline.
+            let n = available.len();
+            reader.consume(n);
+            let mut discard = [0u8; 8_192];
+            loop {
+                let n = std::io::Read::read(reader, &mut discard)?;
+                if n == 0 {
+                    buf.clear();
+                    return Ok(BoundedLine::SkippedOversized);
+                }
+                if discard[..n].contains(&b'\n') {
+                    buf.clear();
+                    return Ok(BoundedLine::SkippedOversized);
+                }
+            }
+        }
+        let n = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(n);
+    }
 }
 
 const WEBHOOK_QUEUE_CAP: usize = 64;
@@ -2673,5 +2750,24 @@ mod tests {
         let (seq, hash) = chain_tip_from_jsonl(&path);
         assert_eq!(seq, 29);
         assert_eq!(hash, format!("{:064x}", 29));
+    }
+
+    #[test]
+    fn oversized_jsonl_line_is_skipped_without_huge_alloc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // One hostile line larger than the cap, then a normal record.
+        let mut body = vec![b'x'; MAX_AUDIT_LINE_BYTES + 64];
+        body.push(b'\n');
+        body.extend_from_slice(
+            br#"{"seq":1,"ts":"t","node_id":"n","node_name":"n","client_id":"c","category":"op","op":"ok","result":"ok","duration_ms":0,"prev_hash":"0","hash":"1"}
+"#,
+        );
+        std::fs::write(&path, &body).unwrap();
+        let page = page_from_jsonl(&path, 10, 0, |_| true);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].op, "ok");
+        // Reader buffer never retained the oversized line as a String.
+        assert!(MAX_AUDIT_LINE_BYTES < body.len());
     }
 }
