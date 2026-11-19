@@ -23,6 +23,8 @@ mod fonts;
 mod indicator;
 #[cfg(not(target_env = "musl"))]
 mod term;
+#[cfg(not(target_env = "musl"))]
+mod term_local_echo;
 mod theme;
 #[cfg(not(target_env = "musl"))]
 mod field_pad;
