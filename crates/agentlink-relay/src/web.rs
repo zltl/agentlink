@@ -1,10 +1,11 @@
-//! Browser login, the machine dashboard, and enrollment.
+//! Browser login, machine dashboard (info), and enrollment.
 //!
-//! `GET /` is the management UI. `GET /view` stays the desktop viewer.
-//! `GET /v1/web` upgrades a dashboard session into a file and terminal socket.
-//! Both pages use the same local accounts as the CLI and the Android app. The
-//! browser keeps an HttpOnly session cookie; device-bound access and refresh
-//! tokens stay on the CLI and the phone. Nothing on the page is loaded from a CDN.
+//! `GET /` is the management UI: account session, machine list, enroll tokens,
+//! install links, and documentation deep-links. It is **not** a controller —
+//! shell / files / desktop / PTY are sealed-client only. `GET /v1/web` and
+//! view-ticket minting are retired (410). `GET /view` serves a notice page.
+//! The browser keeps an HttpOnly session cookie; device-bound access and
+//! refresh tokens stay on the CLI and the phone. Nothing is loaded from a CDN.
 
 use agentlink_core::accounts::WEB_TTL_SECS;
 use agentlink_core::util::{self, unix_now};
@@ -90,12 +91,13 @@ pub async fn handle(
         ("POST", "/api/tokens/revoke") => Ok(Some(WebOutcome::Reply(
             revoke_token(hub, headers, body).await?,
         ))),
-        ("POST", "/api/view-ticket") => Ok(Some(WebOutcome::Reply(
-            view_ticket(hub, headers, body, audit_ip).await?,
-        ))),
-        ("POST", "/api/view-ticket/revoke") => Ok(Some(WebOutcome::Reply(
-            revoke_view_ticket(hub, headers, body).await?,
-        ))),
+        ("POST", "/api/view-ticket") | ("POST", "/api/view-ticket/revoke") => {
+            Ok(Some(WebOutcome::Reply(text(
+                410,
+                "Gone",
+                "browser view tickets are disabled; use a sealed client with a node-local grant",
+            ))))
+        }
         ("POST", "/api/ice") => Ok(Some(WebOutcome::Reply(
             ice_config(hub, headers, body, audit_ip).await?,
         ))),
@@ -119,9 +121,9 @@ pub async fn handle(
             Ok(Some(WebOutcome::Reply(dashboard_page())))
         }
         ("GET", WS_WEB_PATH) => Ok(Some(WebOutcome::Reply(text(
-            426,
-            "Upgrade Required",
-            "terminal and files use a websocket",
+            410,
+            "Gone",
+            "browser control is disabled; use a sealed client with a node-local grant",
         )))),
         ("GET", path) if path.starts_with("/dl/") => Ok(Some(download(hub, path, headers, head))),
         _ => Ok(None),
@@ -400,6 +402,7 @@ async fn revoke_token(hub: &Hub, headers: &[(String, String)], body: &[u8]) -> R
     }
 }
 
+#[allow(dead_code)] // retired: route returns 410 before calling
 async fn view_ticket(
     hub: &Hub,
     headers: &[(String, String)],
@@ -434,6 +437,7 @@ async fn view_ticket(
     }
 }
 
+#[allow(dead_code)] // retired: route returns 410 before calling
 async fn revoke_view_ticket(
     hub: &Hub,
     headers: &[(String, String)],
@@ -1165,12 +1169,6 @@ mod tests {
         assert!(!text.contains("data-mode"));
         assert!(!text.contains(">View<"));
         assert!(!text.contains(">Control<"));
-        assert!(text.contains("control: false"));
-        assert!(text.contains("start=watch"));
-        assert!(text.contains("View only"));
-        assert!(text.contains("仅观看"));
-        assert!(text.contains("Screenshots only"));
-        assert!(text.contains("aria-pressed"));
         assert!(!text.contains("type = \"checkbox\""));
         assert!(!text.contains("type=\"checkbox\""));
         assert!(text.contains("has_display"));
@@ -1179,16 +1177,12 @@ mod tests {
         assert!(!text.contains("id=\"term-screen\""));
         assert!(!text.contains("id=\"term-input\""));
         assert!(!text.contains("id=\"files-pane\""));
-        assert!(text.contains("/v1/web"));
-        assert!(text.contains("overscroll-behavior: contain"));
-        assert!(text.contains("touch-action: pan-x pan-y"));
-        assert!(text.contains("const SCROLLBACK = 1000"));
-        // Dashboard term must consume charset designators (ESC ( B); otherwise
-        // procps `top` prints a literal B on every attribute reset and looks broken.
-        assert!(text.contains("esc-int"));
-        assert!(text.contains("()*+-.%/"));
-        assert!(text.contains("view.reverse"));
-        assert!(text.contains(r#"code === "7""#));
+        // t544: no shipped browser controller client.
+        assert!(!text.contains("/v1/web"));
+        assert!(!text.contains("/api/view-ticket"));
+        assert!(!text.contains("createTerm"));
+        assert!(!text.contains("new WebSocket"));
+        assert!(text.contains("openGuide"));
         assert!(text.contains("/download/agentlink.apk"));
         assert!(text.contains("viewport-fit=cover"));
         assert!(text.contains("safe-area-inset"));

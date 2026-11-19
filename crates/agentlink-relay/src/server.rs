@@ -1095,11 +1095,16 @@ async fn handle_connection(
     let preview = head_text.to_ascii_lowercase();
     let (_, path, _) = request_line(&head_text);
     if path == WS_WEB_PATH && preview.contains("upgrade: websocket") {
-        if !rate_allow(&hub, "ws", audit_ip, 300, 60) {
-            return reject_upgrade(&mut tls, 429, "Too Many Requests", "too many connections")
-                .await;
-        }
-        return serve_web_socket(tls, head, &head_text, hub, peer, audit_ip).await;
+        // t544: browser controller socket is retired. Do not mint a web principal
+        // (operator:true) even for a valid dashboard cookie — info/account stay
+        // on HTTP; sealed clients use /v1/connect.
+        return reject_upgrade(
+            &mut tls,
+            410,
+            "Gone",
+            "browser control is disabled; use a sealed client with a node-local grant",
+        )
+        .await;
     }
     if !preview.contains("upgrade: websocket") {
         return serve_plain_http(&mut tls, &head, &hub, audit_ip).await;
@@ -1430,9 +1435,9 @@ where
     Ok(())
 }
 
-/// Dashboard socket. The browser has no device key; the session cookie is the
-/// credential, and the CSRF value travels in the query because a browser
-/// WebSocket cannot set `X-CSRF-Token`.
+/// Former dashboard control socket. Kept for reference / tests; production
+/// admission refuses `/v1/web` upgrades with 410 before this runs.
+#[allow(dead_code)]
 async fn serve_web_socket(
     mut tls: tokio_rustls::server::TlsStream<TcpStream>,
     head: Vec<u8>,

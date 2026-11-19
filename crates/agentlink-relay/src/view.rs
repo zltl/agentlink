@@ -1,6 +1,7 @@
-//! Browser viewer for a remote desktop. The page is served on the relay's TLS
-//! port. Signaling uses the same JSON envelopes as `/v1/connect`, on
-//! `/v1/webrtc`. Picture bytes are WebRTC between the browser and the node.
+//! Retired browser desktop viewer notice page (`GET /view`).
+//!
+//! Control from the browser is disabled. This module only serves a static
+//! explanation; it does not mint tickets, open WebRTC, or inject input.
 
 use serde_json::json;
 

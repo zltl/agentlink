@@ -237,13 +237,15 @@ nginx does not forward that UDP. Behind the proxy above, clients punch `relay.ex
 - forward public UDP 443 to the relay's UDP port, or
 - give clients a relay URL whose port is a UDP port that really reaches the relay (`wss://relay.example.com:7443` dials TCP 7443 as well, so that only works when TCP and UDP are both open on 7443).
 
-When the punch or the QUIC handshake fails, the copy continues on the relay WebSocket. The transfer's transport is `quic` or `relay`. The open UDP socket is only for learning a reflexive address. It does not carry file bytes or desktop media in the clear. WebRTC picture bytes are separate: they are DTLS-SRTP between the viewer and the node, using host candidates, the STUN list in the next section, and, off the LAN, a TURN server you run yourself. The relay does not carry those picture bytes and does not need UDP for them. If ICE fails, the browser viewer falls back to JPEG screenshots on the sealed `screenshot` invoke over the TCP websocket.
+When the punch or the QUIC handshake fails, the copy continues on the relay WebSocket. The transfer's transport is `quic` or `relay`. The open UDP socket is only for learning a reflexive address. It does not carry file bytes or desktop media in the clear. WebRTC picture bytes for **sealed clients** are DTLS-SRTP between the client and the node, using host candidates, the STUN list in the next section, and, off the LAN, a TURN server you run yourself. The relay does not carry those picture bytes and does not need UDP for them.
 
-## Desktop viewer (STUN and TURN)
+## STUN and TURN (sealed clients)
 
-`GET /view/config.json` is unauthenticated. It tells the browser which ICE server URLs to use. It does not include a TURN username or credential. The node uses the same STUN list when an offer arrives without `ice_servers`.
+Browser control (`/v1/web`, view tickets, `/view` desktop) is **retired**. The dashboard is account/info/enroll only. STUN/TURN configuration still matters for native desktop/phone WebRTC.
 
-Short-lived credentials come from `POST /api/ice`. The caller must present a valid view ticket (before the first redeem, or with the session id the redeem returned) or a logged-in dashboard cookie plus the CSRF header. The response is the ICE document plus a coturn REST credential: `username` is `<expiry unix>:<user id>`, `credential` is base64(HMAC-SHA1(secret, username)). TTL is clamped to 5–15 minutes. The default is 10 minutes.
+`GET /view/config.json` is unauthenticated. It advertises ICE server **URLs only** (no TURN username or credential). The node uses the same STUN list when an offer arrives without `ice_servers`.
+
+Short-lived credentials come from `POST /api/ice`. With tickets gone, a logged-in dashboard cookie plus CSRF can still mint REST credentials for tooling; sealed clients should prefer their own device auth paths. The response is the ICE document plus a coturn REST credential: `username` is `<expiry unix>:<user id>`, `credential` is base64(HMAC-SHA1(secret, username)). TTL is clamped to 5–15 minutes. The default is 10 minutes.
 
 | Variable | When it is unset |
 | --- | --- |
@@ -285,9 +287,9 @@ sudo systemctl restart agentlink-relay
 
 Leaving `AGENTLINK_STUN_URLS` unset is enough for the public STUN defaults. An empty `stun` array in `/view/config.json` means the variable was set to an empty value, not that it was forgotten. IP addresses in `AGENTLINK_TURN_URLS` are used as written. `turn_auth` in that JSON is `rest` when a secret is configured, `unconfigured` when TURN URLs exist without a secret, and `none` when there is no TURN URL.
 
-Live video is DTLS-SRTP between the viewer and the node. It is not the agentlink end-to-end payload cipher. The Connection menu is Auto or Relay only, remembered in the browser. Auto tries paths in order and stops at the first one that connects: host (about 3s), then each STUN server on its own (gather capped at 2.5s, so a dead server is skipped instead of waiting out STUN retransmits), then each TURN URL over UDP, then TURN TCP. Relay only skips host and STUN and sets `iceTransportPolicy` to `relay` (Force TURN). The offer carries `ice_path` and those servers, and the node gathers the same path. The banner names the path that connected (`via host`, `via STUN`, `via TURN udp`, `via TURN tcp`). If every path fails, the page polls a JPEG screenshot through the sealed `screenshot` invoke and the banner says so. A literal address in `198.18.0.0/15` is not contacted; that range is not a reachable STUN or TURN server.
+Live video for sealed clients is DTLS-SRTP between the client and the node. It is not the agentlink end-to-end payload cipher. A literal address in `198.18.0.0/15` is not contacted; that range is not a reachable STUN or TURN server.
 
-A desktop link minted from the dashboard or `agentlink view` is view-only unless Control / `--control` is set. Input still requires remote control on the account grant. The first websocket redeem binds the ticket to a browser session. A second visitor with the bare ticket is rejected. The bound session can reconnect until expiry. `POST /api/view-ticket/revoke` drops a ticket or every ticket for a node.
+`POST /api/view-ticket` and `/api/view-ticket/revoke` return **410 Gone**. `GET /v1/web` upgrades are refused. `agentlink view` does not open a browser controller. Use a sealed CLI/phone client after a node-local grant.
 
 ## Legacy admin token
 

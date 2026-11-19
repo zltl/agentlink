@@ -4,11 +4,12 @@
 //! them, stores pairing, and routes operation envelopes. It terminates TLS,
 //! so it is a trusted part of a deployment: run it on a host you control.
 //!
-//! `/v1/connect` is the control socket. `/v1/webrtc` speaks the same JSON
-//! envelopes for a browser viewer. `/v1/web` is the dashboard session for
-//! files and a terminal. `GET /view` serves the desktop page. `GET /operate`
-//! serves the documentation-only node guide. `GET /` is the machine dashboard.
-//! Media is peer-to-peer WebRTC, not a relay frame.
+//! `/v1/connect` is the sealed-client control socket (CLI / phone / node).
+//! Browser pages are **info and account only**: `GET /` (dashboard), login,
+//! enroll tokens, audit, install downloads, and `GET /operate` (docs).
+//! Former browser control paths (`/v1/web`, view tickets, `/view` desktop)
+//! are retired fail-closed (410 / notice). Neutral authenticated relay and
+//! WebRTC signaling for sealed clients remain. Media is peer-to-peer WebRTC.
 
 #![deny(unsafe_code)]
 

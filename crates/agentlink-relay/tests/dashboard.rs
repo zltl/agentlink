@@ -345,7 +345,10 @@ async fn bob_cannot_mint_view_ticket_for_alice_node() {
     )
     .await;
     assert!(
-        denied.contains("403") || denied.contains("404") || denied.contains("not found"),
+        denied.contains("410")
+            || denied.contains("403")
+            || denied.contains("404")
+            || denied.contains("not found"),
         "{denied}"
     );
     assert!(!body_of(&denied).contains("\"ticket\""), "{denied}");
