@@ -6,8 +6,9 @@
 //! session. The egui view is our own (the `egui_term` crate talks to a
 //! local PTY backend we cannot use here).
 //!
-//! Speculative local echo (faint overlay) lives in
-//! [`super::term_local_echo`] — predictions never enter this grid.
+//! Local-echo bookkeeping lives in [`super::term_local_echo`]. The shipped
+//! safe default **never paints** unconfirmed glyphs (no speculative overlay);
+//! the UI waits for remote echo. See that module’s privacy docs.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,7 +99,7 @@ pub struct Emulator {
     /// GUI keystrokes already taken this frame (so show() does not double-read).
     keys_taken: bool,
     pending_gui_writes: Vec<u8>,
-    /// Faint speculative local echo (mosh-style overlay; remote grid stays authoritative).
+    /// Local-echo expects (safe default: never painted; remote grid authoritative).
     local_echo: SpeculativeEcho,
 }
 
