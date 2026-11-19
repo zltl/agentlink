@@ -151,13 +151,23 @@ async fn dashboard_lists_only_the_callers_machines_and_mints_one_install_command
     let issued: serde_json::Value = serde_json::from_str(body_of(&created)).unwrap();
     let command = issued["command"].as_str().unwrap();
     assert_eq!(issued["linux"], issued["command"]);
-    assert!(command.starts_with(&format!("curl -fsSL https://{host}/install.sh | sh -s -- ")));
+    assert!(
+        command.starts_with(&format!(
+            "curl -fsSL https://{host}/install.sh | env AGENTLINK_TOKEN="
+        )),
+        "{command}"
+    );
+    assert!(command.contains(" sh -s -- "), "{command}");
     assert!(command.contains("--name 'lab top'"), "{command}");
     assert!(command.contains("--access 'desktop'"), "{command}");
     assert!(command.contains("--max-access 'desktop'"), "{command}");
     assert!(
         command.contains(issued["token"].as_str().unwrap()),
         "{command}"
+    );
+    assert!(
+        !command.contains("--token "),
+        "token must ride env, not argv: {command}"
     );
     assert_eq!(issued["relay"], format!("wss://{host}"));
     assert_eq!(issued["trust"], "");
