@@ -5,7 +5,10 @@
 //! `agentlink_node::audit::submit`. This module decides what is stored. It does
 //! not open files; the node and the relay do.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 
@@ -1735,6 +1738,88 @@ pub fn select(records: &[AuditRecord], filter: &AuditFilter) -> Vec<AuditRecord>
     out
 }
 
+/// Stream `audit.jsonl` and keep the newest matching records.
+///
+/// Memory is `O(limit)` (default 200), never the full file size. Prefer this
+/// over loading the whole log into a `Vec` before filtering.
+pub fn select_from_jsonl(path: &Path, filter: &AuditFilter) -> Vec<AuditRecord> {
+    let limit = if filter.limit == 0 { 200 } else { filter.limit };
+    page_from_jsonl(path, limit, 0, |record| filter.matches(record))
+}
+
+/// Newest-last page over a streamed `audit.jsonl`.
+///
+/// Records are scanned oldest→newest. Only rows that pass `keep` enter a ring
+/// of capacity `limit + offset`. The newest `offset` matches are then dropped,
+/// leaving at most `limit` rows. Memory is `O(limit + offset)`, independent of
+/// file length — callers must clamp `offset` themselves for DoS control.
+pub fn page_from_jsonl(
+    path: &Path,
+    limit: usize,
+    offset: usize,
+    mut keep: impl FnMut(&AuditRecord) -> bool,
+) -> Vec<AuditRecord> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let cap = limit.saturating_add(offset);
+    let mut ring: VecDeque<AuditRecord> = VecDeque::with_capacity(cap.min(4_096));
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<AuditRecord>(&line) else {
+            continue;
+        };
+        if !keep(&record) {
+            continue;
+        }
+        if ring.len() == cap {
+            ring.pop_front();
+        }
+        ring.push_back(record);
+    }
+    for _ in 0..offset {
+        if ring.pop_back().is_none() {
+            break;
+        }
+    }
+    ring.into_iter().collect()
+}
+
+/// Last chained audit tip (`seq`, `hash`) without buffering the full log.
+/// Records with `hash == "off"` are skipped. Missing files yield the genesis tip.
+pub fn chain_tip_from_jsonl(path: &Path) -> (u64, String) {
+    let mut seq = 0u64;
+    let mut hash = "0".repeat(64);
+    let Ok(file) = File::open(path) else {
+        return (seq, hash);
+    };
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<AuditRecord>(&line) else {
+            continue;
+        };
+        if record.hash == "off" {
+            continue;
+        }
+        seq = record.seq;
+        hash = record.hash;
+    }
+    (seq, hash)
+}
+
 const WEBHOOK_QUEUE_CAP: usize = 64;
 
 /// POST an alert without blocking the operation that produced it.
@@ -2548,5 +2633,40 @@ mod tests {
                 "preset = \"standard\"\nlock_local = false\n[retention]\nmax_log_bytes = 1073741824\n"
             )
             .is_err());
+    }
+
+    #[test]
+    fn page_from_jsonl_filters_before_paging_and_chain_tip_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut body = String::new();
+        for i in 0..30u64 {
+            let user = if i % 3 == 0 { "alice" } else { "bob" };
+            body.push_str(&format!(
+                "{{\"seq\":{i},\"ts\":\"t{i}\",\"node_id\":\"n\",\"node_name\":\"n\",\"client_id\":\"c\",\"category\":\"op\",\"op\":\"op{i}\",\"result\":\"ok\",\"duration_ms\":0,\"prev_hash\":\"0\",\"hash\":\"{i:064x}\",\"user\":\"{user}\"}}\n"
+            ));
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        let alice = page_from_jsonl(&path, 4, 0, |r| r.user.as_deref() == Some("alice"));
+        assert_eq!(alice.len(), 4);
+        assert_eq!(
+            alice.iter().map(|r| r.op.as_str()).collect::<Vec<_>>(),
+            vec!["op18", "op21", "op24", "op27"]
+        );
+
+        let filter = AuditFilter {
+            user: Some("bob".into()),
+            limit: 3,
+            ..AuditFilter::default()
+        };
+        let bob = select_from_jsonl(&path, &filter);
+        assert_eq!(bob.len(), 3);
+        assert!(bob.iter().all(|r| r.user.as_deref() == Some("bob")));
+        assert_eq!(bob[2].op, "op29");
+
+        let (seq, hash) = chain_tip_from_jsonl(&path);
+        assert_eq!(seq, 29);
+        assert_eq!(hash, format!("{:064x}", 29));
     }
 }

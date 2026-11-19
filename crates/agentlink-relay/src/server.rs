@@ -41,8 +41,11 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1_024;
 /// Default / hard ceiling for HTTP `GET /audit/records` pages.
 const AUDIT_RECORDS_DEFAULT_LIMIT: usize = 200;
 const AUDIT_RECORDS_MAX_LIMIT: usize = 1_000;
+/// Hard ceiling for `offset` so the streamed ring (`limit + offset`) stays bounded.
+const AUDIT_RECORDS_MAX_OFFSET: usize = 10_000;
 
 static STALE_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+static MAX_CONN_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 
 /// Shorten the stale-socket reaper for tests. `None` restores 75s.
 ///
@@ -54,6 +57,19 @@ pub fn set_stale_after_for_test(stale: Option<Duration>) {
         stale.map(|d| d.as_millis() as u64).unwrap_or(0),
         Ordering::SeqCst,
     );
+}
+
+/// Override [`MAX_CONCURRENT_CONNECTIONS`] for tests. `None` restores 1024.
+#[doc(hidden)]
+pub fn set_max_concurrent_connections_for_test(max: Option<usize>) {
+    MAX_CONN_OVERRIDE.store(max.map(|n| n as u64).unwrap_or(0), Ordering::SeqCst);
+}
+
+fn max_concurrent_connections() -> usize {
+    match MAX_CONN_OVERRIDE.load(Ordering::SeqCst) {
+        0 => MAX_CONCURRENT_CONNECTIONS,
+        n => n as usize,
+    }
 }
 
 fn stale_after() -> Duration {
@@ -1026,7 +1042,7 @@ async fn accept_loop(
     hub: Arc<Hub>,
     shutdown: CancellationToken,
 ) {
-    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let slots = Arc::new(Semaphore::new(max_concurrent_connections()));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -2615,8 +2631,11 @@ async fn handle_client(
             }
             let parsed: agentlink_core::audit::AuditFilter =
                 serde_json::from_value(filter).unwrap_or_default();
-            let mut records = agentlink_core::audit::select(&read_audit(&hub.audit_path), &parsed);
-            if !principal.admin {
+            // Visibility sets are resolved first so the JSONL scan can filter
+            // before retaining — never load the whole audit file into memory.
+            let visibility = if principal.admin {
+                None
+            } else {
                 let visible = hub
                     .db
                     .visible(&caller_of(principal))
@@ -2630,16 +2649,25 @@ async fn handle_client(
                     .await
                     .unwrap_or_default();
                 let agent_ids: Vec<String> = agents.into_iter().map(|client| client.id).collect();
-                records.retain(|record| {
-                    record_visible(
-                        record,
-                        &principal.user,
-                        &node_ids,
-                        &agent_ids,
-                        &principal.device_id,
-                    )
-                });
-            }
+                Some((principal.user.clone(), node_ids, agent_ids, principal.device_id.clone()))
+            };
+            let limit = if parsed.limit == 0 { 200 } else { parsed.limit };
+            let records = agentlink_core::audit::page_from_jsonl(
+                &hub.audit_path,
+                limit,
+                0,
+                |record| {
+                    if !parsed.matches(record) {
+                        return false;
+                    }
+                    match &visibility {
+                        None => true,
+                        Some((user, node_ids, agent_ids, device_id)) => {
+                            record_visible(record, user, node_ids, agent_ids, device_id)
+                        }
+                    }
+                },
+            );
             let records = records
                 .into_iter()
                 .filter_map(|record| serde_json::to_value(record).ok())
@@ -3250,18 +3278,9 @@ async fn fanout_admins(hub: &Hub, env: &Envelope) {
     }
 }
 
-fn read_audit(path: &std::path::Path) -> Vec<agentlink_core::audit::AuditRecord> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
-}
-
 fn audit_records_json(path: &std::path::Path, query: &str) -> String {
     let (limit, offset) = audit_page_bounds(query);
-    let records = read_audit_values_page(path, limit, offset);
+    let records = read_audit_values_page(path, limit, offset, None);
     serde_json::to_string(&records).unwrap_or_else(|_| "[]".into())
 }
 
@@ -3271,21 +3290,21 @@ fn audit_records_json_for_session(
     session: &crate::models::WebSession,
 ) -> String {
     let (limit, offset) = audit_page_bounds(query);
-    let records = read_audit_values_page(path, limit, offset);
-    if session.role == "admin" {
-        return serde_json::to_string(&records).unwrap_or_else(|_| "[]".into());
-    }
-    let user = session.user.as_str();
-    let visible: Vec<_> = records
-        .into_iter()
-        .filter(|row| row.get("user").and_then(|value| value.as_str()) == Some(user))
-        .collect();
-    serde_json::to_string(&visible).unwrap_or_else(|_| "[]".into())
+    // Non-admin sessions filter by user *while* streaming so a sparse user
+    // still receives a full page and memory stays O(limit+offset).
+    let user_filter = if session.role == "admin" {
+        None
+    } else {
+        Some(session.user.as_str())
+    };
+    let records = read_audit_values_page(path, limit, offset, user_filter);
+    serde_json::to_string(&records).unwrap_or_else(|_| "[]".into())
 }
 
 /// Parse `limit` / `offset` query params for `/audit/records`. Unknown keys
 /// (including the removed `token=`) are ignored. Limit is clamped to
 /// `[1, AUDIT_RECORDS_MAX_LIMIT]` with default `AUDIT_RECORDS_DEFAULT_LIMIT`.
+/// Offset is clamped to `[0, AUDIT_RECORDS_MAX_OFFSET]`.
 fn audit_page_bounds(query: &str) -> (usize, usize) {
     let mut limit = AUDIT_RECORDS_DEFAULT_LIMIT;
     let mut offset = 0usize;
@@ -3302,7 +3321,7 @@ fn audit_page_bounds(query: &str) -> (usize, usize) {
             }
             "offset" => {
                 if let Ok(parsed) = value.parse::<usize>() {
-                    offset = parsed;
+                    offset = parsed.min(AUDIT_RECORDS_MAX_OFFSET);
                 }
             }
             _ => {}
@@ -3313,20 +3332,20 @@ fn audit_page_bounds(query: &str) -> (usize, usize) {
 
 /// Newest-last page of audit JSON values. `offset` skips the newest records
 /// (so `offset=0` is the latest page); older pages use larger offsets.
+/// When `user` is `Some`, only that user's rows enter the page ring.
 fn read_audit_values_page(
     path: &std::path::Path,
     limit: usize,
     offset: usize,
+    user: Option<&str>,
 ) -> Vec<serde_json::Value> {
-    let mut records: Vec<_> = read_audit(path)
-        .into_iter()
-        .filter_map(|record| serde_json::to_value(record).ok())
-        .collect();
-    let end = records.len().saturating_sub(offset);
-    let start = end.saturating_sub(limit);
-    records.drain(..start);
-    records.truncate(end - start);
-    records
+    agentlink_core::audit::page_from_jsonl(path, limit, offset, |record| match user {
+        None => true,
+        Some(name) => record.user.as_deref() == Some(name),
+    })
+    .into_iter()
+    .filter_map(|record| serde_json::to_value(record).ok())
+    .collect()
 }
 
 fn append_chained_auth(
@@ -3342,16 +3361,7 @@ fn append_chained_auth(
     let Ok(_guard) = CHAIN.lock() else {
         return;
     };
-    let prior = read_audit(path);
-    let mut seq = 0u64;
-    let mut prev = "0".repeat(64);
-    for record in &prior {
-        if record.hash == "off" {
-            continue;
-        }
-        seq = record.seq;
-        prev = record.hash.clone();
-    }
+    let (seq, prev) = agentlink_core::audit::chain_tip_from_jsonl(path);
     let mut record = AuditRecord {
         seq: 0,
         ts: chrono_now(),
@@ -5442,7 +5452,7 @@ mod view_ticket_tests {
         let path = dir.path().join("audit.jsonl");
         note_legacy_use(&path, true, "");
         note_legacy_use(&path, false, "legacy admin token is disabled");
-        let records = read_audit(&path);
+        let records = agentlink_core::audit::page_from_jsonl(&path, 10, 0, |_| true);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].op, "legacy.admin");
         assert_eq!(records[1].op, "legacy.admin");
@@ -5528,6 +5538,10 @@ mod proxy_tests {
         );
         assert_eq!(audit_page_bounds("limit=0"), (1, 0));
         assert_eq!(audit_page_bounds("offset=abc&limit=25"), (25, 0));
+        assert_eq!(
+            audit_page_bounds(&format!("offset={}", AUDIT_RECORDS_MAX_OFFSET + 99)),
+            (AUDIT_RECORDS_DEFAULT_LIMIT, AUDIT_RECORDS_MAX_OFFSET)
+        );
     }
 
     #[test]
@@ -5541,13 +5555,35 @@ mod proxy_tests {
             ));
         }
         std::fs::write(&path, body).unwrap();
-        let page = read_audit_values_page(&path, 3, 0);
+        let page = read_audit_values_page(&path, 3, 0, None);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0]["op"], "op7");
         assert_eq!(page[2]["op"], "op9");
-        let older = read_audit_values_page(&path, 3, 3);
+        let older = read_audit_values_page(&path, 3, 3, None);
         assert_eq!(older[0]["op"], "op4");
         assert_eq!(older[2]["op"], "op6");
+    }
+
+    #[test]
+    fn audit_records_filter_user_before_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut body = String::new();
+        for i in 0..20 {
+            let user = if i % 2 == 0 { "alice" } else { "bob" };
+            body.push_str(&format!(
+                "{{\"seq\":{i},\"ts\":\"t{i}\",\"node_id\":\"n\",\"node_name\":\"n\",\"client_id\":\"c\",\"category\":\"op\",\"op\":\"op{i}\",\"result\":\"ok\",\"duration_ms\":0,\"prev_hash\":\"0\",\"hash\":\"{i}\",\"user\":\"{user}\"}}\n"
+            ));
+        }
+        std::fs::write(&path, body).unwrap();
+        // Alice has 10 rows. A page of 3 must be Alice's newest three (op14,16,18),
+        // not a post-filter of a mixed newest-3 slice (which would undershoot).
+        let page = read_audit_values_page(&path, 3, 0, Some("alice"));
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0]["op"], "op14");
+        assert_eq!(page[1]["op"], "op16");
+        assert_eq!(page[2]["op"], "op18");
+        assert!(page.iter().all(|row| row["user"] == "alice"));
     }
 }
 

@@ -203,3 +203,61 @@ async fn incomplete_http_body_times_out() {
         "Slowloris body must close within handshake timeout"
     );
 }
+
+#[tokio::test]
+async fn connection_semaphore_blocks_beyond_cap_until_slot_frees() {
+    use agentlink_relay::set_max_concurrent_connections_for_test;
+    use tokio::io::AsyncReadExt;
+
+    struct ResetCap;
+    impl Drop for ResetCap {
+        fn drop(&mut self) {
+            set_max_concurrent_connections_for_test(None);
+        }
+    }
+    let _reset = ResetCap;
+    set_max_concurrent_connections_for_test(Some(2));
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = spawn(dir.path(), Vec::new()).await;
+    let pin = agentlink_core::parse_fingerprint(&relay.fingerprint).unwrap();
+    let config = agentlink_core::tls::client_config(pin).unwrap();
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from("agentlink")
+        .unwrap()
+        .to_owned();
+
+    // Hold two Slowloris bodies so both semaphore slots stay occupied.
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let tcp = TcpStream::connect(relay.local_addr).await.unwrap();
+        let mut tls = connector.connect(name.clone(), tcp).await.unwrap();
+        let head = format!(
+            "POST /auth/login HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nOrigin: https://127.0.0.1:{}\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+            relay.local_addr.port(),
+            relay.local_addr.port()
+        );
+        tls.write_all(head.as_bytes()).await.unwrap();
+        tls.flush().await.unwrap();
+        held.push(tls);
+    }
+
+    // Third TCP connect may succeed (kernel backlog), but TLS accept waits on the semaphore.
+    let third = TcpStream::connect(relay.local_addr).await.unwrap();
+    let pending = connector.connect(name.clone(), third);
+    let blocked = tokio::time::timeout(Duration::from_millis(400), pending).await;
+    assert!(
+        blocked.is_err(),
+        "3rd handshake must wait while 2 slots are held"
+    );
+
+    // Free one slot; a fresh dial must then complete.
+    drop(held.pop());
+    let tcp = TcpStream::connect(relay.local_addr).await.unwrap();
+    let mut tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .expect("handshake after free must not hang")
+        .expect("tls ok");
+    let mut buf = [0u8; 1];
+    let _ = tokio::time::timeout(Duration::from_millis(50), tls.read(&mut buf)).await;
+}
