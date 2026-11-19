@@ -6,10 +6,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use std::io::ErrorKind;
+
 use crate::error::{Error, Result};
 
-use super::{canonical_sandbox_root, normalize_link_target_path, resolve_sandboxed, MAX_SUBTREE_SYMLINK_SCAN};
+use super::link_meta::{is_link_entry, remove_link_entry};
+use super::{
+    canonical_sandbox_root, normalize_link_target_path, resolve_sandboxed, MAX_SUBTREE_SYMLINK_SCAN,
+};
 
+/// Re-validate `target` against `root` immediately before committing a write or
 /// atomic install so a concurrent symlink swap cannot escape the sandbox.
 pub fn ensure_path_stays_in_sandbox_at_sink(root: Option<&Path>, target: &Path) -> Result<PathBuf> {
     let Some(root) = root else {
@@ -21,8 +28,8 @@ pub fn ensure_path_stays_in_sandbox_at_sink(root: Option<&Path>, target: &Path) 
 }
 
 /// Verify that moving `from_entry` to `to_entry` does not cause any relative
-/// symlink (either `from_entry` itself or a symlink inside a moved directory
-/// subtree) to resolve outside `root` from its new parent directory.
+/// symlink/junction (either `from_entry` itself or a link inside a moved
+/// directory subtree) to resolve outside `root` from its new parent directory.
 pub fn ensure_moved_symlinks_stay_inside(
     root: Option<&Path>,
     from_entry: &Path,
@@ -35,7 +42,7 @@ pub fn ensure_moved_symlinks_stay_inside(
     let Ok(meta) = fs::symlink_metadata(from_entry) else {
         return Ok(());
     };
-    if meta.file_type().is_symlink() {
+    if is_link_entry(&meta) {
         return check_relocated_symlink(&root_c, root, from_entry, to_entry);
     }
     if meta.is_dir() {
@@ -92,9 +99,8 @@ pub fn open_write_file(
 /// Runs [`ensure_moved_symlinks_stay_inside`] before the syscall (twice, to shrink
 /// the race window), then again on the destination. If the post-check fails —
 /// typically because a concurrent same-UID writer retargeted a relative symlink
-/// during the window — the destination is rolled back (rename back, else unlink
-/// the dest entry) and the error is returned. A successful return means the
-/// destination does not currently escape `root`.
+/// during the window — the destination is rolled back without destroying
+/// legitimate directory trees, and the error is returned.
 ///
 /// Same-UID unrestricted `exec`/`full` is out of scope; this protects `--root`
 /// grant boundaries for `read-write` file ops against symlink relocation races.
@@ -104,24 +110,54 @@ pub fn rename_within_sandbox(root: Option<&Path>, from: &Path, to: &Path) -> Res
     ensure_moved_symlinks_stay_inside(root, from, to)?;
     fs::rename(from, to)?;
     if let Err(err) = ensure_moved_symlinks_stay_inside(root, to, to) {
-        rollback_failed_sandbox_rename(from, to);
+        rollback_failed_sandbox_rename(root, from, to);
         return Err(err);
     }
     Ok(())
 }
 
-pub(crate) fn rollback_failed_sandbox_rename(from: &Path, to: &Path) {
+/// Undo a rename that landed outside the sandbox.
+///
+/// Prefer rename-back. If that fails:
+/// - escaping **link** entries are unlinked (inode only);
+/// - directories are walked and only escaping link leaves are removed —
+///   never [`fs::remove_dir_all`], which would destroy legitimate files.
+pub(crate) fn rollback_failed_sandbox_rename(root: Option<&Path>, from: &Path, to: &Path) {
     if fs::rename(to, from).is_ok() {
         return;
     }
-    // Prefer removing the dest entry over leaving an escaping symlink in place.
-    if let Ok(meta) = fs::symlink_metadata(to) {
-        if meta.file_type().is_symlink() || meta.is_file() {
-            let _ = fs::remove_file(to);
+    let Ok(meta) = fs::symlink_metadata(to) else {
+        return;
+    };
+    if is_link_entry(&meta) {
+        let _ = remove_link_entry(to, &meta);
+        return;
+    }
+    if meta.is_dir() {
+        let _ = scrub_escaping_link_leaves(root, to);
+    }
+    // Plain files: leave in place. A postcheck failure on a regular file is
+    // unexpected; deleting user bytes would be worse than a residual entry.
+}
+
+/// Remove only symlink/junction leaves under `dir` that currently escape `root`.
+fn scrub_escaping_link_leaves(root: Option<&Path>, dir: &Path) -> Result<()> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if is_link_entry(&meta) {
+            if ensure_moved_symlinks_stay_inside(Some(root), &path, &path).is_err() {
+                let _ = remove_link_entry(&path, &meta);
+            }
         } else if meta.is_dir() {
-            let _ = fs::remove_dir_all(to);
+            scrub_escaping_link_leaves(Some(root), &path)?;
         }
     }
+    Ok(())
 }
 
 fn check_relocated_symlink(
@@ -159,7 +195,7 @@ fn check_relocated_dir_symlinks(
         let child_now = entry.path();
         let child_after = dir_after.join(entry.file_name());
         let meta = fs::symlink_metadata(&child_now)?;
-        if meta.file_type().is_symlink() {
+        if is_link_entry(&meta) {
             check_relocated_symlink(root_c, raw_root, &child_now, &child_after)?;
         } else if meta.is_dir() {
             check_relocated_dir_symlinks(root_c, raw_root, &child_now, &child_after, scanned)?;
@@ -167,4 +203,3 @@ fn check_relocated_dir_symlinks(
     }
     Ok(())
 }
-

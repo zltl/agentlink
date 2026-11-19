@@ -953,12 +953,12 @@ fn diagnose_read_io(full: &Path, err: io::Error) -> Error {
     err.into()
 }
 
-/// Remove a path. Symlinks (including Windows junctions / symlink_dir) drop
-/// only the link — never the target tree — even when `recursive` is set.
+/// Remove a path. Symlinks and Windows junctions drop only the link — never
+/// the target tree — even when `recursive` is set (J-03).
 fn remove_path(full: &Path, recursive: bool) -> Result<()> {
     let meta = fs::symlink_metadata(full)?;
-    if meta.file_type().is_symlink() {
-        remove_symlink(full, &meta)?;
+    if agentlink_core::paths::is_link_entry(&meta) {
+        agentlink_core::paths::remove_link_entry(full, &meta)?;
         return Ok(());
     }
     if meta.is_dir() {
@@ -971,37 +971,6 @@ fn remove_path(full: &Path, recursive: bool) -> Result<()> {
         fs::remove_file(full)?;
     }
     Ok(())
-}
-
-fn remove_symlink(full: &Path, meta: &fs::Metadata) -> Result<()> {
-    // Unix: unlink(2) works for file and directory symlinks.
-    // Windows: DeleteFile fails on directory reparse points (junctions /
-    // symlink_dir) with ERROR_ACCESS_DENIED; RemoveDirectory removes the
-    // link and leaves the target intact.
-    #[cfg(windows)]
-    {
-        if meta.is_dir() {
-            fs::remove_dir(full)?;
-            return Ok(());
-        }
-        match fs::remove_file(full) {
-            Ok(()) => Ok(()),
-            Err(err) if err.raw_os_error() == Some(5) => {
-                // Access denied: treat as a directory reparse that did not
-                // advertise FILE_ATTRIBUTE_DIRECTORY on the link metadata.
-                let _ = err;
-                fs::remove_dir(full)?;
-                Ok(())
-            }
-            Err(err) => Err(err.into()),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = meta;
-        fs::remove_file(full)?;
-        Ok(())
-    }
 }
 
 async fn rename_op(resp: &Responder, root: Option<&Path>, from: &str, to: &str) -> Result<()> {

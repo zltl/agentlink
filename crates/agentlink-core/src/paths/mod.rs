@@ -20,7 +20,9 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::{Error, Result};
 
 
+mod link_meta;
 mod sink;
+pub use link_meta::{is_link_entry, remove_link_entry};
 pub use sink::{
     ensure_moved_symlinks_stay_inside, ensure_path_stays_in_sandbox_at_sink, open_write_file,
     rename_within_sandbox,
@@ -245,7 +247,10 @@ pub(crate) fn resolve_sandboxed(
                 }
 
                 match fs::symlink_metadata(&cur) {
-                    Ok(meta) if meta.file_type().is_symlink() => {
+                    Ok(meta) if is_link_entry(&meta) => {
+                        // Symlinks and Windows junctions: nofollow final stays
+                        // on the entry itself (J-03). Otherwise resolve the
+                        // link target and keep verifying sandbox containment.
                         if is_last && !follow_final {
                             if entered_root {
                                 assert_inside(root_c, &cur, user_label)?;
@@ -258,14 +263,22 @@ pub(crate) fn resolve_sandboxed(
                                 "too many levels of symbolic links: {user_label}"
                             )));
                         }
-                        let raw_target = fs::read_link(&cur)?;
+                        let raw_target = fs::read_link(&cur).map_err(|err| {
+                            // Junction/reparse without a readable target: fall
+                            // back to canonicalize + containment, never treat as
+                            // a plain directory that may escape via follow.
+                            Error::Message(format!(
+                                "could not read link target for {}: {err}",
+                                cur.display()
+                            ))
+                        })?;
                         let target = normalize_link_target_path(&raw_target);
                         let parent = cur
                             .parent()
                             .map(Path::to_path_buf)
                             .unwrap_or_else(|| root_c.to_path_buf());
                         if entered_root {
-                            // A symlink living inside the sandbox must itself
+                            // A link living inside the sandbox must itself
                             // resolve inside `root_c` before any trailing path
                             // components are traversed.
                             let link_base = if target.is_absolute() {
@@ -610,11 +623,36 @@ mod tests {
         std::os::unix::fs::symlink("../../escape.txt", &dest).unwrap();
         assert!(ensure_moved_symlinks_stay_inside(Some(&root), &dest, &dest).is_err());
         // Rollback helper must remove the escaping entry when rename-back is impossible.
-        sink::rollback_failed_sandbox_rename(&root.join("missing_from"), &dest);
+        sink::rollback_failed_sandbox_rename(Some(&root), &root.join("missing_from"), &dest);
         assert!(
             !dest.exists()
                 && std::fs::symlink_metadata(&dest).is_err(),
             "escaping destination must not remain after rollback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_preserves_legitimate_files_when_scrubbing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let root = outer.join("inner").join("sandbox");
+        let dest = root.join("moved_tree");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("precious.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink("../../escape.txt", dest.join("bad_link")).unwrap();
+        // Blocker at `from` so rename-back fails.
+        let from = root.join("from_blocker");
+        std::fs::write(&from, b"blocker").unwrap();
+        sink::rollback_failed_sandbox_rename(Some(&root), &from, &dest);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("precious.txt")).unwrap(),
+            "keep",
+            "rollback must not remove_dir_all legitimate trees"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest.join("bad_link")).is_err(),
+            "escaping link leaf must be scrubbed"
         );
     }
 
