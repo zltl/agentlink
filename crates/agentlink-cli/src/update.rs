@@ -1475,7 +1475,8 @@ fn build_deferred_helper_script(pid: u32, jobs: &[DeferredJob], log: &Path) -> S
     script.push_str(
         "run() { orig=$*; if \"$@\" >>\"$log\" 2>&1; then log_line \"ok: $*\"; else status=$?; log_line \"failed ($status): $*\"; if [ \"$1\" = sudo ] && [ \"$2\" = -n ]; then shift 2; log_line \"tip: sudo -n failed; grant passwordless sudo for systemctl or restart manually: sudo $*\"; fi; echo \"agentlink update: failed: $orig\" >&2; fi; }\n",
     );
-    script.push_str(&format!("log_line \"waiting for updater pid {pid}\"\n"));
+    script.push_str(&format!("pid={pid}\n"));
+    script.push_str("log_line \"waiting for updater pid $pid\"\n");
     script.push_str(
         "n=0\nwhile kill -0 \"$pid\" 2>/dev/null; do n=$((n+1)); [ \"$n\" -ge 30 ] && break; sleep 1; done\nsleep 1\n",
     );
@@ -1498,17 +1499,39 @@ fn build_deferred_helper_script(pid: u32, jobs: &[DeferredJob], log: &Path) -> S
     script
 }
 
+/// True when any deferred job already embeds `sudo -n` (system-scope
+/// systemctl). User-only updates must not prefer a root launcher: passwordless
+/// sudo would run `systemctl --user` as root (no user bus) and leave root-owned
+/// logs under `~/.local/bin`.
+#[cfg(unix)]
+fn jobs_need_system_sudo(jobs: &[DeferredJob]) -> bool {
+    jobs.iter().any(|job| {
+        command_starts_with_sudo(&job.restart)
+            || command_starts_with_sudo(&job.start)
+            || job
+                .is_active
+                .as_ref()
+                .is_some_and(|cmd| command_starts_with_sudo(cmd))
+    })
+}
+
+#[cfg(unix)]
+fn command_starts_with_sudo(cmd: &[String]) -> bool {
+    cmd.first().map(String::as_str) == Some("sudo")
+}
+
 /// Detached helper launch commands, preferred first.
 ///
 /// `systemd-run --scope` puts the helper in its own transient scope, so a
 /// `systemctl restart` that kills the node's service cgroup does not take the
-/// helper down before it finishes writing the log and bouncing units. As an
-/// unprivileged user the call needs polkit, so passwordless `sudo -n` goes
-/// first; plain `systemd-run`, `setsid`, and a bare `sh -c` are fallbacks.
+/// helper down before it finishes writing the log and bouncing units. When
+/// system-scope jobs need root, passwordless `sudo -n` goes first; otherwise
+/// plain `systemd-run`, `setsid`, and a bare `sh -c` are tried without sudo.
 #[cfg(unix)]
-fn deferred_launchers(script: &str) -> Vec<(&'static str, Vec<String>)> {
-    vec![
-        (
+fn deferred_launchers(script: &str, prefer_sudo: bool) -> Vec<(&'static str, Vec<String>)> {
+    let mut out = Vec::new();
+    if prefer_sudo {
+        out.push((
             "sudo",
             vec![
                 "-n".into(),
@@ -1520,21 +1543,22 @@ fn deferred_launchers(script: &str) -> Vec<(&'static str, Vec<String>)> {
                 "-c".into(),
                 script.to_string(),
             ],
-        ),
-        (
-            "systemd-run",
-            vec![
-                "--scope".into(),
-                "--collect".into(),
-                "--quiet".into(),
-                "sh".into(),
-                "-c".into(),
-                script.to_string(),
-            ],
-        ),
-        ("setsid", vec!["sh".into(), "-c".into(), script.to_string()]),
-        ("sh", vec!["-c".into(), script.to_string()]),
-    ]
+        ));
+    }
+    out.push((
+        "systemd-run",
+        vec![
+            "--scope".into(),
+            "--collect".into(),
+            "--quiet".into(),
+            "sh".into(),
+            "-c".into(),
+            script.to_string(),
+        ],
+    ));
+    out.push(("setsid", vec!["sh".into(), "-c".into(), script.to_string()]));
+    out.push(("sh", vec!["-c".into(), script.to_string()]));
+    out
 }
 
 /// `systemd-run --scope` supervises the scope in the foreground and exits at
@@ -1561,7 +1585,7 @@ fn scope_launched(child: &mut std::process::Child) -> bool {
 fn spawn_deferred_helper(pid: u32, jobs: &[DeferredJob], log: &Path) -> Result<()> {
     let script = build_deferred_helper_script(pid, jobs, log);
     let mut first_error: Option<io::Error> = None;
-    for (program, args) in deferred_launchers(&script) {
+    for (program, args) in deferred_launchers(&script, jobs_need_system_sudo(jobs)) {
         let spawned = agentlink_core::process::detached(program)
             .args(&args)
             .spawn();
@@ -1641,13 +1665,27 @@ fn escape_cmd_assignment_path(path: &Path) -> Result<String> {
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
-fn format_windows_update_cmd(target: &Path, source: &Path, restart: &str) -> Result<String> {
+fn format_windows_update_cmd(
+    target: &Path,
+    source: &Path,
+    stop: &str,
+    restart: &str,
+) -> Result<String> {
     let escaped_target = escape_cmd_assignment_path(target)?;
     let escaped_source = escape_cmd_assignment_path(source)?;
+    // Stop installed services inside the detached helper — never in the
+    // updater process itself — so a remote `exec`-triggered update cannot
+    // kill itself before staging the new binary and spawning this script.
+    let stop_block = if stop.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{stop}\r\n")
+    };
     Ok(format!(
         "@echo off\r\n\
 set \"TARGET={escaped_target}\"\r\n\
 set \"SOURCE={escaped_source}\"\r\n\
+{stop_block}\
 for /L %%i in (1,1,30) do (\r\n\
   move /Y \"%SOURCE%\" \"%TARGET%\" >nul 2>&1 && goto :moved\r\n\
   timeout /t 1 /nobreak >nul\r\n\
@@ -1666,19 +1704,17 @@ fn stage_windows_replace(
     bytes: &[u8],
     active: &[service::InstalledService],
 ) -> Result<ApplyReport> {
-    for service in active {
-        service::stop_installed(service)?;
-    }
     let new_path = current.with_extension("exe.new");
     fs::write(&new_path, bytes).with_context(|| format!("write {}", new_path.display()))?;
     let script = current.with_extension("update.cmd");
-    let mode = windows_restart_mode(active);
-    let body = format_windows_update_cmd(current, &new_path, &mode)?;
+    let stop = windows_stop_mode(active);
+    let restart = windows_restart_mode(active);
+    let body = format_windows_update_cmd(current, &new_path, &stop, &restart)?;
     fs::write(&script, body)?;
     // CREATE_NO_WINDOW only (via process::detached). DETACHED_PROCESS would
     // make Windows ignore CREATE_NO_WINDOW and flash cmd.exe. Dropping the
-    // Child does not kill it; the script waits until this process exits and
-    // releases the lock Windows keeps on a running executable.
+    // Child does not kill it; the script stops services, waits until this
+    // process exits (file lock), replaces the binary, then restarts.
     agentlink_core::process::detached("cmd")
         .arg("/C")
         .arg(&script)
@@ -1693,6 +1729,27 @@ fn stage_windows_replace(
             current.display()
         )],
     })
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_stop_mode_for_kinds(kinds: &[service::ServiceKind]) -> String {
+    let mut lines = Vec::new();
+    for kind in kinds {
+        match kind {
+            service::ServiceKind::WindowsTask => {
+                lines.push("schtasks /End /TN agentlink-node".to_string());
+            }
+            service::ServiceKind::WindowsRun => {
+                // Tray/Run entries have no service stop; the move loop waits
+                // for the updater process to release the executable lock.
+            }
+            service::ServiceKind::WindowsService => {
+                lines.push("sc.exe stop agentlink-node".to_string());
+            }
+            _ => {}
+        }
+    }
+    lines.join("\r\n")
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -1713,6 +1770,12 @@ fn windows_restart_mode_for_kinds(kinds: &[service::ServiceKind]) -> String {
         }
     }
     lines.join("\r\n")
+}
+
+#[cfg(windows)]
+fn windows_stop_mode(active: &[service::InstalledService]) -> String {
+    let kinds: Vec<service::ServiceKind> = active.iter().map(|s| s.kind).collect();
+    windows_stop_mode_for_kinds(&kinds)
 }
 
 #[cfg(windows)]
@@ -2409,7 +2472,11 @@ mod tests {
             &jobs,
             Path::new("/opt/agentlink/agentlink.update.log"),
         );
-        assert!(script.contains("waiting for updater pid 4242"));
+        assert!(
+            script.contains("pid=4242\n"),
+            "helper must assign pid so kill -0 waits: {script}"
+        );
+        assert!(script.contains("waiting for updater pid $pid"));
         assert!(script.contains("kill -0 \"$pid\""));
         assert!(script.contains("sleep 1"));
         // user-scope jobs stay unprivileged
@@ -2439,7 +2506,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn helper_prefers_sudo_systemd_run_scope_then_falls_back() {
-        let launchers = deferred_launchers("echo hi");
+        let launchers = deferred_launchers("echo hi", true);
         let names: Vec<&str> = launchers.iter().map(|(program, _)| *program).collect();
         assert_eq!(names, vec!["sudo", "systemd-run", "setsid", "sh"]);
         let (program, args) = &launchers[0];
@@ -2455,6 +2522,70 @@ mod tests {
         assert_eq!(&args[0..4], ["--scope", "--collect", "--quiet", "sh"]);
         assert_eq!(launchers[2].1, vec!["sh", "-c", "echo hi"]);
         assert_eq!(launchers[3].1, vec!["-c", "echo hi"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_only_helper_skips_sudo_launcher() {
+        let user = service::InstalledService {
+            scope: Scope::User,
+            kind: service::ServiceKind::Systemd,
+            active: true,
+        };
+        let jobs = vec![DeferredJob::from_service(&user).unwrap()];
+        assert!(!jobs_need_system_sudo(&jobs));
+        let names: Vec<&str> = deferred_launchers("echo hi", false)
+            .iter()
+            .map(|(program, _)| *program)
+            .collect();
+        assert_eq!(names, vec!["systemd-run", "setsid", "sh"]);
+        assert!(jobs_need_system_sudo(&[DeferredJob::relay()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_helper_pid_assignment_is_what_makes_wait_work() {
+        // Pre-fix bug: `$pid` was never assigned, so `kill -0 ""` failed
+        // immediately and the helper bounced services in ~0ms.
+        let empty = std::process::Command::new("sh")
+            .args([
+                "-c",
+                r#"pid=; n=0; while kill -0 "$pid" 2>/dev/null; do n=$((n+1)); [ "$n" -ge 5 ] && break; sleep 1; done; echo n=$n"#,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&empty.stdout).trim(),
+            "n=0",
+            "empty pid must not enter the wait loop"
+        );
+
+        // With pid assigned to a live child, the loop observes it. `wait`
+        // reaps the zombie so kill -0 stops succeeding after exit.
+        let live = std::process::Command::new("sh")
+            .args([
+                "-c",
+                r#"
+sleep 1 &
+pid=$!
+n=0
+while kill -0 "$pid" 2>/dev/null; do
+  n=$((n+1))
+  wait "$pid" 2>/dev/null && break
+  [ "$n" -ge 30 ] && break
+  sleep 1
+done
+echo n=$n
+"#,
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&live.stdout);
+        assert!(live.status.success(), "{stdout}");
+        assert!(
+            stdout.trim() == "n=1" || stdout.trim() == "n=2",
+            "assigned pid must be observed for at least one iteration: {stdout}"
+        );
     }
 
     #[cfg(unix)]
@@ -2673,13 +2804,19 @@ mod tests {
     fn windows_update_cmd_quotes_paths_with_parens_and_ampersands() {
         let target = Path::new(r"C:\Program Files (x86)\A&B%1\agentlink.exe");
         let source = Path::new(r"C:\Program Files (x86)\A&B%1\agentlink.exe.new");
+        let stop = windows_stop_mode_for_kinds(&[service::ServiceKind::WindowsService]);
         let restart = windows_restart_mode_for_kinds(&[service::ServiceKind::WindowsRun]);
+        assert_eq!(stop, "sc.exe stop agentlink-node");
         assert_eq!(restart, "start \"\" \"%TARGET%\" tray --background");
-        let script = format_windows_update_cmd(target, source, &restart).unwrap();
+        let script = format_windows_update_cmd(target, source, &stop, &restart).unwrap();
         assert!(
             script.contains("set \"TARGET=C:\\Program Files (x86)\\A&B%%1\\agentlink.exe\"\r\n"),
             "{script}"
         );
+        // Stop must run inside the detached helper, before the move loop.
+        let stop_at = script.find("sc.exe stop agentlink-node").expect(&script);
+        let move_at = script.find("move /Y").expect(&script);
+        assert!(stop_at < move_at, "stop must precede move: {script}");
         assert!(
             script.contains("start \"\" \"%TARGET%\" tray --background\r\n"),
             "{script}"
@@ -2689,7 +2826,7 @@ mod tests {
             "must not expand unquoted %TARGET% in echo: {script}"
         );
         assert!(
-            format_windows_update_cmd(Path::new("bad\"quote.exe"), source, "rem").is_err()
+            format_windows_update_cmd(Path::new("bad\"quote.exe"), source, "", "rem").is_err()
         );
     }
 }
