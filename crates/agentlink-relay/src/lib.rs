@@ -12,6 +12,7 @@
 
 #![deny(unsafe_code)]
 
+mod audit_http;
 mod db;
 mod models;
 mod operate;
