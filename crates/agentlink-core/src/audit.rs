@@ -1741,7 +1741,8 @@ pub fn select(records: &[AuditRecord], filter: &AuditFilter) -> Vec<AuditRecord>
 }
 
 pub use crate::audit_jsonl::{
-    chain_tip_from_jsonl, page_from_jsonl, select_from_jsonl, MAX_AUDIT_LINE_BYTES,
+    chain_tip_from_jsonl, for_each_bounded_line, page_from_jsonl, select_from_jsonl,
+    tail_bounded_lines, MAX_AUDIT_LINE_BYTES,
 };
 
 const WEBHOOK_QUEUE_CAP: usize = 64;

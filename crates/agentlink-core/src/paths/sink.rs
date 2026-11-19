@@ -121,7 +121,31 @@ pub fn rename_within_sandbox(root: Option<&Path>, from: &Path, to: &Path) -> Res
 /// Prefer rename-back. If that fails:
 /// - escaping **link** entries are unlinked (inode only);
 /// - directories are walked and only escaping link leaves are removed —
-///   never [`fs::remove_dir_all`], which would destroy legitimate files.
+///   never [`fs::remove_dir_all`], which would destroy legitimate files;
+/// - after a successful scrub, rename-back is attempted again so a directory
+///   whose only escape was a link leaf can return to `from`.
+///
+/// # Residual safety (honest assessment)
+///
+/// This rollback is **best-effort, not atomic**. Between `fs::rename` and the
+/// post-check there is an inherent TOCTOU window under a same-UID concurrent
+/// writer. Outcomes we accept:
+///
+/// 1. **Rename-back succeeds** — no residue; preferred path.
+/// 2. **Escaping symlink/junction at `to`** — unlinked; no escape remains.
+/// 3. **Directory at `to` with escaping link leaves** — those leaves are
+///    scrubbed; then rename-back is retried. If rename-back still fails (e.g.
+///    `from` is occupied, cross-device), a **non-escaping directory tree may
+///    remain at `to`**. That residue is still under the grant root when every
+///    escaping link was removed; it is **not** an escape hatch. We deliberately
+///    do not `remove_dir_all` because that would destroy legitimate user data
+///    that happened to be moved.
+/// 4. **Plain file residual at `to`** — left in place. A post-check failure on a
+///    regular file is unexpected; deleting caller bytes would be worse.
+///
+/// Same-UID unrestricted `exec`/`full` is out of scope for this helper; the
+/// guarantee is "no sandbox escape via symlink relocation," not "no leftover
+/// path names under the root after a raced rename."
 pub(crate) fn rollback_failed_sandbox_rename(root: Option<&Path>, from: &Path, to: &Path) {
     if fs::rename(to, from).is_ok() {
         return;
@@ -135,6 +159,9 @@ pub(crate) fn rollback_failed_sandbox_rename(root: Option<&Path>, from: &Path, t
     }
     if meta.is_dir() {
         let _ = scrub_escaping_link_leaves(root, to);
+        // Retry rename-back now that escaping links are gone.
+        let _ = fs::rename(to, from);
+        return;
     }
     // Plain files: leave in place. A postcheck failure on a regular file is
     // unexpected; deleting user bytes would be worse than a residual entry.

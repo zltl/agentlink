@@ -4844,4 +4844,51 @@ mod pty_fairness_tests {
         });
         let _ = saw_data; // flood may race Close before first push; Close success is the gate
     }
+
+    /// Same production path as Close: `PtyCmd::Write([0x03])` (Ctrl+C) shares the
+    /// biased cmd-before-recv arm. Assert the write hook sees `^C` promptly under
+    /// an always-ready Chunk flood (Stage J R3 residual).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_pty_ctrl_c_beats_chunk_flood() {
+        let io = PtySession::test_io();
+        let mut writes = io.writes;
+        let shared = Arc::new(Shared::new());
+        let cmd_tx = spawn_pty(io.session, Arc::clone(&shared), 43, (24, 80));
+
+        let flood_tx = io.tx.clone();
+        let flood = tokio::spawn(async move {
+            let mut seq = 0u64;
+            loop {
+                seq = seq.saturating_add(1);
+                let env = Envelope::Chunk {
+                    request_id: "pty-test".into(),
+                    stream: "pty".into(),
+                    data_b64: util::b64_encode(b"Y"),
+                    seq,
+                };
+                if flood_tx.send(env).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        cmd_tx
+            .send(PtyCmd::Write(vec![0x03]))
+            .expect("pty cmd channel open");
+        let written = tokio::time::timeout(Duration::from_millis(750), writes.recv()).await;
+        flood.abort();
+        let bytes = written
+            .expect("Ctrl+C Write must complete under Chunk flood")
+            .expect("write hook open");
+        assert!(
+            bytes.contains(&0x03),
+            "spawn_pty must deliver Ctrl+C bytes under flood, got {bytes:?}"
+        );
+
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        let _ = cmd_tx.send(PtyCmd::Close(Some(done)));
+        let _ = tokio::time::timeout(Duration::from_millis(750), done_rx).await;
+    }
 }

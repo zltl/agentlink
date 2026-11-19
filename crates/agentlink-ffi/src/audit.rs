@@ -6,7 +6,7 @@
 //! reads.
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, RwLock};
 
@@ -66,12 +66,9 @@ pub fn read_all(path: &Path) -> Vec<u8> {
 
 pub fn tail(path: &Path, limit: usize) -> String {
     let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(file) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let lines: Vec<String> = BufReader::new(file).lines().map_while(Result::ok).collect();
-    let start = lines.len().saturating_sub(limit);
-    lines[start..].join("\n")
+    // Bounded per-line and O(limit) ring — never `BufRead::lines().collect()` of
+    // the whole file (hostile multi-MiB lines or huge logs must not force RAM).
+    agentlink_core::audit::tail_bounded_lines(path, limit).join("\n")
 }
 
 fn append(path: &Path, line: &str) -> std::io::Result<()> {
@@ -352,6 +349,26 @@ mod tests {
         assert_eq!(value["error"], "denied");
         assert_eq!(value["peer"], "c1");
         assert!(value["ts"].as_str().unwrap().contains('T'));
+    }
+
+    #[test]
+    fn tail_skips_oversized_line_and_keeps_ring_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let mut body = vec![b'x'; agentlink_core::audit::MAX_AUDIT_LINE_BYTES + 4_096];
+        body.push(b'\n');
+        body.extend_from_slice(br#"{"op":"keep","ok":true}"#);
+        body.push(b'\n');
+        for i in 0..8 {
+            body.extend_from_slice(format!(r#"{{"op":"n{i}"}}"#).as_bytes());
+            body.push(b'\n');
+        }
+        std::fs::write(&path, &body).unwrap();
+        let text = tail(&path, 3);
+        assert!(!text.contains("xxxxx"), "oversized line must not be retained");
+        assert!(text.contains(r#""op":"n5""#) || text.contains(r#""op":"n6""#));
+        assert!(text.contains(r#""op":"n7""#));
+        assert!(!text.contains(r#""op":"n0""#), "ring must keep only last N");
     }
 
     #[test]

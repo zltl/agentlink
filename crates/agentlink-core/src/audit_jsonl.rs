@@ -44,7 +44,7 @@ pub fn page_from_jsonl(
     };
     let cap = limit.saturating_add(offset);
     let mut ring: VecDeque<AuditRecord> = VecDeque::with_capacity(cap.min(4_096));
-    for_each_bounded_jsonl_line(file, |line| {
+    for_each_bounded_line(file, |line| {
         let Ok(record) = serde_json::from_str::<AuditRecord>(line) else {
             return;
         };
@@ -72,7 +72,7 @@ pub fn chain_tip_from_jsonl(path: &Path) -> (u64, String) {
     let Ok(file) = File::open(path) else {
         return (seq, hash);
     };
-    for_each_bounded_jsonl_line(file, |line| {
+    for_each_bounded_line(file, |line| {
         let Ok(record) = serde_json::from_str::<AuditRecord>(line) else {
             return;
         };
@@ -85,9 +85,30 @@ pub fn chain_tip_from_jsonl(path: &Path) -> (u64, String) {
     (seq, hash)
 }
 
-/// Invoke `on_line` for each UTF-8 JSONL record whose encoded size is at most
-/// [`MAX_AUDIT_LINE_BYTES`]. Larger lines are discarded without retaining them.
-fn for_each_bounded_jsonl_line(file: File, mut on_line: impl FnMut(&str)) {
+/// Newest-last `limit` raw UTF-8 lines (not parsed), each at most
+/// [`MAX_AUDIT_LINE_BYTES`]. Oversized lines are skipped. Memory is
+/// `O(limit + MAX_AUDIT_LINE_BYTES)`.
+pub fn tail_bounded_lines(path: &Path, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(limit.min(4_096));
+    for_each_bounded_line(file, |line| {
+        if ring.len() == limit {
+            ring.pop_front();
+        }
+        ring.push_back(line.to_string());
+    });
+    ring.into_iter().collect()
+}
+
+/// Invoke `on_line` for each UTF-8 line whose encoded size is at most
+/// [`MAX_AUDIT_LINE_BYTES`]. Larger lines are discarded without retaining them
+/// and without consuming bytes that belong to the following line.
+pub fn for_each_bounded_line(file: File, mut on_line: impl FnMut(&str)) {
     let mut reader = BufReader::new(file);
     let mut buf = Vec::with_capacity(4_096);
     loop {
@@ -116,6 +137,11 @@ enum BoundedLine {
     Eof,
 }
 
+/// Read one logical line with a hard byte cap.
+///
+/// Discard of oversized lines uses only [`BufRead::fill_buf`]/[`BufRead::consume`]
+/// so the terminating newline is consumed precisely — never a raw `Read::read`
+/// that could swallow the start of the next record.
 fn read_bounded_line(
     reader: &mut impl BufRead,
     buf: &mut Vec<u8>,
@@ -138,6 +164,7 @@ fn read_bounded_line(
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
             let take = pos + 1;
             if buf.len() + pos > max {
+                // Consume only through this line's newline; leave following bytes.
                 reader.consume(take);
                 buf.clear();
                 return Ok(BoundedLine::SkippedOversized);
@@ -147,20 +174,24 @@ fn read_bounded_line(
             return Ok(BoundedLine::Line);
         }
         if buf.len() + available.len() > max {
-            // Drop this chunk and keep discarding until the newline.
+            // Oversized and no newline in this buffer: drop the chunk, then
+            // keep discarding with fill_buf until we see a newline (consume
+            // only through that byte so the next line remains intact).
             let n = available.len();
             reader.consume(n);
-            let mut discard = [0u8; 8_192];
             loop {
-                let n = std::io::Read::read(reader, &mut discard)?;
-                if n == 0 {
+                let data = reader.fill_buf()?;
+                if data.is_empty() {
                     buf.clear();
                     return Ok(BoundedLine::SkippedOversized);
                 }
-                if discard[..n].contains(&b'\n') {
+                if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+                    reader.consume(pos + 1);
                     buf.clear();
                     return Ok(BoundedLine::SkippedOversized);
                 }
+                let n = data.len();
+                reader.consume(n);
             }
         }
         let n = available.len();
@@ -169,3 +200,47 @@ fn read_bounded_line(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn discard_path_preserves_bytes_after_oversized_newline() {
+        // Force the overflow branch: fill past max with no newline in the first
+        // chunks, then a large gap before `\n`, then a good record. Previously
+        // `Read::read` into a fixed discard buffer could swallow the good line.
+        let max = 64usize;
+        let mut body = vec![b'x'; max + 50_000];
+        body.push(b'\n');
+        body.extend_from_slice(br#"{"op":"keep"}"#);
+        body.push(b'\n');
+        let mut reader = BufReader::with_capacity(32, Cursor::new(body));
+        let mut buf = Vec::new();
+        let skipped = read_bounded_line(&mut reader, &mut buf, max).unwrap();
+        assert!(matches!(skipped, BoundedLine::SkippedOversized));
+        buf.clear();
+        let kept = read_bounded_line(&mut reader, &mut buf, max).unwrap();
+        assert!(matches!(kept, BoundedLine::Line), "good line must survive");
+        let text = std::str::from_utf8(&buf)
+            .unwrap()
+            .trim_end_matches(['\r', '\n']);
+        assert_eq!(text, r#"{"op":"keep"}"#);
+    }
+
+    #[test]
+    fn page_from_jsonl_keeps_record_after_hostile_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut body = vec![b'x'; MAX_AUDIT_LINE_BYTES + 50_000];
+        body.push(b'\n');
+        body.extend_from_slice(
+            br#"{"seq":1,"ts":"t","node_id":"n","node_name":"n","client_id":"c","category":"op","op":"keep","result":"ok","duration_ms":0,"prev_hash":"0","hash":"1"}
+"#,
+        );
+        std::fs::write(&path, &body).unwrap();
+        let page = page_from_jsonl(&path, 10, 0, |_| true);
+        assert_eq!(page.len(), 1, "good record after hostile gap must be kept");
+        assert_eq!(page[0].op, "keep");
+    }
+}
