@@ -761,21 +761,16 @@ async fn write_op(
         return Err(Error::Message("write chunk is larger than 1 MiB".into()));
     }
     let full = resolve_path(root, path)?;
+    let full = agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(root, &full)?;
     let before = audit_before_snapshot(&full).await;
-    let mut file = if truncate {
-        tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&full)
-            .await?
-    } else {
-        tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&full)
-            .await?
-    };
+    let nofollow = root.is_some();
+    let open_path = full.clone();
+    let std_file = tokio::task::spawn_blocking(move || {
+        agentlink_core::paths::open_write_file(&open_path, true, truncate, nofollow)
+    })
+    .await
+    .map_err(|err| Error::Message(format!("write open task: {err}")))??;
+    let mut file = tokio::fs::File::from_std(std_file);
     if !truncate || offset > 0 {
         file.seek(SeekFrom::Start(offset)).await?;
     }
@@ -908,7 +903,7 @@ async fn remove_op(
     path: &str,
     recursive: bool,
 ) -> Result<()> {
-    let full = resolve_path(root, path)?;
+    let full = agentlink_core::paths::resolve_path_no_follow(root, path)?;
     let rm_path = full.clone();
     let path_display = path.to_string();
     tokio::task::spawn_blocking(move || {
@@ -995,11 +990,19 @@ fn remove_symlink(full: &Path, meta: &fs::Metadata) -> Result<()> {
 }
 
 async fn rename_op(resp: &Responder, root: Option<&Path>, from: &str, to: &str) -> Result<()> {
-    let from_full = resolve_path(root, from)?;
+    let from_full = agentlink_core::paths::resolve_path_no_follow(root, from)?;
     let trailing = agentlink_core::paths::path_trailing_sep(to);
     let to_trimmed = agentlink_core::paths::trim_trailing_sep(to);
-    let to_base = resolve_path(root, to_trimmed)?;
+    // Follow `to_trimmed` when it names an existing directory (so `mv a dir_link`
+    // moves `a` into the linked directory inside `--root`), otherwise keep the
+    // destination entry un-dereferenced so renaming onto an existing symlink
+    // replaces the symlink entry rather than escaping through a dangling target.
+    let to_base = match resolve_path(root, to_trimmed) {
+        Ok(resolved) if resolved.is_dir() => resolved,
+        _ => agentlink_core::paths::resolve_path_no_follow(root, to_trimmed)?,
+    };
     let to_full = agentlink_core::paths::rename_destination(&from_full, &to_base, trailing)?;
+    agentlink_core::paths::ensure_moved_symlinks_stay_inside(root, &from_full, &to_full)?;
     let (from_full, to_full) = tokio::task::spawn_blocking(move || {
         fs::rename(&from_full, &to_full)
             .map_err(|err| diagnose_rename_io(&from_full, &to_full, err))?;
