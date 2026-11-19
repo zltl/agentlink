@@ -7,7 +7,8 @@
 //! | [`resolve_path`] | Need the final target of a path (follows the last component). |
 //! | [`resolve_path_no_follow`] | Operating on the path entry itself (`rm`/`mv` of a symlink). |
 //! | [`ensure_path_stays_in_sandbox_at_sink`] | Writing through a path that may be a dangling relative symlink. |
-//! | [`ensure_moved_symlinks_stay_inside`] | After relocating a tree that may contain relative symlinks. |
+//! | [`ensure_moved_symlinks_stay_inside`] | Before/after relocating a tree that may contain relative symlinks. |
+//! | [`rename_within_sandbox`] | `rename(2)` with pre-check + post-check rollback so a raced retarget cannot leave an escape. |
 //! | [`open_write_file`] | Creating/truncating a sandboxed file without following a final symlink. |
 
 use std::collections::VecDeque;
@@ -142,8 +143,13 @@ pub fn ensure_moved_symlinks_stay_inside(
     Ok(())
 }
 
-/// Open a file for writing, adding `O_NOFOLLOW` on Unix whenever `nofollow` is
-/// set so a last-microsecond TOCTOU regular-file -> symlink swap fails with `ELOOP`.
+/// Open a file for writing without following a final-component symlink when
+/// `nofollow` is set.
+///
+/// - **Unix:** `O_NOFOLLOW` so a last-microsecond regular→symlink swap fails with `ELOOP`.
+/// - **Windows:** `FILE_FLAG_OPEN_REPARSE_POINT` opens the name itself; any reparse
+///   point (symlink or junction) is then rejected. This closes the check-then-open
+///   TOCTOU that a plain `symlink_metadata` + `open` left on Windows.
 pub fn open_write_file(
     path: &Path,
     create: bool,
@@ -157,18 +163,63 @@ pub fn open_write_file(
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     if nofollow {
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "refusing to open symbolic link target directly",
-                ));
-            }
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT — do not follow the final name.
+        opts.custom_flags(0x0020_0000);
+    }
+    let file = opts.open(path)?;
+    #[cfg(windows)]
+    if nofollow {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let meta = file.metadata()?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "refusing to open reparse point (symlink/junction) for sandboxed write",
+            ));
         }
     }
-    opts.open(path)
+    Ok(file)
+}
+
+/// Rename `from` → `to` under an optional sandbox root.
+///
+/// Runs [`ensure_moved_symlinks_stay_inside`] before the syscall (twice, to shrink
+/// the race window), then again on the destination. If the post-check fails —
+/// typically because a concurrent same-UID writer retargeted a relative symlink
+/// during the window — the destination is rolled back (rename back, else unlink
+/// the dest entry) and the error is returned. A successful return means the
+/// destination does not currently escape `root`.
+///
+/// Same-UID unrestricted `exec`/`full` is out of scope; this protects `--root`
+/// grant boundaries for `read-write` file ops against symlink relocation races.
+pub fn rename_within_sandbox(root: Option<&Path>, from: &Path, to: &Path) -> Result<()> {
+    ensure_moved_symlinks_stay_inside(root, from, to)?;
+    // Second pre-check immediately before the syscall.
+    ensure_moved_symlinks_stay_inside(root, from, to)?;
+    fs::rename(from, to)?;
+    if let Err(err) = ensure_moved_symlinks_stay_inside(root, to, to) {
+        rollback_failed_sandbox_rename(from, to);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn rollback_failed_sandbox_rename(from: &Path, to: &Path) {
+    if fs::rename(to, from).is_ok() {
+        return;
+    }
+    // Prefer removing the dest entry over leaving an escaping symlink in place.
+    if let Ok(meta) = fs::symlink_metadata(to) {
+        if meta.file_type().is_symlink() || meta.is_file() {
+            let _ = fs::remove_file(to);
+        } else if meta.is_dir() {
+            let _ = fs::remove_dir_all(to);
+        }
+    }
 }
 
 fn check_relocated_symlink(
@@ -696,6 +747,86 @@ mod tests {
             toctou_err.raw_os_error() == Some(libc::ELOOP),
             "{toctou_err:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_within_sandbox_rolls_back_escaping_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let root = outer.join("inner").join("sandbox");
+        std::fs::create_dir_all(&root).unwrap();
+        // Place an already-escaping symlink at `to` as if a raced rename landed badly.
+        let dest = root.join("landed");
+        std::os::unix::fs::symlink("../../escape.txt", &dest).unwrap();
+        assert!(ensure_moved_symlinks_stay_inside(Some(&root), &dest, &dest).is_err());
+        // Rollback helper must remove the escaping entry when rename-back is impossible.
+        rollback_failed_sandbox_rename(&root.join("missing_from"), &dest);
+        assert!(
+            !dest.exists()
+                && std::fs::symlink_metadata(&dest).is_err(),
+            "escaping destination must not remain after rollback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_within_sandbox_rejects_escape_and_concurrent_retarget_leaves_no_escape() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let root = outer.join("inner").join("sandbox");
+        std::fs::create_dir_all(root.join("d1").join("d2")).unwrap();
+
+        for round in 0..80u32 {
+            let from = root.join("d1").join("d2").join(format!("sym{round}"));
+            let to = root.join(format!("top{round}"));
+            let _ = std::fs::remove_file(&from);
+            let _ = std::fs::remove_file(&to);
+            // Start with a relative link that would escape once moved to root.
+            std::os::unix::fs::symlink("../../escape.txt", &from).unwrap();
+            let err = rename_within_sandbox(Some(&root), &from, &to).unwrap_err();
+            assert!(err.to_string().contains("escapes"), "{err}");
+            assert!(std::fs::symlink_metadata(&to).is_err(), "pre-check must not move");
+            assert!(std::fs::symlink_metadata(&from).is_ok(), "source kept on reject");
+        }
+
+        // Concurrent retarget: flip between an in-sandbox target and an escaping
+        // target while rename_within_sandbox runs. Whatever wins the race, an
+        // escaping symlink must not remain at the destination afterwards.
+        for round in 0..120u32 {
+            let from = root.join("d1").join("d2").join(format!("race{round}"));
+            let to = root.join(format!("race_top{round}"));
+            let _ = std::fs::remove_file(&from);
+            let _ = std::fs::remove_file(&to);
+            std::os::unix::fs::symlink("ok.txt", &from).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let from_flip = from.clone();
+            let b2 = barrier.clone();
+            let flipper = thread::spawn(move || {
+                b2.wait();
+                for _ in 0..40 {
+                    let _ = std::fs::remove_file(&from_flip);
+                    let _ = std::os::unix::fs::symlink("../../escape.txt", &from_flip);
+                    let _ = std::fs::remove_file(&from_flip);
+                    let _ = std::os::unix::fs::symlink("ok.txt", &from_flip);
+                }
+            });
+            barrier.wait();
+            let _ = rename_within_sandbox(Some(&root), &from, &to);
+            let _ = flipper.join();
+            if let Ok(meta) = std::fs::symlink_metadata(&to) {
+                if meta.file_type().is_symlink() {
+                    assert!(
+                        ensure_moved_symlinks_stay_inside(Some(&root), &to, &to).is_ok(),
+                        "round {round}: durable escape at {}",
+                        to.display()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

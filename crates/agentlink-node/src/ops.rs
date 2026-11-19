@@ -1009,10 +1009,15 @@ async fn rename_op(resp: &Responder, root: Option<&Path>, from: &str, to: &str) 
         _ => agentlink_core::paths::resolve_path_no_follow(root, to_trimmed)?,
     };
     let to_full = agentlink_core::paths::rename_destination(&from_full, &to_base, trailing)?;
-    agentlink_core::paths::ensure_moved_symlinks_stay_inside(root, &from_full, &to_full)?;
+    let root_owned = root.map(|path| path.to_path_buf());
     let (from_full, to_full) = tokio::task::spawn_blocking(move || {
-        fs::rename(&from_full, &to_full)
-            .map_err(|err| diagnose_rename_io(&from_full, &to_full, err))?;
+        let root_ref = root_owned.as_deref();
+        agentlink_core::paths::rename_within_sandbox(root_ref, &from_full, &to_full).map_err(
+            |err| match err {
+                Error::Io(io) => diagnose_rename_io(&from_full, &to_full, io),
+                other => other,
+            },
+        )?;
         Ok::<_, Error>((from_full, to_full))
     })
     .await
