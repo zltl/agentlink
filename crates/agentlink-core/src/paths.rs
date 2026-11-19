@@ -1,4 +1,14 @@
 //! Path resolution and symlink-safe sandbox confinement.
+//!
+//! # Entry points
+//!
+//! | Function | Use when |
+//! |---|---|
+//! | [`resolve_path`] | Need the final target of a path (follows the last component). |
+//! | [`resolve_path_no_follow`] | Operating on the path entry itself (`rm`/`mv` of a symlink). |
+//! | [`ensure_path_stays_in_sandbox_at_sink`] | Writing through a path that may be a dangling relative symlink. |
+//! | [`ensure_moved_symlinks_stay_inside`] | After relocating a tree that may contain relative symlinks. |
+//! | [`open_write_file`] | Creating/truncating a sandboxed file without following a final symlink. |
 
 use std::collections::VecDeque;
 use std::ffi::OsString;

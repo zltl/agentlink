@@ -543,9 +543,7 @@ impl Callback for Router {
                 if !self.authorized(request) {
                     return Err(plain(401, "admin token required"));
                 }
-                let (limit, offset) = audit_page_bounds(request.uri().query().unwrap_or(""));
-                let records = read_audit_values_page(&self.audit_path, limit, offset);
-                let body = serde_json::to_string(&records).unwrap_or_else(|_| "[]".into());
+                let body = audit_records_json(&self.audit_path, request.uri().query().unwrap_or(""));
                 Err(Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
@@ -903,32 +901,19 @@ where
             "webrtc signaling is a websocket".into(),
         ),
         ("GET", "/audit/records") => {
-            let (limit, offset) = audit_page_bounds(query);
-            let records = read_audit_values_page(&hub.audit_path, limit, offset);
             if http_authorized(hub, &headers) {
                 (
                     200,
                     "OK",
                     "application/json",
-                    serde_json::to_string(&records).unwrap_or_else(|_| "[]".into()),
+                    audit_records_json(&hub.audit_path, query),
                 )
             } else if let Some(session) = web_session.as_ref() {
-                let visible: Vec<_> = if session.role == "admin" {
-                    records
-                } else {
-                    let user = session.user.as_str();
-                    records
-                        .into_iter()
-                        .filter(|row| {
-                            row.get("user").and_then(|value| value.as_str()) == Some(user)
-                        })
-                        .collect()
-                };
                 (
                     200,
                     "OK",
                     "application/json",
-                    serde_json::to_string(&visible).unwrap_or_else(|_| "[]".into()),
+                    audit_records_json_for_session(&hub.audit_path, query, session),
                 )
             } else {
                 (
@@ -3272,6 +3257,30 @@ fn read_audit(path: &std::path::Path) -> Vec<agentlink_core::audit::AuditRecord>
     text.lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
+}
+
+fn audit_records_json(path: &std::path::Path, query: &str) -> String {
+    let (limit, offset) = audit_page_bounds(query);
+    let records = read_audit_values_page(path, limit, offset);
+    serde_json::to_string(&records).unwrap_or_else(|_| "[]".into())
+}
+
+fn audit_records_json_for_session(
+    path: &std::path::Path,
+    query: &str,
+    session: &crate::models::WebSession,
+) -> String {
+    let (limit, offset) = audit_page_bounds(query);
+    let records = read_audit_values_page(path, limit, offset);
+    if session.role == "admin" {
+        return serde_json::to_string(&records).unwrap_or_else(|_| "[]".into());
+    }
+    let user = session.user.as_str();
+    let visible: Vec<_> = records
+        .into_iter()
+        .filter(|row| row.get("user").and_then(|value| value.as_str()) == Some(user))
+        .collect();
+    serde_json::to_string(&visible).unwrap_or_else(|_| "[]".into())
 }
 
 /// Parse `limit` / `offset` query params for `/audit/records`. Unknown keys

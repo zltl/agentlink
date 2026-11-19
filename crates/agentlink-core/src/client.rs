@@ -45,6 +45,18 @@ struct PendingGuard {
     id: String,
 }
 
+impl PendingGuard {
+    /// Track a pending request id until this guard drops, also clearing any
+    /// unary `routes` entry noted during seal/protect.
+    fn new(inner: &ClientInner, id: String) -> Self {
+        Self {
+            map: inner.pending.clone(),
+            routes: inner.routes.clone(),
+            id,
+        }
+    }
+}
+
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if let Ok(mut map) = self.map.lock() {
@@ -719,11 +731,7 @@ impl PtyWriter {
                     .map_err(|_| Error::Message("client lock poisoned".into()))?;
                 map.insert(request_id.clone(), wait_tx);
             }
-            let _guard = PendingGuard {
-                map: self.inner.pending.clone(),
-                routes: self.inner.routes.clone(),
-                id: request_id.clone(),
-            };
+            let _guard = PendingGuard::new(&self.inner, request_id.clone());
             let env = Envelope::Invoke {
                 request_id,
                 node_id: self.node_id.clone(),
@@ -1657,11 +1665,7 @@ impl Client {
                 .map_err(|_| Error::Message("client lock poisoned".into()))?;
             map.insert(request_id.clone(), wait_tx);
         }
-        let guard = PendingGuard {
-            map: self.inner.pending.clone(),
-            routes: self.inner.routes.clone(),
-            id: request_id.clone(),
-        };
+        let guard = PendingGuard::new(&self.inner, request_id.clone());
         self.send(&Envelope::Invoke {
             request_id: request_id.clone(),
             node_id: node_id.clone(),
@@ -1838,11 +1842,7 @@ impl Client {
                 .map_err(|_| Error::Message("client lock poisoned".into()))?;
             map.insert(request_id.clone(), wait_tx);
         }
-        let _guard = PendingGuard {
-            map: self.inner.pending.clone(),
-            routes: self.inner.routes.clone(),
-            id: request_id.clone(),
-        };
+        let _guard = PendingGuard::new(&self.inner, request_id.clone());
         self.send(&Envelope::Invoke {
             request_id: request_id.clone(),
             node_id: node_id.clone(),
@@ -1919,11 +1919,7 @@ impl Client {
                 .map_err(|_| Error::Message("client lock poisoned".into()))?;
             map.insert(request_id.clone(), wait_tx);
         }
-        let _guard = PendingGuard {
-            map: self.inner.pending.clone(),
-            routes: self.inner.routes.clone(),
-            id: request_id.clone(),
-        };
+        let _guard = PendingGuard::new(&self.inner, request_id.clone());
         self.send(&Envelope::Invoke {
             request_id: request_id.clone(),
             node_id: node_id.to_string(),
@@ -2034,11 +2030,7 @@ impl Client {
                 .map_err(|_| Error::Message("client lock poisoned".into()))?;
             map.insert(request_id.clone(), wait_tx);
         }
-        let _guard = PendingGuard {
-            map: self.inner.pending.clone(),
-            routes: self.inner.routes.clone(),
-            id: request_id.clone(),
-        };
+        let _guard = PendingGuard::new(&self.inner, request_id.clone());
         self.send(&build(request_id)).await?;
         timeout(limit, rx.recv())
             .await
@@ -2561,11 +2553,7 @@ pub(crate) async fn ensure_e2e(
             .map_err(|_| Error::Message("client lock poisoned".into()))?;
         map.insert(request_id.clone(), wait_tx);
     }
-    let _drop = PendingGuard {
-        map: inner.pending.clone(),
-        routes: inner.routes.clone(),
-        id: request_id.clone(),
-    };
+    let _drop = PendingGuard::new(inner, request_id.clone());
     let hello = Envelope::E2eHello {
         request_id: request_id.clone(),
         node_id: node_id.to_string(),
