@@ -231,10 +231,9 @@ Release archives, when you build them yourself, are named:
 Linux and macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zltl/agentlink/main/install.sh | sh -s -- \
+curl -fsSL https://raw.githubusercontent.com/zltl/agentlink/main/install.sh | \
+  env AGENTLINK_TOKEN="..." AGENTLINK_FINGERPRINT="sha256:..." sh -s -- \
   --relay wss://relay.example:7443 \
-  --fingerprint "$AGENTLINK_FINGERPRINT" \
-  --token "$AGENTLINK_TOKEN" \
   --name laptop
 ```
 
@@ -247,7 +246,7 @@ $env:AGENTLINK_TOKEN = "..."
 irm https://raw.githubusercontent.com/zltl/agentlink/main/install.ps1 | iex
 ```
 
-`--token` is the relay admin token (also accepted via `AGENTLINK_TOKEN` so it need not appear in process argv). The installer uses it to mint a one-time pairing token and writes that token into the node data directory. The service definition does not contain it. After the node enrolls, the token is removed from `node.json`. Pass `--pairing-token` when `agentlink pair` already minted one. The relay preset and node `--max-access` ceiling default to `full`.
+`AGENTLINK_TOKEN` is the relay admin token (CLI `--token` still works for compatibility, but prefer the environment so the secret is not visible in `ps` argv). The installer uses it to mint a one-time pairing token and writes that token into the node data directory. The service definition does not contain it. After the node enrolls, the token is removed from `node.json`. Pass `AGENTLINK_PAIRING_TOKEN` (or `--pairing-token`) when `agentlink pair` already minted one. The relay preset and node `--max-access` ceiling default to `full`.
 
 The script always checks `SHA256SUMS` and `SHA256SUMS.minisig`. The public key is the copy pinned in the script (the same material as `deploy/minisign.pub`). It is not downloaded from the release host. `AGENTLINK_UPDATE_PUBKEY` may point at a local file or paste the key text. The install scripts call `minisign` and stop if it is missing or the signature does not verify. `AGENTLINK_CHECKSUM_ONLY=1` is the only way to skip the signature. `agentlink update` verifies the signature itself with the key embedded at build time and does not need the `minisign` program.
 
@@ -258,10 +257,9 @@ User scope installs the binary under `~/.local/bin`, or `%LOCALAPPDATA%\agentlin
 ## Background service
 
 ```bash
-agentlink service install \
+env AGENTLINK_TOKEN="$AGENTLINK_TOKEN" agentlink service install \
   --relay wss://relay.example:7443 \
   --fingerprint "$AGENTLINK_FINGERPRINT" \
-  --token "$AGENTLINK_TOKEN" \
   --name laptop
 
 agentlink service status

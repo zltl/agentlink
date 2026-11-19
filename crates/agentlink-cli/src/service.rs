@@ -68,7 +68,8 @@ pub struct InstallArgs {
     #[arg(long)]
     pub name: Option<String>,
     /// One-time token from `agentlink pair`. Omit to mint one with `--token`.
-    #[arg(long)]
+    /// Prefer `AGENTLINK_PAIRING_TOKEN` so the secret is not visible in `ps` argv.
+    #[arg(long, env = "AGENTLINK_PAIRING_TOKEN")]
     pub pairing_token: Option<String>,
     /// Invite from `agentlink pair`. Flags and `--pairing-token` override it.
     #[arg(long)]

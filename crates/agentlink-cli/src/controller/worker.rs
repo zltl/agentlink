@@ -4781,3 +4781,81 @@ mod worker_client_recovery_tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), node_task_2).await;
     }
 }
+
+#[cfg(test)]
+mod pty_fairness_tests {
+    use std::time::Duration;
+
+    /// J-06 regression: with `biased;` + always-ready PTY output, local commands
+    /// (Ctrl+C / Close) must be polled first or they starve. Mirrors `spawn_pty`'s
+    /// select arm order (`cmd` before `session.recv()`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_cmd_beats_always_ready_output_flood() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let (flood_tx, mut flood_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+        for _ in 0..64 {
+            flood_tx.send(1).unwrap();
+        }
+        cmd_tx.send("close").unwrap();
+
+        let mut saw_cmd = false;
+        let mut flooded = 0u32;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                biased;
+                cmd = cmd_rx.recv() => {
+                    assert_eq!(cmd, Some("close"));
+                    saw_cmd = true;
+                    break;
+                }
+                chunk = flood_rx.recv() => {
+                    assert!(chunk.is_some());
+                    flooded = flooded.saturating_add(1);
+                    let _ = flood_tx.send(1);
+                    if flooded > 10_000 {
+                        panic!("local Close/Ctrl+C starved by PTY output flood");
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_cmd,
+            "local cmd must win under biased flood (drained {flooded} output chunks)"
+        );
+        assert_eq!(flooded, 0, "cmd-first order must not drain the flood first");
+    }
+
+    /// Contrasting control: flood-first biased select never observes a queued cmd
+    /// while output stays ready — the starvation Stage J reported.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flood_first_biased_select_starves_local_cmd() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let (flood_tx, mut flood_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+        for _ in 0..64 {
+            flood_tx.send(1).unwrap();
+        }
+        cmd_tx.send("close").unwrap();
+
+        let mut flooded = 0u32;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let mut saw_cmd = false;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                biased;
+                chunk = flood_rx.recv() => {
+                    assert!(chunk.is_some());
+                    flooded = flooded.saturating_add(1);
+                    let _ = flood_tx.send(1);
+                }
+                cmd = cmd_rx.recv() => {
+                    let _ = cmd;
+                    saw_cmd = true;
+                    break;
+                }
+            }
+        }
+        assert!(!saw_cmd, "flood-first order must starve the queued cmd");
+        assert!(flooded > 0);
+    }
+}

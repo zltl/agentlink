@@ -2,11 +2,13 @@
 # Install agentlink on Linux or macOS, verify the release checksum, and
 # optionally pair the machine and install the user service.
 #
-#   curl -fsSL https://raw.githubusercontent.com/zltl/agentlink/main/install.sh | sh -s -- \
+#   curl -fsSL https://raw.githubusercontent.com/zltl/agentlink/main/install.sh | \
+#     env AGENTLINK_TOKEN="..." AGENTLINK_FINGERPRINT="sha256:..." sh -s -- \
 #     --relay wss://relay.example:7443 \
-#     --fingerprint "sha256:..." \
-#     --token "$AGENTLINK_TOKEN" \
 #     --name laptop
+#
+# Prefer AGENTLINK_TOKEN / AGENTLINK_PAIRING_TOKEN in the environment so secrets
+# do not appear in `ps` argv. `--token` / `--pairing-token` remain accepted.
 #
 # The agentlink binary parses the relay port. wss://host and wss://host:443 dial
 # 443. An explicit port is kept. A bare host with no scheme defaults to 7443.
@@ -290,16 +292,16 @@ install_service() {
     if [ -n "$TRUST" ]; then
         set -- "$@" --trust "$TRUST"
     fi
-    # Prefer env for the admin token so it is not visible in `ps` argv.
+    # Prefer env for admin/pairing tokens so they are not visible in `ps` argv.
     if [ -n "$TOKEN" ]; then
         export AGENTLINK_TOKEN="$TOKEN"
+    fi
+    if [ -n "$PAIRING" ]; then
+        export AGENTLINK_PAIRING_TOKEN="$PAIRING"
     fi
     set -- "$@" service install --scope "$SCOPE" --name "$NAME" --access "$ACCESS"
     if [ -n "$MAX_ACCESS" ]; then
         set -- "$@" --max-access "$MAX_ACCESS"
-    fi
-    if [ -n "$PAIRING" ]; then
-        set -- "$@" --pairing-token "$PAIRING"
     fi
     if [ "$AUTO" -eq 1 ]; then
         set -- "$@" --auto-update
