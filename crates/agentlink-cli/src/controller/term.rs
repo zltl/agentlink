@@ -162,7 +162,12 @@ impl Emulator {
     }
 
     pub fn reconcile_local_echo(&mut self) {
-        self.local_echo.reconcile(&self.term);
+        self.local_echo.reconcile(&self.term, false);
+    }
+
+    /// UI-frame tick: expire painted blanks / TTL without waiting on remote feed.
+    pub fn tick_local_echo(&mut self) -> bool {
+        self.local_echo.tick(&self.term)
     }
 
     #[cfg(test)]
@@ -177,7 +182,7 @@ impl Emulator {
     pub fn feed(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
             self.parser.advance(&mut self.term, bytes);
-            self.local_echo.reconcile(&self.term);
+            self.local_echo.reconcile(&self.term, true);
         }
     }
 
@@ -763,6 +768,11 @@ impl Emulator {
                 }
             }
         } // drop renderable_content before mutating the term
+
+        // Active expiry even when the remote is silent (E1b — no feed required).
+        if self.tick_local_echo() {
+            ui.ctx().request_repaint();
+        }
 
         // Speculative local echo: faint overlay on top of remote cells. Never
         // mutates the alacritty grid; confirmed glyphs are cleared in reconcile.
