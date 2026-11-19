@@ -4792,78 +4792,56 @@ mod worker_client_recovery_tests {
 
 #[cfg(test)]
 mod pty_fairness_tests {
+    use super::{spawn_pty, PtyCmd, Shared, UiEvent};
+    use agentlink_core::protocol::Envelope;
+    use agentlink_core::{util, PtySession};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    /// J-06 regression: with `biased;` + always-ready PTY output, local commands
-    /// (Ctrl+C / Close) must be polled first or they starve. Mirrors `spawn_pty`'s
-    /// select arm order (`cmd` before `session.recv()`).
-    #[tokio::test(flavor = "current_thread")]
-    async fn local_cmd_beats_always_ready_output_flood() {
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
-        let (flood_tx, mut flood_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
-        for _ in 0..64 {
-            flood_tx.send(1).unwrap();
-        }
-        cmd_tx.send("close").unwrap();
+    /// Production-path J-06 regression: drive the real [`spawn_pty`] loop with a
+    /// [`PtySession::test_io`] flood of `Envelope::Chunk` and assert `PtyCmd::Close`
+    /// completes promptly (the Stage J starvation failure mode).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_pty_close_beats_chunk_flood() {
+        let io = PtySession::test_io();
+        let shared = Arc::new(Shared::new());
+        let cmd_tx = spawn_pty(io.session, Arc::clone(&shared), 42, (24, 80));
 
-        let mut saw_cmd = false;
-        let mut flooded = 0u32;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-        while tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                biased;
-                cmd = cmd_rx.recv() => {
-                    assert_eq!(cmd, Some("close"));
-                    saw_cmd = true;
+        let flood_tx = io.tx.clone();
+        let flood = tokio::spawn(async move {
+            let mut seq = 0u64;
+            loop {
+                seq = seq.saturating_add(1);
+                let env = Envelope::Chunk {
+                    request_id: "pty-test".into(),
+                    stream: "pty".into(),
+                    data_b64: util::b64_encode(b"Y"),
+                    seq,
+                };
+                if flood_tx.send(env).await.is_err() {
                     break;
                 }
-                chunk = flood_rx.recv() => {
-                    assert!(chunk.is_some());
-                    flooded = flooded.saturating_add(1);
-                    let _ = flood_tx.send(1);
-                    if flooded > 10_000 {
-                        panic!("local Close/Ctrl+C starved by PTY output flood");
-                    }
-                }
             }
-        }
+        });
+
+        // Let the pending queue and spawn_pty select arm see continuous output.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(PtyCmd::Close(Some(done)))
+            .expect("pty cmd channel open");
+        let closed = tokio::time::timeout(Duration::from_millis(750), done_rx).await;
+        flood.abort();
         assert!(
-            saw_cmd,
-            "local cmd must win under biased flood (drained {flooded} output chunks)"
+            closed.is_ok() && closed.unwrap().is_ok(),
+            "spawn_pty must apply Close under an always-ready Chunk flood"
         );
-        assert_eq!(flooded, 0, "cmd-first order must not drain the flood first");
-    }
 
-    /// Contrasting control: flood-first biased select never observes a queued cmd
-    /// while output stays ready — the starvation Stage J reported.
-    #[tokio::test(flavor = "current_thread")]
-    async fn flood_first_biased_select_starves_local_cmd() {
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
-        let (flood_tx, mut flood_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
-        for _ in 0..64 {
-            flood_tx.send(1).unwrap();
-        }
-        cmd_tx.send("close").unwrap();
-
-        let mut flooded = 0u32;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-        let mut saw_cmd = false;
-        while tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                biased;
-                chunk = flood_rx.recv() => {
-                    assert!(chunk.is_some());
-                    flooded = flooded.saturating_add(1);
-                    let _ = flood_tx.send(1);
-                }
-                cmd = cmd_rx.recv() => {
-                    let _ = cmd;
-                    saw_cmd = true;
-                    break;
-                }
-            }
-        }
-        assert!(!saw_cmd, "flood-first order must starve the queued cmd");
-        assert!(flooded > 0);
+        // Optional: confirm the loop observed some output (flood was real).
+        let saw_data = shared.drain().into_iter().any(|ev| {
+            matches!(ev, UiEvent::Pty { gen: 42, .. })
+        });
+        let _ = saw_data; // flood may race Close before first push; Close success is the gate
     }
 }
