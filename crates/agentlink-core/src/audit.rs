@@ -4,6 +4,11 @@
 //! [`AuditEvent`] and pass it to [`crate`] consumers through
 //! `agentlink_node::audit::submit`. This module decides what is stored. It does
 //! not open files; the node and the relay do.
+//!
+//! **JSONL reads:** prefer [`page_from_jsonl`] / [`select_from_jsonl`] /
+//! [`chain_tip_from_jsonl`] so callers never buffer an entire `audit.jsonl`.
+//! Filter predicates run during the scan (before paging) for correct pages and
+//! bounded memory. Webhook delivery is a separate bounded queue (`fire_webhook`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;

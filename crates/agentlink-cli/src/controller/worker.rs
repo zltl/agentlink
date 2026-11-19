@@ -1994,6 +1994,14 @@ async fn close_pty(pty: &mut Option<UnboundedSender<PtyCmd>>) {
     let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
 }
 
+// =============================================================================
+// Local PTY drive loop (J-06 fairness)
+//
+// Responsibility: bridge `PtySession` output to UI events and apply local
+// PtyCmd (write/resize/probe/close). The biased select MUST poll `rx` (local
+// commands) before `session.recv()` so Ctrl+C/Close stay responsive under an
+// always-ready remote flood (`yes`). See `pty_fairness_tests`.
+// =============================================================================
 const PTY_WRITE_COALESCE_CAP: usize = 16 * 1024;
 const PTY_SOCKET_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const PTY_IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(300);

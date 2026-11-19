@@ -1,4 +1,12 @@
-//! File, command, and extension operations.
+//! Node operation dispatch: files, exec, PTY, search/edit/watch, extensions.
+//!
+//! **Filesystem ops** (`stat`/`list`/`read`/`write`/`mkdir`/`remove`/`rename`)
+//! honor `--root` via `agentlink_core::paths` (`resolve_path_no_follow`,
+//! `rename_within_sandbox`, `open_write_file`). Same-UID `exec`/`full` is out of
+//! sandbox scope; these paths must stay fail-closed for `read-write` grants.
+//!
+//! **PTY input** writes through `spawn_blocking` so a stalled peer cannot block
+//! the Tokio worker; controller-side flood fairness lives in the CLI worker.
 
 use std::fs;
 use std::io::{self, ErrorKind, SeekFrom};

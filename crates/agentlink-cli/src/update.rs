@@ -1462,11 +1462,17 @@ fn command_line(args: &[String]) -> String {
         .join(" ")
 }
 
-// --- Deferred Unix restart helper -----------------------------------------
-// The updater replaces the binary, then spawns a short shell script that
-// waits for this process to exit before bouncing systemd/launchd units.
-// Keep `pid=` assigned, and only prefer `sudo -n` when a system-scope job
-// is present (see `jobs_need_system_sudo`).
+// =============================================================================
+// Deferred Unix restart helper (J-04 lifecycle)
+//
+// Responsibility: after the binary is replaced, spawn a short shell script that
+// waits for *this* updater pid to exit, then bounces systemd/launchd units.
+// Keep this block cohesive: script text, sudo policy, and launcher fallbacks.
+// Do not fold Slowloris/TLS or file-sandbox concerns into these helpers.
+//
+// Invariants: `pid=` must be assigned; prefer `sudo -n` only when a system-scope
+// job is present (`jobs_need_system_sudo`).
+// =============================================================================
 
 /// Build the detached helper. It waits for the updater to exit (or ~30s),
 /// then restarts active units and starts inactive ones.
