@@ -63,12 +63,20 @@ pub(crate) enum TransferInbound {
     Frame(Vec<u8>),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ActivePtyStream {
+    pub(crate) session_id: String,
+    pub(crate) node_id: String,
+    pub(crate) client_id: String,
+}
+
 pub(crate) struct ClientInner {
     pub(crate) tx: mpsc::Sender<Outbound>,
     pub(crate) pending: Arc<Mutex<HashMap<String, PendingSender>>>,
     /// Per-request queue shared by transfer control messages and binary frames.
     pub(crate) binary: Arc<Mutex<HashMap<String, UnboundedSender<TransferInbound>>>>,
     pub(crate) alive: Arc<AtomicBool>,
+    pub(crate) socket_gen: std::sync::atomic::AtomicU64,
     pub(crate) shutdown: CancellationToken,
     pub(crate) relay_addr: Option<SocketAddr>,
     pub(crate) direct_id: OnceLock<crate::identity::Identity>,
@@ -80,6 +88,7 @@ pub(crate) struct ClientInner {
     session_id: String,
     inflight: Mutex<HashMap<String, Envelope>>,
     cursors: Mutex<crate::resume::Cursors>,
+    pty_streams: Mutex<HashMap<String, ActivePtyStream>>,
     /// Transfer request ids. A socket drop fails only these waiters.
     pub(crate) transfers: Arc<Mutex<HashSet<String>>>,
     /// Config directory holding `grants/<node_id>.json`.
@@ -102,6 +111,21 @@ impl ClientInner {
     pub(crate) fn note_route(&self, request_id: &str, node_id: &str) {
         if let Ok(mut map) = self.routes.lock() {
             map.insert(request_id.to_string(), node_id.to_string());
+        }
+    }
+
+    pub(crate) fn forget_pty_stream(&self, request_id: &str) {
+        if let Ok(mut map) = self.pty_streams.lock() {
+            map.remove(request_id);
+        }
+        if let Ok(mut map) = self.inflight.lock() {
+            map.remove(request_id);
+        }
+        if let Ok(mut map) = self.offline_since.lock() {
+            map.remove(request_id);
+        }
+        if let Ok(mut map) = self.routes.lock() {
+            map.remove(request_id);
         }
     }
 
@@ -209,6 +233,7 @@ pub struct PtyRead {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        self.inner.forget_pty_stream(&self._guard.id);
         if self.close_sent {
             return;
         }
@@ -232,6 +257,83 @@ impl Drop for PtySession {
 }
 
 impl PtySession {
+    pub fn is_client_alive(&self) -> bool {
+        self.inner.alive.load(Ordering::SeqCst)
+    }
+
+    pub fn socket_generation(&self) -> u64 {
+        self.inner.socket_gen.load(Ordering::SeqCst)
+    }
+
+    /// Lightweight roundtrip check that the remote PTY session and its grant
+    /// still exist on the node (`TIOCSWINSZ` with unchanged dimensions is a
+    /// kernel no-op on live PTYs).
+    pub async fn probe_alive(&self, rows: u16, cols: u16) -> Result<()> {
+        self.resize(rows, cols).await
+    }
+
+    /// Re-announce the stream cursor and inflight `PtyOpen` frame on the active
+    /// socket so an un-upgraded relay whose node-side `detach()` dropped the
+    /// stream route re-binds `request_id` and replays buffered output chunks
+    /// without opening a duplicate shell when `live.sessions` still holds it.
+    pub async fn rebind_stream(&self) -> Result<()> {
+        if !self.is_client_alive() {
+            return Err(Error::Message("connection closed".into()));
+        }
+        let req_id = self._guard.id.clone();
+        let maybe_env = {
+            let mut map = self
+                .inner
+                .inflight
+                .lock()
+                .map_err(|_| Error::Message("client lock poisoned".into()))?;
+            if let Some(env) = map.get_mut(&req_id) {
+                if let Envelope::Invoke { authz, .. } = env {
+                    if let Ok(fresh) = self.inner.authz_for(&self.node_id) {
+                        *authz = fresh;
+                    }
+                }
+                Some(env.clone())
+            } else {
+                None
+            }
+        };
+        let Some(env) = maybe_env else {
+            return Ok(());
+        };
+        ensure_e2e(&self.inner, &self.node_id, &self.client_id).await?;
+        let applied = self
+            .inner
+            .cursors
+            .lock()
+            .map(|c| c.applied(&req_id))
+            .unwrap_or(0);
+        let cursors = if applied > 0 {
+            vec![crate::protocol::SessionCursor {
+                request_id: req_id.clone(),
+                seq: applied,
+            }]
+        } else {
+            Vec::new()
+        };
+        let session_env = Envelope::Session {
+            session_id: self.inner.session_id.clone(),
+            node_id: self.node_id.clone(),
+            cursors,
+        };
+        self.inner
+            .tx
+            .send(ws::encode(&session_env)?)
+            .await
+            .map_err(|_| Error::Message("connection closed".into()))?;
+        let out = seal_now(&self.inner, &self.node_id, &self.client_id, &env)?;
+        self.inner
+            .tx
+            .send(out)
+            .await
+            .map_err(|_| Error::Message("connection closed".into()))
+    }
+
     pub async fn recv(&mut self) -> Result<PtyEvent> {
         loop {
             let env = self
@@ -246,17 +348,24 @@ impl PtySession {
                 Envelope::End {
                     exit_code, error, ..
                 } => {
+                    self.close_sent = true;
+                    self.inner.forget_pty_stream(&self._guard.id);
                     if let Some(err) = error {
+                        self.finished = Some(Err(err.clone()));
                         return Ok(PtyEvent::Error(err));
                     }
-                    return Ok(PtyEvent::Exit(exit_code.unwrap_or(0)));
+                    let code = exit_code.unwrap_or(0);
+                    self.finished = Some(Ok(code));
+                    return Ok(PtyEvent::Exit(code));
                 }
                 Envelope::Result {
                     ok: false, error, ..
                 } => {
-                    return Ok(PtyEvent::Error(
-                        error.unwrap_or_else(|| "pty failed".into()),
-                    ));
+                    self.close_sent = true;
+                    self.inner.forget_pty_stream(&self._guard.id);
+                    let err = error.unwrap_or_else(|| "pty failed".into());
+                    self.finished = Some(Err(err.clone()));
+                    return Ok(PtyEvent::Error(err));
                 }
                 _ => continue,
             }
@@ -335,6 +444,8 @@ impl PtySession {
                 Ok(Some(Envelope::End {
                     exit_code, error, ..
                 })) => {
+                    self.close_sent = true;
+                    self.inner.forget_pty_stream(&self._guard.id);
                     if let Some(err) = error {
                         self.finished = Some(Err(err.clone()));
                         return Ok(PtyRead {
@@ -354,6 +465,8 @@ impl PtySession {
                 Ok(Some(Envelope::Result {
                     ok: false, error, ..
                 })) => {
+                    self.close_sent = true;
+                    self.inner.forget_pty_stream(&self._guard.id);
                     let err = error.unwrap_or_else(|| "pty failed".into());
                     self.finished = Some(Err(err.clone()));
                     return Ok(PtyRead {
@@ -403,6 +516,8 @@ impl PtySession {
                             out.flush().ok();
                         }
                         Some(Envelope::End { exit_code, error, .. }) => {
+                            self.close_sent = true;
+                            self.inner.forget_pty_stream(&self._guard.id);
                             if let Some(err) = error {
                                 eprintln!("\n{err}");
                                 return Err(Error::Message(err));
@@ -412,6 +527,8 @@ impl PtySession {
                             return Ok(code);
                         }
                         Some(Envelope::Result { ok: false, error, .. }) => {
+                            self.close_sent = true;
+                            self.inner.forget_pty_stream(&self._guard.id);
                             return Err(Error::Message(error.unwrap_or_else(|| "pty failed".into())));
                         }
                         None => return Err(Error::Message("connection closed".into())),
@@ -477,6 +594,7 @@ impl PtySession {
             pending: pending.clone(),
             binary: std::sync::Arc::new(Mutex::new(HashMap::new())),
             alive: std::sync::Arc::new(AtomicBool::new(true)),
+            socket_gen: std::sync::atomic::AtomicU64::new(1),
             shutdown: CancellationToken::new(),
             relay_addr: None,
             direct_id: OnceLock::new(),
@@ -487,6 +605,7 @@ impl PtySession {
             session_id: "test-session".into(),
             inflight: Mutex::new(HashMap::new()),
             cursors: Mutex::new(crate::resume::Cursors::default()),
+            pty_streams: Mutex::new(HashMap::new()),
             transfers: std::sync::Arc::new(Mutex::new(HashSet::new())),
             grant_dir: std::sync::Arc::new(Mutex::new(None)),
             session_dir: std::sync::Arc::new(Mutex::new(None)),
@@ -566,27 +685,131 @@ impl PtyWriter {
                         .map_err(|_| Error::Message("connection closed".into()))?;
                     return Ok(());
                 }
-                Op::PtyResize { .. } => return Ok(()),
+                Op::PtyResize { .. } | Op::PtyClose { .. } => return Ok(()),
                 _ => {}
             }
         }
-        let env = Envelope::Invoke {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            node_id: self.node_id.clone(),
-            client_id: self.client_id.clone(),
-            op,
-            grant: None,
-            authz: self.inner.authz_for(&self.node_id)?,
-            user: None,
-            device_id: None,
+        let idempotent = matches!(op, Op::PtyResize { .. } | Op::PtyClose { .. });
+        let wait_limit = if matches!(op, Op::PtyClose { .. }) {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(10)
         };
-        let out = seal_now(&self.inner, &self.node_id, &self.client_id, &env)?;
-        self.inner
-            .tx
-            .send(out)
-            .await
-            .map_err(|_| Error::Message("connection closed".into()))
+        for attempt in 0..2 {
+            if !self.inner.alive.load(Ordering::SeqCst) {
+                return Err(Error::Message("connection closed".into()));
+            }
+            let start_gen = self.inner.socket_gen.load(Ordering::SeqCst);
+            ensure_e2e(&self.inner, &self.node_id, &self.client_id).await?;
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let (wait_tx, rx) = pending::channel();
+            {
+                let mut map = self
+                    .inner
+                    .pending
+                    .lock()
+                    .map_err(|_| Error::Message("client lock poisoned".into()))?;
+                map.insert(request_id.clone(), wait_tx);
+            }
+            let _guard = PendingGuard {
+                map: self.inner.pending.clone(),
+                id: request_id.clone(),
+            };
+            let env = Envelope::Invoke {
+                request_id,
+                node_id: self.node_id.clone(),
+                client_id: self.client_id.clone(),
+                op: op.clone(),
+                grant: None,
+                authz: self.inner.authz_for(&self.node_id)?,
+                user: None,
+                device_id: None,
+            };
+            let out = seal_now(&self.inner, &self.node_id, &self.client_id, &env)?;
+            self.inner
+                .tx
+                .send(out)
+                .await
+                .map_err(|_| Error::Message("connection closed".into()))?;
+            let recv_res = timeout(wait_limit, rx.recv()).await;
+            let reply = match recv_res {
+                Ok(Some(env)) => env,
+                Ok(None) => return Err(Error::Message("connection closed".into())),
+                Err(_) => {
+                    if idempotent
+                        && attempt == 0
+                        && self.inner.alive.load(Ordering::SeqCst)
+                        && self.inner.socket_gen.load(Ordering::SeqCst) != start_gen
+                    {
+                        continue;
+                    }
+                    return Err(Error::Timeout);
+                }
+            };
+            match reply {
+                Envelope::Result { ok: true, .. } => return Ok(()),
+                Envelope::Result {
+                    ok: false, error, ..
+                } => {
+                    let msg = error.unwrap_or_else(|| "pty operation failed".into());
+                    let lower = msg.to_ascii_lowercase();
+                    if attempt == 0 && self.inner.alive.load(Ordering::SeqCst) {
+                        if lower.contains("e2e session reset") {
+                            self.inner.e2e.forget(&self.node_id);
+                            continue;
+                        }
+                        if lower.trim() == "session revoked"
+                            || lower.trim() == "session expired"
+                        {
+                            // Un-upgraded relays reject frames on an aged access token
+                            // in `handle_client` right before closing the socket (never
+                            // routed to the node); wait for `supervise` to redial on
+                            // the rotated token, then send once.
+                            if wait_for_socket_rotation(&self.inner, start_gen, Duration::from_millis(2500)).await {
+                                continue;
+                            }
+                        }
+                        if idempotent
+                            && (lower.contains("connection closed")
+                                || lower.contains("going away")
+                                || lower.contains("node disconnected"))
+                        {
+                            let _ = wait_for_socket_rotation(
+                                &self.inner,
+                                start_gen,
+                                Duration::from_millis(1000),
+                            )
+                            .await;
+                            if self.inner.alive.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                        }
+                    }
+                    return Err(Error::Message(msg));
+                }
+                other => return Err(Error::Protocol(format!("unexpected {}", kind(&other)))),
+            }
+        }
+        Err(Error::Message("pty operation retry exhausted".into()))
     }
+}
+
+async fn wait_for_socket_rotation(
+    inner: &ClientInner,
+    start_gen: u64,
+    max_wait: Duration,
+) -> bool {
+    let deadline = Instant::now() + max_wait;
+    while Instant::now() < deadline {
+        if !inner.alive.load(Ordering::SeqCst) {
+            return false;
+        }
+        if inner.socket_gen.load(Ordering::SeqCst) != start_gen {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    inner.alive.load(Ordering::SeqCst) && inner.socket_gen.load(Ordering::SeqCst) != start_gen
 }
 
 #[derive(Debug, Clone)]
@@ -659,6 +882,7 @@ impl Client {
             pending,
             binary,
             alive,
+            socket_gen: std::sync::atomic::AtomicU64::new(0),
             shutdown,
             relay_addr,
             direct_id: OnceLock::new(),
@@ -669,6 +893,7 @@ impl Client {
             session_id: uuid::Uuid::new_v4().to_string(),
             inflight: Mutex::new(HashMap::new()),
             cursors: Mutex::new(crate::resume::Cursors::default()),
+            pty_streams: Mutex::new(HashMap::new()),
             transfers: Arc::new(Mutex::new(HashSet::new())),
             grant_dir: Arc::new(Mutex::new(None)),
             session_dir: Arc::new(Mutex::new(None)),
@@ -1448,16 +1673,29 @@ impl Client {
             .map_err(|_| Error::Timeout)?
             .ok_or_else(|| Error::Message("connection closed".into()))?;
         match first {
-            Envelope::Result { ok: true, body, .. } => Ok(PtySession {
-                session_id: Self::pty_open_session_id(body.as_ref())?,
-                node_id,
-                client_id: self.client_id.clone(),
-                inner: self.inner.clone(),
-                rx,
-                finished: None,
-                close_sent: false,
-                _guard: guard,
-            }),
+            Envelope::Result { ok: true, body, .. } => {
+                let session_id = Self::pty_open_session_id(body.as_ref())?;
+                if let Ok(mut map) = self.inner.pty_streams.lock() {
+                    map.insert(
+                        request_id,
+                        ActivePtyStream {
+                            session_id: session_id.clone(),
+                            node_id: node_id.clone(),
+                            client_id: self.client_id.clone(),
+                        },
+                    );
+                }
+                Ok(PtySession {
+                    session_id,
+                    node_id,
+                    client_id: self.client_id.clone(),
+                    inner: self.inner.clone(),
+                    rx,
+                    finished: None,
+                    close_sent: false,
+                    _guard: guard,
+                })
+            }
             Envelope::Result {
                 ok: false, error, ..
             } => Err(Error::Message(error.unwrap_or_else(|| "pty failed".into()))),
@@ -2871,6 +3109,7 @@ async fn supervise(
             }
             Ok(ws) => {
                 connected_once = true;
+                inner.socket_gen.fetch_add(1, Ordering::SeqCst);
                 backoff.reset();
                 if let Some(tx) = ready.take() {
                     let _ = tx.send(Ok(()));
@@ -3227,7 +3466,16 @@ async fn resend_inflight(inner: &Arc<ClientInner>, sock_tx: &mpsc::Sender<Outbou
     let pending: Vec<Envelope> = inner
         .inflight
         .lock()
-        .map(|map| map.values().cloned().collect())
+        .map(|mut map| {
+            for env in map.values_mut() {
+                if let Envelope::Invoke { node_id, authz, .. } = env {
+                    if let Ok(fresh) = inner.authz_for(node_id) {
+                        *authz = fresh;
+                    }
+                }
+            }
+            map.values().cloned().collect()
+        })
         .unwrap_or_default();
     let mut handshake = Vec::new();
     for env in pending {
@@ -3271,7 +3519,37 @@ async fn resend_inflight(inner: &Arc<ClientInner>, sock_tx: &mpsc::Sender<Outbou
     }
 }
 
-fn take_ready(inner: &ClientInner, env: Envelope) -> Vec<Envelope> {
+fn close_orphan_pty_best_effort(
+    inner: &Arc<ClientInner>,
+    node_id: String,
+    client_id: String,
+    session_ids: Vec<String>,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let inner = inner.clone();
+    handle.spawn(async move {
+        for sid in session_ids {
+            if sid.is_empty() {
+                continue;
+            }
+            let writer = PtyWriter {
+                session_id: sid,
+                node_id: node_id.clone(),
+                client_id: client_id.clone(),
+                inner: inner.clone(),
+            };
+            let _ = writer
+                .send_op(Op::PtyClose {
+                    session_id: writer.session_id.clone(),
+                })
+                .await;
+        }
+    });
+}
+
+fn take_ready(inner: &Arc<ClientInner>, env: Envelope) -> Vec<Envelope> {
     let env = unwrap_client(&inner.e2e, env);
     if let Envelope::Result {
         ok: false,
@@ -3282,46 +3560,119 @@ fn take_ready(inner: &ClientInner, env: Envelope) -> Vec<Envelope> {
     {
         if crate::resume::is_transient_message(message) {
             let lower = message.to_ascii_lowercase();
-            let is_offline =
-                lower.contains("node offline") || lower.contains("node disconnected");
-            if is_offline && !request_id.is_empty() {
-                let expired = inner
-                    .offline_since
+            if lower.contains("e2e session reset") {
+                if let Some(node) = inner
+                    .routes
                     .lock()
                     .ok()
-                    .map(|mut map| {
-                        let first = *map.entry(request_id.clone()).or_insert_with(Instant::now);
-                        if first.elapsed() >= crate::resume::OFFLINE_GRACE {
-                            map.remove(request_id);
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .unwrap_or(true);
-                if !expired {
+                    .and_then(|routes| routes.get(request_id).cloned())
+                {
+                    inner.e2e.forget(&node);
+                }
+            }
+            let is_inflight = !request_id.is_empty()
+                && inner
+                    .inflight
+                    .lock()
+                    .ok()
+                    .is_some_and(|map| map.contains_key(request_id));
+            if is_inflight {
+                let is_offline =
+                    lower.contains("node offline") || lower.contains("node disconnected");
+                if is_offline {
+                    let expired = inner
+                        .offline_since
+                        .lock()
+                        .ok()
+                        .map(|mut map| {
+                            let first = *map.entry(request_id.clone()).or_insert_with(Instant::now);
+                            if first.elapsed() >= crate::resume::OFFLINE_GRACE {
+                                map.remove(request_id);
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(true);
+                    if !expired {
+                        inner.resend.notify_waiters();
+                        return Vec::new();
+                    }
+                } else {
                     inner.resend.notify_waiters();
                     return Vec::new();
                 }
             } else {
-                if lower.contains("e2e session reset") {
-                    if let Some(node) = inner
-                        .routes
-                        .lock()
-                        .ok()
-                        .and_then(|routes| routes.get(request_id).cloned())
-                    {
-                        inner.e2e.forget(&node);
-                    }
-                }
-                inner.resend.notify_waiters();
-                return Vec::new();
+                // Non-inflight unary calls (e.g. `PtyWriter::send_op`) will not
+                // be resent by `resend_inflight`: deliver the transient error
+                // immediately so the caller can decide (or fail fast).
+                return vec![env];
             }
         }
     }
     if let Some(id) = env.request_id() {
         if let Ok(mut map) = inner.offline_since.lock() {
             map.remove(id);
+        }
+    }
+    if let Envelope::Result {
+        request_id,
+        ok,
+        body,
+        error,
+        ..
+    } = &env
+    {
+        let already_acked = inner
+            .cursors
+            .lock()
+            .map(|c| c.applied(request_id) >= 1)
+            .unwrap_or(false);
+        if already_acked {
+            let active = inner
+                .pty_streams
+                .lock()
+                .ok()
+                .and_then(|map| map.get(request_id).cloned());
+            if let Some(active) = active {
+                if !*ok {
+                    inner.forget_pty_stream(request_id);
+                    return vec![Envelope::result_err(
+                        request_id.clone(),
+                        error
+                            .clone()
+                            .unwrap_or_else(|| "remote shell session ended".into()),
+                    )];
+                }
+                if let Some(replayed_sid) = body
+                    .as_ref()
+                    .and_then(|v| v.get("session_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if replayed_sid != active.session_id {
+                        // An un-upgraded node evicted `request_id` from its
+                        // 256-entry `live.sessions` map (or restarted) and
+                        // executed `PtyOpen` again at `seq = 1` instead of
+                        // replaying the original shell's ring. Close both
+                        // shells best-effort and surface a clean session end
+                        // rather than dropping `seq = 1 < expected` into a
+                        // zombie prompt.
+                        inner.forget_pty_stream(request_id);
+                        close_orphan_pty_best_effort(
+                            inner,
+                            active.node_id,
+                            active.client_id,
+                            vec![replayed_sid.to_string(), active.session_id],
+                        );
+                        return vec![Envelope::result_err(
+                            request_id.clone(),
+                            "Remote shell session lost its replay slot across reconnect; reopen shell to continue.",
+                        )];
+                    }
+                }
+            }
         }
     }
     let ready = inner
@@ -3334,6 +3685,9 @@ fn take_ready(inner: &ClientInner, env: Envelope) -> Vec<Envelope> {
             if env.is_terminal_frame() {
                 if let Some(id) = env.request_id() {
                     inflight.remove(id);
+                    if let Ok(mut streams) = inner.pty_streams.lock() {
+                        streams.remove(id);
+                    }
                 }
             }
         }
@@ -4029,11 +4383,12 @@ mod session_maintain_tests {
     #[test]
     fn take_ready_surfaces_node_offline_after_grace_instead_of_swallowing_forever() {
         let (tx, _rx) = mpsc::channel(4);
-        let inner = ClientInner {
+        let inner = Arc::new(ClientInner {
             tx,
             pending: Arc::new(Mutex::new(HashMap::new())),
             binary: Arc::new(Mutex::new(HashMap::new())),
             alive: Arc::new(AtomicBool::new(true)),
+            socket_gen: std::sync::atomic::AtomicU64::new(1),
             shutdown: CancellationToken::new(),
             relay_addr: None,
             direct_id: OnceLock::new(),
@@ -4044,6 +4399,7 @@ mod session_maintain_tests {
             session_id: "sess-1".into(),
             inflight: Mutex::new(HashMap::new()),
             cursors: Mutex::new(crate::resume::Cursors::default()),
+            pty_streams: Mutex::new(HashMap::new()),
             transfers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             grant_dir: Arc::new(Mutex::new(None)),
             session_dir: Arc::new(Mutex::new(None)),
@@ -4052,11 +4408,18 @@ mod session_maintain_tests {
             transport: crate::transport_status::TransportObserver::new(),
             offline_since: Mutex::new(HashMap::new()),
             write_hook: Mutex::new(None),
-        };
+        });
         let req = "pty-open-1";
+        inner.inflight.lock().unwrap().insert(
+            req.to_string(),
+            Envelope::Ping,
+        );
         let offline = Envelope::result_err(req.to_string(), "node offline: sufa");
-        // Initial offline reply within OFFLINE_GRACE is retried transiently.
+        // Initial offline reply within OFFLINE_GRACE is retried transiently for inflight ops.
         assert!(take_ready(&inner, offline.clone()).is_empty());
+        // Non-inflight unary ops (e.g. PtyWriter::send_op) must receive transient errors immediately.
+        let non_inflight = Envelope::result_err("pty-input-1".into(), "node offline: sufa");
+        assert_eq!(take_ready(&inner, non_inflight).len(), 1);
         // Once OFFLINE_GRACE has elapsed, take_ready MUST deliver the real error
         // rather than swallowing it for 30s until Error::Timeout!
         std::thread::sleep(crate::resume::OFFLINE_GRACE + Duration::from_millis(80));
@@ -4066,5 +4429,140 @@ mod session_maintain_tests {
             1,
             "node offline stayed swallowed past OFFLINE_GRACE, causing 30s PtyOpen timeout!"
         );
+    }
+
+    #[tokio::test]
+    async fn take_ready_catches_bc97_evicted_pty_open_phantom_shell_and_seq1_error() {
+        let (tx, mut out_rx) = mpsc::channel(16);
+        let node_ep = crate::e2e::Endpoint::new(crate::identity::Identity::generate());
+        let client_id_ident = crate::identity::Identity::generate();
+        let client_ep = crate::e2e::Endpoint::new(client_id_ident.clone());
+        let node_id = node_ep.peer_id().to_string();
+        let pending_hello = client_ep.client_hello(&node_id).unwrap();
+        let (_, welcome) = node_ep
+            .accept(crate::e2e::Endpoint::hello_bytes(&pending_hello))
+            .unwrap();
+        client_ep.complete(pending_hello, &welcome).unwrap();
+
+        let inner = Arc::new(ClientInner {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            binary: Arc::new(Mutex::new(HashMap::new())),
+            alive: Arc::new(AtomicBool::new(true)),
+            socket_gen: std::sync::atomic::AtomicU64::new(1),
+            shutdown: CancellationToken::new(),
+            relay_addr: None,
+            direct_id: OnceLock::new(),
+            quic: Mutex::new(None),
+            e2e: client_ep,
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            gates: Mutex::new(HashMap::new()),
+            session_id: "sess-bc97".into(),
+            inflight: Mutex::new(HashMap::new()),
+            cursors: Mutex::new(crate::resume::Cursors::default()),
+            pty_streams: Mutex::new(HashMap::new()),
+            transfers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            grant_dir: Arc::new(Mutex::new(None)),
+            session_dir: Arc::new(Mutex::new(None)),
+            resend: Notify::new(),
+            fast: AtomicBool::new(false),
+            transport: crate::transport_status::TransportObserver::new(),
+            offline_since: Mutex::new(HashMap::new()),
+            write_hook: Mutex::new(None),
+        });
+
+        let req = "r-open-2".to_string();
+        inner
+            .inflight
+            .lock()
+            .unwrap()
+            .insert(req.clone(), Envelope::Ping);
+        inner.pty_streams.lock().unwrap().insert(
+            req.clone(),
+            ActivePtyStream {
+                session_id: "sid-orig".into(),
+                node_id: node_id.clone(),
+                client_id: client_id_ident.public_hex().to_string(),
+            },
+        );
+        // Simulate initial ack (seq=1) + 3 output chunks (seq=2..=4) so expected == 5.
+        let mut ack1 = Envelope::result_ack(
+            req.clone(),
+            serde_json::json!({"session_id": "sid-orig", "rows": 24, "cols": 80}),
+        );
+        ack1.set_seq(1);
+        assert_eq!(take_ready(&inner, ack1.clone()).len(), 1);
+        for seq in 2..=4 {
+            assert_eq!(
+                take_ready(
+                    &inner,
+                    Envelope::Chunk {
+                        request_id: req.clone(),
+                        stream: "pty".into(),
+                        data_b64: "b2s=".into(),
+                        seq,
+                    }
+                )
+                .len(),
+                1
+            );
+        }
+
+        // 1. Legitimate duplicate ack of the SAME session_id at seq=1 is deduplicated cleanly.
+        assert!(take_ready(&inner, ack1).is_empty());
+        assert!(inner.pty_streams.lock().unwrap().contains_key(&req));
+
+        // 2. Un-upgraded bc97 node evicted `r-open-2` from its 256-entry `live.sessions`
+        // and spawned phantom `sid-phantom` at `seq = 1 < 5`. `take_ready` MUST surface a
+        // terminal error (seq=0) AND dispatch best-effort `PtyClose` for both sessions!
+        let mut phantom_ack = Envelope::result_ack(
+            req.clone(),
+            serde_json::json!({"session_id": "sid-phantom", "rows": 24, "cols": 80}),
+        );
+        phantom_ack.set_seq(1);
+        let out = take_ready(&inner, phantom_ack);
+        assert_eq!(out.len(), 1, "phantom seq=1 replay was swallowed!");
+        assert!(
+            matches!(&out[0], Envelope::Result { ok: false, error: Some(msg), .. } if msg.contains("lost its replay slot")),
+            "unexpected frame: {:?}",
+            out[0]
+        );
+        assert!(!inner.pty_streams.lock().unwrap().contains_key(&req));
+        assert!(!inner.inflight.lock().unwrap().contains_key(&req));
+
+        // Verify best-effort PtyClose frames were queued on `tx` for cleanup.
+        let close_1 = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("close 1 timeout")
+            .expect("close 1 frame");
+        let _ = close_1;
+
+        // 3. Also verify a `seq = 1 < expected` fatal `Result { ok: false }` on another
+        // active stream is surfaced instead of swallowed by `Cursors::push`!
+        let req2 = "r-open-3".to_string();
+        inner
+            .inflight
+            .lock()
+            .unwrap()
+            .insert(req2.clone(), Envelope::Ping);
+        inner.pty_streams.lock().unwrap().insert(
+            req2.clone(),
+            ActivePtyStream {
+                session_id: "sid-2".into(),
+                node_id,
+                client_id: client_id_ident.public_hex().to_string(),
+            },
+        );
+        let mut ack2 = Envelope::result_ack(req2.clone(), serde_json::json!({"session_id": "sid-2"}));
+        ack2.set_seq(1);
+        assert_eq!(take_ready(&inner, ack2).len(), 1);
+        let mut err_seq1 = Envelope::result_err(req2.clone(), "too many concurrent pty sessions");
+        err_seq1.set_seq(1);
+        let out2 = take_ready(&inner, err_seq1);
+        assert_eq!(out2.len(), 1, "seq=1 fatal Result on active PTY was dropped!");
+        assert!(matches!(
+            &out2[0],
+            Envelope::Result { ok: false, error: Some(msg), .. } if msg.contains("too many concurrent pty sessions")
+        ));
     }
 }

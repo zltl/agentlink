@@ -492,6 +492,14 @@ pub fn notice_refers_to_path(notice: &str, path: &str) -> bool {
     !path.is_empty() && notice.starts_with("Saved ") && notice.contains(path)
 }
 
+/// Terminal-scoped status badges (such as a previous shell's `"Shell exited (130)"`)
+/// that must clear when opening, reopening, or leaving a terminal session so an
+/// active shell never wears an earlier shell's exit badge.
+pub fn notice_is_terminal_status(notice: &str) -> bool {
+    let trimmed = notice.trim();
+    trimmed.starts_with("Shell exited (") || trimmed.starts_with("Terminal copied ")
+}
+
 /// Width of the compact device nav (session and machines), including frame.
 ///
 /// This is a name+status list, not a stack of four action buttons, so it

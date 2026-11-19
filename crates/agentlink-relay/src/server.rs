@@ -273,6 +273,13 @@ impl RelayHandle {
     }
 
     #[doc(hidden)]
+    pub fn testing_clear_routes(&self) {
+        if let Ok(mut routes) = lock_routes(&self.hub) {
+            routes.clear();
+        }
+    }
+
+    #[doc(hidden)]
     pub fn testing_backdate_routes_and_run_periodic_reap(&self, age: Duration) {
         if let Ok(mut routes) = lock_routes(&self.hub) {
             let past = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);

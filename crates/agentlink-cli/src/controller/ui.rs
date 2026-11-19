@@ -283,6 +283,11 @@ pub struct ControllerApp {
     pins: Vec<String>,
     terminal: Emulator,
     term_size: (u16, u16),
+    /// Monotonic generation tag isolating events of the active shell from
+    /// delayed close/exit notifications of a replaced shell.
+    term_gen: u64,
+    term_node_id: Option<String>,
+    term_window_focused: bool,
     /// When the current shell open was requested; None once output arrives.
     term_open: Option<Instant>,
     term_got_output: bool,
@@ -564,6 +569,9 @@ impl ControllerApp {
             pins: Vec::new(),
             terminal: Emulator::new(24, 80),
             term_size: (24, 80),
+            term_gen: 0,
+            term_node_id: None,
+            term_window_focused: true,
             term_open: None,
             term_got_output: false,
             term_alive: false,
@@ -683,8 +691,15 @@ impl ControllerApp {
                         }
                         self.password.clear();
                         self.totp.clear();
-                    } else if matches!(self.screen, Screen::Restoring | Screen::Login) {
-                        self.screen = Screen::Login;
+                    } else {
+                        self.term_gen = self.term_gen.wrapping_add(1);
+                        self.term_node_id = None;
+                        self.term_open = None;
+                        self.term_alive = false;
+                        self.clear_stale_terminal_notice();
+                        if matches!(self.screen, Screen::Restoring | Screen::Login) {
+                            self.screen = Screen::Login;
+                        }
                     }
                 }
                 UiEvent::Nodes(nodes) => {
@@ -735,26 +750,43 @@ impl ControllerApp {
                         self.notice = message;
                     }
                 }
-                UiEvent::Pty(bytes) => {
-                    if !bytes.is_empty() {
-                        self.term_got_output = true;
-                        self.term_open = None;
-                        self.term_alive = true;
-                    }
-                    self.terminal.feed(&bytes);
-                    let replies = self.terminal.take_writes();
-                    if !replies.is_empty() {
-                        self.send(Cmd::PtyWrite { data: replies });
+                UiEvent::Pty { gen, bytes } => {
+                    if gen == self.term_gen {
+                        if !bytes.is_empty() {
+                            self.term_got_output = true;
+                            self.term_open = None;
+                            self.term_alive = true;
+                        }
+                        self.terminal.feed(&bytes);
+                        let replies = self.terminal.take_writes();
+                        if !replies.is_empty() {
+                            self.send(Cmd::PtyWrite { data: replies });
+                        }
                     }
                 }
-                UiEvent::PtyDone => {
-                    self.term_open = None;
-                    self.term_alive = false;
-                    if !self.term_got_output
-                        && matches!(self.screen, Screen::Terminal { .. })
-                        && self.error.is_empty()
-                    {
-                        self.error = "The shell session ended before any output arrived.".into();
+                UiEvent::PtyExited { gen, code } => {
+                    if gen == self.term_gen {
+                        self.notice = format!("Shell exited ({code})");
+                    }
+                }
+                UiEvent::PtyFailed { gen, message } => {
+                    if gen == self.term_gen {
+                        self.term_open = None;
+                        self.term_alive = false;
+                        self.error = message;
+                    }
+                }
+                UiEvent::PtyDone { gen } => {
+                    if gen == self.term_gen {
+                        self.term_open = None;
+                        self.term_alive = false;
+                        if !self.term_got_output
+                            && matches!(self.screen, Screen::Terminal { .. })
+                            && self.error.is_empty()
+                        {
+                            self.error =
+                                "The shell session ended before any output arrived.".into();
+                        }
                     }
                 }
                 UiEvent::Dir { path, entries } => {
@@ -935,29 +967,53 @@ impl ControllerApp {
         let _ = file.write_all(line.as_bytes());
     }
 
-    fn open_terminal(&mut self, node: &NodeInfo) {
-        if let Screen::Terminal { id, .. } = &self.screen {
-            if id == &node.id && (self.term_alive || self.term_open.is_some()) {
-                self.terminal.focused = true;
-                return;
-            }
+    fn clear_stale_terminal_notice(&mut self) {
+        if model::notice_is_terminal_status(&self.notice) {
+            self.notice.clear();
         }
+    }
+
+    fn start_terminal_session(&mut self, node: &NodeInfo) {
+        self.term_gen = self.term_gen.wrapping_add(1);
+        let gen = self.term_gen;
+        self.term_node_id = Some(node.id.clone());
         self.terminal = Emulator::new(self.term_size.0, self.term_size.1);
         self.terminal.focused = true;
         self.term_got_output = false;
         self.term_open = Some(Instant::now());
         self.term_alive = true;
         self.error.clear();
+        self.clear_stale_terminal_notice();
         self.send(Cmd::PtyOpen {
             node: node.id.clone(),
             rows: self.term_size.0,
             cols: self.term_size.1,
+            gen,
         });
         self.selected_id = Some(node.id.clone());
         self.screen = Screen::Terminal {
             id: node.id.clone(),
             name: node.name.clone(),
         };
+    }
+
+    fn open_terminal(&mut self, node: &NodeInfo) {
+        if self.term_node_id.as_deref() == Some(node.id.as_str())
+            && (self.term_alive || self.term_open.is_some())
+        {
+            self.selected_id = Some(node.id.clone());
+            self.screen = Screen::Terminal {
+                id: node.id.clone(),
+                name: node.name.clone(),
+            };
+            self.terminal.focused = true;
+            self.clear_stale_terminal_notice();
+            if self.term_alive && self.term_open.is_none() {
+                self.send(Cmd::PtyProbe);
+            }
+            return;
+        }
+        self.start_terminal_session(node);
     }
 
     fn open_files(&mut self, node: &NodeInfo) {
@@ -1151,8 +1207,11 @@ impl ControllerApp {
 
     fn back_to_machines(&mut self) {
         self.release_remote_input();
+        self.term_gen = self.term_gen.wrapping_add(1);
+        self.term_node_id = None;
         self.term_open = None;
         self.term_alive = false;
+        self.clear_stale_terminal_notice();
         self.send(Cmd::PtyClose);
         self.send(Cmd::LiveStop);
         if self.desk_fullscreen {
@@ -1382,6 +1441,16 @@ impl ControllerApp {
         self.debug_layout.clear();
         self.sync_window_size(ctx);
         self.pump(ctx);
+        let win_focused = ctx.input(|i| i.focused);
+        let regained_window_focus = win_focused && !self.term_window_focused;
+        self.term_window_focused = win_focused;
+        if regained_window_focus
+            && matches!(self.screen, Screen::Terminal { .. })
+            && self.term_alive
+            && self.term_open.is_none()
+        {
+            self.send(Cmd::PtyProbe);
+        }
         self.release_keyboard_if_ungated(ctx);
         if matches!(self.screen, Screen::Terminal { .. }) && self.terminal.focused {
             self.terminal.consume_focused_keys(ctx);
@@ -2396,15 +2465,54 @@ impl ControllerApp {
         }
     }
 
+    fn terminal_target_node(&self, id: &str, name: &str) -> NodeInfo {
+        self.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .unwrap_or_else(|| NodeInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                hostname: String::new(),
+                os: String::new(),
+                arch: String::new(),
+                version: String::new(),
+                online: true,
+                policy: NodePolicy::exec(),
+                effective: NodePolicy::exec(),
+                owner: String::new(),
+                relation: String::new(),
+                access: "exec".into(),
+                has_display: None,
+            })
+    }
+
     fn terminal(&mut self, ui: &mut egui::Ui) {
         let (id, name) = match &self.screen {
             Screen::Terminal { id, name } => (id.clone(), name.clone()),
             _ => return,
         };
         self.session_back_row(ui, format!("{name} · terminal"));
-        ui.label(theme::muted_text(
-            "Type in the terminal. Ctrl+Shift+C copies, Ctrl+Shift+V pastes. Ctrl+C sends interrupt.",
-        ));
+        let mut restart_target = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::muted_text(
+                "Type in the terminal. Ctrl+Shift+C copies, Ctrl+Shift+V pastes. Ctrl+C sends interrupt.",
+            ));
+            if self.term_alive || self.term_open.is_some() {
+                let restart = ui
+                    .add(theme::secondary_button("Restart shell"))
+                    .on_hover_text("Close the current shell session and open a fresh shell.");
+                if restart.has_focus() {
+                    restart.surrender_focus();
+                }
+                if restart.clicked() {
+                    restart_target = Some(self.terminal_target_node(&id, &name));
+                }
+            }
+        });
+        if let Some(node) = restart_target {
+            self.start_terminal_session(&node);
+        }
         if let Some(started) = self.term_open {
             if !self.term_got_output {
                 ui.horizontal(|ui| {
@@ -2429,33 +2537,16 @@ impl ControllerApp {
                 } else {
                     "Shell session is not open."
                 }));
-                if ui.add(theme::secondary_button("Reopen shell")).clicked() {
-                    reopen_target = self
-                        .nodes
-                        .iter()
-                        .find(|n| n.id == id)
-                        .cloned()
-                        .or_else(|| {
-                            Some(NodeInfo {
-                                id: id.clone(),
-                                name: name.clone(),
-                                hostname: String::new(),
-                                os: String::new(),
-                                arch: String::new(),
-                                version: String::new(),
-                                online: true,
-                                policy: NodePolicy::exec(),
-                                effective: NodePolicy::exec(),
-                                owner: String::new(),
-                                relation: String::new(),
-                                access: "exec".into(),
-                                has_display: None,
-                            })
-                        });
+                let reopen = ui.add(theme::secondary_button("Reopen shell"));
+                if reopen.has_focus() {
+                    reopen.surrender_focus();
+                }
+                if reopen.clicked() {
+                    reopen_target = Some(self.terminal_target_node(&id, &name));
                 }
             });
             if let Some(node) = reopen_target {
-                self.open_terminal(&node);
+                self.start_terminal_session(&node);
             }
         }
         let frame = egui::Frame::new()
@@ -7273,25 +7364,41 @@ mod geometry_tests {
 
         // 1. Open terminal -> shell sends output -> shell exits (`exit` -> PtyDone).
         harn.app.open_terminal(&node);
+        let gen1 = harn.app.term_gen;
         let mut saw_open_1 = false;
         while let Ok(cmd) = harn.cmd_rx.try_recv() {
-            if matches!(cmd, Cmd::PtyOpen { .. }) {
+            if matches!(cmd, Cmd::PtyOpen { gen, .. } if gen == gen1) {
                 saw_open_1 = true;
             }
         }
         assert!(saw_open_1);
-        harn.app.shared.push(UiEvent::Pty(b"sufa$ ".to_vec()));
+        harn.app.shared.push(UiEvent::Pty {
+            gen: gen1,
+            bytes: b"sufa$ ".to_vec(),
+        });
         harn.pass();
         assert!(harn.app.term_got_output);
-        harn.app.shared.push(UiEvent::PtyDone);
+        harn.app.shared.push(UiEvent::PtyExited {
+            gen: gen1,
+            code: 130,
+        });
+        harn.app.shared.push(UiEvent::PtyDone { gen: gen1 });
         harn.pass();
+        assert_eq!(harn.app.notice, "Shell exited (130)");
 
         // Clicking Terminal / calling open_terminal for the same node after `exit`
-        // MUST emit a fresh Cmd::PtyOpen instead of returning early!
+        // MUST emit a fresh Cmd::PtyOpen AND clear the stale `Shell exited (130)` badge!
         harn.app.open_terminal(&node);
+        let gen2 = harn.app.term_gen;
+        assert_ne!(gen1, gen2);
+        assert!(
+            harn.app.notice.is_empty(),
+            "stale shell exit notice survived reopen: {:?}",
+            harn.app.notice
+        );
         let mut saw_open_2 = false;
         while let Ok(cmd) = harn.cmd_rx.try_recv() {
-            if matches!(cmd, Cmd::PtyOpen { .. }) {
+            if matches!(cmd, Cmd::PtyOpen { gen, .. } if gen == gen2) {
                 saw_open_2 = true;
             }
         }
@@ -7300,21 +7407,38 @@ mod geometry_tests {
             "open_terminal after PtyDone returned early without sending Cmd::PtyOpen!"
         );
 
-        // 2. When PtyOpen fails (e.g. timeout or node offline), UiEvent::Failed MUST
-        // clear term_open so the spinner does not spin forever saying
-        // "Waiting for the node to open a session…", and another open_terminal retries!
-        harn.app
-            .shared
-            .push(UiEvent::Failed("node offline: workstation".into()));
+        // Stale exit/done events from `gen1` arriving late MUST NOT clobber `gen2`!
+        harn.app.shared.push(UiEvent::PtyExited {
+            gen: gen1,
+            code: 130,
+        });
+        harn.app.shared.push(UiEvent::PtyDone { gen: gen1 });
         harn.pass();
         assert!(
-            harn.app.term_open.is_none(),
-            "UiEvent::Failed left term_open set, leaving terminal spinner stuck forever!"
+            harn.app.term_alive && harn.app.notice.is_empty(),
+            "late gen1 event clobbered active gen2 shell: alive={} notice={:?}",
+            harn.app.term_alive,
+            harn.app.notice
+        );
+
+        // 2. When PtyOpen fails (e.g. timeout or node offline), UiEvent::PtyFailed + PtyDone MUST
+        // clear term_open and mark term_alive=false so the spinner does not spin forever,
+        // and another open_terminal retries cleanly!
+        harn.app.shared.push(UiEvent::PtyFailed {
+            gen: gen2,
+            message: "node offline: workstation".into(),
+        });
+        harn.app.shared.push(UiEvent::PtyDone { gen: gen2 });
+        harn.pass();
+        assert!(
+            harn.app.term_open.is_none() && !harn.app.term_alive,
+            "PtyFailed left term_open/term_alive stuck!"
         );
         harn.app.open_terminal(&node);
+        let gen3 = harn.app.term_gen;
         let mut saw_open_3 = false;
         while let Ok(cmd) = harn.cmd_rx.try_recv() {
-            if matches!(cmd, Cmd::PtyOpen { .. }) {
+            if matches!(cmd, Cmd::PtyOpen { gen, .. } if gen == gen3) {
                 saw_open_3 = true;
             }
         }
@@ -7322,5 +7446,78 @@ mod geometry_tests {
             saw_open_3,
             "open_terminal after Failed did not retry Cmd::PtyOpen!"
         );
+    }
+
+    #[test]
+    fn terminal_window_refocus_probes_liveness_and_restart_shell_preserves_terminal_focus() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let node = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "workstation")
+            .cloned()
+            .expect("fixture node");
+        while harn.cmd_rx.try_recv().is_ok() {}
+
+        harn.app.open_terminal(&node);
+        let gen1 = harn.app.term_gen;
+        while harn.cmd_rx.try_recv().is_ok() {}
+        harn.app.shared.push(UiEvent::Pty {
+            gen: gen1,
+            bytes: b"ltl@surf:~$ ".to_vec(),
+        });
+        harn.pass();
+        assert!(harn.app.term_alive);
+        assert!(harn.app.terminal.focused);
+
+        // Simulate window losing focus during 63m idle, then regaining focus:
+        // must emit `Cmd::PtyProbe` to verify/rebind the live PTY before user types!
+        let mut unfocus = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            focused: false,
+            ..Default::default()
+        };
+        let _ = harn.ctx.run(unfocus.take(), |ctx| harn.app.ui_frame(ctx));
+        while harn.cmd_rx.try_recv().is_ok() {}
+
+        let mut refocus = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            focused: true,
+            ..Default::default()
+        };
+        let _ = harn.ctx.run(refocus.take(), |ctx| harn.app.ui_frame(ctx));
+        let mut saw_probe = false;
+        while let Ok(cmd) = harn.cmd_rx.try_recv() {
+            if matches!(cmd, Cmd::PtyProbe) {
+                saw_probe = true;
+            }
+        }
+        assert!(
+            saw_probe,
+            "regaining OS window focus on active Terminal did not emit Cmd::PtyProbe!"
+        );
+
+        // Manual Restart shell (`start_terminal_session`) while `term_alive == true`
+        // opens a brand-new generation, clears stale terminal notices, and keeps focus.
+        harn.app.notice = "Shell exited (130)".into();
+        harn.app.start_terminal_session(&node);
+        let gen2 = harn.app.term_gen;
+        assert_eq!(gen2, gen1 + 1);
+        assert!(harn.app.notice.is_empty());
+        assert!(harn.app.terminal.focused);
+        let mut saw_restart_open = false;
+        while let Ok(cmd) = harn.cmd_rx.try_recv() {
+            if matches!(cmd, Cmd::PtyOpen { gen, .. } if gen == gen2) {
+                saw_restart_open = true;
+            }
+        }
+        assert!(saw_restart_open, "Restart shell did not send Cmd::PtyOpen!");
     }
 }
