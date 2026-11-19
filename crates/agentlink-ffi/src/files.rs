@@ -199,7 +199,9 @@ pub fn remove_guest(
         }
         GuestTarget::Real(path) => {
             let meta = fs::symlink_metadata(&path)?;
-            if meta.is_dir() && !meta.file_type().is_symlink() {
+            if agentlink_core::paths::is_link_entry(&meta) {
+                agentlink_core::paths::remove_link_entry(&path, &meta)?;
+            } else if meta.is_dir() {
                 if recursive {
                     fs::remove_dir_all(&path)?;
                 } else {
@@ -241,12 +243,10 @@ pub fn rename_guest(roots: &Roots, host: &Arc<dyn NodeHost>, from: &str, to: &st
         },
     };
     let to_real = agentlink_core::paths::rename_destination(&from_real, &to_base, trailing)?;
-    agentlink_core::paths::ensure_moved_symlinks_stay_inside(
-        dst_root.as_deref(),
-        &from_real,
-        &to_real,
-    )?;
-    fs::rename(&from_real, &to_real)?;
+    // Same fail-closed rename as the desktop node: pre×2 + postcheck +
+    // non-destructive rollback so a raced relative-link retarget cannot leave
+    // a durable escape under `app:/files`.
+    agentlink_core::paths::rename_within_sandbox(dst_root.as_deref(), &from_real, &to_real)?;
     Ok(())
 }
 
@@ -465,6 +465,25 @@ mod tests {
         fs::create_dir_all(&deep).unwrap();
         std::os::unix::fs::symlink("../../escaped_app_data.txt", deep.join("sym")).unwrap();
         assert!(rename_guest(&roots, &host, "app:/files/d1/d2/d3/sym", "app:/files/sym").is_err());
+
+        // 1b. Deterministic TOCTOU: precheck would pass for an in-sandbox link, then
+        // retarget before rename. `rename_within_sandbox` must not leave an escape.
+        let race_from = deep.join("race_sym");
+        std::os::unix::fs::symlink("ok.txt", &race_from).unwrap();
+        agentlink_core::paths::ensure_moved_symlinks_stay_inside(
+            Some(files.as_path()),
+            &race_from,
+            &files.join("race_top"),
+        )
+        .unwrap();
+        fs::remove_file(&race_from).unwrap();
+        std::os::unix::fs::symlink("../../escaped_via_ffi_race.txt", &race_from).unwrap();
+        let raced = rename_guest(&roots, &host, "app:/files/d1/d2/d3/race_sym", "app:/files/race_top");
+        assert!(raced.is_err(), "raced retarget must fail closed: {raced:?}");
+        assert!(
+            fs::symlink_metadata(files.join("race_top")).is_err(),
+            "no durable escape after FFI rename race"
+        );
 
         // 2. Pre-existing dangling symlink escaping `app:/files` cannot be written through.
         std::os::unix::fs::symlink("../escaped_app_data.txt", files.join("pre_dangling")).unwrap();
