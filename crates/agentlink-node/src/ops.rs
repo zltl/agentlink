@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentlink_core::e2e::{self, Direction};
-use agentlink_core::extensions::{dispatch_extension_as, NodeExtension};
 use agentlink_core::engine::sweep_stale_partials;
+use agentlink_core::extensions::{dispatch_extension_as, NodeExtension};
 use agentlink_core::paths::{resolve_lexical, resolve_path};
 use agentlink_core::protocol::{DirEntry, Envelope, FileStat, Op};
 use agentlink_core::sandbox::CommandPolicy;
@@ -93,12 +93,8 @@ impl Responder {
 
     pub fn encode_env(&self, env: &Envelope) -> Result<Outbound> {
         if let Some(seal) = &self.seal {
-            let wrapped = e2e::seal_envelope_session(
-                &seal.session,
-                &seal.node_id,
-                &seal.peer,
-                env,
-            )?;
+            let wrapped =
+                e2e::seal_envelope_session(&seal.session, &seal.node_id, &seal.peer, env)?;
             return ws::encode(&wrapped);
         }
         ws::encode(env)
@@ -381,7 +377,18 @@ pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: O
             env,
             shell,
             stdin_b64,
-        } => bg_start(&ctx, &program, &args, cwd, &env, shell, stdin_b64.as_deref()).await,
+        } => {
+            bg_start(
+                &ctx,
+                &program,
+                &args,
+                cwd,
+                &env,
+                shell,
+                stdin_b64.as_deref(),
+            )
+            .await
+        }
         Op::BgList => ctx.procs.list().map(|value| ready(Outcome::ok(value))),
         Op::BgOutput {
             id,
@@ -659,13 +666,14 @@ fn directory_for_list(full: &Path, path_display: &str) -> Result<PathBuf> {
 }
 
 fn missing_path_error(operation: &str, path_display: &str) -> Error {
-    Error::Message(format!(
-        "{operation}: path `{path_display}` does not exist"
-    ))
+    Error::Message(format!("{operation}: path `{path_display}` does not exist"))
 }
 
 async fn list_op(resp: &Responder, root: Option<&Path>, path: &str) -> Result<()> {
-    let full = resolve_path(root, path)?;
+    // Do not follow the final component: `ls` on a dangling symlink should
+    // report "broken symbolic link", and `ls` on a symlink-to-dir still works
+    // because `directory_for_list` uses `metadata` (which follows).
+    let full = agentlink_core::paths::resolve_path_no_follow(root, path)?;
     let path_display = path.to_string();
     let entries = tokio::task::spawn_blocking(move || list_dir_entries(full, path_display))
         .await
@@ -896,7 +904,6 @@ fn mkdir_not_dir_message(path: &Path, recursive: bool) -> String {
     }
 }
 
-
 async fn remove_op(
     resp: &Responder,
     root: Option<&Path>,
@@ -1040,10 +1047,7 @@ fn diagnose_rename_io(from: &Path, to: &Path, err: io::Error) -> Error {
         return err.into();
     }
     if enoent && !from.exists() {
-        return Error::Message(format!(
-            "mv source `{}` does not exist",
-            from.display()
-        ));
+        return Error::Message(format!("mv source `{}` does not exist", from.display()));
     }
     // rename(dir, file) → ENOTDIR on Linux; parent checks below would miss it.
     if enotdir && path_is_nondir(to) && from.is_dir() {
@@ -1116,7 +1120,6 @@ fn canonicalize_allow_missing_local(path: &Path) -> Option<PathBuf> {
         }
     }
 }
-
 
 fn decode_stdin_b64(b64: &str) -> Result<Vec<u8>> {
     use base64::Engine as _;
@@ -1751,7 +1754,10 @@ mod tests {
         let to = dir.path().join("b");
         let err = io::Error::new(ErrorKind::PermissionDenied, "os error 13");
         let msg = diagnose_rename_io(&from, &to, err).to_string();
-        assert!(msg.contains("os error 13") || msg.contains("Permission"), "{msg}");
+        assert!(
+            msg.contains("os error 13") || msg.contains("Permission"),
+            "{msg}"
+        );
         assert!(!msg.contains("mkdir -p"), "{msg}");
     }
 
@@ -1775,7 +1781,12 @@ mod tests {
         let msg = diagnose_mkdir_io(&path, false, err).to_string();
         assert!(msg.contains("exists but is not a directory"), "{msg}");
         assert!(!msg.contains("already exists as a directory"), "{msg}");
-        let msg_p = diagnose_mkdir_io(&path, true, io::Error::new(ErrorKind::AlreadyExists, "File exists")).to_string();
+        let msg_p = diagnose_mkdir_io(
+            &path,
+            true,
+            io::Error::new(ErrorKind::AlreadyExists, "File exists"),
+        )
+        .to_string();
         assert!(msg_p.contains("cannot replace a file"), "{msg_p}");
     }
 
@@ -1792,7 +1803,6 @@ mod tests {
         assert!(msg.contains("blocker"), "{msg}");
     }
 
-
     #[test]
     fn stream_grant_flags_overwrite_client_fields_from_verified_grant() {
         let ceiling = NodePolicy::full();
@@ -1804,7 +1814,12 @@ mod tests {
             "_grant_jti": "forged",
             "_grant_exp": 9999999999i64
         });
-        fill_stream_grant_flags(&mut stamped, NodePolicy::remote_view(), Some("real-jti"), Some(42));
+        fill_stream_grant_flags(
+            &mut stamped,
+            NodePolicy::remote_view(),
+            Some("real-jti"),
+            Some(42),
+        );
         assert_eq!(stamped["_allow_control"], json!(false));
         assert_eq!(stamped["_allow_view"], json!(true));
         assert_eq!(stamped["_grant_jti"], json!("real-jti"));
@@ -1882,7 +1897,9 @@ mod tests {
         let file = dir.path().join("file.txt");
         fs::write(&file, b"x").unwrap();
         let child = file.join("child");
-        let err = directory_for_list(&child, child.to_str().unwrap()).unwrap_err().to_string();
+        let err = directory_for_list(&child, child.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("path component"), "{err}");
         assert!(err.contains("exists but is not a directory"), "{err}");
         assert!(err.contains("file.txt"), "{err}");
@@ -1894,7 +1911,10 @@ mod tests {
         let file = dir.path().join("file.txt");
         fs::write(&file, b"x").unwrap();
         let child = file.join("child");
-        let err = Error::Io(io::Error::new(ErrorKind::NotADirectory, "Not a directory (os error 20)"));
+        let err = Error::Io(io::Error::new(
+            ErrorKind::NotADirectory,
+            "Not a directory (os error 20)",
+        ));
         let msg = diagnose_remove_io(child.to_str().unwrap(), &child, err).to_string();
         assert!(msg.contains("path component"), "{msg}");
         assert!(msg.contains("file.txt"), "{msg}");
@@ -1940,7 +1960,12 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let child = file.join("child");
         let err = fs::File::open(&child).unwrap_err();
-        eprintln!("LIVE kind={:?} raw={:?} display={}", err.kind(), err.raw_os_error(), err);
+        eprintln!(
+            "LIVE kind={:?} raw={:?} display={}",
+            err.kind(),
+            err.raw_os_error(),
+            err
+        );
         let msg = diagnose_read_io(&child, err).to_string();
         assert!(msg.contains("path component"), "{msg}");
         assert!(msg.contains("file.txt"), "{msg}");
@@ -1956,13 +1981,19 @@ mod tests {
 
     #[test]
     fn diagnose_remove_io_missing() {
-        let err = Error::Io(io::Error::new(ErrorKind::NotFound, "No such file or directory"));
+        let err = Error::Io(io::Error::new(
+            ErrorKind::NotFound,
+            "No such file or directory",
+        ));
         let full = Path::new("/tmp/nope");
         let msg = diagnose_remove_io("/tmp/nope", full, err).to_string();
         assert_eq!(msg, "rm: path `/tmp/nope` does not exist");
         let err = Error::Io(io::Error::new(ErrorKind::PermissionDenied, "os error 13"));
         let msg = diagnose_remove_io("/tmp/nope", full, err).to_string();
-        assert!(msg.contains("os error 13") || msg.contains("Permission"), "{msg}");
+        assert!(
+            msg.contains("os error 13") || msg.contains("Permission"),
+            "{msg}"
+        );
         assert!(!msg.contains("does not exist"), "{msg}");
     }
 
@@ -1970,7 +2001,9 @@ mod tests {
     fn directory_for_list_missing_path() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        let err = directory_for_list(&missing, "/tmp/nope").unwrap_err().to_string();
+        let err = directory_for_list(&missing, "/tmp/nope")
+            .unwrap_err()
+            .to_string();
         assert_eq!(err, "ls: path `/tmp/nope` does not exist");
     }
 
@@ -1983,7 +2016,8 @@ mod tests {
             Error::Io(ioerr) => assert_eq!(ioerr.kind(), ErrorKind::NotFound),
             other => panic!("expected Io NotFound, got {other}"),
         }
-        let tipped = diagnose_remove_io("nope", &missing, remove_path(&missing, true).unwrap_err()).to_string();
+        let tipped = diagnose_remove_io("nope", &missing, remove_path(&missing, true).unwrap_err())
+            .to_string();
         assert_eq!(tipped, "rm: path `nope` does not exist");
     }
 
@@ -1993,12 +2027,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let broken = dir.path().join("broken");
         std::os::unix::fs::symlink(dir.path().join("missing"), &broken).unwrap();
-        let err = directory_for_list(&broken, "broken").unwrap_err().to_string();
+        let err = directory_for_list(&broken, "broken")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("broken symbolic link"), "{err}");
 
         let file = dir.path().join("file.txt");
         fs::write(&file, b"x").unwrap();
-        let err = directory_for_list(&file, "file.txt").unwrap_err().to_string();
+        let err = directory_for_list(&file, "file.txt")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("is a file"), "{err}");
     }
 
@@ -2014,7 +2052,10 @@ mod tests {
 
         let stat = file_stat(&link).unwrap();
         assert!(stat.is_symlink, "{stat:?}");
-        assert!(stat.is_dir, "symlink-to-dir must be is_dir for PullDir routing: {stat:?}");
+        assert!(
+            stat.is_dir,
+            "symlink-to-dir must be is_dir for PullDir routing: {stat:?}"
+        );
         assert!(!stat.is_file, "{stat:?}");
     }
 
@@ -2086,7 +2127,10 @@ mod tests {
 
         remove_path(&link, false).unwrap();
         assert!(fs::symlink_metadata(&link).is_err());
-        assert!(real.join("keep.txt").is_file(), "junction target must survive");
+        assert!(
+            real.join("keep.txt").is_file(),
+            "junction target must survive"
+        );
     }
 
     #[tokio::test]
@@ -2358,7 +2402,10 @@ mod tests {
         fn name(&self) -> &'static str {
             agentlink_core::PHASE3_WEBRTC_SIGNAL
         }
-        fn handle(&self, payload: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+        fn handle(
+            &self,
+            payload: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, String> {
             self.handle_peer(payload, "")
         }
         fn handle_peer(

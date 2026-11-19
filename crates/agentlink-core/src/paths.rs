@@ -108,10 +108,7 @@ pub fn resolve_path_no_follow(root: Option<&Path>, user_path: &str) -> Result<Pa
 
 /// Re-validate `target` against `root` immediately before committing a write or
 /// atomic install so a concurrent symlink swap cannot escape the sandbox.
-pub fn ensure_path_stays_in_sandbox_at_sink(
-    root: Option<&Path>,
-    target: &Path,
-) -> Result<PathBuf> {
+pub fn ensure_path_stays_in_sandbox_at_sink(root: Option<&Path>, target: &Path) -> Result<PathBuf> {
     let Some(root) = root else {
         return Ok(target.to_path_buf());
     };
@@ -185,10 +182,7 @@ fn check_relocated_symlink(
     let candidate = if target_norm.is_absolute() {
         target_norm
     } else {
-        link_after
-            .parent()
-            .unwrap_or(root_c)
-            .join(&target_norm)
+        link_after.parent().unwrap_or(root_c).join(&target_norm)
     };
     let label = link_after.to_string_lossy();
     resolve_sandboxed(root_c, raw_root, &candidate, false, true, &label, 1).map(|_| ())
@@ -380,13 +374,7 @@ fn resolve_sandboxed(
                                 parent.join(&target)
                             };
                             cur = resolve_sandboxed(
-                                root_c,
-                                raw_root,
-                                &link_base,
-                                false,
-                                true,
-                                user_label,
-                                hops,
+                                root_c, raw_root, &link_base, false, true, user_label, hops,
                             )?;
                             missing_depth = if fs::symlink_metadata(&cur).is_ok() {
                                 0
@@ -415,7 +403,15 @@ fn resolve_sandboxed(
                             missing_depth = 0;
                         }
                     }
-                    Ok(_) => {
+                    Ok(meta) => {
+                        // Intermediate non-directories must fail with a tip
+                        // before we walk into ENOTDIR on the next component.
+                        if !is_last && !meta.is_dir() {
+                            return Err(Error::Message(format!(
+                                "path component `{}` exists but is not a directory",
+                                cur.display()
+                            )));
+                        }
                         if let Ok(canon) = fs::canonicalize(&cur) {
                             cur = strip_verbatim_prefix(&canon);
                         }
@@ -640,7 +636,8 @@ mod tests {
         assert!(e2.to_string().contains("escapes"), "{e2}");
 
         // 3. Dangling intermediate directory symlink with missing children (`mkdir -p` / `cp`).
-        std::os::unix::fs::symlink("../../nonexistent_outside_dir", root.join("dangling_dir")).unwrap();
+        std::os::unix::fs::symlink("../../nonexistent_outside_dir", root.join("dangling_dir"))
+            .unwrap();
         assert!(resolve_lexical(Some(&root), "dangling_dir/sub/file.txt").is_err());
 
         // 4. Legitimate intra-sandbox dangling symlink STILL works!
@@ -653,7 +650,10 @@ mod tests {
         std::os::unix::fs::symlink("loop_b", root.join("loop_a")).unwrap();
         std::os::unix::fs::symlink("loop_a", root.join("loop_b")).unwrap();
         let loop_err = resolve_path(Some(&root), "loop_a").unwrap_err();
-        assert!(loop_err.to_string().contains("symbolic links"), "{loop_err}");
+        assert!(
+            loop_err.to_string().contains("symbolic links"),
+            "{loop_err}"
+        );
 
         // 6. Relative symlink inside deep subdir cannot be moved to top of sandbox (`mv` escape)!
         let deep = root.join("d1").join("d2").join("d3");
@@ -661,7 +661,9 @@ mod tests {
         let deep_sym = deep.join("sym");
         std::os::unix::fs::symlink("../../escaped_via_mv.txt", &deep_sym).unwrap();
         // Direct symlink move rejected:
-        assert!(ensure_moved_symlinks_stay_inside(Some(&root), &deep_sym, &root.join("sym")).is_err());
+        assert!(
+            ensure_moved_symlinks_stay_inside(Some(&root), &deep_sym, &root.join("sym")).is_err()
+        );
         // Moving parent subtree `d1/d2/d3` to `root/d3_top` (so `d3_top/sym` -> `../../` escapes `root`) ALSO rejected!
         assert!(ensure_moved_symlinks_stay_inside(
             Some(&root),
@@ -681,17 +683,19 @@ mod tests {
         // following it to the target directory, while still blocking escaping parents!
         std::os::unix::fs::symlink("sub", root.join("link_to_sub")).unwrap();
         let self_entry = resolve_path_no_follow(Some(&root), "link_to_sub").unwrap();
-        assert!(
-            std::fs::symlink_metadata(&self_entry)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(std::fs::symlink_metadata(&self_entry)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(resolve_path_no_follow(Some(&root), "live_escape/victim").is_err());
 
         // 8. TOCTOU O_NOFOLLOW guard rejects opening a symlink directly when sandboxed!
-        let toctou_err = open_write_file(&root.join("valid_dangling"), true, true, true).unwrap_err();
-        assert!(toctou_err.raw_os_error() == Some(libc::ELOOP), "{toctou_err:?}");
+        let toctou_err =
+            open_write_file(&root.join("valid_dangling"), true, true, true).unwrap_err();
+        assert!(
+            toctou_err.raw_os_error() == Some(libc::ELOOP),
+            "{toctou_err:?}"
+        );
     }
 
     #[test]
@@ -742,13 +746,31 @@ mod tests {
         assert_eq!(normalize_windows_drive_path("c:").as_ref(), r"c:\");
         assert_eq!(normalize_windows_drive_path("C:/").as_ref(), "C:/");
         assert_eq!(normalize_windows_drive_path(r"C:\").as_ref(), r"C:\");
-        assert_eq!(normalize_windows_drive_path("C:/Users").as_ref(), "C:/Users");
-        assert_eq!(normalize_windows_drive_path(r"C:\Users").as_ref(), r"C:\Users");
-        assert_eq!(normalize_windows_drive_path("C:Users").as_ref(), r"C:\Users");
-        assert_eq!(normalize_windows_drive_path(r"C:Users\x").as_ref(), r"C:\Users\x");
-        assert_eq!(normalize_windows_drive_path("D:foo/bar").as_ref(), r"D:\foo/bar");
+        assert_eq!(
+            normalize_windows_drive_path("C:/Users").as_ref(),
+            "C:/Users"
+        );
+        assert_eq!(
+            normalize_windows_drive_path(r"C:\Users").as_ref(),
+            r"C:\Users"
+        );
+        assert_eq!(
+            normalize_windows_drive_path("C:Users").as_ref(),
+            r"C:\Users"
+        );
+        assert_eq!(
+            normalize_windows_drive_path(r"C:Users\x").as_ref(),
+            r"C:\Users\x"
+        );
+        assert_eq!(
+            normalize_windows_drive_path("D:foo/bar").as_ref(),
+            r"D:\foo/bar"
+        );
         assert_eq!(normalize_windows_drive_path("/tmp").as_ref(), "/tmp");
-        assert_eq!(normalize_windows_drive_path("relative").as_ref(), "relative");
+        assert_eq!(
+            normalize_windows_drive_path("relative").as_ref(),
+            "relative"
+        );
     }
 
     #[test]
