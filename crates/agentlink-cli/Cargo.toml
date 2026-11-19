@@ -53,6 +53,8 @@ openh264 = "0.8"
 # Alacritty's VT/grid core (Apache-2.0). Used for the desktop Controller
 # terminal; we feed the remote agentlink PTY and do not spawn a local tty.
 alacritty_terminal = "0.25.1"
+# Same width table alacritty uses for speculative local-echo cell advance.
+unicode-width = "0.2"
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 ksni = "0.3.7"

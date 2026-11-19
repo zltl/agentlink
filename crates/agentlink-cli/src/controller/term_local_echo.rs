@@ -1,20 +1,30 @@
 //! Speculative local echo (type-ahead) for the desktop Controller terminal.
 //!
 //! Design follows the **mosh / VS Code overlay** model (see
-//! https://github.com/microsoft/vscode/issues/115949 and xterm predictive
-//! echo addons): predictions live in a **separate overlay**, never in the
-//! alacritty grid. Remote PTY bytes are always applied unchanged via
-//! [`super::term::Emulator::feed`]; the overlay is then reconciled against
-//! parsed cells. Confirmed glyphs disappear (remote paint takes over at the
-//! same pixels); mismatches or unsafe modes clear the overlay.
+//! https://github.com/microsoft/vscode/issues/115949): predictions live in a
+//! **separate overlay**, never in the alacritty grid. Remote PTY bytes are
+//! always applied unchanged via [`super::term::Emulator::feed`]; the overlay is
+//! then reconciled against parsed cells.
 //!
-//! Safety rules (conservative — prefer lag over leaking secrets):
-//! - No paint until echo is **established** (at least one successful
-//!   invisible expect→cell match). Password / `noecho` never lights the overlay.
-//! - Disable / clear on alt-screen, insert mode, signals, cursor keys, Enter,
-//!   Tab, large/multiline paste, IME preedit, resize, reconnect, TTL expiry.
-//! - Bound pending queue size and per-prediction TTL.
-//! - Never duplicate bytes on the wire; authorization and write path unchanged.
+//! # Privacy model (fail-closed)
+//!
+//! Previous echo confirmation is **not** permission to speculate at the next
+//! prompt. Classic `sudo` / `ssh` / `read -s` flip to no-echo without
+//! alt-screen. Therefore:
+//!
+//! - Paint only while `echo_ready` is true for the **current line**.
+//! - Any line / control / prompt / IME / mode / generation / resize boundary
+//!   calls [`SpeculativeEcho::invalidate`] (clears pending **and** readiness).
+//! - Blank cells under a painted prediction are treated as no-echo after a
+//!   short grace (not only the long TTL).
+//! - Heuristics **cannot** know TTY echo mode; we never claim guaranteed
+//!   no-echo safety — only that we refuse to paint across ambiguous transitions.
+//!
+//! # Latency claims
+//!
+//! `note_outbound` updates the overlay struct locally (no network wait). That
+//! is **enqueue** latency, not egui frame/paint latency. Callers may
+//! `request_repaint`; pixel timing is not asserted here.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -23,6 +33,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
+use unicode_width::UnicodeWidthChar;
 
 use super::term::TermHost;
 
@@ -30,7 +41,10 @@ use super::term::TermHost;
 pub const MAX_PENDING: usize = 256;
 /// Drop predictions that the remote never confirmed.
 pub const PREDICTION_TTL: Duration = Duration::from_millis(1_500);
-/// After this many consecutive confirms, keep predicting until a mismatch.
+/// Painted (or expected) glyphs that stay blank this long → treat as no-echo.
+pub const BLANK_NOECHO_GRACE: Duration = Duration::from_millis(120);
+/// After this many consecutive confirms **on the current line**, paint further
+/// printables on that same line.
 const ECHO_ESTABLISH_STREAK: u32 = 1;
 
 /// One predicted (or expected) glyph at a grid point.
@@ -60,7 +74,7 @@ pub struct SpeculativeEcho {
     /// Speculative cursor after the last pending prediction (grid coords).
     cursor_line: i32,
     cursor_col: usize,
-    /// Echo appears to match typed printables — safe to paint faintly.
+    /// Echo appears to match typed printables **on this line** — may paint.
     echo_ready: bool,
     confirm_streak: u32,
     /// Generation identity; bumps on reconnect / emulator rebuild.
@@ -96,8 +110,23 @@ impl SpeculativeEcho {
         *self = Self::new(generation);
     }
 
-    pub fn clear(&mut self) {
+    /// Drop pending overlay entries only (keeps readiness). Prefer
+    /// [`Self::invalidate`] at any ambiguous boundary.
+    pub fn clear_pending(&mut self) {
         self.pending.clear();
+    }
+
+    /// Fail-closed: drop pending **and** forget that echo was established.
+    /// Used at line/control/prompt/IME/mode/generation/resize transitions.
+    pub fn invalidate(&mut self) {
+        self.pending.clear();
+        self.echo_ready = false;
+        self.confirm_streak = 0;
+    }
+
+    /// Backward-compatible name used by paint/IME paths — must invalidate.
+    pub fn clear(&mut self) {
+        self.invalidate();
     }
 
     pub fn echo_ready(&self) -> bool {
@@ -137,78 +166,79 @@ impl SpeculativeEcho {
         !mode.contains(TermMode::ALT_SCREEN) && !mode.contains(TermMode::INSERT)
     }
 
-    /// Observe modes after remote feed; clear when entering unsafe modes.
+    /// Observe modes after remote feed; invalidate when entering unsafe modes.
     pub fn observe_modes(&mut self, term: &Term<TermHost>) {
         let safe = Self::modes_safe(term);
         if !safe {
             if !self.blocked {
-                self.clear();
-                self.echo_ready = false;
-                self.confirm_streak = 0;
+                self.invalidate();
             }
             self.blocked = true;
-        } else {
+        } else if self.blocked {
+            // Leaving alt-screen / insert: still require fresh establish.
             self.blocked = false;
+            self.invalidate();
         }
     }
 
     /// Classify outbound PTY bytes and update the overlay / expect queue.
     ///
     /// Returns whether any new painted prediction was added (caller may
-    /// request an immediate egui repaint — no network wait).
+    /// request an egui repaint). This return is about **enqueue**, not frame
+    /// paint timing.
     pub fn note_outbound(&mut self, term: &Term<TermHost>, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
             return false;
         }
         self.observe_modes(term);
         if self.blocked || !Self::modes_safe(term) {
-            self.clear();
+            self.invalidate();
             return false;
         }
 
-        // Signals / controls: invalidate.
+        // Signals / controls: invalidate readiness (new prompt / interrupt).
         if bytes.iter().any(|&b| matches!(b, 0x03 | 0x04 | 0x1a | 0x1c)) {
-            self.clear();
-            self.echo_ready = false;
-            self.confirm_streak = 0;
+            self.invalidate();
             return false;
         }
 
-        // Escape / CSI / SS3 — cursor keys, function keys: do not predict.
+        // Escape / CSI / SS3 — cursor keys, function keys, mode sets.
         if bytes.contains(&0x1b) {
-            self.clear();
+            self.invalidate();
             return false;
         }
 
-        // Backspace / DEL: drop last prediction if any; else clear expects.
+        // Backspace / DEL: drop last prediction if any; else invalidate.
         if bytes.iter().all(|&b| matches!(b, 0x08 | 0x7f)) {
             if let Some(last) = self.pending.pop_back() {
                 self.cursor_line = last.line;
                 self.cursor_col = last.col;
             } else {
-                self.clear();
+                // No local prediction to edit — ambiguous remote line state.
+                self.invalidate();
             }
             return false;
         }
 
-        // CR / LF / Tab: line-editing boundary — clear overlay.
+        // CR / LF / Tab: line / completion boundary — must forget readiness
+        // so a following password/no-echo prompt cannot paint secrets.
         if bytes.iter().any(|&b| matches!(b, b'\r' | b'\n' | b'\t')) {
-            self.clear();
+            self.invalidate();
             return false;
         }
 
         // Bracketed paste markers or very large blobs: do not speculate.
         if bytes.len() > 64 || bytes.windows(6).any(|w| w == b"\x1b[200~") {
-            self.clear();
+            self.invalidate();
             return false;
         }
 
         let Ok(text) = std::str::from_utf8(bytes) else {
-            self.clear();
+            self.invalidate();
             return false;
         };
         if text.chars().any(|c| c.is_control()) {
-            self.clear();
+            self.invalidate();
             return false;
         }
 
@@ -216,19 +246,24 @@ impl SpeculativeEcho {
         let mut painted_any = false;
         for ch in text.chars() {
             if !is_predictable_char(ch) {
-                self.clear();
-                return painted_any;
-            }
-            if self.pending.len() >= MAX_PENDING {
-                self.clear();
-                self.echo_ready = false;
+                self.invalidate();
                 return painted_any;
             }
             let cells = cell_width(ch);
+            // Combining / zero-width: do not open a new cell prediction
+            // (matches alacritty zerowidth attachment). Refuse to speculate.
+            if cells == 0 {
+                self.invalidate();
+                return painted_any;
+            }
+            if self.pending.len() >= MAX_PENDING {
+                self.invalidate();
+                return painted_any;
+            }
             let cols = term.columns();
             if self.cursor_col + cells > cols {
                 // Wrap prediction is fragile; skip rather than mis-draw.
-                self.clear();
+                self.invalidate();
                 return painted_any;
             }
             let painted = self.echo_ready;
@@ -254,7 +289,7 @@ impl SpeculativeEcho {
         if self.blocked {
             return;
         }
-        self.expire_ttl();
+        self.expire_stale();
 
         let now_cursor = {
             let content = term.renderable_content();
@@ -268,7 +303,14 @@ impl SpeculativeEcho {
                 break;
             };
             if ch == ' ' || ch == '\0' {
-                // Not yet echoed — leave pending (blank is neutral).
+                // Blank under a painted prediction past grace → no-echo.
+                if front.painted
+                    && Instant::now().duration_since(front.created) >= BLANK_NOECHO_GRACE
+                {
+                    self.invalidate();
+                    return;
+                }
+                // Unpainted expect still learning — wait (TTL handles abandon).
                 break;
             }
             if ch == front.ch {
@@ -285,9 +327,7 @@ impl SpeculativeEcho {
                 break;
             }
             // Mismatch: foreign content — drop this and all later predictions.
-            self.pending.clear();
-            self.echo_ready = false;
-            self.confirm_streak = 0;
+            self.invalidate();
             self.sync_cursor_from_term(term);
             return;
         }
@@ -303,16 +343,18 @@ impl SpeculativeEcho {
         }
     }
 
-    fn expire_ttl(&mut self) {
+    fn expire_stale(&mut self) {
         let now = Instant::now();
         let before = self.pending.len();
-        self.pending.retain(|p| now.duration_since(p.created) <= PREDICTION_TTL);
+        // Painted blanks past grace already handled in reconcile; TTL is the
+        // hard ceiling for any remaining expects.
+        self.pending
+            .retain(|p| now.duration_since(p.created) <= PREDICTION_TTL);
         if self.pending.len() < before {
-            // Timed-out expects → treat as no-echo (password / silent).
-            if self.pending.is_empty() {
-                self.echo_ready = false;
-                self.confirm_streak = 0;
-            }
+            // Timed-out expects → treat as no-echo / abandon line.
+            self.echo_ready = false;
+            self.confirm_streak = 0;
+            self.pending.clear();
         }
     }
 
@@ -357,31 +399,13 @@ fn is_predictable_char(ch: char) -> bool {
     if ch.is_control() || ch == '\u{7f}' {
         return false;
     }
-    // Space is predictable for normal echo shells; still gated by echo_ready.
     true
 }
 
-/// Terminal cell width heuristic (ASCII=1, common CJK/wide=2) without new deps.
+/// Cell width using the same `unicode_width` semantics as alacritty:
+/// combining / zero-width → 0, ASCII → 1, East-Asian wide → 2.
 pub fn cell_width(ch: char) -> usize {
-    if ch.is_ascii() {
-        return 1;
-    }
-    match ch {
-        '\u{1100}'..='\u{115f}'
-        | '\u{2329}'..='\u{232a}'
-        | '\u{2e80}'..='\u{a4cf}'
-        | '\u{ac00}'..='\u{d7a3}'
-        | '\u{f900}'..='\u{faff}'
-        | '\u{fe10}'..='\u{fe19}'
-        | '\u{fe30}'..='\u{fe6f}'
-        | '\u{ff01}'..='\u{ff60}'
-        | '\u{ffe0}'..='\u{ffe6}'
-        | '\u{1f300}'..='\u{1f64f}'
-        | '\u{1f900}'..='\u{1f9ff}'
-        | '\u{20000}'..='\u{2fffd}'
-        | '\u{30000}'..='\u{3fffd}' => 2,
-        _ => 1,
-    }
+    UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 fn cell_at(term: &Term<TermHost>, line: i32, col: usize) -> Option<(char, bool)> {
@@ -396,7 +420,6 @@ fn cell_at(term: &Term<TermHost>, line: i32, col: usize) -> Option<(char, bool)>
             return Some((indexed.cell.c, wide));
         }
     }
-    // Fallback: read via grid if not in display_iter (scrolled out).
     let cell = &term.grid()[Line(line)][Column(col)];
     let wide = cell.flags.contains(Flags::WIDE_CHAR);
     Some((cell.c, wide))
@@ -416,7 +439,6 @@ mod tests {
     #[test]
     fn no_paint_until_echo_established_password_safe() {
         let mut emu = Emulator::new(24, 80);
-        // First keystroke: expect only, no paint (password / unknown echo).
         let painted = emu.note_local_echo_outbound(b"s");
         assert!(!painted);
         assert_eq!(emu.local_echo().painted_len(), 0);
@@ -428,45 +450,139 @@ mod tests {
     fn establish_echo_then_paint_faint_then_confirm() {
         let mut emu = Emulator::new(24, 80);
         emu.note_local_echo_outbound(b"a");
-        // Remote echoes 'a' and advances cursor.
         emu.feed_raw(b"a");
         assert!(emu.local_echo().echo_ready(), "first confirm establishes echo");
         assert_eq!(emu.local_echo().pending_len(), 0);
 
         let t0 = Instant::now();
         let painted = emu.note_local_echo_outbound(b"b");
-        let local_latency = t0.elapsed();
+        let enqueue_latency = t0.elapsed();
         assert!(painted);
         assert!(
-            local_latency < Duration::from_millis(5),
-            "keystroke→overlay must not wait on network; took {local_latency:?}"
+            enqueue_latency < Duration::from_millis(5),
+            "keystroke→overlay enqueue must not wait on network; took {enqueue_latency:?} \
+             (this is not egui paint/frame latency)"
         );
         assert_eq!(emu.local_echo().painted_len(), 1);
         let overlay = emu.local_echo().overlay_cells(emu.term_ref());
         assert_eq!(overlay.len(), 1);
         assert_eq!(overlay[0].ch, 'b');
 
-        // Delayed remote echo — reconcile removes overlay without duplication.
         thread::sleep(Duration::from_millis(20));
         emu.feed_raw(b"b");
         assert_eq!(emu.local_echo().painted_len(), 0);
         assert!(emu.viewport_text().contains('b'));
     }
 
+    /// E1: shell echo established → Enter → password/no-echo typing must not paint.
+    #[test]
+    fn shell_enter_then_noecho_typing_never_paints_secret() {
+        let mut emu = Emulator::new(24, 80);
+        // Establish echo on a normal shell line.
+        emu.note_local_echo_outbound(b"whoami");
+        emu.feed_raw(b"whoami");
+        assert!(emu.local_echo().echo_ready());
+        // Line boundary (Enter): readiness must die.
+        emu.note_local_echo_outbound(b"\r");
+        assert!(!emu.local_echo().echo_ready());
+        assert_eq!(emu.local_echo().pending_len(), 0);
+        // Remote shows a password-style prompt (no TTY echo mode bit available).
+        emu.feed_raw(b"\r\nPassword: ");
+        // Sensitive typing — stand-in glyphs, not a real secret.
+        let painted = emu.note_local_echo_outbound(b"sekrit");
+        assert!(!painted, "must not paint after line boundary");
+        assert_eq!(emu.local_echo().painted_len(), 0);
+        assert!(!emu.local_echo().echo_ready());
+        // Expects may exist for learning, but none painted.
+        let overlay = emu.local_echo().overlay_cells(emu.term_ref());
+        assert!(overlay.is_empty());
+        // No-echo remote: blanks only — still no paint after grace.
+        thread::sleep(BLANK_NOECHO_GRACE + Duration::from_millis(30));
+        emu.reconcile_local_echo();
+        assert_eq!(emu.local_echo().painted_len(), 0);
+        assert!(!emu.local_echo().echo_ready());
+    }
+
+    #[test]
+    fn tab_and_lf_also_invalidate_readiness() {
+        let mut emu = Emulator::new(24, 80);
+        emu.note_local_echo_outbound(b"a");
+        emu.feed_raw(b"a");
+        assert!(emu.local_echo().echo_ready());
+        emu.note_local_echo_outbound(b"\t");
+        assert!(!emu.local_echo().echo_ready());
+        emu.note_local_echo_outbound(b"a");
+        emu.feed_raw(b"a");
+        assert!(emu.local_echo().echo_ready());
+        emu.note_local_echo_outbound(b"\n");
+        assert!(!emu.local_echo().echo_ready());
+    }
+
+    #[test]
+    fn prompt_without_newline_cr_only_still_invalidates() {
+        let mut emu = Emulator::new(24, 80);
+        emu.note_local_echo_outbound(b"x");
+        emu.feed_raw(b"x");
+        assert!(emu.local_echo().echo_ready());
+        // Some prompts redraw with CR without LF.
+        emu.note_local_echo_outbound(b"\r");
+        assert!(!emu.local_echo().echo_ready());
+        let painted = emu.note_local_echo_outbound(b"y");
+        assert!(!painted);
+    }
+
+    #[test]
+    fn ansi_partial_remote_output_does_not_keep_readiness_across_invalidate() {
+        let mut emu = Emulator::new(24, 80);
+        emu.note_local_echo_outbound(b"a");
+        emu.feed_raw(b"a");
+        assert!(emu.local_echo().echo_ready());
+        emu.note_local_echo_outbound(b"\r");
+        // Fragmented CSI from remote after line boundary.
+        emu.feed_raw(b"\x1b[");
+        emu.feed_raw(b"0mPassword: ");
+        let painted = emu.note_local_echo_outbound(b"z");
+        assert!(!painted);
+        assert_eq!(emu.local_echo().painted_len(), 0);
+    }
+
+    #[test]
+    fn resize_invalidates_readiness() {
+        let mut emu = Emulator::new(24, 80);
+        emu.note_local_echo_outbound(b"a");
+        emu.feed_raw(b"a");
+        assert!(emu.local_echo().echo_ready());
+        assert!(emu.resize(30, 100));
+        assert!(!emu.local_echo().echo_ready());
+        assert_eq!(emu.local_echo().pending_len(), 0);
+    }
+
     #[test]
     fn no_echo_timeout_disables_predictions() {
         let mut emu = Emulator::new(24, 80);
-        // Force a short TTL path by manually aging — establish first.
         emu.note_local_echo_outbound(b"x");
         emu.feed_raw(b"x");
         assert!(emu.local_echo().echo_ready());
         emu.note_local_echo_outbound(b"y");
         assert_eq!(emu.local_echo().painted_len(), 1);
-        // Simulate TTL expiry.
         emu.age_local_echo_front(PREDICTION_TTL + Duration::from_millis(1));
         emu.reconcile_local_echo();
         assert!(!emu.local_echo().echo_ready());
         assert_eq!(emu.local_echo().pending_len(), 0);
+    }
+
+    #[test]
+    fn painted_blank_grace_treats_as_noecho() {
+        let mut emu = Emulator::new(24, 80);
+        emu.note_local_echo_outbound(b"a");
+        emu.feed_raw(b"a");
+        emu.note_local_echo_outbound(b"b");
+        assert_eq!(emu.local_echo().painted_len(), 1);
+        emu.age_local_echo_front(BLANK_NOECHO_GRACE + Duration::from_millis(1));
+        // Remote stays blank (noecho) — reconcile must invalidate, not wait TTL.
+        emu.reconcile_local_echo();
+        assert_eq!(emu.local_echo().painted_len(), 0);
+        assert!(!emu.local_echo().echo_ready());
     }
 
     #[test]
@@ -476,7 +592,7 @@ mod tests {
         emu.feed_raw(b"a");
         emu.note_local_echo_outbound(b"b");
         assert_eq!(emu.local_echo().painted_len(), 1);
-        emu.feed_raw(b"\x1b[?1049h"); // enter alt screen
+        emu.feed_raw(b"\x1b[?1049h");
         assert_eq!(emu.local_echo().painted_len(), 0);
         assert!(!emu.local_echo().echo_ready());
         let painted = emu.note_local_echo_outbound(b"c");
@@ -515,7 +631,6 @@ mod tests {
         emu.note_local_echo_outbound(b"a");
         emu.feed_raw(b"a");
         emu.note_local_echo_outbound(b"b");
-        // Remote prints something else at cursor (shell redraw).
         emu.feed_raw(b"Z");
         assert_eq!(emu.local_echo().pending_len(), 0);
         assert!(emu.viewport_text().contains('Z') || emu.viewport_text().contains('a'));
@@ -531,6 +646,19 @@ mod tests {
     }
 
     #[test]
+    fn combining_mark_has_zero_width_and_is_not_predicted() {
+        assert_eq!(cell_width('\u{0301}'), 0); // combining acute
+        let mut emu = Emulator::new(24, 80);
+        emu.note_local_echo_outbound(b"a");
+        emu.feed_raw(b"a");
+        assert!(emu.local_echo().echo_ready());
+        // Combining mark alone must invalidate rather than mis-advance.
+        let painted = emu.note_local_echo_outbound("\u{0301}".as_bytes());
+        assert!(!painted);
+        assert!(!emu.local_echo().echo_ready());
+    }
+
+    #[test]
     fn reset_on_generation_change() {
         let mut echo = SpeculativeEcho::new(1);
         echo.echo_ready = true;
@@ -538,5 +666,19 @@ mod tests {
         assert_eq!(echo.generation(), 2);
         assert!(!echo.echo_ready());
         assert_eq!(echo.pending_len(), 0);
+    }
+
+    #[test]
+    fn same_line_echo_still_paints_after_establish() {
+        // Legitimate instant echo on the same line must keep working.
+        let mut emu = Emulator::new(24, 80);
+        emu.note_local_echo_outbound(b"h");
+        emu.feed_raw(b"h");
+        assert!(emu.local_echo().echo_ready());
+        assert!(emu.note_local_echo_outbound(b"i"));
+        assert_eq!(emu.local_echo().painted_len(), 1);
+        emu.feed_raw(b"i");
+        assert_eq!(emu.local_echo().painted_len(), 0);
+        assert!(emu.local_echo().echo_ready(), "same-line confirms keep readiness");
     }
 }
