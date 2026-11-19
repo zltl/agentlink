@@ -6,6 +6,7 @@
 //! not open files; the node and the relay do.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -1734,32 +1735,56 @@ pub fn select(records: &[AuditRecord], filter: &AuditFilter) -> Vec<AuditRecord>
     out
 }
 
+const WEBHOOK_QUEUE_CAP: usize = 64;
+
 /// POST an alert without blocking the operation that produced it.
+///
+/// Dispatches through a single worker and a bounded queue so a slow or
+/// unreachable webhook cannot spawn unbounded threads under alert floods.
+/// When the queue is full, the newest alert is dropped (fail-open for the
+/// audited operation; alerts are best-effort).
 pub fn fire_webhook(url: &str, payload: &Value) {
-    let url = url.to_string();
-    let body = payload.to_string();
-    std::thread::spawn(move || {
-        let Ok(parsed) = validate_local_webhook_url("alert", &url) else {
-            return;
-        };
-        let Ok(pinned) = resolve_vetted_local_webhook_addrs(&parsed) else {
-            return;
-        };
-        let mut builder = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5));
-        if let Some((domain, addrs)) = pinned {
-            builder = builder.resolve_to_addrs(&domain, &addrs);
-        }
-        let Ok(client) = builder.build() else {
-            return;
-        };
-        let _ = client
-            .post(parsed)
-            .header("content-type", "application/json")
-            .body(body)
-            .send();
-    });
+    let _ = webhook_queue().try_send((url.to_string(), payload.to_string()));
+}
+
+fn webhook_queue() -> &'static mpsc::SyncSender<(String, String)> {
+    static QUEUE: OnceLock<mpsc::SyncSender<(String, String)>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel(WEBHOOK_QUEUE_CAP);
+        let _ = std::thread::Builder::new()
+            .name("agentlink-audit-webhook".into())
+            .spawn(move || webhook_worker(rx));
+        tx
+    })
+}
+
+fn webhook_worker(rx: mpsc::Receiver<(String, String)>) {
+    while let Ok((url, body)) = rx.recv() {
+        deliver_webhook(&url, &body);
+    }
+}
+
+fn deliver_webhook(url: &str, body: &str) {
+    let Ok(parsed) = validate_local_webhook_url("alert", url) else {
+        return;
+    };
+    let Ok(pinned) = resolve_vetted_local_webhook_addrs(&parsed) else {
+        return;
+    };
+    let mut builder = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5));
+    if let Some((domain, addrs)) = pinned {
+        builder = builder.resolve_to_addrs(&domain, &addrs);
+    }
+    let Ok(client) = builder.build() else {
+        return;
+    };
+    let _ = client
+        .post(parsed)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send();
 }
 
 impl AuditFilter {

@@ -290,8 +290,9 @@ install_service() {
     if [ -n "$TRUST" ]; then
         set -- "$@" --trust "$TRUST"
     fi
+    # Prefer env for the admin token so it is not visible in `ps` argv.
     if [ -n "$TOKEN" ]; then
-        set -- "$@" --token "$TOKEN"
+        export AGENTLINK_TOKEN="$TOKEN"
     fi
     set -- "$@" service install --scope "$SCOPE" --name "$NAME" --access "$ACCESS"
     if [ -n "$MAX_ACCESS" ]; then

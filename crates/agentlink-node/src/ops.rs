@@ -1379,8 +1379,16 @@ async fn pty_input(
     data_b64: &str,
 ) -> Result<()> {
     let data = util::b64_decode(data_b64)?;
-    pty.write(session_id, &data, peer)?;
-    resp.ok(serde_json::json!({"bytes": data.len()})).await?;
+    let nbytes = data.len();
+    // Large pastes into a stalled child must not block a Tokio worker on
+    // synchronous PTY write_all/flush.
+    let pty = pty.clone();
+    let session_id = session_id.to_string();
+    let peer = peer.to_string();
+    tokio::task::spawn_blocking(move || pty.write(&session_id, &data, &peer))
+        .await
+        .map_err(|err| Error::Message(format!("pty write join: {err}")))??;
+    resp.ok(serde_json::json!({"bytes": nbytes})).await?;
     Ok(())
 }
 

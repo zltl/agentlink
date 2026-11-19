@@ -181,7 +181,8 @@ try {
     $argList = @("--relay", $Relay)
     if ($Fingerprint) { $argList += @("--fingerprint", $Fingerprint) }
     if ($Trust) { $argList += @("--trust", $Trust) }
-    if ($Token) { $argList += @("--token", $Token) }
+    # Prefer env for the admin token so it is not visible in process argv.
+    if ($Token) { $env:AGENTLINK_TOKEN = $Token }
     $argList += @("service", "install", "--scope", $Scope, "--name", $Name, "--access", $Access)
     if ($MaxAccess) { $argList += @("--max-access", $MaxAccess) }
     if ($PairingToken) { $argList += @("--pairing-token", $PairingToken) }

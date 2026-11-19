@@ -919,8 +919,10 @@ fn enroll_target(host: &str, leaf_fingerprint: &str) -> EnrollTarget {
 }
 
 fn unix_install_command(origin: &str, token: &str, name: &str, access: &str) -> String {
+    // Pass the admin token via the environment so it does not appear in the
+    // installer's argv (visible to other users via `ps` on shared hosts).
     format!(
-        "curl -fsSL {origin}/install.sh | sh -s -- --token {} --name {} --access {} --max-access {}",
+        "curl -fsSL {origin}/install.sh | env AGENTLINK_TOKEN={} sh -s -- --name {} --access {} --max-access {}",
         shell_single(token),
         shell_single(name),
         shell_single(access),
@@ -930,7 +932,7 @@ fn unix_install_command(origin: &str, token: &str, name: &str, access: &str) -> 
 
 fn windows_install_command(origin: &str, token: &str, name: &str, access: &str) -> String {
     format!(
-        "& ([scriptblock]::Create((irm {origin}/install.ps1))) -Token {} -Name {} -Access {} -MaxAccess {}",
+        "$env:AGENTLINK_TOKEN={}; & ([scriptblock]::Create((irm {origin}/install.ps1))) -Name {} -Access {} -MaxAccess {}",
         ps_single(token),
         ps_single(name),
         ps_single(access),
@@ -1257,7 +1259,7 @@ mod tests {
         let command = unix_install_command(&public.origin, "abc", "lab top", "desktop");
         assert_eq!(
             command,
-            "curl -fsSL https://relay.example.com/install.sh | sh -s -- --token 'abc' --name 'lab top' --access 'desktop' --max-access 'desktop'"
+            "curl -fsSL https://relay.example.com/install.sh | env AGENTLINK_TOKEN='abc' sh -s -- --name 'lab top' --access 'desktop' --max-access 'desktop'"
         );
         let quoted = unix_install_command(&public.origin, "abc", "o'brien", "read-only");
         assert!(quoted.contains("--name 'o'\\''brien'"), "{quoted}");

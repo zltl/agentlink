@@ -2030,8 +2030,11 @@ fn spawn_pty(
                         None => std::future::pending::<()>().await,
                     }
                 };
+                // Prefer local commands (Ctrl+C / Close / resize) over a flood
+                // of remote PTY chunks so interrupt stays responsive under `yes`.
                 tokio::select! {
                     biased;
+                    cmd = rx.recv() => cmd,
                     event = session.recv() => {
                         match event {
                             Ok(PtyEvent::Data(bytes)) => {
@@ -2060,7 +2063,6 @@ fn spawn_pty(
                         }
                         continue;
                     }
-                    cmd = rx.recv() => cmd,
                     _ = heal_sleep => {
                         echo_heal_at = None;
                         if last_rebind_at

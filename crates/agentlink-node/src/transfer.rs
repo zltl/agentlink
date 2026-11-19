@@ -1070,7 +1070,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let err = copy_tree(&src, &dir.path().join("dest"))
+        let err = copy_tree(None, &src, &dir.path().join("dest"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a regular file"), "{err}");

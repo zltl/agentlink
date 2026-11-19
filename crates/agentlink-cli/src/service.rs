@@ -73,10 +73,10 @@ pub struct InstallArgs {
     /// Invite from `agentlink pair`. Flags and `--pairing-token` override it.
     #[arg(long)]
     pub invite: Option<String>,
-    /// Kept for older scripts. Enrollment is full access for the owner.
+    /// Relay enrollment preset for the owner (`full` by default).
     #[arg(long, default_value = "full")]
     pub access: String,
-    /// Kept for older scripts. The node does not clip a connected owner.
+    /// Local node ceiling intersected with every signed grant (`full` when omitted).
     #[arg(long)]
     pub max_access: Option<String>,
     #[arg(long)]
