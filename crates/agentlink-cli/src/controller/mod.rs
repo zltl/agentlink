@@ -9,6 +9,8 @@ mod diagnostics;
 /// STD-only ordered input reducer (also `rustc --test` without workspace deps).
 #[cfg(not(target_env = "musl"))]
 mod input_policy;
+/// Window-free controller decisions; still GUI-crate-bound via `agentlink_view`.
+#[cfg(not(target_env = "musl"))]
 mod model;
 
 #[cfg(not(target_env = "musl"))]
@@ -25,6 +27,8 @@ mod indicator;
 mod term;
 #[cfg(not(target_env = "musl"))]
 mod term_local_echo;
+/// egui tokens / fonts — requires `eframe` (absent on musl).
+#[cfg(not(target_env = "musl"))]
 mod theme;
 #[cfg(not(target_env = "musl"))]
 mod field_pad;
@@ -366,6 +370,14 @@ pub fn enter_args(args: EnterArgs) -> i32 {
 #[cfg(test)]
 mod preview_isolation_tests {
     use super::*;
+
+    /// Musl release archives omit eframe / agentlink-view. `theme` and `model`
+    /// must stay behind the same `not(musl)` gate as those crates, or the
+    /// static zigbuild fails (see t551).
+    #[test]
+    fn musl_controller_boundary_stays_headless() {
+        assert_eq!(available(), !cfg!(target_env = "musl"));
+    }
 
     #[test]
     fn enter_preview_setup_skips_live_hooks() {
