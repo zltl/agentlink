@@ -777,3 +777,206 @@ async fn e2e_ws_agent_cannot_user_passwd_or_set_policy_and_wire_reauth_works() {
     .await;
     assert!(logged_in.is_ok(), "new password must log in cleanly");
 }
+
+#[tokio::test]
+async fn e2e_audit_chain_has_no_off_hashes_and_http_audit_blocks_node_user_spoof() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = spawn(dir.path(), false).await;
+    let relay_url = format!("wss://127.0.0.1:{}", relay.local_addr.port());
+    let host = format!("127.0.0.1:{}", relay.local_addr.port());
+
+    // Admin (legacy token -> note_legacy_use) creates alice and bob.
+    let admin = Client::connect_identity(
+        &ClientSettings {
+            relay: relay_url.clone(),
+            token: relay.admin_token.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        },
+        Identity::generate(),
+        true,
+    )
+    .await
+    .unwrap();
+    admin
+        .user_add("alice", "alice-pw-1234", false)
+        .await
+        .unwrap();
+    admin.user_add("bob", "bob-pw-12345", false).await.unwrap();
+
+    // Enroll a node for Bob via Bob's account session.
+    let bob_dev = Identity::generate();
+    let bob_sess = agentlink_core::client::login_user(
+        &relay_url,
+        &relay.fingerprint,
+        None,
+        &bob_dev,
+        "bob",
+        "bob-pw-12345",
+        None,
+        "bob-cli",
+    )
+    .await
+    .unwrap();
+    let bob_client = Client::connect_identity(
+        &ClientSettings {
+            relay: relay_url.clone(),
+            token: bob_sess.access_token.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        },
+        bob_dev,
+        true,
+    )
+    .await
+    .unwrap();
+    let bob_node_key = Identity::generate();
+    let bob_node_id = bob_node_key.public_hex().to_string();
+    bob_client
+        .enroll_self("bob-box", &bob_node_key, Some(NodePolicy::full()))
+        .await
+        .unwrap();
+
+    // Connect Bob's node over WS and send an AuditBatch spoofing `user: "alice"`.
+    let tls = tls_connect(&relay).await;
+    let (mut node_ws, _) = tokio_tungstenite::client_async(
+        format!("wss://127.0.0.1:{}/v1/connect", relay.local_addr.port()),
+        tls,
+    )
+    .await
+    .unwrap();
+    node_ws
+        .send(Message::Text(
+            serde_json::to_string(&Envelope::Hello {
+                role: Role::Node,
+                protocol: PROTOCOL_VERSION,
+                name: Some("bob-box".into()),
+                node_id: Some(bob_node_id.clone()),
+                public_key: Some(bob_node_id.clone()),
+                token: None,
+                pairing_token: None,
+                hostname: Some("bob-box".into()),
+                os: Some("linux".into()),
+                arch: Some("x86_64".into()),
+                version: Some("0.1.0".into()),
+                ceiling: Some(NodePolicy::full()),
+                has_display: Some(false),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ch = node_ws.next().await.unwrap().unwrap().into_text().unwrap();
+    let Envelope::Challenge { nonce } = serde_json::from_str(&ch).unwrap() else {
+        panic!("expected challenge, got {ch}");
+    };
+    node_ws
+        .send(Message::Text(
+            serde_json::to_string(&Envelope::Authenticate {
+                signature: bob_node_key.sign_nonce(&nonce),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let hello_ok = node_ws.next().await.unwrap().unwrap().into_text().unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<Envelope>(&hello_ok).unwrap(),
+            Envelope::HelloOk { .. }
+        ),
+        "expected HelloOk, got {hello_ok}"
+    );
+    node_ws
+        .send(Message::Text(
+            serde_json::to_string(&Envelope::AuditBatch {
+                node_id: bob_node_id.clone(),
+                records: vec![serde_json::json!({
+                    "seq": 1,
+                    "ts": format!("{}", agentlink_core::util::unix_now()),
+                    "node_id": "relay",
+                    "node_name": "relay",
+                    "client_id": "forged",
+                    "category": "exec",
+                    "op": "bob.forged.alice.record",
+                    "result": "ok",
+                    "duration_ms": 0,
+                    "prev_hash": "0",
+                    "hash": "1",
+                    "user": "alice",
+                })],
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    // Ping-pong so relay has processed the preceding AuditBatch frame.
+    node_ws
+        .send(Message::Text(
+            serde_json::to_string(&Envelope::Ping {}).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = node_ws.next().await;
+
+    // Alice logs in over HTTP -> writes chained web.login to audit.jsonl.
+    let login_body = r#"{"username":"alice","password":"alice-pw-1234"}"#;
+    let login = https(
+        &relay,
+        &format!(
+            "POST /auth/login HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{login_body}",
+            login_body.len()
+        ),
+    )
+    .await;
+    assert!(login.starts_with("HTTP/1.1 200 OK"), "{login}");
+    let sess = cookie(&login, "agentlink_session");
+
+    // 1. GET /audit/records for Alice must NOT contain Bob's spoofed record, while
+    //    returning Alice's own relay-authored web.login event.
+    let audit_resp = https(
+        &relay,
+        &format!(
+            "GET /audit/records?limit=100 HTTP/1.1\r\nHost: {host}\r\nCookie: agentlink_session={sess}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    let (head, body) = split_response(&audit_resp);
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(body).unwrap();
+    assert!(
+        rows.iter().all(|r| r["op"] != "bob.forged.alice.record"),
+        "Bob's spoofed AuditBatch record must not appear in Alice's /audit/records: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r["op"] == "web.login"),
+        "Alice's own web.login record should appear in /audit/records: {rows:?}"
+    );
+
+    // 2. Relay audit.jsonl combines legacy admin auth + normal login + web.login
+    //    with a valid continuous hash chain and zero "hash": "off" records.
+    let relay_records = agentlink_core::audit::page_from_jsonl(
+        &dir.path().join("audit.jsonl"),
+        200,
+        0,
+        |_| true,
+    );
+    assert!(
+        relay_records.len() >= 3,
+        "expected legacy + bob login + alice web.login records, got {}",
+        relay_records.len()
+    );
+    assert!(
+        relay_records
+            .iter()
+            .all(|r| r.hash != "off" && r.prev_hash != "off" && !r.hash.is_empty()),
+        "relay audit.jsonl must not contain 'off' hashes: {relay_records:?}"
+    );
+    agentlink_core::audit::verify_chain(&relay_records).unwrap();
+}

@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit_http::{
     append_node_audit, audit_page, audit_records_json, audit_records_json_for_session,
-    node_audit_path, note_legacy_use, open_private_append, read_audit_records_merged,
+    node_audit_path, note_legacy_use, open_private_append, read_audit_records_merged_split,
     rotate_if_needed, AUDIT_RECORDS_DEFAULT_LIMIT, AUDIT_RECORDS_MAX_LIMIT, AUDIT_ROTATE_KEEP,
     AUDIT_ROTATE_MAX_BYTES,
 };
@@ -1014,6 +1014,8 @@ fn parse_forwarded_ip(token: &str) -> Option<IpAddr> {
     None
 }
 
+static CONNECT_LOCK: Mutex<()> = Mutex::new(());
+
 fn record_connect(
     path: &std::path::Path,
     role: &str,
@@ -1031,6 +1033,9 @@ fn record_connect(
         "tcp_peer": tcp.to_string(),
     });
     let text = format!("{line}\n");
+    let Ok(_guard) = CONNECT_LOCK.lock() else {
+        return;
+    };
     rotate_if_needed(
         path,
         text.len() as u64,
@@ -1258,12 +1263,32 @@ where
                     content_length: None,
                 }
             } else if let Some(session) = web_session.as_ref() {
+                let visible_node_ids: Vec<String> = if session.role == "admin" {
+                    Vec::new()
+                } else {
+                    let caller = Caller {
+                        user: session.user.clone(),
+                        admin: false,
+                    };
+                    hub.db
+                        .visible(&caller)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|node| node.node.id)
+                        .collect()
+                };
                 crate::web::HttpReply {
                     status: 200,
                     reason: "OK",
                     content_type: "application/json",
-                    body: audit_records_json_for_session(&hub.audit_path, query, session)
-                        .into_bytes(),
+                    body: audit_records_json_for_session(
+                        &hub.audit_path,
+                        query,
+                        session,
+                        &visible_node_ids,
+                    )
+                    .into_bytes(),
                     headers: vec![("Content-Security-Policy".into(), AUDIT_JSON_CSP.into())],
                     content_length: None,
                 }
@@ -3001,17 +3026,31 @@ async fn handle_client(
             } else {
                 parsed.limit.min(AUDIT_RECORDS_MAX_LIMIT)
             };
-            let records = read_audit_records_merged(&hub.audit_path, limit, 0, |record| {
-                if !parsed.matches(record) {
-                    return false;
-                }
-                match &visibility {
-                    None => true,
-                    Some((user, node_ids, agent_ids, device_id)) => {
-                        record_visible(record, user, node_ids, agent_ids, device_id)
+            let records = read_audit_records_merged_split(
+                &hub.audit_path,
+                limit,
+                0,
+                |record| {
+                    if !parsed.matches(record) {
+                        return false;
                     }
-                }
-            });
+                    match &visibility {
+                        None => true,
+                        Some((user, node_ids, agent_ids, device_id)) => {
+                            record_visible(record, user, node_ids, agent_ids, device_id)
+                        }
+                    }
+                },
+                |record| {
+                    if !parsed.matches(record) {
+                        return false;
+                    }
+                    match &visibility {
+                        None => true,
+                        Some((_, node_ids, _, _)) => node_ids.iter().any(|id| id == &record.node_id),
+                    }
+                },
+            );
             let records = records
                 .into_iter()
                 .filter_map(|record| serde_json::to_value(record).ok())
@@ -4624,11 +4663,16 @@ fn record_visible(
     agent_ids: &[String],
     device_id: &str,
 ) -> bool {
+    // Node-authored records carry untrusted `user`/`client_id`/`device_id`
+    // metadata; gate them strictly by visible `node_id` so a compromised node
+    // from another tenant cannot spoof records into a victim's audit feed.
+    if record.node_id != "relay" {
+        return node_ids.iter().any(|id| id == &record.node_id);
+    }
     record.user.as_deref() == Some(user)
-        || node_ids.iter().any(|id| id == &record.node_id)
         || agent_ids.iter().any(|id| id == &record.client_id)
         || (!device_id.is_empty() && record.client_id == device_id)
-        || record.device_id.as_deref() == Some(device_id)
+        || (!device_id.is_empty() && record.device_id.as_deref() == Some(device_id))
 }
 
 async fn access_hello(
@@ -7218,5 +7262,180 @@ mod wave1_security_tests {
             }
             other => panic!("expected AuditPage, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn bob_node_audit_batch_user_spoof_is_hidden_from_alice_query_audit_and_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = spawn_test_relay(dir.path()).await;
+        let hub = &relay.hub;
+        hub.db
+            .create_user("alice", "alice-pw-1234", "user")
+            .await
+            .unwrap();
+        hub.db
+            .create_user("bob", "bob-pw-12345", "user")
+            .await
+            .unwrap();
+        let alice_node = hub
+            .db
+            .enroll_self(
+                "alice",
+                agentlink_core::Identity::generate().public_hex(),
+                "alice-box",
+                NodePolicy::full(),
+                meta("alice-box"),
+            )
+            .await
+            .unwrap();
+        let bob_node = hub
+            .db
+            .enroll_self(
+                "bob",
+                agentlink_core::Identity::generate().public_hex(),
+                "bob-box",
+                NodePolicy::full(),
+                meta("bob-box"),
+            )
+            .await
+            .unwrap();
+        let alice_agent_id = agentlink_core::Identity::generate().public_hex().to_string();
+        hub.db
+            .register_client("alice", "alice-agent", &alice_agent_id)
+            .await
+            .unwrap();
+
+        // Relay-authored auth events (both audit_auth and note_legacy_use) stay hash-chained.
+        audit_auth(&hub.audit_path, "login", "alice", "alice-dev", true, "");
+        note_legacy_use(&hub.audit_path, true, "");
+        let relay_records =
+            agentlink_core::audit::page_from_jsonl(&hub.audit_path, 50, 0, |_| true);
+        assert_eq!(relay_records.len(), 2);
+        assert!(relay_records
+            .iter()
+            .all(|r| r.hash != "off" && r.prev_hash != "off"));
+        agentlink_core::audit::verify_chain(&relay_records).unwrap();
+
+        // Compromised Bob node uploads AuditBatch spoofing user=alice, client_id=alice_agent_id,
+        // and device_id=alice-dev.
+        let (bob_tx, _bob_rx) = mpsc::channel(8);
+        handle_node(
+            hub,
+            401,
+            &bob_node.id,
+            &bob_tx,
+            Envelope::AuditBatch {
+                node_id: alice_node.id.clone(),
+                records: vec![serde_json::json!({
+                    "seq": 1,
+                    "ts": format!("{}", unix_now()),
+                    "node_id": alice_node.id,
+                    "node_name": "alice-box",
+                    "client_id": alice_agent_id,
+                    "category": "exec",
+                    "op": "bob.spoof.as.alice",
+                    "result": "ok",
+                    "duration_ms": 0,
+                    "prev_hash": "0",
+                    "hash": "1",
+                    "user": "alice",
+                    "device_id": "alice-dev",
+                })],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Alice's own node uploads a legitimate record.
+        let (alice_node_tx, _alice_node_rx) = mpsc::channel(8);
+        handle_node(
+            hub,
+            402,
+            &alice_node.id,
+            &alice_node_tx,
+            Envelope::AuditBatch {
+                node_id: alice_node.id.clone(),
+                records: vec![serde_json::json!({
+                    "seq": 1,
+                    "ts": format!("{}", unix_now() + 1),
+                    "node_id": alice_node.id,
+                    "node_name": "alice-box",
+                    "client_id": "c",
+                    "category": "exec",
+                    "op": "alice.legit.op",
+                    "result": "ok",
+                    "duration_ms": 0,
+                    "prev_hash": "0",
+                    "hash": "2",
+                    "user": "alice",
+                })],
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Alice's WS QueryAudit must NOT see Bob's spoofed record, even though
+        //    user/client_id/device_id match Alice!
+        let mut alice = operator_user("alice");
+        alice.device_id = "alice-dev".into();
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_client(
+            hub,
+            403,
+            &tx,
+            "s-alice",
+            &alice,
+            &WireReauth::default(),
+            Envelope::QueryAudit {
+                request_id: "qa-alice".into(),
+                filter: serde_json::json!({"limit": 100}),
+            },
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        match recv_env(&mut rx) {
+            Envelope::AuditPage { records, .. } => {
+                assert!(
+                    records.iter().all(|r| r["op"] != "bob.spoof.as.alice"),
+                    "Bob's node AuditBatch spoofing user/agent/device must not leak to Alice QueryAudit: {records:?}"
+                );
+                assert!(records.iter().any(|r| r["op"] == "login"));
+                assert!(records.iter().any(|r| r["op"] == "alice.legit.op"));
+            }
+            other => panic!("expected AuditPage, got {other:?}"),
+        }
+
+        // 2. Alice's HTTP /audit/records helper must also block Bob's spoofed record.
+        let alice_web = crate::models::WebSession {
+            user: "alice".into(),
+            role: "user".into(),
+            csrf: "csrf".into(),
+            expires_unix: i64::MAX,
+        };
+        let visible_ids: Vec<String> = hub
+            .db
+            .visible(&Caller {
+                user: "alice".into(),
+                admin: false,
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.node.id)
+            .collect();
+        let http_json = audit_records_json_for_session(
+            &hub.audit_path,
+            "limit=100",
+            &alice_web,
+            &visible_ids,
+        );
+        let http_rows: Vec<serde_json::Value> = serde_json::from_str(&http_json).unwrap();
+        assert!(
+            http_rows.iter().all(|r| r["op"] != "bob.spoof.as.alice"),
+            "Bob's node AuditBatch spoofing user=alice must not leak to HTTP /audit/records: {http_rows:?}"
+        );
+        assert!(http_rows.iter().any(|r| r["op"] == "login"));
+        assert!(http_rows.iter().any(|r| r["op"] == "alice.legit.op"));
     }
 }

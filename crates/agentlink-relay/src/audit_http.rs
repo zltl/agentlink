@@ -36,7 +36,7 @@ pub(crate) fn node_audit_path(audit_path: &Path) -> PathBuf {
 
 pub(crate) fn audit_records_json(path: &Path, query: &str) -> String {
     let (limit, offset) = audit_page_bounds(query);
-    let records = read_audit_values_page(path, limit, offset, None);
+    let records = read_audit_values_page(path, limit, offset, None, &[]);
     serde_json::to_string(&records).unwrap_or_else(|_| "[]".into())
 }
 
@@ -44,16 +44,19 @@ pub(crate) fn audit_records_json_for_session(
     path: &Path,
     query: &str,
     session: &WebSession,
+    visible_node_ids: &[String],
 ) -> String {
     let (limit, offset) = audit_page_bounds(query);
-    // Non-admin sessions filter by user *while* streaming so a sparse user
-    // still receives a full page and memory stays O(limit+offset).
+    // Non-admin sessions filter *while* streaming so a sparse user still
+    // receives a full page and memory stays O(limit+offset). Node-uploaded
+    // records are gated strictly by `visible_node_ids` so a compromised node
+    // cannot inject records into another user's feed by forging `"user"`.
     let user_filter = if session.role == "admin" {
         None
     } else {
         Some(session.user.as_str())
     };
-    let records = read_audit_values_page(path, limit, offset, user_filter);
+    let records = read_audit_values_page(path, limit, offset, user_filter, visible_node_ids);
     serde_json::to_string(&records).unwrap_or_else(|_| "[]".into())
 }
 
@@ -87,22 +90,23 @@ pub(crate) fn audit_page_bounds(query: &str) -> (usize, usize) {
 }
 
 /// Stream newest-last records from both the relay audit log and the isolated
-/// node-uploaded audit log, applying `keep` while streaming so memory stays
-/// `O(limit + offset)`.
-pub(crate) fn read_audit_records_merged(
+/// node-uploaded audit log, applying separate predicates for relay-authored
+/// vs node-uploaded files while streaming so memory stays `O(limit + offset)`.
+pub(crate) fn read_audit_records_merged_split(
     audit_path: &Path,
     limit: usize,
     offset: usize,
-    mut keep: impl FnMut(&AuditRecord) -> bool,
+    mut keep_relay: impl FnMut(&AuditRecord) -> bool,
+    mut keep_node: impl FnMut(&AuditRecord) -> bool,
 ) -> Vec<AuditRecord> {
     if limit == 0 {
         return Vec::new();
     }
     let cap = limit.saturating_add(offset);
-    let mut relay = agentlink_core::audit::page_from_jsonl(audit_path, cap, 0, &mut keep);
+    let mut relay = agentlink_core::audit::page_from_jsonl(audit_path, cap, 0, &mut keep_relay);
     let node_path = node_audit_path(audit_path);
     let mut nodes = if node_path.is_file() {
-        agentlink_core::audit::page_from_jsonl(&node_path, cap, 0, &mut keep)
+        agentlink_core::audit::page_from_jsonl(&node_path, cap, 0, &mut keep_node)
     } else {
         Vec::new()
     };
@@ -132,17 +136,35 @@ fn compare_audit_ts(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Newest-last page of audit JSON values. `offset` skips the newest records
 /// (so `offset=0` is the latest page); older pages use larger offsets.
-/// When `user` is `Some`, only that user's rows enter the page ring.
+/// When `user` is `Some`, relay-authored records (`node_id == "relay"`) match
+/// `record.user == Some(name)` while node-authored records require `node_id`
+/// to be present in `visible_node_ids`.
 pub(crate) fn read_audit_values_page(
     path: &Path,
     limit: usize,
     offset: usize,
     user: Option<&str>,
+    visible_node_ids: &[String],
 ) -> Vec<serde_json::Value> {
-    read_audit_records_merged(path, limit, offset, |record| match user {
-        None => true,
-        Some(name) => record.user.as_deref() == Some(name),
-    })
+    read_audit_records_merged_split(
+        path,
+        limit,
+        offset,
+        |record| match user {
+            None => true,
+            Some(name) => {
+                if record.node_id == "relay" {
+                    record.user.as_deref() == Some(name)
+                } else {
+                    visible_node_ids.iter().any(|id| id == &record.node_id)
+                }
+            }
+        },
+        |record| match user {
+            None => true,
+            Some(_) => visible_node_ids.iter().any(|id| id == &record.node_id),
+        },
+    )
     .into_iter()
     .filter_map(|record| serde_json::to_value(record).ok())
     .collect()
@@ -281,10 +303,6 @@ pub(crate) fn append_chained_auth_with_limit(
     let Ok(_guard) = AUDIT_LOCK.lock() else {
         return;
     };
-    // Rotate BEFORE reading the chain tip so each rotated segment and the new
-    // active file each carry an intact, self-contained hash chain.
-    rotate_if_needed(path, 512, max_bytes, keep);
-    let (seq, prev) = agentlink_core::audit::chain_tip_from_jsonl(path);
     let mut record = AuditRecord {
         seq: 0,
         ts: chrono_now(),
@@ -309,31 +327,28 @@ pub(crate) fn append_chained_auth_with_limit(
         diff_ref: None,
         output_ref: None,
         exit_code: None,
-        prev_hash: String::new(),
-        hash: String::new(),
+        prev_hash: "0".repeat(64),
+        hash: "0".repeat(64),
         user: Some(user.into()),
         device_id: Some(device.into()),
     };
+    // Measure exact upper bound of serialized record length and rotate ONCE
+    // BEFORE reading the chain tip so neither the rotated archive nor the new
+    // active file can ever lose its genesis anchor.
+    let estimated_bytes = serde_json::to_string(&record)
+        .map(|s| (s.len() + 32) as u64)
+        .unwrap_or(1024);
+    rotate_if_needed(path, estimated_bytes, max_bytes, keep);
+    let (seq, prev) = agentlink_core::audit::chain_tip_from_jsonl(path);
     assign_chain(&mut record, seq.saturating_add(1), &prev, true);
-    if let Ok(value) = serde_json::to_value(&record) {
-        append_serialized_locked(path, &[value], max_bytes, keep);
-    }
-}
-
-pub(crate) fn append_audit(path: &Path, records: &[serde_json::Value]) {
-    append_audit_with_limit(path, records, AUDIT_ROTATE_MAX_BYTES, AUDIT_ROTATE_KEEP);
-}
-
-pub(crate) fn append_audit_with_limit(
-    path: &Path,
-    records: &[serde_json::Value],
-    max_bytes: u64,
-    keep: usize,
-) {
-    let Ok(_guard) = AUDIT_LOCK.lock() else {
+    let Ok(mut line) = serde_json::to_string(&record) else {
         return;
     };
-    append_serialized_locked(path, records, max_bytes, keep);
+    line.push('\n');
+    let Ok(mut file) = open_private_append(path) else {
+        return;
+    };
+    let _ = file.write_all(line.as_bytes());
 }
 
 /// Append node-uploaded audit records to the isolated `node-audit.jsonl` file
@@ -436,24 +451,7 @@ pub(crate) fn audit_auth(
     ok: bool,
     error: &str,
 ) {
-    let record = serde_json::json!({
-        "seq": 0,
-        "ts": chrono_now(),
-        "node_id": "relay",
-        "node_name": "relay",
-        "client_id": device,
-        "category": "auth",
-        "op": op,
-        "args": {"user": user},
-        "result": if ok { "ok" } else { "error" },
-        "error": if error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(error.into()) },
-        "duration_ms": 0,
-        "prev_hash": "off",
-        "hash": "off",
-        "user": user,
-        "device_id": device,
-    });
-    append_audit(path, &[record]);
+    append_chained_auth(path, op, user, device, ok, error);
 }
 
 pub(crate) fn chrono_now() -> String {
@@ -494,11 +492,11 @@ mod tests {
             ));
         }
         std::fs::write(&path, body).unwrap();
-        let page = read_audit_values_page(&path, 3, 0, None);
+        let page = read_audit_values_page(&path, 3, 0, None, &[]);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0]["op"], "op7");
         assert_eq!(page[2]["op"], "op9");
-        let older = read_audit_values_page(&path, 3, 3, None);
+        let older = read_audit_values_page(&path, 3, 3, None, &[]);
         assert_eq!(older[0]["op"], "op4");
         assert_eq!(older[2]["op"], "op6");
     }
@@ -511,16 +509,101 @@ mod tests {
         for i in 0..20 {
             let user = if i % 2 == 0 { "alice" } else { "bob" };
             body.push_str(&format!(
-                "{{\"seq\":{i},\"ts\":\"t{i}\",\"node_id\":\"n\",\"node_name\":\"n\",\"client_id\":\"c\",\"category\":\"op\",\"op\":\"op{i}\",\"result\":\"ok\",\"duration_ms\":0,\"prev_hash\":\"0\",\"hash\":\"{i}\",\"user\":\"{user}\"}}\n"
+                "{{\"seq\":{i},\"ts\":\"t{i}\",\"node_id\":\"relay\",\"node_name\":\"relay\",\"client_id\":\"c\",\"category\":\"op\",\"op\":\"op{i}\",\"result\":\"ok\",\"duration_ms\":0,\"prev_hash\":\"0\",\"hash\":\"{i}\",\"user\":\"{user}\"}}\n"
             ));
         }
         std::fs::write(&path, body).unwrap();
-        let page = read_audit_values_page(&path, 3, 0, Some("alice"));
+        let page = read_audit_values_page(&path, 3, 0, Some("alice"), &[]);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0]["op"], "op14");
         assert_eq!(page[1]["op"], "op16");
         assert_eq!(page[2]["op"], "op18");
         assert!(page.iter().all(|row| row["user"] == "alice"));
+    }
+
+    #[test]
+    fn audit_auth_and_note_legacy_use_share_verified_hash_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        audit_auth(&path, "web.login", "alice", "web", true, "");
+        note_legacy_use(&path, true, "");
+        audit_auth(
+            &path,
+            "login",
+            "bob",
+            "dev-1",
+            false,
+            "invalid username or password",
+        );
+        note_legacy_use(&path, false, "legacy admin token expired");
+        audit_auth(&path, "ice.mint", "user:alice", "bearer", true, "");
+
+        let records = agentlink_core::audit::page_from_jsonl(&path, 50, 0, |_| true);
+        assert_eq!(records.len(), 5);
+        assert!(
+            records
+                .iter()
+                .all(|r| r.hash != "off" && r.prev_hash != "off" && !r.hash.is_empty()),
+            "audit.jsonl must contain zero unchained 'off' records: {records:?}"
+        );
+        agentlink_core::audit::verify_chain(&records).unwrap();
+    }
+
+    #[test]
+    fn audit_records_for_session_blocks_cross_tenant_node_user_spoof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let node_path = node_audit_path(&path);
+        audit_auth(&path, "web.login", "alice", "web", true, "");
+        append_node_audit(
+            &node_path,
+            &[
+                serde_json::json!({
+                    "seq": 1,
+                    "ts": "9000000001",
+                    "node_id": "bob-node-id",
+                    "node_name": "bob-box",
+                    "client_id": "alice-agent",
+                    "category": "exec",
+                    "op": "spoofed.op",
+                    "result": "ok",
+                    "duration_ms": 0,
+                    "prev_hash": "0",
+                    "hash": "1",
+                    "user": "alice",
+                }),
+                serde_json::json!({
+                    "seq": 2,
+                    "ts": "9000000002",
+                    "node_id": "alice-node-id",
+                    "node_name": "alice-box",
+                    "client_id": "c",
+                    "category": "exec",
+                    "op": "alice.node.op",
+                    "result": "ok",
+                    "duration_ms": 0,
+                    "prev_hash": "0",
+                    "hash": "2",
+                    "user": "alice",
+                }),
+            ],
+        );
+
+        let alice_session = WebSession {
+            user: "alice".into(),
+            role: "user".into(),
+            csrf: "csrf".into(),
+            expires_unix: i64::MAX,
+        };
+        let visible = vec!["alice-node-id".to_string()];
+        let json = audit_records_json_for_session(&path, "limit=50", &alice_session, &visible);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert!(
+            rows.iter().all(|r| r["op"] != "spoofed.op"),
+            "Bob's node record spoofing user=alice must not leak to Alice: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r["op"] == "web.login"));
+        assert!(rows.iter().any(|r| r["op"] == "alice.node.op"));
     }
 
     #[test]
