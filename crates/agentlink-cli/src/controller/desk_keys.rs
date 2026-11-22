@@ -73,6 +73,9 @@ pub struct KeyPairState {
     pub ctrl_paste_armed: bool,
     /// Remembers a clean `Shift` hold while captured for empty-clipboard `Shift+Insert`.
     pub shift_paste_armed: bool,
+    /// Persistent IME composition state across frames (set while non-empty
+    /// `ImePreedit` is active; cleared on `ImeCommit` or empty `ImePreedit`).
+    pub ime_composing: bool,
 }
 
 impl KeyPairState {
@@ -270,8 +273,9 @@ fn frame_has_shortcut(slots: &[Slot]) -> bool {
     })
 }
 
-fn char_keys_sent(slots: &[Slot], composed: bool) -> Vec<char> {
+fn char_keys_sent(slots: &[Slot], composed: bool) -> (Vec<char>, bool) {
     let mut chars = Vec::new();
+    let mut saw_space = false;
     for slot in slots {
         let Slot::Key(HostKey::Key {
             name,
@@ -291,13 +295,17 @@ fn char_keys_sent(slots: &[Slot], composed: bool) -> Vec<char> {
         if shortcut_mods(*mods) {
             continue;
         }
+        if name == "space" {
+            saw_space = true;
+            continue;
+        }
         if name.chars().count() == 1 {
             if let Some(ch) = name.chars().next() {
                 chars.push(ch.to_ascii_lowercase());
             }
         }
     }
-    chars
+    (chars, saw_space)
 }
 
 fn push_chord(out: &mut Vec<FrameEvent>, key: &str, mods: ModSnapshot) {
@@ -315,10 +323,15 @@ fn push_chord(out: &mut Vec<FrameEvent>, key: &str, mods: ModSnapshot) {
     });
 }
 
-fn text_is_duplicate(text: &str, chars: &[char]) -> bool {
+/// Deduplicate single-character printable ASCII `Event::Text` against a
+/// same-frame printable `Key` press so shifted symbols absent from `egui::Key`
+/// (`@ # $ % ^ & * ( ) _ " ~ < >`) never double-type as both `Shift+<key>` and
+/// `inject_text("<sym>")`.
+fn text_is_duplicate(text: &str, chars: &[char], saw_space: bool) -> bool {
     let mut iter = text.chars();
     match (iter.next(), iter.next()) {
-        (Some(ch), None) => chars.contains(&ch.to_ascii_lowercase()),
+        (Some(' '), None) => saw_space,
+        (Some(ch), None) if ch.is_ascii_graphic() => !chars.is_empty(),
         _ => false,
     }
 }
@@ -381,8 +394,8 @@ pub fn interleave_with_state(
             Slot::Key(HostKey::Copy { .. } | HostKey::Cut { .. } | HostKey::Paste { .. })
         )
     });
-    let composed = composition_frame(slots);
-    let typed = char_keys_sent(slots, composed);
+    let mut composed = state.ime_composing || composition_frame(slots);
+    let (typed, saw_space) = char_keys_sent(slots, composed);
     let shortcut = frame_has_shortcut(slots);
     let mut commits: Vec<String> = Vec::new();
     let mut copy_done = false;
@@ -393,8 +406,16 @@ pub fn interleave_with_state(
     for slot in slots {
         match slot {
             Slot::Pointer(event) => out.push(event.clone()),
-            Slot::Key(HostKey::ImePreedit(_)) => {}
+            Slot::Key(HostKey::ImePreedit(preedit)) => {
+                if preedit.is_empty() {
+                    state.ime_composing = false;
+                } else {
+                    state.ime_composing = true;
+                    composed = true;
+                }
+            }
             Slot::Key(HostKey::ImeCommit(text)) => {
+                state.ime_composing = false;
                 if text.is_empty() || commits.iter().any(|have| have == text) {
                     continue;
                 }
@@ -461,6 +482,10 @@ pub fn interleave_with_state(
                     if matches!(name.as_str(), "copy" | "cut" | "paste") {
                         continue;
                     }
+                    if name == "escape" && state.ime_composing {
+                        state.ime_composing = false;
+                        continue;
+                    }
                     if composed && is_composition_key(name) && !shortcut_mods(*mods) {
                         continue;
                     }
@@ -525,7 +550,7 @@ pub fn interleave_with_state(
                 if shortcut && text.chars().all(|ch| ch.is_ascii()) {
                     continue;
                 }
-                if text_is_duplicate(text, &typed) {
+                if text_is_duplicate(text, &typed, saw_space) {
                     continue;
                 }
                 out.push(FrameEvent::Text { text: text.clone() });
@@ -1024,5 +1049,101 @@ mod tests {
                 "ctrl:up".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn shifted_us_symbols_do_not_double_type_with_text() {
+        for (phys, sym) in [
+            ("2", "@"),
+            ("3", "#"),
+            ("4", "$"),
+            ("5", "%"),
+            ("6", "^"),
+            ("7", "&"),
+            ("8", "*"),
+            ("9", "("),
+            ("0", ")"),
+            ("-", "_"),
+            ("'", "\""),
+            ("`", "~"),
+            (",", "<"),
+            (".", ">"),
+        ] {
+            let out = interleave(
+                true,
+                true,
+                &[
+                    key_phys(phys, phys, true, shift()),
+                    Slot::Key(HostKey::Text(sym.into())),
+                ],
+            );
+            assert_eq!(
+                names(&out),
+                vec![format!("{phys}:down")],
+                "shifted symbol {sym} on key {phys} must not emit both Key and Text: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_frame_ime_preedit_suppresses_raw_ascii_until_commit() {
+        let mods = ModSnapshot::default();
+        let mut state = KeyPairState {
+            captured_active: true,
+            ..KeyPairState::default()
+        };
+        // Frame 1: IME opens with preedit "n".
+        let f1 = interleave_with_state(
+            true,
+            true,
+            TargetOs::Standard,
+            &mut state,
+            &[Slot::Key(HostKey::ImePreedit("n".into())), key("n", true, mods)],
+            mods,
+        );
+        assert!(f1.is_empty(), "frame 1 should suppress preedit key: {f1:?}");
+        assert!(state.ime_composing);
+
+        // Frame 2: next ASCII key arrives without a fresh ImePreedit in the same frame.
+        let f2 = interleave_with_state(
+            true,
+            true,
+            TargetOs::Standard,
+            &mut state,
+            &[key("i", true, mods), Slot::Key(HostKey::Text("i".into()))],
+            mods,
+        );
+        assert!(
+            f2.is_empty(),
+            "frame 2 must suppress raw ASCII while ime_composing is active: {f2:?}"
+        );
+        assert!(state.ime_composing);
+
+        // Frame 3: IME commits "你".
+        let f3 = interleave_with_state(
+            true,
+            true,
+            TargetOs::Standard,
+            &mut state,
+            &[
+                key("space", true, mods),
+                Slot::Key(HostKey::ImeCommit("你".into())),
+                Slot::Key(HostKey::Text("你".into())),
+            ],
+            mods,
+        );
+        assert_eq!(names(&f3), vec!["text:你".to_string()]);
+        assert!(!state.ime_composing);
+
+        // Frame 4: normal typing resumes immediately after commit.
+        let f4 = interleave_with_state(
+            true,
+            true,
+            TargetOs::Standard,
+            &mut state,
+            &[key("a", true, mods), Slot::Key(HostKey::Text("a".into()))],
+            mods,
+        );
+        assert_eq!(names(&f4), vec!["a:down".to_string()]);
     }
 }

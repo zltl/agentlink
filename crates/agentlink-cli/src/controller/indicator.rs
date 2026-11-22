@@ -4,22 +4,43 @@
 //! requests with Allow / Deny. Those actions sign or refuse locally; they are
 //! not `approve allow/deny` and they do not send the issuer key anywhere.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
+
+use eframe::egui;
+
+/// Shared slot populated with the `egui::Context` once `eframe::run_native`
+/// constructs the window, allowing the tray thread to wake a hidden window.
+pub type SharedEguiCtx = Arc<OnceLock<egui::Context>>;
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-pub fn spawn(open: Arc<AtomicBool>, quit: Arc<AtomicBool>) -> bool {
+const GRANT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+pub fn spawn(
+    open: Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
+    data_dir: PathBuf,
+    egui_ctx: SharedEguiCtx,
+) -> bool {
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
         return false;
     }
     let reveal = Arc::clone(&open);
+    let wake_err = Arc::clone(&egui_ctx);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     match std::thread::Builder::new()
         .name("agentlink-tray".into())
         .spawn(move || {
-            if let Err(err) = run(open, quit, ready_tx) {
+            if let Err(err) = run(open, quit, data_dir, egui_ctx, ready_tx) {
                 tracing::warn!(error = %err, "status icon is not available");
                 reveal.store(true, Ordering::Relaxed);
+                if let Some(ctx) = wake_err.get() {
+                    ctx.request_repaint();
+                }
             }
         }) {
         Ok(_) => match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
@@ -34,14 +55,28 @@ pub fn spawn(open: Arc<AtomicBool>, quit: Arc<AtomicBool>) -> bool {
 }
 
 #[cfg(not(all(target_os = "linux", not(target_env = "musl"))))]
-pub fn spawn(_open: Arc<AtomicBool>, _quit: Arc<AtomicBool>) -> bool {
+pub fn spawn(
+    _open: Arc<AtomicBool>,
+    _quit: Arc<AtomicBool>,
+    _data_dir: PathBuf,
+    _egui_ctx: SharedEguiCtx,
+) -> bool {
     false
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn has_local_node(dir: &std::path::Path) -> bool {
+    dir.join("node.json").is_file()
+        || dir.join("identity.json").is_file()
+        || dir.join("grant-issuer.json").is_file()
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn run(
     open: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
+    data_dir: PathBuf,
+    egui_ctx: SharedEguiCtx,
     ready_tx: std::sync::mpsc::SyncSender<bool>,
 ) -> Result<(), String> {
     use ksni::TrayMethods;
@@ -52,11 +87,19 @@ fn run(
         .build()
         .map_err(|err| err.to_string())?;
     runtime.block_on(async move {
+        let on_node = has_local_node(&data_dir);
         let spawned = AgentTray {
             open,
             quit,
-            pending: load_pending(),
-            on_node: agentlink_core::grant_request::default_node_data_dir().is_some(),
+            data_dir: data_dir.clone(),
+            egui_ctx,
+            pending: if on_node {
+                load_pending(&data_dir)
+            } else {
+                Vec::new()
+            },
+            on_node,
+            last_action_status: None,
         }
         .spawn()
         .await;
@@ -71,9 +114,13 @@ fn run(
             }
         };
         while !quit_flag.load(Ordering::Relaxed) && !handle.is_closed() {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let pending = load_pending();
-            let on_node = agentlink_core::grant_request::default_node_data_dir().is_some();
+            tokio::time::sleep(GRANT_POLL_INTERVAL).await;
+            let on_node = has_local_node(&data_dir);
+            let pending = if on_node {
+                load_pending(&data_dir)
+            } else {
+                Vec::new()
+            };
             let _ = handle
                 .update(|tray| {
                     if tray.pending != pending || tray.on_node != on_node {
@@ -96,15 +143,21 @@ struct PendingItem {
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-fn load_pending() -> Vec<PendingItem> {
-    let Some(dir) = agentlink_core::grant_request::default_node_data_dir() else {
+fn load_pending(dir: &std::path::Path) -> Vec<PendingItem> {
+    let Ok(reqs) = agentlink_core::grant_request::list_requests(dir) else {
         return Vec::new();
     };
+    if reqs.is_empty() {
+        return Vec::new();
+    }
     let now = agentlink_core::util::unix_now();
-    let _ = agentlink_core::grant_request::expire_pending(&dir, now);
-    let Ok(reqs) = agentlink_core::grant_request::list_requests(&dir) else {
-        return Vec::new();
-    };
+    // Only expire on disk when at least one request has actually crossed its deadline.
+    if reqs
+        .iter()
+        .any(|r| r.status == agentlink_core::grant_request::RequestStatus::Pending && !r.is_pending(now))
+    {
+        let _ = agentlink_core::grant_request::expire_pending(dir, now);
+    }
     reqs.into_iter()
         .filter(|r| r.is_pending(now))
         .map(|r| {
@@ -113,7 +166,7 @@ fn load_pending() -> Vec<PendingItem> {
             PendingItem {
                 request_id: r.request_id,
                 label: format!(
-                    "{fp} — {} — ttl {}s（签名≠人员/名称）",
+                    "{fp} — {} — ttl {}s (signature != identity name)",
                     r.policy.capability_summary(),
                     r.ttl_secs
                 ),
@@ -123,38 +176,43 @@ fn load_pending() -> Vec<PendingItem> {
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-#[cfg(all(target_os = "linux", not(target_env = "musl")))]
-fn launch_paste_ui() {
+fn launch_paste_ui(data_dir: &std::path::Path) -> String {
     if crate::grant_local::remote_exec_is_set() {
         tracing::warn!("{}", crate::grant_local::REMOTE_EXEC_REFUSAL);
-        return;
+        return crate::grant_local::REMOTE_EXEC_REFUSAL.to_string();
     }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(err) => {
             tracing::warn!(error = %err, "cannot launch grant paste-ui");
-            return;
+            return format!("Cannot launch grant UI: {err}");
         }
     };
     match std::process::Command::new(exe) // no-window-reviewed: Linux-only grant paste-ui; must stay visible
-        .args(["grant", "paste-ui"])
+        .args(["grant", "paste-ui", "--data-dir"])
+        .arg(data_dir)
         .spawn()
     {
-        Ok(_) => {}
-        Err(err) => tracing::warn!(error = %err, "failed to open grant paste-ui"),
+        Ok(_) => "Opened grant paste window.".into(),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to open grant paste-ui");
+            format!("Failed to open grant UI: {err}")
+        }
     }
 }
 
-fn local_allow(request_id: &str) {
-    let Some(dir) = agentlink_core::grant_request::default_node_data_dir() else {
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn local_allow(dir: &std::path::Path, request_id: &str) -> String {
+    if !has_local_node(dir) {
         tracing::warn!("grant allow from tray: this machine has no local node identity");
-        return;
-    };
+        return "Grant allow failed: no local node identity".into();
+    }
     let now = agentlink_core::util::unix_now();
-    match agentlink_core::grant_request::allow_request_in_dir(&dir, request_id, now, None, None) {
+    match agentlink_core::grant_request::allow_request_in_dir(dir, request_id, now, None, None) {
         Ok((_req, grant)) => {
-            if let Err(err) = agentlink_core::grant_request::save_issued_grant(&dir, &grant) {
+            if let Err(err) = agentlink_core::grant_request::save_issued_grant(dir, &grant) {
                 tracing::warn!(error = %err, "failed to store issued grant on the node");
+                return format!("Grant signed, but failed to store on node: {err}");
             }
             if let Ok(client_dir) = agentlink_core::config::default_data_dir("client") {
                 let _ = agentlink_core::grant::save_grant(&client_dir, &grant);
@@ -164,20 +222,30 @@ fn local_allow(request_id: &str) {
                 request_id,
                 "signed grant locally from the node tray; issuer key stayed on this machine"
             );
+            format!("Allowed grant request {request_id}")
         }
-        Err(err) => tracing::warn!(error = %err, request_id, "tray grant allow failed"),
+        Err(err) => {
+            tracing::warn!(error = %err, request_id, "tray grant allow failed");
+            format!("Grant allow failed: {err}")
+        }
     }
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-fn local_deny(request_id: &str) {
-    let Some(dir) = agentlink_core::grant_request::default_node_data_dir() else {
-        return;
-    };
+fn local_deny(dir: &std::path::Path, request_id: &str) -> String {
+    if !has_local_node(dir) {
+        return "Grant deny failed: no local node identity".into();
+    }
     let now = agentlink_core::util::unix_now();
-    match agentlink_core::grant_request::deny_request(&dir, request_id, now) {
-        Ok(_) => tracing::info!(request_id, "denied grant request from the node tray"),
-        Err(err) => tracing::warn!(error = %err, request_id, "tray grant deny failed"),
+    match agentlink_core::grant_request::deny_request(dir, request_id, now) {
+        Ok(_) => {
+            tracing::info!(request_id, "denied grant request from the node tray");
+            format!("Denied grant request {request_id}")
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, request_id, "tray grant deny failed");
+            format!("Grant deny failed: {err}")
+        }
     }
 }
 
@@ -185,8 +253,20 @@ fn local_deny(request_id: &str) {
 struct AgentTray {
     open: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
+    data_dir: PathBuf,
+    egui_ctx: SharedEguiCtx,
     pending: Vec<PendingItem>,
     on_node: bool,
+    last_action_status: Option<String>,
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+impl AgentTray {
+    fn wake_window(&self) {
+        if let Some(ctx) = self.egui_ctx.get() {
+            ctx.request_repaint();
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
@@ -197,10 +277,10 @@ impl ksni::Tray for AgentTray {
 
     fn title(&self) -> String {
         if self.pending.is_empty() {
-            "agentlink".into()
+            "Agentlink".into()
         } else {
             format!(
-                "agentlink ({} grant request{})",
+                "Agentlink ({} grant request{})",
                 self.pending.len(),
                 if self.pending.len() == 1 { "" } else { "s" }
             )
@@ -208,20 +288,36 @@ impl ksni::Tray for AgentTray {
     }
 
     fn icon_name(&self) -> String {
-        "computer".into()
+        if !self.pending.is_empty() {
+            "dialog-information".into()
+        } else {
+            "network-workgroup".into()
+        }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
         self.open.store(true, Ordering::Relaxed);
+        self.wake_window();
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
         let mut items = Vec::new();
+        if let Some(status) = &self.last_action_status {
+            items.push(MenuItem::Standard(StandardItem {
+                label: status.clone(),
+                enabled: false,
+                ..Default::default()
+            }));
+            items.push(MenuItem::Separator);
+        }
         if self.on_node {
             items.push(MenuItem::Standard(StandardItem {
-                label: "粘贴控制端身份码…".into(),
-                activate: Box::new(|_tray: &mut Self| launch_paste_ui()),
+                label: "Paste controller identity code...".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let msg = launch_paste_ui(&tray.data_dir);
+                    tray.last_action_status = Some(msg);
+                }),
                 ..Default::default()
             }));
             if self.pending.is_empty() {
@@ -241,12 +337,20 @@ impl ksni::Tray for AgentTray {
                     let deny_id = p.request_id.clone();
                     items.push(MenuItem::Standard(StandardItem {
                         label: format!("Allow {}", p.label),
-                        activate: Box::new(move |_tray: &mut Self| local_allow(&id)),
+                        activate: Box::new(move |tray: &mut Self| {
+                            let msg = local_allow(&tray.data_dir, &id);
+                            tray.last_action_status = Some(msg);
+                            tray.pending = load_pending(&tray.data_dir);
+                        }),
                         ..Default::default()
                     }));
                     items.push(MenuItem::Standard(StandardItem {
                         label: format!("Deny {}", p.label),
-                        activate: Box::new(move |_tray: &mut Self| local_deny(&deny_id)),
+                        activate: Box::new(move |tray: &mut Self| {
+                            let msg = local_deny(&tray.data_dir, &deny_id);
+                            tray.last_action_status = Some(msg);
+                            tray.pending = load_pending(&tray.data_dir);
+                        }),
                         ..Default::default()
                     }));
                 }
@@ -257,6 +361,7 @@ impl ksni::Tray for AgentTray {
             label: "Open".into(),
             activate: Box::new(|tray: &mut Self| {
                 tray.open.store(true, Ordering::Relaxed);
+                tray.wake_window();
             }),
             ..Default::default()
         }));
@@ -264,6 +369,7 @@ impl ksni::Tray for AgentTray {
             label: "Quit".into(),
             activate: Box::new(|tray: &mut Self| {
                 tray.quit.store(true, Ordering::Relaxed);
+                tray.wake_window();
             }),
             ..Default::default()
         }));

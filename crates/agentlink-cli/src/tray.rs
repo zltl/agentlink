@@ -11,21 +11,36 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::{config, parse_join_text, Client, ClientSettings, Identity, JoinText};
 use agentlink_node::{save_node_config, write_status, LinkState, LinkStatus, NodeConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::fmt::MakeWriter;
 
 use crate::node_cfg::{self, NodeArgs};
 use crate::{emit, version};
 
 pub const RUN_VALUE_NAME: &str = "agentlink";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+/// Legacy Startup-folder batch script name. Still cleaned up on migration/uninstall;
+/// production Startup-folder fallback writes [`STARTUP_SHORTCUT`] (`.lnk`) instead.
 pub const STARTUP_SCRIPT: &str = "agentlink.cmd";
+/// Safe Startup-folder shortcut fallback (no `cmd.exe` parsing, zero console flash).
+pub const STARTUP_SHORTCUT: &str = "agentlink.lnk";
+
+const NODE_LOCK_FILE: &str = "node.lock";
+const TRAY_LOG_MAX_BYTES: u64 = 1024 * 1024;
+static TRAY_LOG_INIT: OnceLock<()> = OnceLock::new();
 
 /// `WM_APP` is `0x8000`. Posted to the tray window from a second process.
 pub const TRAY_CALLBACK: u32 = 0x8000 + 1;
@@ -120,6 +135,8 @@ fn run_tray(ctx: &TrayContext) -> Result<i32> {
 fn install_cmd(ctx: &TrayContext, dry_run: bool) -> Result<i32> {
     let data_dir = resolve_data_dir(ctx.data_dir.as_deref())?;
     let binary = current_binary()?;
+    validate_autostart_path(&binary)?;
+    validate_autostart_path(&data_dir)?;
     let plan = autostart_plan(&binary, &data_dir);
     if dry_run {
         emit(
@@ -346,13 +363,85 @@ pub fn resolve_config_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     config::default_config_dir().map_err(|err| anyhow!(err.to_string()))
 }
 
+/// Reject control characters (`\r`, `\n`, `\0`) in paths written into autostart
+/// commands, registry values, or shortcuts.
+pub fn validate_autostart_path(path: &Path) -> Result<()> {
+    let text = path.to_string_lossy();
+    if text.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        bail!("autostart path contains forbidden control characters (CR, LF, or NUL)");
+    }
+    Ok(())
+}
+
+/// Prefer a sibling GUI-subsystem `agentlink-gui.exe` when it exists on disk
+/// beside `binary` (eliminating console flashes on Windows). Synthetic paths
+/// where no sibling `agentlink-gui.exe` exists are returned unchanged.
+pub fn preferred_gui_binary(binary: &Path) -> PathBuf {
+    if exe_is_agentlink(&binary.to_string_lossy()) {
+        let sibling = binary.with_file_name("agentlink-gui.exe");
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    binary.to_path_buf()
+}
+
+/// Arguments for launching the Controller window from the tray with matching
+/// `--config-dir` and `--data-dir`.
+pub fn controller_launch_args(config_dir: &Path, data_dir: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("--config-dir"),
+        config_dir.as_os_str().to_os_string(),
+        OsString::from("controller"),
+        OsString::from("--data-dir"),
+        data_dir.as_os_str().to_os_string(),
+    ]
+}
+
+fn normalize_windows_path_key(path: &Path) -> String {
+    let stripped = strip_verbatim(path);
+    stripped
+        .to_string_lossy()
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// Stable 16-hex-char hash of a normalized `data_dir`, used to key single-instance
+/// tray mutexes and window classes independently per data directory.
+pub fn data_dir_instance_tag(data_dir: &Path) -> String {
+    let key = normalize_windows_path_key(data_dir);
+    let digest = Sha256::digest(key.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// Single-instance named mutex for the Windows tray scoped to `data_dir`.
+pub fn tray_mutex_name(data_dir: &Path) -> String {
+    format!("Local\\agentlink-tray-{}", data_dir_instance_tag(data_dir))
+}
+
+/// Per-`data_dir` Win32 window class name for the tray status window.
+pub fn tray_window_class(data_dir: &Path) -> String {
+    format!("AgentlinkTray-{}", data_dir_instance_tag(data_dir))
+}
+
 /// Command line stored in HKCU Run. The executable and data directory are quoted.
 pub fn autostart_command(binary: &Path, data_dir: &Path) -> String {
+    let exe = preferred_gui_binary(binary);
     format!(
         "{} tray --background --data-dir {}",
-        quote_windows_arg(&binary.to_string_lossy()),
+        quote_windows_arg(&exe.to_string_lossy()),
         quote_windows_arg(&data_dir.to_string_lossy()),
     )
+}
+
+/// Validated variant of [`autostart_command`] that rejects control characters.
+pub fn try_autostart_command(binary: &Path, data_dir: &Path) -> Result<String> {
+    validate_autostart_path(binary)?;
+    validate_autostart_path(data_dir)?;
+    Ok(autostart_command(binary, data_dir))
 }
 
 pub fn autostart_plan(binary: &Path, data_dir: &Path) -> String {
@@ -363,40 +452,107 @@ pub fn autostart_plan(binary: &Path, data_dir: &Path) -> String {
 # Value name: {RUN_VALUE_NAME}
 # The tray starts at sign-in and runs the node in this session.
 {}
-# If that registry value cannot be written, the same command is saved as
-# %APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{STARTUP_SCRIPT}
+# If that registry value cannot be written, a Windows shortcut is saved as
+# %APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{STARTUP_SHORTCUT}
 ",
         autostart_command(binary, data_dir),
     )
 }
 
+/// Quote one argument using Win32 `CommandLineToArgvW` / MSVCRT rules.
+///
+/// Backslashes immediately preceding an embedded `"` are doubled plus one extra
+/// backslash to escape the quote; trailing backslashes are doubled so they do
+/// not escape the closing `"`.
 pub fn quote_windows_arg(text: &str) -> String {
-    let escaped = text.replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in text.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push('\\');
+            }
+            out.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
 }
 
+/// Parse a Windows command line symmetrically with [`quote_windows_arg`] using
+/// `CommandLineToArgvW` / MSVCRT backslash-before-quote rules.
 pub fn split_windows_command(command: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
+    let mut has_token = false;
     let mut in_quotes = false;
     let mut chars = command.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\\' && in_quotes && chars.peek() == Some(&'"') {
-            current.push('"');
-            chars.next();
-            continue;
-        }
         match ch {
-            '"' => in_quotes = !in_quotes,
             ' ' | '\t' if !in_quotes => {
-                if !current.is_empty() {
+                if has_token {
                     args.push(std::mem::take(&mut current));
+                    has_token = false;
                 }
             }
-            _ => current.push(ch),
+            '\\' => {
+                has_token = true;
+                let mut count = 1usize;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    count += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    for _ in 0..(count / 2) {
+                        current.push('\\');
+                    }
+                    if count % 2 == 1 {
+                        chars.next();
+                        current.push('"');
+                    } else {
+                        chars.next();
+                        if in_quotes && chars.peek() == Some(&'"') {
+                            chars.next();
+                            current.push('"');
+                        } else {
+                            in_quotes = !in_quotes;
+                        }
+                    }
+                } else {
+                    for _ in 0..count {
+                        current.push('\\');
+                    }
+                }
+            }
+            '"' => {
+                has_token = true;
+                if in_quotes && chars.peek() == Some(&'"') {
+                    chars.next();
+                    current.push('"');
+                } else {
+                    in_quotes = !in_quotes;
+                }
+            }
+            _ => {
+                has_token = true;
+                current.push(ch);
+            }
         }
     }
-    if !current.is_empty() {
+    if has_token {
         args.push(current);
     }
     args
@@ -418,6 +574,8 @@ pub fn data_dir_from_command(command: &str) -> Option<PathBuf> {
     None
 }
 
+/// Retained for legacy compatibility/tests. Production Startup-folder fallback
+/// writes a safe `.lnk` shortcut via [`build_windows_lnk`] instead of `.cmd`.
 pub fn startup_script_contents(binary: &Path, data_dir: &Path) -> String {
     format!(
         "@echo off\r\nstart \"\" {}\r\n",
@@ -425,7 +583,437 @@ pub fn startup_script_contents(binary: &Path, data_dir: &Path) -> String {
     )
 }
 
-/// One `HKCU\...\Run` value, or the Startup-folder script treated as a value.
+const LNK_HEADER_SIZE: u32 = 0x0000_004C;
+const LNK_CLSID: [u8; 16] = [
+    0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const LNK_FLAG_HAS_LINK_TARGET_ID_LIST: u32 = 0x0000_0001;
+const LNK_FLAG_HAS_LINK_INFO: u32 = 0x0000_0002;
+const LNK_FLAG_HAS_NAME: u32 = 0x0000_0004;
+const LNK_FLAG_HAS_RELATIVE_PATH: u32 = 0x0000_0008;
+const LNK_FLAG_HAS_WORKING_DIR: u32 = 0x0000_0010;
+const LNK_FLAG_HAS_ARGUMENTS: u32 = 0x0000_0020;
+const LNK_FLAG_HAS_ICON_LOCATION: u32 = 0x0000_0040;
+const LNK_FLAG_IS_UNICODE: u32 = 0x0000_0080;
+const LNK_FLAG_HAS_EXP_STRING: u32 = 0x0000_0200;
+const LNK_EXP_ENV_SIG: u32 = 0xA000_0001;
+const LNK_EXP_ENV_SIZE: u32 = 0x0000_0314;
+
+/// My Computer root shell item (CLSID `{20D04FE0-3AEA-1069-A2D8-08002B30309D}`).
+const MY_COMPUTER_ITEM: [u8; 20] = [
+    0x14, 0x00, 0x1F, 0x50, 0xE0, 0x4F, 0xD0, 0x20, 0xEA, 0x3A, 0x69, 0x10, 0xA2, 0xD8, 0x08, 0x00,
+    0x2B, 0x30, 0x30, 0x9D,
+];
+
+fn lnk_file_shell_item(name: &str, is_dir: bool) -> Result<Vec<u8>> {
+    let mut item = Vec::new();
+    item.extend_from_slice(&0u16.to_le_bytes()); // total size placeholder
+    item.push(if is_dir { 0x31 } else { 0x32 });
+    item.push(0x00);
+    item.extend_from_slice(&0u32.to_le_bytes()); // file size
+    item.extend_from_slice(&0u16.to_le_bytes()); // mod date
+    item.extend_from_slice(&0u16.to_le_bytes()); // mod time
+    item.extend_from_slice(&(if is_dir { 0x0010u16 } else { 0x0020u16 }).to_le_bytes()); // file attrs
+    for ch in name.chars() {
+        let byte = if ch.is_ascii() && (0x20..0x7F).contains(&(ch as u32)) {
+            ch as u8
+        } else {
+            b'_'
+        };
+        item.push(byte);
+    }
+    item.push(0);
+    if item.len() % 2 != 0 {
+        item.push(0);
+    }
+    let ext_offset = u16::try_from(item.len())
+        .map_err(|_| anyhow!("shortcut path component is too long"))?;
+
+    // Windows Vista/10/11 BEEF0004 v9 extension block carrying exact UTF-16LE name.
+    let mut uni_bytes = Vec::with_capacity((name.len() + 1) * 2);
+    for unit in name.encode_utf16().chain(std::iter::once(0)) {
+        uni_bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let ext_size = u16::try_from(46 + uni_bytes.len() + 2)
+        .map_err(|_| anyhow!("shortcut Unicode component is too long"))?;
+    item.extend_from_slice(&ext_size.to_le_bytes());
+    item.extend_from_slice(&0x0009u16.to_le_bytes()); // version 9
+    item.extend_from_slice(&0xBEEF_0004u32.to_le_bytes());
+    item.extend_from_slice(&0u32.to_le_bytes()); // create date/time
+    item.extend_from_slice(&0u32.to_le_bytes()); // access date/time
+    item.extend_from_slice(&0x0000_002Eu32.to_le_bytes()); // v9 header size (46)
+    item.extend_from_slice(&[0u8; 26]); // MFT ref & reserved v9 fields
+    item.extend_from_slice(&uni_bytes);
+    item.extend_from_slice(&ext_offset.to_le_bytes());
+
+    let total = u16::try_from(item.len())
+        .map_err(|_| anyhow!("shortcut shell item exceeds 64 KiB"))?;
+    item[0..2].copy_from_slice(&total.to_le_bytes());
+    Ok(item)
+}
+
+fn build_drive_id_list(target_win: &str) -> Result<Option<Vec<u8>>> {
+    let bytes = target_win.as_bytes();
+    if bytes.len() < 4 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return Ok(None);
+    }
+    let drive = bytes[0].to_ascii_uppercase();
+    let components: Vec<&str> = target_win[3..]
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if components.is_empty() {
+        return Ok(None);
+    }
+    let mut id_list = Vec::new();
+    id_list.extend_from_slice(&MY_COMPUTER_ITEM);
+    let mut drive_item = [0u8; 25];
+    drive_item[0] = 0x19;
+    drive_item[2] = 0x2F;
+    drive_item[3] = drive;
+    drive_item[4] = b':';
+    drive_item[5] = b'\\';
+    id_list.extend_from_slice(&drive_item);
+    for (idx, part) in components.iter().enumerate() {
+        let is_dir = idx + 1 < components.len();
+        id_list.extend_from_slice(&lnk_file_shell_item(part, is_dir)?);
+    }
+    id_list.extend_from_slice(&0u16.to_le_bytes()); // terminal ID
+    Ok(Some(id_list))
+}
+
+fn push_lnk_unicode_string(out: &mut Vec<u8>, text: &str) -> Result<()> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let count = u16::try_from(units.len())
+        .map_err(|_| anyhow!("shortcut string exceeds 65535 UTF-16 code units"))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Build a Windows Shell Link (`.lnk`, MS-SHLLINK) binary launching the tray in
+/// background mode with zero `cmd.exe` parsing and zero console flash.
+pub fn build_windows_lnk(binary: &Path, data_dir: &Path) -> Result<Vec<u8>> {
+    validate_autostart_path(binary)?;
+    validate_autostart_path(data_dir)?;
+
+    let target_path = strip_verbatim(&preferred_gui_binary(binary));
+    let target_win = target_path.to_string_lossy().replace('/', "\\");
+    let workdir_win = target_path
+        .parent()
+        .map(|parent| parent.to_string_lossy().replace('/', "\\"))
+        .unwrap_or_default();
+    let args = format!(
+        "tray --background --data-dir {}",
+        quote_windows_arg(&data_dir.to_string_lossy()),
+    );
+    let desc = "agentlink";
+    let id_list = build_drive_id_list(&target_win)?;
+
+    let mut flags = LNK_FLAG_HAS_NAME
+        | LNK_FLAG_HAS_ARGUMENTS
+        | LNK_FLAG_HAS_ICON_LOCATION
+        | LNK_FLAG_IS_UNICODE;
+    if !workdir_win.is_empty() {
+        flags |= LNK_FLAG_HAS_WORKING_DIR;
+    }
+    if id_list.is_some() {
+        flags |= LNK_FLAG_HAS_LINK_TARGET_ID_LIST;
+    } else {
+        flags |= LNK_FLAG_HAS_EXP_STRING;
+    }
+
+    let mut out = Vec::with_capacity(512);
+    // ShellLinkHeader (76 bytes)
+    out.extend_from_slice(&LNK_HEADER_SIZE.to_le_bytes());
+    out.extend_from_slice(&LNK_CLSID);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&0x0000_0020u32.to_le_bytes()); // FILE_ATTRIBUTE_ARCHIVE
+    out.extend_from_slice(&0u64.to_le_bytes()); // CreationTime
+    out.extend_from_slice(&0u64.to_le_bytes()); // AccessTime
+    out.extend_from_slice(&0u64.to_le_bytes()); // WriteTime
+    out.extend_from_slice(&0u32.to_le_bytes()); // FileSize
+    out.extend_from_slice(&0i32.to_le_bytes()); // IconIndex
+    out.extend_from_slice(&1u32.to_le_bytes()); // ShowCommand = SW_SHOWNORMAL
+    out.extend_from_slice(&0u16.to_le_bytes()); // HotKey
+    out.extend_from_slice(&0u16.to_le_bytes()); // Reserved1
+    out.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
+    out.extend_from_slice(&0u32.to_le_bytes()); // Reserved3
+    debug_assert_eq!(out.len(), LNK_HEADER_SIZE as usize);
+
+    if let Some(id_list) = id_list {
+        let id_len = u16::try_from(id_list.len())
+            .map_err(|_| anyhow!("shortcut IDList exceeds 64 KiB"))?;
+        out.extend_from_slice(&id_len.to_le_bytes());
+        out.extend_from_slice(&id_list);
+    }
+
+    // StringData (MS-SHLLINK §2.4 order: Name, WorkingDir, Arguments, IconLocation)
+    push_lnk_unicode_string(&mut out, desc)?;
+    if !workdir_win.is_empty() {
+        push_lnk_unicode_string(&mut out, &workdir_win)?;
+    }
+    push_lnk_unicode_string(&mut out, &args)?;
+    push_lnk_unicode_string(&mut out, &target_win)?;
+
+    // ExtraData: fallback EnvironmentVariableDataBlock for non-drive/UNC paths.
+    if flags & LNK_FLAG_HAS_EXP_STRING != 0 {
+        out.extend_from_slice(&LNK_EXP_ENV_SIZE.to_le_bytes());
+        out.extend_from_slice(&LNK_EXP_ENV_SIG.to_le_bytes());
+        let mut ansi_buf = [0u8; 260];
+        for (slot, ch) in ansi_buf.iter_mut().take(259).zip(target_win.chars()) {
+            *slot = if ch.is_ascii() { ch as u8 } else { b'?' };
+        }
+        out.extend_from_slice(&ansi_buf);
+        let mut uni_buf = [0u8; 520];
+        for (i, unit) in target_win.encode_utf16().take(259).enumerate() {
+            let le = unit.to_le_bytes();
+            uni_buf[i * 2] = le[0];
+            uni_buf[i * 2 + 1] = le[1];
+        }
+        out.extend_from_slice(&uni_buf);
+    }
+
+    // ExtraData TerminalBlock
+    out.extend_from_slice(&0u32.to_le_bytes());
+    Ok(out)
+}
+
+fn parse_lnk_id_list(data: &[u8]) -> Option<String> {
+    let mut pos = 0usize;
+    let mut drive: Option<String> = None;
+    let mut parts: Vec<String> = Vec::new();
+    while pos + 2 <= data.len() {
+        let size = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        if size == 0 {
+            break;
+        }
+        if size < 3 || pos + size > data.len() {
+            return None;
+        }
+        let item = &data[pos..pos + size];
+        let kind = item[2];
+        if (kind & 0x70) == 0x20 && item.len() >= 6 && item[4] == b':' {
+            // Drive item (e.g. "C:\")
+            let raw = &item[3..];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            let text = String::from_utf8_lossy(&raw[..end]).to_string();
+            if !text.is_empty() {
+                drive = Some(text);
+            }
+        } else if matches!(kind & 0x70, 0x30) && item.len() >= 15 {
+            // File/directory shell item; prefer BEEF0004 Unicode extension block.
+            let mut extracted: Option<String> = None;
+            if item.len() >= 2 {
+                let ext_off = u16::from_le_bytes([item[item.len() - 2], item[item.len() - 1]])
+                    as usize;
+                if ext_off >= 14 && ext_off + 8 <= item.len() - 2 {
+                    let ext = &item[ext_off..item.len() - 2];
+                    let ext_ver = u16::from_le_bytes([ext[2], ext[3]]);
+                    let sig = u32::from_le_bytes([ext[4], ext[5], ext[6], ext[7]]);
+                    if sig == 0xBEEF_0004 {
+                        let name_off = match ext_ver {
+                            v if v >= 9 => 46,
+                            v if v >= 8 => 42,
+                            v if v >= 7 => 38,
+                            _ => 20,
+                        };
+                        if name_off < ext.len() {
+                            let words: Vec<u16> = ext[name_off..]
+                                .chunks_exact(2)
+                                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                                .take_while(|&u| u != 0)
+                                .collect();
+                            if !words.is_empty() {
+                                extracted = Some(String::from_utf16_lossy(&words));
+                            }
+                        }
+                    }
+                }
+            }
+            if extracted.is_none() {
+                let raw = &item[14..];
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                if end > 0 {
+                    extracted = Some(String::from_utf8_lossy(&raw[..end]).to_string());
+                }
+            }
+            if let Some(part) = extracted {
+                parts.push(part);
+            }
+        }
+        pos += size;
+    }
+    let drive = drive?;
+    if parts.is_empty() {
+        return None;
+    }
+    let mut path = drive;
+    if !path.ends_with('\\') {
+        path.push('\\');
+    }
+    path.push_str(&parts.join("\\"));
+    Some(path)
+}
+
+fn read_lnk_string(bytes: &[u8], pos: &mut usize, unicode: bool) -> Option<String> {
+    if *pos + 2 > bytes.len() {
+        return None;
+    }
+    let count = u16::from_le_bytes([bytes[*pos], bytes[*pos + 1]]) as usize;
+    *pos += 2;
+    if unicode {
+        let byte_len = count.checked_mul(2)?;
+        if *pos + byte_len > bytes.len() {
+            return None;
+        }
+        let words: Vec<u16> = bytes[*pos..*pos + byte_len]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        *pos += byte_len;
+        Some(String::from_utf16_lossy(&words))
+    } else {
+        if *pos + count > bytes.len() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&bytes[*pos..*pos + count]).to_string();
+        *pos += count;
+        Some(text)
+    }
+}
+
+/// Extract the equivalent command line (`"<target>" <arguments>`) from an
+/// MS-SHLLINK `.lnk` file.
+pub fn parse_windows_lnk_command(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < LNK_HEADER_SIZE as usize {
+        return None;
+    }
+    let header_size = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    if header_size != LNK_HEADER_SIZE || bytes[4..20] != LNK_CLSID {
+        return None;
+    }
+    let flags = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
+    let unicode = flags & LNK_FLAG_IS_UNICODE != 0;
+    let mut pos = LNK_HEADER_SIZE as usize;
+
+    let mut target: Option<String> = None;
+    if flags & LNK_FLAG_HAS_LINK_TARGET_ID_LIST != 0 {
+        if pos + 2 > bytes.len() {
+            return None;
+        }
+        let id_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        pos += 2;
+        if pos + id_len > bytes.len() {
+            return None;
+        }
+        target = parse_lnk_id_list(&bytes[pos..pos + id_len]);
+        pos += id_len;
+    }
+
+    if flags & LNK_FLAG_HAS_LINK_INFO != 0 {
+        if pos + 4 > bytes.len() {
+            return None;
+        }
+        let info_size = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+        if info_size < 4 || pos + info_size > bytes.len() {
+            return None;
+        }
+        if target.is_none() && info_size >= 28 {
+            let info = &bytes[pos..pos + info_size];
+            let hdr_size = u32::from_le_bytes(info[4..8].try_into().ok()?) as usize;
+            let li_flags = u32::from_le_bytes(info[8..12].try_into().ok()?);
+            if li_flags & 1 != 0 {
+                if hdr_size >= 0x24 && info.len() >= 32 {
+                    let uni_off = u32::from_le_bytes(info[28..32].try_into().ok()?) as usize;
+                    if uni_off < info.len() {
+                        let words: Vec<u16> = info[uni_off..]
+                            .chunks_exact(2)
+                            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                            .take_while(|&u| u != 0)
+                            .collect();
+                        if !words.is_empty() {
+                            target = Some(String::from_utf16_lossy(&words));
+                        }
+                    }
+                }
+                if target.is_none() {
+                    let local_off = u32::from_le_bytes(info[16..20].try_into().ok()?) as usize;
+                    if local_off < info.len() {
+                        let end = info[local_off..]
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(info.len() - local_off);
+                        if end > 0 {
+                            target = Some(
+                                String::from_utf8_lossy(&info[local_off..local_off + end])
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        pos += info_size;
+    }
+
+    let mut arguments = String::new();
+    if flags & LNK_FLAG_HAS_NAME != 0 {
+        let _ = read_lnk_string(bytes, &mut pos, unicode)?;
+    }
+    if flags & LNK_FLAG_HAS_RELATIVE_PATH != 0 {
+        let _ = read_lnk_string(bytes, &mut pos, unicode)?;
+    }
+    if flags & LNK_FLAG_HAS_WORKING_DIR != 0 {
+        let _ = read_lnk_string(bytes, &mut pos, unicode)?;
+    }
+    if flags & LNK_FLAG_HAS_ARGUMENTS != 0 {
+        arguments = read_lnk_string(bytes, &mut pos, unicode)?;
+    }
+    if flags & LNK_FLAG_HAS_ICON_LOCATION != 0 {
+        let icon = read_lnk_string(bytes, &mut pos, unicode)?;
+        if target.is_none() && !icon.trim().is_empty() {
+            // Keep parsing ExtraData first; icon is only last-resort fallback.
+            let _ = icon;
+        }
+    }
+
+    // Parse ExtraData blocks for EnvironmentVariableDataBlock if target not yet found.
+    while pos + 4 <= bytes.len() {
+        let block_size = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+        if block_size < 4 || pos + block_size > bytes.len() {
+            break;
+        }
+        if block_size >= 8 {
+            let sig = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?);
+            if sig == LNK_EXP_ENV_SIG && block_size >= LNK_EXP_ENV_SIZE as usize && target.is_none()
+            {
+                let uni_slice = &bytes[pos + 8 + 260..pos + 8 + 260 + 520];
+                let words: Vec<u16> = uni_slice
+                    .chunks_exact(2)
+                    .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                    .take_while(|&u| u != 0)
+                    .collect();
+                if !words.is_empty() {
+                    target = Some(String::from_utf16_lossy(&words));
+                }
+            }
+        }
+        pos += block_size;
+    }
+
+    let target = target.filter(|t| !t.trim().is_empty())?;
+    let args = arguments.trim();
+    if args.is_empty() {
+        Some(quote_windows_arg(&target))
+    } else {
+        Some(format!("{} {args}", quote_windows_arg(&target)))
+    }
+}
+
+/// One `HKCU\...\Run` value, or a Startup-folder entry treated as a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunValue {
     pub name: String,
@@ -437,7 +1025,7 @@ pub struct RunValue {
 pub struct AutostartMigration {
     /// Command to store under [`RUN_VALUE_NAME`]. `None` leaves that value alone.
     pub write_command: Option<String>,
-    /// Other Run value names to delete. [`STARTUP_SCRIPT`] removes the file.
+    /// Other Run value names to delete. [`STARTUP_SHORTCUT`] / [`STARTUP_SCRIPT`] remove those files.
     pub delete_names: Vec<String>,
 }
 
@@ -453,16 +1041,8 @@ const GLOBAL_FLAGS_WITH_VALUES: &[&str] = &[
 
 /// Compare Windows paths without requiring them to exist.
 pub fn windows_paths_equal(left: &Path, right: &Path) -> bool {
-    fn norm(path: &Path) -> String {
-        path.to_string_lossy()
-            .trim()
-            .trim_matches('"')
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
-    }
-    let left = norm(left);
-    !left.is_empty() && left == norm(right)
+    let left = normalize_windows_path_key(left);
+    !left.is_empty() && left == normalize_windows_path_key(right)
 }
 
 fn exe_is_agentlink(arg: &str) -> bool {
@@ -470,7 +1050,7 @@ fn exe_is_agentlink(arg: &str) -> bool {
     let file = file.trim_matches('"');
     let lower = file.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    stem == "agentlink"
+    matches!(stem, "agentlink" | "agentlink-gui")
 }
 
 /// First positional argument after the executable and global flags.
@@ -638,6 +1218,10 @@ pub fn tray_autostart_blocks_node(
 /// any other value that starts `node` for the same data directory. Unrelated
 /// Run values are left alone. A node entry for a different directory is left
 /// alone.
+fn is_startup_folder_entry(name: &str) -> bool {
+    name == STARTUP_SCRIPT || name == STARTUP_SHORTCUT
+}
+
 pub fn plan_run_migration(
     entries: &[RunValue],
     binary: &Path,
@@ -680,10 +1264,15 @@ pub fn plan_run_migration(
 
     let hkcu_tray = write_command.is_some()
         || entries.iter().any(|entry| {
-            entry.name != STARTUP_SCRIPT
+            !is_startup_folder_entry(&entry.name)
                 && command_launches_tray(&entry.command, data_dir, missing_dir_matches)
                 && (write_command.is_none() || !entry.name.eq_ignore_ascii_case(RUN_VALUE_NAME))
         });
+
+    let shortcut_tray = entries.iter().any(|entry| {
+        entry.name == STARTUP_SHORTCUT
+            && command_launches_tray(&entry.command, data_dir, missing_dir_matches)
+    });
 
     let mut delete_names = Vec::new();
     for entry in entries {
@@ -691,6 +1280,15 @@ pub fn plan_run_migration(
             continue;
         }
         if entry.name == STARTUP_SCRIPT {
+            if (hkcu_tray || shortcut_tray)
+                && (command_is_standalone_node(&entry.command, data_dir, missing_dir_matches)
+                    || command_launches_tray(&entry.command, data_dir, missing_dir_matches))
+            {
+                delete_names.push(entry.name.clone());
+            }
+            continue;
+        }
+        if entry.name == STARTUP_SHORTCUT {
             if hkcu_tray
                 && (command_is_standalone_node(&entry.command, data_dir, missing_dir_matches)
                     || command_launches_tray(&entry.command, data_dir, missing_dir_matches))
@@ -710,6 +1308,8 @@ pub fn plan_run_migration(
 }
 
 pub fn install_user_autostart(binary: &Path, data_dir: &Path) -> Result<()> {
+    validate_autostart_path(binary)?;
+    validate_autostart_path(data_dir)?;
     #[cfg(windows)]
     {
         let entries = collect_autostart_entries();
@@ -725,9 +1325,10 @@ pub fn install_user_autostart(binary: &Path, data_dir: &Path) -> Result<()> {
         };
         match set_run_value(&command) {
             Ok(()) => {
+                let _ = remove_startup_shortcut();
                 let _ = remove_startup_script();
                 for name in &plan.delete_names {
-                    if name == STARTUP_SCRIPT {
+                    if is_startup_folder_entry(name) {
                         continue;
                     }
                     let _ = delete_named_run_value(name);
@@ -735,17 +1336,18 @@ pub fn install_user_autostart(binary: &Path, data_dir: &Path) -> Result<()> {
                 Ok(())
             }
             Err(err) => {
-                write_startup_script(binary, data_dir).with_context(|| {
+                write_startup_shortcut(binary, data_dir).with_context(|| {
                     format!("HKCU Run failed ({err:#}); Startup folder fallback also failed")
                 })?;
+                let _ = remove_startup_script();
                 for name in &plan.delete_names {
-                    if name == STARTUP_SCRIPT {
+                    if is_startup_folder_entry(name) {
                         continue;
                     }
                     let _ = delete_named_run_value(name);
                 }
                 eprintln!(
-                    "HKCU Run was not writable; saved {STARTUP_SCRIPT} in the Startup folder"
+                    "HKCU Run was not writable; saved {STARTUP_SHORTCUT} in the Startup folder"
                 );
                 Ok(())
             }
@@ -765,14 +1367,18 @@ pub fn remove_user_autostart() -> Result<()> {
         let tray_dirs: Vec<PathBuf> = entries
             .iter()
             .filter(|entry| {
-                entry.name.eq_ignore_ascii_case(RUN_VALUE_NAME) || entry.name == STARTUP_SCRIPT
+                entry.name.eq_ignore_ascii_case(RUN_VALUE_NAME)
+                    || is_startup_folder_entry(&entry.name)
             })
             .filter_map(|entry| data_dir_from_command(&entry.command))
             .collect();
         let _ = delete_run_value();
+        let _ = remove_startup_shortcut();
         let _ = remove_startup_script();
         for entry in &entries {
-            if entry.name.eq_ignore_ascii_case(RUN_VALUE_NAME) || entry.name == STARTUP_SCRIPT {
+            if entry.name.eq_ignore_ascii_case(RUN_VALUE_NAME)
+                || is_startup_folder_entry(&entry.name)
+            {
                 continue;
             }
             let Some(dir) = data_dir_from_command(&entry.command) else {
@@ -809,30 +1415,58 @@ pub fn retire_duplicate_node_autostart(binary: &Path, data_dir: &Path) {
     }
 }
 
-/// Why `agentlink node` must exit before dialing, if the tray already owns this directory.
-pub fn standalone_node_block_reason(data_dir: &Path) -> Option<String> {
-    #[cfg(windows)]
-    {
-        let entries = collect_autostart_entries();
-        if tray_autostart_blocks_node(&entries, data_dir, missing_dir_matches(data_dir)) {
-            return Some(
-                "not dialing: Windows start-on-login already runs the tray for this data directory (`tray --background`). A second `agentlink node` resets that WebSocket. The tray is the user-scope node."
-                    .into(),
-            );
+/// True when another process currently holds `data_dir/node.lock`.
+///
+/// Matches `agentlink_node::lock::acquire_node_lock` without creating `node.lock`
+/// when it does not already exist.
+pub fn node_lock_held(data_dir: &Path) -> bool {
+    let path = data_dir.join(NODE_LOCK_FILE);
+    if !path.exists() {
+        return false;
+    }
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(err) => {
+            #[cfg(windows)]
+            if matches!(err.raw_os_error(), Some(32 | 33)) {
+                return true;
+            }
+            let _ = err;
+            return false;
         }
-        None
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => false,
     }
-    #[cfg(not(windows))]
-    {
-        let _ = data_dir;
-        None
+}
+
+/// Why `agentlink node` must exit before dialing, if another live node or tray
+/// currently holds `node.lock` for this data directory.
+///
+/// Checking the live lock instead of `HKCU\Run` allows manual `agentlink node`
+/// when start-on-login is registered but the tray is stopped.
+pub fn standalone_node_block_reason(data_dir: &Path) -> Option<String> {
+    if node_lock_held(data_dir) {
+        return Some(format!(
+            "not dialing: another agentlink node or tray is currently running for {} (node.lock is held). Stop the running tray or node first.",
+            data_dir.display()
+        ));
     }
+    None
 }
 
 pub fn autostart_enabled() -> bool {
     #[cfg(windows)]
     {
-        read_run_value().is_some() || startup_script_path().is_some_and(|path| path.exists())
+        read_run_value().is_some()
+            || startup_shortcut_path().is_some_and(|path| path.exists())
+            || startup_script_path().is_some_and(|path| path.exists())
     }
     #[cfg(not(windows))]
     {
@@ -848,16 +1482,14 @@ pub fn installed_data_dir() -> Option<PathBuf> {
                 return Some(dir);
             }
         }
-        if let Some(path) = startup_script_path() {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if let Some(rest) = line.strip_prefix("start \"\" ") {
-                        if let Some(dir) = data_dir_from_command(rest) {
-                            return Some(dir);
-                        }
-                    }
-                }
+        if let Some(command) = startup_shortcut_command() {
+            if let Some(dir) = data_dir_from_command(&command) {
+                return Some(dir);
+            }
+        }
+        if let Some(command) = startup_script_command() {
+            if let Some(dir) = data_dir_from_command(&command) {
+                return Some(dir);
             }
         }
         None
@@ -883,7 +1515,8 @@ pub fn user_node_running() -> bool {
 pub fn signal_tray(message: u32) -> bool {
     #[cfg(windows)]
     {
-        crate::tray_win::post(message)
+        let dir = installed_data_dir().or_else(|| config::default_data_dir("node").ok());
+        crate::tray_win::post_for(dir.as_deref(), message)
     }
     #[cfg(not(windows))]
     {
@@ -893,11 +1526,14 @@ pub fn signal_tray(message: u32) -> bool {
 }
 
 pub fn spawn_tray(binary: &Path, data_dir: &Path) -> Result<()> {
+    validate_autostart_path(binary)?;
+    validate_autostart_path(data_dir)?;
     #[cfg(windows)]
     {
+        let exe = preferred_gui_binary(binary);
         // CREATE_NO_WINDOW via process::detached — do not OR DETACHED_PROCESS;
         // Windows ignores CREATE_NO_WINDOW when that bit is set.
-        agentlink_core::process::detached(binary)
+        agentlink_core::process::detached(&exe)
             .args(["tray", "--background", "--data-dir"])
             .arg(data_dir)
             .spawn()
@@ -958,6 +1594,21 @@ impl Supervisor {
         }
     }
 
+    pub fn update_target(
+        &mut self,
+        relay: Option<String>,
+        fingerprint: Option<String>,
+        trust: Option<String>,
+    ) {
+        if let Some(relay) = relay.filter(|s| !s.trim().is_empty()) {
+            self.launch.relay = Some(relay);
+        }
+        if fingerprint.is_some() || trust.is_some() {
+            self.launch.fingerprint = fingerprint;
+            self.launch.trust = trust;
+        }
+    }
+
     pub fn running(&self) -> bool {
         self.thread
             .as_ref()
@@ -992,6 +1643,8 @@ impl Supervisor {
             self.restart = false;
             self.stop_requested = false;
             self.spawn();
+        } else if self.stop_requested {
+            note_status(&self.launch.data_dir, "", "", LinkState::Stopped, "stopped");
         }
     }
 
@@ -1003,13 +1656,52 @@ impl Supervisor {
         }
     }
 
-    pub fn stop(&mut self) {
+    /// Initiate asynchronous node stop without blocking the UI thread.
+    pub fn request_stop(&mut self) {
         self.restart = false;
         self.stop_requested = true;
         self.cancel();
         if !self.running() {
             note_status(&self.launch.data_dir, "", "", LinkState::Stopped, "stopped");
         }
+    }
+
+    /// Cancel the embedded node, wait up to 3 seconds for a clean shutdown
+    /// (so PTYs terminate and audit logs flush), and record `LinkState::Stopped`.
+    pub fn stop(&mut self) {
+        let _ = self.stop_with_timeout(Duration::from_secs(3));
+    }
+
+    /// Bounded variant of [`Supervisor::stop`]. Returns `true` when the node
+    /// thread exited cleanly before `timeout` (or was not running).
+    pub fn stop_with_timeout(&mut self, timeout: Duration) -> bool {
+        self.restart = false;
+        self.stop_requested = true;
+        self.cancel();
+        let mut joined = true;
+        if let Some(handle) = self.thread.take() {
+            let deadline = Instant::now() + timeout;
+            while !handle.is_finished() && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+            if handle.is_finished() {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => self.last_exit = Some(err),
+                    Err(_) => self.last_exit = Some("node thread panicked".into()),
+                }
+            } else {
+                joined = false;
+                tracing::warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "embedded node thread did not finish before stop timeout"
+                );
+            }
+        }
+        self.shutdown = None;
+        note_status(&self.launch.data_dir, "", "", LinkState::Stopped, "stopped");
+        joined
     }
 
     pub fn reconnect(&mut self) {
@@ -1063,7 +1755,64 @@ impl Supervisor {
     }
 }
 
+/// Read persisted `stream_consent` (`auto`, `notify`, `prompt`, `deny`) from
+/// `data_dir/node.json`, if present.
+pub fn read_stream_consent(data_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(data_dir.join("node.json")).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    value
+        .get("stream_consent")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+}
+
+/// Persist `stream_consent` (`auto`, `notify`, `prompt`, or `deny`) into
+/// `data_dir/node.json`, validating the mode first.
+pub fn set_stream_consent(data_dir: &Path, consent: &str) -> Result<()> {
+    let trimmed = consent.trim().to_ascii_lowercase();
+    agentlink_desktop::ConsentMode::parse(&trimmed).map_err(|err| anyhow!(err))?;
+    let path = data_dir.join("node.json");
+    let mut obj = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<Value>(&text)
+            .with_context(|| format!("parse {}", path.display()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(err) => return Err(err.into()),
+    };
+    let map = obj
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("node.json must be a JSON object"))?;
+    map.insert("stream_consent".into(), Value::String(trimmed));
+    let bytes = serde_json::to_string_pretty(&obj)?;
+    agentlink_core::util::write_secret(&path, bytes.as_bytes())
+        .map_err(|err| anyhow!(err.to_string()))?;
+    Ok(())
+}
+
+fn persist_node_config_with_consent(config: &NodeConfig, consent: Option<&str>) -> Result<()> {
+    let effective = consent
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| read_stream_consent(&config.data_dir))
+        .unwrap_or_else(|| "notify".to_string());
+    agentlink_desktop::ConsentMode::parse(&effective).map_err(|err| anyhow!(err))?;
+    save_node_config(config)?;
+    let path = config.data_dir.join("node.json");
+    let text = std::fs::read_to_string(&path)?;
+    let mut obj = serde_json::from_str::<Value>(&text)?;
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("stream_consent".into(), Value::String(effective));
+        let bytes = serde_json::to_string_pretty(&obj)?;
+        agentlink_core::util::write_secret(&path, bytes.as_bytes())
+            .map_err(|err| anyhow!(err.to_string()))?;
+    }
+    Ok(())
+}
+
 fn load_node(launch: &NodeLaunch) -> Result<NodeConfig> {
+    let saved_consent = read_stream_consent(&launch.data_dir);
     node_cfg::load(NodeArgs {
         relay: launch.relay.clone(),
         fingerprint: launch.fingerprint.clone(),
@@ -1074,7 +1823,7 @@ fn load_node(launch: &NodeLaunch) -> Result<NodeConfig> {
         data_dir: Some(launch.data_dir.clone()),
         root: None,
         max_access: None,
-        stream_consent: Some("notify".into()),
+        stream_consent: saved_consent,
     })
 }
 
@@ -1125,6 +1874,81 @@ pub struct SignInRequest {
     pub totp: Option<String>,
 }
 
+/// Pre-filled Relay URL & Trust/Pin fields for the Windows Sign-In dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignInDefaults {
+    pub relay: String,
+    pub trust: String,
+}
+
+fn nonempty_opt(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn combine_trust_display(fingerprint: Option<&str>, trust: Option<&str>) -> String {
+    let fp = fingerprint.map(str::trim).filter(|s| !s.is_empty());
+    let tr = trust.map(str::trim).filter(|s| !s.is_empty());
+    match (fp, tr) {
+        (Some(f), Some(t)) if f.eq_ignore_ascii_case(t) => f.to_string(),
+        (Some(f), Some(t)) => format!("{f}+{t}"),
+        (Some(f), None) => f.to_string(),
+        (None, Some(t)) => t.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// Pre-fill Relay URL and Trust/Pin for the Sign-In dialog from CLI context,
+/// existing `node.json`, `config.json`, or `AGENTLINK_RELAY` / trust env vars.
+pub fn prefill_sign_in_defaults(ctx: &TrayContext, data_dir: &Path) -> SignInDefaults {
+    let saved_node = std::fs::read_to_string(data_dir.join("node.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let node_str = |key: &str| {
+        saved_node
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let saved_cfg = config::load_file(&ctx.config_dir).unwrap_or_default();
+
+    let relay = nonempty_opt(ctx.relay.clone())
+        .or_else(|| node_str("relay_url"))
+        .or_else(|| nonempty_opt(saved_cfg.relay.clone()))
+        .or_else(|| nonempty_opt(std::env::var("AGENTLINK_RELAY").ok()))
+        .unwrap_or_default();
+
+    let fp = nonempty_opt(ctx.fingerprint.clone())
+        .or_else(|| node_str("fingerprint"))
+        .or_else(|| nonempty_opt(saved_cfg.fingerprint.clone()))
+        .or_else(|| nonempty_opt(std::env::var("AGENTLINK_FINGERPRINT").ok()))
+        .or_else(|| nonempty_opt(std::env::var("AGENTLINK_RELAY_PIN").ok()));
+    let tr = nonempty_opt(ctx.trust.clone())
+        .or_else(|| node_str("trust"))
+        .or_else(|| nonempty_opt(saved_cfg.trust.clone()))
+        .or_else(|| nonempty_opt(std::env::var("AGENTLINK_TRUST").ok()));
+    let trust = combine_trust_display(fp.as_deref(), tr.as_deref());
+    SignInDefaults { relay, trust }
+}
+
+/// Parse a user-entered Trust / Pin field (`system`, `webpki`, `sha256:...`,
+/// `spki:sha256:...`, or `+`-combined expressions) into `(fingerprint, trust)`.
+pub fn parse_trust_input(input: &str) -> Result<(Option<String>, Option<String>)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok((None, None));
+    }
+    let parsed = agentlink_core::RelayTrust::parse(trimmed, None)
+        .map_err(|err| anyhow!(err.to_string()))?;
+    let fp = parsed.fingerprint_value();
+    let tr = parsed.trust_value();
+    Ok((if fp.is_empty() { None } else { Some(fp) }, tr))
+}
+
 /// Password login, then enroll this machine's node key under that account.
 pub async fn sign_in_and_enroll(request: SignInRequest) -> Result<String> {
     let username = request.username.trim().to_string();
@@ -1134,6 +1958,15 @@ pub async fn sign_in_and_enroll(request: SignInRequest) -> Result<String> {
     if request.password.is_empty() {
         bail!("password is required");
     }
+    let existing_consent = read_stream_consent(&request.data_dir);
+    let explicit_fp_only = request
+        .fingerprint
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && request
+            .trust
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty());
     let launch = NodeLaunch {
         relay: request.relay.clone(),
         fingerprint: request.fingerprint.clone(),
@@ -1141,9 +1974,16 @@ pub async fn sign_in_and_enroll(request: SignInRequest) -> Result<String> {
         data_dir: request.data_dir.clone(),
         name: request.name.clone(),
     };
-    let node = load_node(&launch)?;
+    let mut node = load_node(&launch)?;
+    if explicit_fp_only {
+        // An explicit pin-only entry from the Sign-In dialog overrides any
+        // previously saved `trust` in `node.json`.
+        node.trust = None;
+    }
     let parsed = agentlink_core::RelayTrust::parse(&node.fingerprint, node.trust.as_deref())
         .map_err(|err| anyhow!(err.to_string()))?;
+    node.fingerprint = parsed.fingerprint_value();
+    node.trust = parsed.trust_value();
     let device = Identity::load_or_create(&request.config_dir.join("identity.json"))
         .map_err(|err| anyhow!(err.to_string()))?;
     let totp = request
@@ -1189,28 +2029,106 @@ pub async fn sign_in_and_enroll(request: SignInRequest) -> Result<String> {
         .enroll_self(&node.name, &node_identity, Some(policy))
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
+    persist_node_config_with_consent(&node, existing_consent.as_deref())?;
     Ok(session.user)
 }
 
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub async fn sign_out(config_dir: &Path) -> Result<()> {
+    sign_out_with(
+        config_dir,
+        unix_now_secs(),
+        |relay, fingerprint, trust, identity, refresh| async move {
+            agentlink_core::client::refresh_user(
+                &relay,
+                &fingerprint,
+                trust.as_deref(),
+                &identity,
+                &refresh,
+            )
+            .await
+            .map(|session| (session.access_token, session.refresh_token))
+            .map_err(|err| anyhow!(err.to_string()))
+        },
+        |settings, identity, config_dir, refresh| async move {
+            let client = Client::connect_identity(&settings, identity, true)
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+            client.remember_grants(&config_dir);
+            client
+                .logout_session(Some(refresh))
+                .await
+                .map_err(|err| anyhow!(err.to_string()))
+        },
+    )
+    .await
+}
+
+async fn sign_out_with<RF, RFut, LF, LFut>(
+    config_dir: &Path,
+    now_unix: i64,
+    refresh_fn: RF,
+    logout_fn: LF,
+) -> Result<()>
+where
+    RF: FnOnce(String, String, Option<String>, Identity, String) -> RFut,
+    RFut: std::future::Future<Output = Result<(String, String)>>,
+    LF: FnOnce(ClientSettings, Identity, PathBuf, String) -> LFut,
+    LFut: std::future::Future<Output = Result<()>>,
+{
+    let lock_dir = config_dir.to_path_buf();
+    let _session_lock = tokio::task::spawn_blocking(move || config::lock_session(&lock_dir))
+        .await
+        .ok()
+        .and_then(|res| res.ok());
+
     let file = config::load_file(config_dir).unwrap_or_default();
-    if let Some(refresh) = file.refresh_token.clone() {
+    if let Some(refresh) = file
+        .refresh_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+    {
         let mut relay = file.relay.clone().unwrap_or_default();
         let fingerprint = file.fingerprint.clone().unwrap_or_default();
         let mut trust = file.trust.clone();
         agentlink_core::apply_relay_defaults(&mut relay, &fingerprint, &mut trust);
-        let token = file.token.clone().unwrap_or_default();
-        if !relay.is_empty() && !token.is_empty() {
-            let settings = ClientSettings {
-                relay,
-                token,
-                fingerprint,
-                trust,
-            };
+        if !relay.is_empty() && (!fingerprint.is_empty() || trust.is_some()) {
             if let Ok(identity) = Identity::load_or_create(&config_dir.join("identity.json")) {
-                if let Ok(client) = Client::connect_identity(&settings, identity, true).await {
-                    client.remember_grants(config_dir);
-                    let _ = client.logout_session(Some(refresh)).await;
+                let mut active_token = file.token.clone().unwrap_or_default();
+                let mut active_refresh = refresh;
+                if !config::access_token_is_fresh(&file, now_unix, 30) {
+                    if let Ok((new_access, new_refresh)) = refresh_fn(
+                        relay.clone(),
+                        fingerprint.clone(),
+                        trust.clone(),
+                        identity.clone(),
+                        active_refresh.clone(),
+                    )
+                    .await
+                    {
+                        if !new_access.trim().is_empty() {
+                            active_token = new_access;
+                        }
+                        if !new_refresh.trim().is_empty() {
+                            active_refresh = new_refresh;
+                        }
+                    }
+                }
+                if !active_token.trim().is_empty() {
+                    let settings = ClientSettings {
+                        relay,
+                        token: active_token,
+                        fingerprint,
+                        trust,
+                    };
+                    let _ = logout_fn(settings, identity, config_dir.to_path_buf(), active_refresh)
+                        .await;
                 }
             }
         }
@@ -1243,6 +2161,7 @@ pub fn apply_pairing_text(
         JoinText::Invite(_) => (Some(text.to_string()), None),
         JoinText::Token(token) => (None, Some(token)),
     };
+    let existing_consent = read_stream_consent(data_dir);
     let config = node_cfg::load(NodeArgs {
         relay,
         fingerprint,
@@ -1253,9 +2172,9 @@ pub fn apply_pairing_text(
         data_dir: Some(data_dir.to_path_buf()),
         root: None,
         max_access: None,
-        stream_consent: Some("notify".into()),
+        stream_consent: existing_consent.clone(),
     })?;
-    save_node_config(&config)?;
+    persist_node_config_with_consent(&config, existing_consent.as_deref())?;
     Ok(config.name)
 }
 
@@ -1274,23 +2193,165 @@ fn strip_verbatim(path: &Path) -> PathBuf {
     }
 }
 
+struct RotatingLogState {
+    path: PathBuf,
+    backup_path: PathBuf,
+    max_bytes: u64,
+    file: Option<File>,
+    written: u64,
+}
+
+impl RotatingLogState {
+    fn new(path: PathBuf, max_bytes: u64) -> Self {
+        let mut backup_os = path.as_os_str().to_os_string();
+        backup_os.push(".1");
+        let backup_path = PathBuf::from(backup_os);
+        let written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Self {
+            path,
+            backup_path,
+            max_bytes: max_bytes.max(1),
+            file: None,
+            written,
+        }
+    }
+
+    fn ensure_open(&mut self) -> Option<&mut File> {
+        if self.file.is_none() {
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(file) = OpenOptions::new().create(true).append(true).open(&self.path) {
+                self.written = file.metadata().map(|m| m.len()).unwrap_or(self.written);
+                self.file = Some(file);
+            }
+        }
+        self.file.as_mut()
+    }
+
+    fn rotate(&mut self) {
+        // Close handle first — Windows rejects renaming an open file.
+        self.file = None;
+        let _ = std::fs::remove_file(&self.backup_path);
+        let _ = std::fs::rename(&self.path, &self.backup_path);
+        self.written = 0;
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+        {
+            self.file = Some(file);
+        }
+    }
+
+    fn write_bytes(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.written > 0 && self.written.saturating_add(buf.len() as u64) > self.max_bytes {
+            self.rotate();
+        }
+        if self.ensure_open().is_some() {
+            if self.written > 0 && self.written.saturating_add(buf.len() as u64) > self.max_bytes {
+                self.rotate();
+            }
+            if let Some(file) = self.file.as_mut() {
+                if file.write_all(buf).is_ok() {
+                    self.written = self.written.saturating_add(buf.len() as u64);
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush_file(&mut self) -> std::io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            let _ = file.flush();
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RotatingLogMakeWriter {
+    state: Arc<Mutex<RotatingLogState>>,
+}
+
+impl RotatingLogMakeWriter {
+    fn new(path: PathBuf, max_bytes: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RotatingLogState::new(path, max_bytes))),
+        }
+    }
+}
+
+struct RotatingLogHandle {
+    state: Arc<Mutex<RotatingLogState>>,
+}
+
+impl Write for RotatingLogHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.write_bytes(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.flush_file()
+    }
+}
+
+impl<'a> MakeWriter<'a> for RotatingLogMakeWriter {
+    type Writer = RotatingLogHandle;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RotatingLogHandle {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
 pub fn init_tray_log(data_dir: &Path) {
-    let _ = std::fs::create_dir_all(data_dir);
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data_dir.join("tray.log"))
-    else {
-        return;
-    };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .with_writer(move || file.try_clone().expect("tray log"))
-        .try_init();
-    tracing::info!(version = version::current(), "tray starting");
+    let mut initialized = false;
+    TRAY_LOG_INIT.get_or_init(|| {
+        initialized = true;
+        let _ = std::fs::create_dir_all(data_dir);
+        let writer = RotatingLogMakeWriter::new(data_dir.join("tray.log"), TRAY_LOG_MAX_BYTES);
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(writer)
+            .try_init();
+    });
+    if initialized {
+        tracing::info!(version = version::current(), "tray starting");
+    }
+}
+
+/// Decode a Windows registry UTF-16LE byte buffer (`REG_SZ` or `REG_EXPAND_SZ`),
+/// trimming only trailing NUL code units without dropping the last character
+/// when the stored bytes are not NUL-terminated.
+pub(crate) fn decode_reg_utf16(bytes: &[u8]) -> String {
+    let mut words: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    while words.last() == Some(&0) {
+        words.pop();
+    }
+    String::from_utf16_lossy(&words)
+        .trim_end_matches('\u{0}')
+        .trim()
+        .to_string()
 }
 
 #[cfg(windows)]
@@ -1300,18 +2361,32 @@ fn startup_dir() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
+fn startup_shortcut_path() -> Option<PathBuf> {
+    startup_dir().map(|dir| dir.join(STARTUP_SHORTCUT))
+}
+
+#[cfg(windows)]
 fn startup_script_path() -> Option<PathBuf> {
     startup_dir().map(|dir| dir.join(STARTUP_SCRIPT))
 }
 
 #[cfg(windows)]
-fn write_startup_script(binary: &Path, data_dir: &Path) -> Result<()> {
+fn write_startup_shortcut(binary: &Path, data_dir: &Path) -> Result<()> {
+    let lnk = build_windows_lnk(binary, data_dir)?;
     let dir = startup_dir().context("APPDATA is not set")?;
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join(STARTUP_SCRIPT),
-        startup_script_contents(binary, data_dir),
-    )?;
+    std::fs::write(dir.join(STARTUP_SHORTCUT), lnk)?;
+    let _ = remove_startup_script();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_startup_shortcut() -> Result<()> {
+    if let Some(path) = startup_shortcut_path() {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
     Ok(())
 }
 
@@ -1333,6 +2408,13 @@ fn missing_dir_matches(data_dir: &Path) -> bool {
 }
 
 #[cfg(windows)]
+fn startup_shortcut_command() -> Option<String> {
+    let path = startup_shortcut_path()?;
+    let bytes = std::fs::read(path).ok()?;
+    parse_windows_lnk_command(&bytes)
+}
+
+#[cfg(windows)]
 fn startup_script_command() -> Option<String> {
     let path = startup_script_path()?;
     let text = std::fs::read_to_string(path).ok()?;
@@ -1351,6 +2433,12 @@ fn startup_script_command() -> Option<String> {
 #[cfg(windows)]
 fn collect_autostart_entries() -> Vec<RunValue> {
     let mut entries = list_run_values().unwrap_or_default();
+    if let Some(command) = startup_shortcut_command() {
+        entries.push(RunValue {
+            name: STARTUP_SHORTCUT.to_string(),
+            command,
+        });
+    }
     if let Some(command) = startup_script_command() {
         entries.push(RunValue {
             name: STARTUP_SCRIPT.to_string(),
@@ -1362,6 +2450,8 @@ fn collect_autostart_entries() -> Vec<RunValue> {
 
 #[cfg(windows)]
 fn retire_duplicate_node_autostart_windows(binary: &Path, data_dir: &Path) -> Result<()> {
+    validate_autostart_path(binary)?;
+    validate_autostart_path(data_dir)?;
     let entries = collect_autostart_entries();
     let plan = plan_run_migration(
         &entries,
@@ -1374,7 +2464,9 @@ fn retire_duplicate_node_autostart_windows(binary: &Path, data_dir: &Path) -> Re
         set_run_value(command)?;
     }
     for name in &plan.delete_names {
-        if name == STARTUP_SCRIPT {
+        if name == STARTUP_SHORTCUT {
+            let _ = remove_startup_shortcut();
+        } else if name == STARTUP_SCRIPT {
             let _ = remove_startup_script();
         } else {
             let _ = delete_named_run_value(name);
@@ -1386,11 +2478,14 @@ fn retire_duplicate_node_autostart_windows(binary: &Path, data_dir: &Path) -> Re
 #[cfg(windows)]
 fn list_run_values() -> Result<Vec<RunValue>> {
     use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+    use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS};
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_SZ,
-        REG_VALUE_TYPE,
+        RegCloseKey, RegEnumValueW, RegOpenKeyExW, RegQueryInfoKeyW, HKEY_CURRENT_USER,
+        KEY_QUERY_VALUE, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
     };
+
+    const MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_NAME_CHARS: usize = 32_768;
 
     unsafe {
         let key_name = wide(RUN_KEY);
@@ -1404,48 +2499,83 @@ fn list_run_values() -> Result<Vec<RunValue>> {
         )
         .ok()
         .context("open HKCU Run")?;
+
+        let mut max_name_len = 0u32;
+        let mut max_value_len = 0u32;
+        let _ = RegQueryInfoKeyW(
+            key,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut max_name_len),
+            Some(&mut max_value_len),
+            None,
+            None,
+        );
+        let initial_name_cap = (max_name_len as usize).saturating_add(1).clamp(256, MAX_NAME_CHARS);
+        let initial_data_cap = (max_value_len as usize)
+            .saturating_add(2)
+            .clamp(1024, 65_536);
+
         let mut entries = Vec::new();
         let mut index = 0u32;
-        loop {
-            let mut name_buf = vec![0u16; 256];
-            let mut name_len = (name_buf.len() - 1) as u32;
-            let mut kind = REG_VALUE_TYPE::default();
-            let mut data = vec![0u8; 8192];
-            let mut data_len = data.len() as u32;
-            let status = RegEnumValueW(
-                key,
-                index,
-                Some(PWSTR(name_buf.as_mut_ptr())),
-                &mut name_len,
-                None,
-                Some(&mut kind.0), // windows 0.61 RegEnumValueW lpType is *mut u32
-                Some(data.as_mut_ptr()),
-                Some(&mut data_len),
-            );
-            if status == ERROR_NO_MORE_ITEMS {
+        'outer: loop {
+            let mut name_cap = initial_name_cap;
+            let mut data_cap = initial_data_cap;
+            loop {
+                let mut name_buf = vec![0u16; name_cap];
+                let mut name_len = name_cap as u32;
+                let mut kind = REG_VALUE_TYPE::default();
+                let mut data = vec![0u8; data_cap];
+                let mut data_len = data.len() as u32;
+                let status = RegEnumValueW(
+                    key,
+                    index,
+                    Some(PWSTR(name_buf.as_mut_ptr())),
+                    &mut name_len,
+                    None,
+                    Some(&mut kind.0), // windows 0.61 RegEnumValueW lpType is *mut u32
+                    Some(data.as_mut_ptr()),
+                    Some(&mut data_len),
+                );
+                if status == ERROR_NO_MORE_ITEMS {
+                    break 'outer;
+                }
+                if status == ERROR_MORE_DATA {
+                    let needed_data = (data_len as usize).saturating_add(2);
+                    if needed_data > data_cap && needed_data <= MAX_VALUE_BYTES {
+                        data_cap = needed_data;
+                        continue;
+                    }
+                    if name_cap < MAX_NAME_CHARS {
+                        name_cap = (name_cap * 2).min(MAX_NAME_CHARS);
+                        continue;
+                    }
+                    // Skip unreasonably oversized unrelated entry rather than aborting enum.
+                    index += 1;
+                    continue 'outer;
+                }
+                if status.is_err() {
+                    let _ = RegCloseKey(key);
+                    return Err(anyhow!("enumerate HKCU Run values: {status:?}"));
+                }
+                index += 1;
+                if (kind != REG_SZ && kind != REG_EXPAND_SZ) || name_len == 0 {
+                    continue 'outer;
+                }
+                let name = String::from_utf16_lossy(
+                    &name_buf[..(name_len as usize).min(name_buf.len())],
+                );
+                let bytes = &data[..(data_len as usize).min(data.len())];
+                let command = decode_reg_utf16(bytes);
+                if !name.is_empty() && !command.is_empty() {
+                    entries.push(RunValue { name, command });
+                }
                 break;
-            }
-            if status.is_err() {
-                let _ = RegCloseKey(key);
-                return Err(anyhow!("enumerate HKCU Run values: {status:?}"));
-            }
-            index += 1;
-            if kind != REG_SZ || name_len == 0 {
-                continue;
-            }
-            let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-            let bytes = (data_len as usize).min(data.len());
-            let wide_len = (bytes / 2).saturating_sub(1);
-            let chars = data[..bytes]
-                .chunks_exact(2)
-                .take(wide_len)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
-            let command = String::from_utf16_lossy(&chars.collect::<Vec<_>>())
-                .trim_end_matches('\u{0}')
-                .trim()
-                .to_string();
-            if !name.is_empty() && !command.is_empty() {
-                entries.push(RunValue { name, command });
             }
         }
         let _ = RegCloseKey(key);
@@ -1459,6 +2589,10 @@ fn set_run_value(command: &str) -> Result<()> {
     use windows::Win32::System::Registry::{
         RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
     };
+
+    if command.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        bail!("HKCU Run command contains forbidden control characters");
+    }
 
     unsafe {
         let key_name = wide(RUN_KEY);
@@ -1524,9 +2658,10 @@ fn delete_named_run_value(name: &str) -> Result<()> {
 #[cfg(windows)]
 fn read_run_value() -> Option<String> {
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_MORE_DATA;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_SZ,
-        REG_VALUE_TYPE,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
+        REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
     };
     unsafe {
         let key_name = wide(RUN_KEY);
@@ -1554,39 +2689,41 @@ fn read_run_value() -> Option<String> {
             Some(&mut len),
         )
         .is_err()
-            || kind != REG_SZ
+            || (kind != REG_SZ && kind != REG_EXPAND_SZ)
             || len < 2
         {
             let _ = RegCloseKey(key);
             return None;
         }
-        let mut buf = vec![0u8; len as usize + 2];
-        let ok = RegQueryValueExW(
-            key,
-            PCWSTR(name.as_ptr()),
-            None,
-            Some(&mut kind),
-            Some(buf.as_mut_ptr()),
-            Some(&mut len),
-        )
-        .is_ok();
+        let mut buf = vec![0u8; (len as usize).saturating_add(2)];
+        for _ in 0..4 {
+            let mut cap = buf.len() as u32;
+            let status = RegQueryValueExW(
+                key,
+                PCWSTR(name.as_ptr()),
+                None,
+                Some(&mut kind),
+                Some(buf.as_mut_ptr()),
+                Some(&mut cap),
+            );
+            if status == ERROR_MORE_DATA {
+                let next = (cap as usize).saturating_add(2);
+                if next <= 4 * 1024 * 1024 {
+                    buf.resize(next, 0);
+                    continue;
+                }
+                let _ = RegCloseKey(key);
+                return None;
+            }
+            let _ = RegCloseKey(key);
+            if status.is_err() || (kind != REG_SZ && kind != REG_EXPAND_SZ) {
+                return None;
+            }
+            let text = decode_reg_utf16(&buf[..(cap as usize).min(buf.len())]);
+            return if text.is_empty() { None } else { Some(text) };
+        }
         let _ = RegCloseKey(key);
-        if !ok {
-            return None;
-        }
-        let wide_len = (len as usize / 2).saturating_sub(1);
-        let words = buf
-            .chunks_exact(2)
-            .take(wide_len)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect::<Vec<_>>();
-        let text = String::from_utf16_lossy(&words);
-        let text = text.trim_end_matches('\u{0}').trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        None
     }
 }
 
@@ -2045,5 +3182,483 @@ mod tests {
         assert_eq!(view.account, "Legacy token saved");
         assert_eq!(view.relay, "relay not set");
         assert_eq!(view.node_name, "this computer");
+    }
+
+    #[test]
+    fn autostart_paths_reject_control_characters() {
+        for bad in [
+            "C:\\agentlink\\node\r\nbad",
+            "C:\\agentlink\\bad\npath",
+            "C:\\agentlink\\bad\rpath",
+            "C:\\agentlink\\bad\0path",
+        ] {
+            assert!(validate_autostart_path(Path::new(bad)).is_err(), "{bad:?}");
+            assert!(
+                try_autostart_command(Path::new(r"C:\agentlink\agentlink.exe"), Path::new(bad))
+                    .is_err()
+            );
+            assert!(
+                install_user_autostart(
+                    Path::new(r"C:\agentlink\agentlink.exe"),
+                    Path::new(bad)
+                )
+                .is_err()
+            );
+            assert!(
+                build_windows_lnk(Path::new(r"C:\agentlink\agentlink.exe"), Path::new(bad))
+                    .is_err()
+            );
+        }
+        assert!(validate_autostart_path(Path::new(r"C:\Users\Ada Lovelace\node\")).is_ok());
+    }
+
+    #[test]
+    fn windows_quoting_and_splitting_handle_trailing_backslashes_and_quotes() {
+        let samples = [
+            r"C:\Users\Ada Lovelace\node\",
+            r"C:\Users\Ada\node\\",
+            r#"C:\Users\a"b\node"#,
+            r#"C:\Users\a\"b\node\"#,
+            r#"plain"#,
+            r"\\",
+            r#"""#,
+            r#"\"#,
+        ];
+        for sample in samples {
+            let quoted = quote_windows_arg(sample);
+            let parsed = split_windows_command(&quoted);
+            assert_eq!(parsed, vec![sample.to_string()], "quoted={quoted}");
+        }
+        // Specific CommandLineToArgvW encoding checks:
+        assert_eq!(
+            quote_windows_arg(r"C:\agentlink\node\"),
+            r#""C:\agentlink\node\\""#
+        );
+        assert_eq!(
+            quote_windows_arg(r#"a\"b"#),
+            r#""a\\\"b""#
+        );
+
+        let cmd = autostart_command(
+            Path::new(r"C:\Program Files\agentlink\agentlink.exe"),
+            Path::new(r"C:\agentlink\node\"),
+        );
+        assert_eq!(
+            data_dir_from_command(&cmd),
+            Some(PathBuf::from(r"C:\agentlink\node\"))
+        );
+        assert!(command_launches_tray(
+            &cmd,
+            Path::new(r"C:\agentlink\node"),
+            false
+        ));
+    }
+
+    #[test]
+    fn windows_lnk_builder_round_trips_unicode_spaces_and_trailing_backslash() {
+        let exe = Path::new(r"C:\Users\测试 Ada\agentlink\agentlink-gui.exe");
+        let data = Path::new(r"C:\Users\测试 Ada\node\");
+        let bytes = build_windows_lnk(exe, data).expect("build .lnk");
+        assert!(bytes.len() > 76);
+        assert_eq!(&bytes[0..4], &LNK_HEADER_SIZE.to_le_bytes());
+        assert_eq!(&bytes[4..20], &LNK_CLSID);
+
+        let parsed = parse_windows_lnk_command(&bytes).expect("parse .lnk");
+        assert_eq!(agentlink_subcommand(&parsed).as_deref(), Some("tray"));
+        assert!(command_launches_tray(&parsed, data, false), "{parsed}");
+        assert_eq!(data_dir_from_command(&parsed), Some(data.to_path_buf()));
+
+        // Plan mentions agentlink.lnk, never agentlink.cmd.
+        let plan = autostart_plan(exe, data);
+        assert!(plan.contains(STARTUP_SHORTCUT), "{plan}");
+        assert!(!plan.contains(STARTUP_SCRIPT), "{plan}");
+
+        // UNC / non-drive fallback path round-trips via EnvironmentVariableDataBlock.
+        let unc_exe = Path::new(r"\\fileserver\tools\agentlink-gui.exe");
+        let unc_bytes = build_windows_lnk(unc_exe, data).expect("build UNC .lnk");
+        let unc_parsed = parse_windows_lnk_command(&unc_bytes).expect("parse UNC .lnk");
+        assert_eq!(agentlink_subcommand(&unc_parsed).as_deref(), Some("tray"));
+        assert_eq!(data_dir_from_command(&unc_parsed), Some(data.to_path_buf()));
+
+        // cmd.exe metacharacters (%VAR%, &, |, ^, !) are preserved literally in .lnk.
+        let meta_dir = Path::new(r"C:\Users\A&B %TEMP% ^!|node\");
+        let meta_bytes = build_windows_lnk(exe, meta_dir).expect("build metachar .lnk");
+        let meta_parsed = parse_windows_lnk_command(&meta_bytes).expect("parse metachar .lnk");
+        assert_eq!(
+            data_dir_from_command(&meta_parsed),
+            Some(meta_dir.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn preferred_gui_binary_uses_sibling_agentlink_gui_exe_when_present_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("agentlink.exe");
+        let gui = dir.path().join("agentlink-gui.exe");
+        std::fs::write(&cli, b"cli").unwrap();
+        assert_eq!(preferred_gui_binary(&cli), cli);
+
+        std::fs::write(&gui, b"gui").unwrap();
+        assert_eq!(preferred_gui_binary(&cli), gui);
+
+        let cmd = autostart_command(&cli, Path::new(r"C:\data\node"));
+        assert!(cmd.contains("agentlink-gui.exe"), "{cmd}");
+        assert_eq!(agentlink_subcommand(&cmd).as_deref(), Some("tray"));
+        assert!(command_launches_tray(
+            &cmd,
+            Path::new(r"C:\data\node"),
+            false
+        ));
+
+        // Synthetic non-existent path stays unchanged.
+        let synthetic = Path::new(r"C:\nonexistent-agentlink-test\agentlink.exe");
+        assert_eq!(preferred_gui_binary(synthetic), synthetic);
+
+        // Controller launch args forward both --config-dir and --data-dir.
+        let args = controller_launch_args(Path::new(r"C:\cfg"), Path::new(r"C:\data"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--config-dir"),
+                OsString::from(r"C:\cfg"),
+                OsString::from("controller"),
+                OsString::from("--data-dir"),
+                OsString::from(r"C:\data"),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_cmd_is_retired_when_lnk_or_hkcu_owns_tray_autostart() {
+        let (node, tray, data) = probe_commands();
+        let exe = PathBuf::from(r"C:\Users\probe\AppData\Local\agentlink\agentlink.exe");
+        let entries = vec![
+            RunValue {
+                name: STARTUP_SHORTCUT.into(),
+                command: tray.clone(),
+            },
+            RunValue {
+                name: STARTUP_SCRIPT.into(),
+                command: node,
+            },
+        ];
+        let plan = plan_run_migration(&entries, &exe, &data, false, false);
+        assert_eq!(plan.delete_names, vec![STARTUP_SCRIPT.to_string()]);
+
+        // When HKCU Run has tray, both agentlink.lnk and legacy agentlink.cmd are cleaned up.
+        let entries_both = vec![
+            RunValue {
+                name: RUN_VALUE_NAME.into(),
+                command: tray.clone(),
+            },
+            RunValue {
+                name: STARTUP_SHORTCUT.into(),
+                command: tray.clone(),
+            },
+            RunValue {
+                name: STARTUP_SCRIPT.into(),
+                command: tray,
+            },
+        ];
+        let plan_both = plan_run_migration(&entries_both, &exe, &data, false, false);
+        assert_eq!(
+            plan_both.delete_names,
+            vec![STARTUP_SHORTCUT.to_string(), STARTUP_SCRIPT.to_string()]
+        );
+    }
+
+    #[test]
+    fn standalone_node_block_reason_tracks_live_node_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unlocked / absent lock: never blocks, and does not create node.lock.
+        assert_eq!(standalone_node_block_reason(dir.path()), None);
+        assert!(!dir.path().join(NODE_LOCK_FILE).exists());
+
+        // Acquire exclusive lock matching agentlink_node::lock::acquire_node_lock.
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(NODE_LOCK_FILE))
+            .unwrap();
+        lock_file.try_lock().unwrap();
+
+        let reason = standalone_node_block_reason(dir.path()).expect("should block while locked");
+        assert!(reason.contains("node.lock"), "{reason}");
+
+        // Once the holder exits / drops the lock, standalone node is allowed again.
+        drop(lock_file);
+        assert_eq!(standalone_node_block_reason(dir.path()), None);
+    }
+
+    #[test]
+    fn supervisor_stop_with_timeout_joins_cleanly_and_writes_stopped_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = TrayContext {
+            json: false,
+            relay: None,
+            fingerprint: None,
+            trust: None,
+            config_dir: dir.path().to_path_buf(),
+            data_dir: Some(dir.path().to_path_buf()),
+            name: None,
+            background: false,
+            action: TrayAction::Run,
+        };
+        let mut sup = Supervisor::new(&ctx, dir.path().to_path_buf());
+        let token = CancellationToken::new();
+        let child_token = token.clone();
+        sup.shutdown = Some(token);
+        sup.thread = Some(std::thread::spawn(move || {
+            while !child_token.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        }));
+        assert!(sup.running());
+        assert!(sup.stop_with_timeout(Duration::from_secs(2)));
+        assert!(!sup.running());
+        let status = agentlink_node::read_status(dir.path()).expect("status.json written");
+        assert_eq!(status.state, LinkState::Stopped);
+
+        // Bounded timeout: a stuck thread does not block beyond timeout and still writes Stopped.
+        let mut stuck = Supervisor::new(&ctx, dir.path().to_path_buf());
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        stuck.thread = Some(std::thread::spawn(move || {
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+            Ok(())
+        }));
+        let start = Instant::now();
+        assert!(!stuck.stop_with_timeout(Duration::from_millis(80)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let status = agentlink_node::read_status(dir.path()).expect("status.json written");
+        assert_eq!(status.state, LinkState::Stopped);
+        let _ = tx.send(());
+    }
+
+    #[test]
+    fn rotating_tray_log_caps_size_and_rotates_to_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("tray.log");
+        let backup_path = dir.path().join("tray.log.1");
+        let maker = RotatingLogMakeWriter::new(log_path.clone(), 64);
+
+        for idx in 0..8 {
+            let mut writer = maker.make_writer();
+            writeln!(writer, "line-{idx}-0123456789abcdef").unwrap();
+            writer.flush().unwrap();
+        }
+        assert!(log_path.is_file(), "active tray.log must exist");
+        assert!(backup_path.is_file(), "rotated tray.log.1 must exist");
+        let active_len = std::fs::metadata(&log_path).unwrap().len();
+        let backup_len = std::fs::metadata(&backup_path).unwrap().len();
+        assert!(active_len <= 64, "active log exceeded cap: {active_len}");
+        assert!(backup_len > 0 && backup_len <= 64, "backup len: {backup_len}");
+    }
+
+    #[test]
+    fn decode_reg_utf16_handles_missing_and_multiple_trailing_nuls() {
+        fn utf16le(s: &str) -> Vec<u8> {
+            s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+        }
+        // Standard NUL-terminated REG_SZ / REG_EXPAND_SZ
+        assert_eq!(decode_reg_utf16(&utf16le("agentlink\0")), "agentlink");
+        // Multiple trailing NULs
+        assert_eq!(decode_reg_utf16(&utf16le("agentlink\0\0")), "agentlink");
+        // Non-NUL-terminated REG_SZ must NOT chop the last character!
+        assert_eq!(decode_reg_utf16(&utf16le("agentlink")), "agentlink");
+        // Empty / NUL-only
+        assert_eq!(decode_reg_utf16(&[]), "");
+        assert_eq!(decode_reg_utf16(&utf16le("\0")), "");
+    }
+
+    #[test]
+    fn sign_out_refreshes_expired_access_token_before_server_logout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = format!("sha256:{}", "ab".repeat(32));
+        let settings = ClientSettings {
+            relay: "wss://relay.example.com:7443".into(),
+            token: "expired-access".into(),
+            fingerprint: pin.clone(),
+            trust: None,
+        };
+        config::save_session(dir.path(), &settings, "ada", "old-refresh", 100).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let refreshed_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let logged_out = Arc::new(Mutex::new(None::<(String, String)>));
+
+        let r_flag = Arc::clone(&refreshed_called);
+        let l_slot = Arc::clone(&logged_out);
+        rt.block_on(sign_out_with(
+            dir.path(),
+            500, // now > access_expires_unix (100) -> expired!
+            move |_relay, _fp, _trust, _id, refresh| async move {
+                assert_eq!(refresh, "old-refresh");
+                r_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(("fresh-access".into(), "rotated-refresh".into()))
+            },
+            move |settings, _id, _cfg_dir, refresh| async move {
+                *l_slot.lock().unwrap() = Some((settings.token, refresh));
+                Ok(())
+            },
+        ))
+        .unwrap();
+
+        assert!(refreshed_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            *logged_out.lock().unwrap(),
+            Some(("fresh-access".to_string(), "rotated-refresh".to_string()))
+        );
+        let after = config::load_file(dir.path()).unwrap();
+        assert_eq!(after.token.as_deref(), Some(""));
+        assert_eq!(after.refresh_token, None);
+        assert_eq!(after.user, None);
+        assert!(config::session_lock_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn sign_out_skips_refresh_when_access_token_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = format!("sha256:{}", "ab".repeat(32));
+        let settings = ClientSettings {
+            relay: "wss://relay.example.com:7443".into(),
+            token: "still-fresh".into(),
+            fingerprint: pin,
+            trust: None,
+        };
+        config::save_session(dir.path(), &settings, "ada", "live-refresh", 1000).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let logged_out = Arc::new(Mutex::new(None::<(String, String)>));
+        let l_slot = Arc::clone(&logged_out);
+        rt.block_on(sign_out_with(
+            dir.path(),
+            500, // 500s remaining > 30s skew -> fresh!
+            |_relay, _fp, _trust, _id, _refresh| async move {
+                panic!("refresh must not be called when access token is fresh");
+            },
+            move |settings, _id, _cfg_dir, refresh| async move {
+                *l_slot.lock().unwrap() = Some((settings.token, refresh));
+                Ok(())
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            *logged_out.lock().unwrap(),
+            Some(("still-fresh".to_string(), "live-refresh".to_string()))
+        );
+        let after = config::load_file(dir.path()).unwrap();
+        assert_eq!(after.refresh_token, None);
+    }
+
+    #[test]
+    fn stream_consent_persists_in_node_json_and_is_honored_by_load_node() {
+        std::env::set_var("AGENTLINK_DESKTOP", "mock");
+        let dir = tempfile::tempdir().unwrap();
+        let token = "ef".repeat(32);
+        let pin = format!("sha256:{}", "cd".repeat(32));
+        let invite = agentlink_core::encode_invite(&agentlink_core::Invite {
+            relay: "wss://relay.example:7443".into(),
+            fingerprint: pin,
+            trust: None,
+            token,
+            name: "workstation".into(),
+        })
+        .unwrap();
+
+        apply_pairing_text(dir.path(), &invite, None, None, None, None).unwrap();
+        assert_eq!(read_stream_consent(dir.path()).as_deref(), Some("notify"));
+
+        set_stream_consent(dir.path(), "prompt").unwrap();
+        assert_eq!(read_stream_consent(dir.path()).as_deref(), Some("prompt"));
+
+        // Re-applying an invite preserves the persisted stream_consent instead of clobbering it.
+        apply_pairing_text(dir.path(), &invite, None, None, None, None).unwrap();
+        assert_eq!(read_stream_consent(dir.path()).as_deref(), Some("prompt"));
+
+        // Invalid consent fails closed in set_stream_consent and load_node.
+        assert!(set_stream_consent(dir.path(), "bogus").is_err());
+        let mut raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("node.json")).unwrap())
+                .unwrap();
+        raw["stream_consent"] = Value::String("invalid-mode".into());
+        std::fs::write(dir.path().join("node.json"), raw.to_string()).unwrap();
+        let launch = NodeLaunch {
+            relay: None,
+            fingerprint: None,
+            trust: None,
+            data_dir: dir.path().to_path_buf(),
+            name: None,
+        };
+        assert!(
+            load_node(&launch).is_err(),
+            "load_node must honor node.json stream_consent and fail closed on invalid mode"
+        );
+    }
+
+    #[test]
+    fn sign_in_defaults_and_trust_parsing_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = format!("sha256:{}", "12".repeat(32));
+        std::fs::write(
+            dir.path().join("node.json"),
+            serde_json::json!({
+                "relay_url": "wss://node-relay.example.com",
+                "fingerprint": pin,
+                "trust": "system",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ctx = TrayContext {
+            json: false,
+            relay: None,
+            fingerprint: None,
+            trust: None,
+            config_dir: dir.path().to_path_buf(),
+            data_dir: Some(dir.path().to_path_buf()),
+            name: None,
+            background: false,
+            action: TrayAction::Run,
+        };
+        let defaults = prefill_sign_in_defaults(&ctx, dir.path());
+        assert_eq!(defaults.relay, "wss://node-relay.example.com");
+        assert_eq!(defaults.trust, format!("{pin}+system"));
+
+        assert_eq!(parse_trust_input("").unwrap(), (None, None));
+        assert_eq!(
+            parse_trust_input("system").unwrap(),
+            (Some("system".into()), Some("system".into()))
+        );
+        assert_eq!(
+            parse_trust_input(&pin).unwrap(),
+            (Some(pin.clone()), None)
+        );
+        assert_eq!(
+            parse_trust_input(&format!("{pin}+webpki")).unwrap(),
+            (Some(pin), Some("webpki".into()))
+        );
+        assert!(parse_trust_input("not-a-valid-trust").is_err());
+    }
+
+    #[test]
+    fn instance_tag_normalizes_same_dir_and_separates_distinct_dirs() {
+        let a1 = Path::new(r"C:\Users\Ada\node");
+        let a2 = Path::new(r"\\?\c:/users/ada/node\");
+        let b = Path::new(r"D:\other\node");
+        assert_eq!(data_dir_instance_tag(a1), data_dir_instance_tag(a2));
+        assert_eq!(tray_mutex_name(a1), tray_mutex_name(a2));
+        assert_eq!(tray_window_class(a1), tray_window_class(a2));
+        assert_ne!(data_dir_instance_tag(a1), data_dir_instance_tag(b));
+        assert!(tray_mutex_name(a1).starts_with(r"Local\agentlink-tray-"));
     }
 }

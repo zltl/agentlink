@@ -137,7 +137,7 @@ pub struct AdapterState {
 }
 
 const WHEEL_DELTA: f32 = 120.0;
-const LINE_PIXELS: f32 = 40.0;
+const LINE_PIXELS: f32 = 120.0;
 const PAGE_PIXELS: f32 = 800.0;
 
 fn wheel_pixels(delta_x: f32, delta_y: f32, unit: WheelUnit) -> (f32, f32) {
@@ -638,6 +638,35 @@ mod tests {
             }
         }
         assert!(saw >= 1, "accumulated notches={saw}");
+    }
+
+    #[test]
+    fn single_line_wheel_detent_maps_to_one_remote_notch() {
+        let mut state = AdapterState::default();
+        state.pointer = Some((50.0, 50.0));
+        let out = adapt_frame(
+            &mut state,
+            geom(),
+            &[FrameEvent::MouseWheel {
+                x: None,
+                y: None,
+                delta_x: 0.0,
+                delta_y: -1.0,
+                unit: WheelUnit::Line,
+                mods: ModSnapshot::default(),
+            }],
+            None,
+            false,
+        );
+        let dy = out.iter().find_map(|e| match e {
+            OutEvent::Mouse {
+                action: "scroll",
+                dy,
+                ..
+            } => Some(*dy),
+            _ => None,
+        });
+        assert_eq!(dy, Some(1), "1 Line detent must produce 1 notch: {out:?}");
     }
 
     #[test]

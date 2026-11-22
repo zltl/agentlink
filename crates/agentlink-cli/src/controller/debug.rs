@@ -463,6 +463,11 @@ fn spawn_socket_server(path: &Path) -> Result<(Receiver<DebugInbox>, JoinHandle<
         let _ = std::fs::create_dir_all(parent);
     }
     let listener = UnixListener::bind(path).map_err(|e| e.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 debug socket: {e}"))?;
+    }
     listener
         .set_nonblocking(false)
         .map_err(|e| e.to_string())?;

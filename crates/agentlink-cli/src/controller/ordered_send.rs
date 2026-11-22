@@ -7,8 +7,6 @@
 //!
 //! `rustc --test` without workspace Cargo.
 
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,13 +29,13 @@ pub enum EnqueueError {
 }
 
 #[derive(Clone, Debug)]
-pub struct OrderedControlQueue {
+pub struct OrderedControlQueue<T = String> {
     cap: usize,
     closed: bool,
-    q: VecDeque<(ControlKind, String)>,
+    q: VecDeque<(ControlKind, T)>,
 }
 
-impl OrderedControlQueue {
+impl<T> OrderedControlQueue<T> {
     pub fn new(cap: usize) -> Self {
         Self {
             cap: cap.max(1),
@@ -46,10 +44,12 @@ impl OrderedControlQueue {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.q.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.q.is_empty()
     }
@@ -58,13 +58,14 @@ impl OrderedControlQueue {
         self.closed = true;
     }
 
+    #[cfg(test)]
     pub fn is_closed(&self) -> bool {
         self.closed
     }
 
     /// Enqueue one control payload. Barriers never displace earlier barriers;
     /// adjacent moves at the tail coalesce to the latest body.
-    pub fn enqueue(&mut self, kind: ControlKind, body: String) -> Result<(), EnqueueError> {
+    pub fn enqueue(&mut self, kind: ControlKind, body: T) -> Result<(), EnqueueError> {
         if self.closed {
             return Err(EnqueueError::Closed);
         }
@@ -91,16 +92,20 @@ impl OrderedControlQueue {
     }
 
     /// Pop the next payload in order (simulates the RTC consumer).
-    pub fn pop(&mut self) -> Option<(ControlKind, String)> {
+    pub fn pop(&mut self) -> Option<(ControlKind, T)> {
         self.q.pop_front()
     }
 
     /// Wait-style helper for tests: retry barrier until space (after pops).
+    #[cfg(test)]
     pub fn enqueue_barrier_with_space(
         &mut self,
-        body: String,
+        body: T,
         make_space: impl FnOnce(&mut Self),
-    ) -> Result<(), EnqueueError> {
+    ) -> Result<(), EnqueueError>
+    where
+        T: Clone,
+    {
         match self.enqueue(ControlKind::Barrier, body.clone()) {
             Ok(()) => Ok(()),
             Err(EnqueueError::BarrierBlocked) => {
@@ -123,7 +128,7 @@ mod tests {
 
     #[test]
     fn adjacent_moves_coalesce_under_cap() {
-        let mut q = OrderedControlQueue::new(2);
+        let mut q = OrderedControlQueue::<String>::new(2);
         q.enqueue(ControlKind::Move, "m1".into()).unwrap();
         q.enqueue(ControlKind::Move, "m2".into()).unwrap();
         assert_eq!(q.len(), 1);
@@ -132,7 +137,7 @@ mod tests {
 
     #[test]
     fn barrier_blocked_does_not_reorder_via_second_route() {
-        let mut q = OrderedControlQueue::new(1);
+        let mut q = OrderedControlQueue::<String>::new(1);
         q.enqueue(ControlKind::Barrier, "down".into()).unwrap();
         let err = q
             .enqueue(ControlKind::Barrier, "up".into())
@@ -148,7 +153,7 @@ mod tests {
 
     #[test]
     fn saturation_keeps_earlier_down_before_later_click() {
-        let mut q = OrderedControlQueue::new(2);
+        let mut q = OrderedControlQueue::<String>::new(2);
         q.enqueue(ControlKind::Barrier, "down-a".into()).unwrap();
         q.enqueue(ControlKind::Move, "move".into()).unwrap();
         // Queue full of [down-a, move]. Later click must block, not skip ahead.
@@ -166,7 +171,7 @@ mod tests {
 
     #[test]
     fn closed_queue_rejects_without_extension_when_live() {
-        let mut q = OrderedControlQueue::new(4);
+        let mut q = OrderedControlQueue::<String>::new(4);
         q.close();
         let err = q
             .enqueue(ControlKind::Barrier, "x".into())
@@ -178,7 +183,7 @@ mod tests {
 
     #[test]
     fn move_dropped_when_full_of_barriers() {
-        let mut q = OrderedControlQueue::new(1);
+        let mut q = OrderedControlQueue::<String>::new(1);
         q.enqueue(ControlKind::Barrier, "down".into()).unwrap();
         assert_eq!(
             q.enqueue(ControlKind::Move, "m".into()),

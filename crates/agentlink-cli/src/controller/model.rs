@@ -85,7 +85,7 @@ pub fn desktop_action(online: bool, has_display: Option<bool>, policy: NodePolic
     if has_display == Some(true) && !desktop_allowed(policy) {
         return Action {
             enabled: false,
-            reason: "This machine has a screen. Set access to full to open Desktop.",
+            reason: "This machine has a screen. Set access to remote-view or full to open Desktop.",
         };
     }
     Action {
@@ -99,7 +99,7 @@ pub fn display_note(has_display: Option<bool>, policy: NodePolicy) -> Option<&'s
         return Some("Headless. Shell and files only.");
     }
     if has_display == Some(true) && !desktop_allowed(policy) {
-        return Some("Screen detected. Set access to full to open Desktop.");
+        return Some("Screen detected. Set access to remote-view or full to open Desktop.");
     }
     None
 }
@@ -411,15 +411,240 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Install line for a freshly minted enrollment token.
+pub fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Convert a relay WebSocket URL (`wss://host:port`) into its HTTPS base for
+/// installer downloads. Returns empty string when no relay URL is set.
+pub fn relay_http_base(relay_url: &str) -> String {
+    let trimmed = relay_url.trim().trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        trimmed.to_string()
+    } else if !trimmed.is_empty() {
+        format!("https://{trimmed}")
+    } else {
+        String::new()
+    }
+}
+
+/// Unix shell and Windows PowerShell enrollment commands using the active relay
+/// URL and optional `--pin` / `--trust` flags (never a placeholder domain).
+pub fn enroll_commands(
+    relay_url: &str,
+    pin: &str,
+    trust: &str,
+    token: &str,
+    name: &str,
+    access: &str,
+) -> (String, String) {
+    let relay = relay_url.trim();
+    let base = relay_http_base(relay);
+    let sh_url = if base.is_empty() {
+        "https://<your-relay>/install.sh".to_string()
+    } else {
+        format!("{base}/install.sh")
+    };
+    let ps_url = if base.is_empty() {
+        "https://<your-relay>/install.ps1".to_string()
+    } else {
+        format!("{base}/install.ps1")
+    };
+
+    let mut sh_args = Vec::new();
+    let mut ps_args = Vec::new();
+    if !relay.is_empty() {
+        sh_args.push(format!("--relay {}", shell_quote(relay)));
+        ps_args.push(format!("-Relay {}", powershell_quote(relay)));
+    }
+    let pin = pin.trim();
+    let trust = trust.trim();
+    if !pin.is_empty() {
+        sh_args.push(format!("--pin {}", shell_quote(pin)));
+        ps_args.push(format!("-Pin {}", powershell_quote(pin)));
+    } else if !trust.is_empty() {
+        sh_args.push(format!("--trust {}", shell_quote(trust)));
+        ps_args.push(format!("-Trust {}", powershell_quote(trust)));
+    }
+    sh_args.push(format!("--token {}", shell_quote(token)));
+    sh_args.push(format!("--name {}", shell_quote(name)));
+    sh_args.push(format!("--access {}", shell_quote(access)));
+    sh_args.push(format!("--max-access {}", shell_quote(access)));
+
+    ps_args.push(format!("-Token {}", powershell_quote(token)));
+    ps_args.push(format!("-Name {}", powershell_quote(name)));
+    ps_args.push(format!("-Access {}", powershell_quote(access)));
+    ps_args.push(format!("-MaxAccess {}", powershell_quote(access)));
+
+    let unix = format!(
+        "curl -fsSL {} | sh -s -- {}",
+        shell_quote(&sh_url),
+        sh_args.join(" "),
+    );
+    let powershell = format!(
+        "& ([scriptblock]::Create((irm {}))) {}",
+        powershell_quote(&ps_url),
+        ps_args.join(" "),
+    );
+    (unix, powershell)
+}
+
+/// Install line for a freshly minted enrollment token when no relay override is supplied.
 pub fn enroll_command(token: &str, name: &str, access: &str) -> String {
-    format!(
-        "curl -fsSL https://relay.example.com/install.sh | sh -s -- --token {} --name {} --access {} --max-access {}",
-        shell_quote(token),
-        shell_quote(name),
-        shell_quote(access),
-        shell_quote(access),
-    )
+    enroll_commands("", "", "", token, name, access).0
+}
+
+/// Maximum remote file size opened for in-place text editing (256 KiB).
+/// Larger files open in read-only preview so Save can never truncate and
+/// destroy trailing bytes.
+pub const MAX_EDITABLE_FILE_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedFile {
+    pub path: String,
+    pub text: String,
+    pub read_only: bool,
+    pub read_only_reason: Option<String>,
+    pub total_size: Option<u64>,
+}
+
+/// Inspect downloaded file bytes + optional reported total size before opening
+/// the editor. Files larger than 256 KiB or containing non-UTF-8/NUL bytes
+/// open in read-only preview rather than allowing lossy or truncated saves.
+pub fn inspect_file_for_editor(path: String, bytes: &[u8], total_size: Option<u64>) -> LoadedFile {
+    let oversized = total_size.is_some_and(|sz| sz > MAX_EDITABLE_FILE_BYTES)
+        || (bytes.len() as u64) > MAX_EDITABLE_FILE_BYTES;
+    if oversized {
+        let preview_bytes = &bytes[..bytes.len().min(MAX_EDITABLE_FILE_BYTES as usize)];
+        let preview = if looks_textual(preview_bytes) {
+            String::from_utf8_lossy(preview_bytes).to_string()
+        } else {
+            format!(
+                "[Binary preview omitted — {} bytes shown out of {} bytes. Use Download to save locally.]",
+                preview_bytes.len(),
+                total_size.unwrap_or(bytes.len() as u64)
+            )
+        };
+        let reason = match total_size {
+            Some(sz) => format!(
+                "Read-only preview: file is {} bytes (exceeds 256 KiB editor limit). Use Download to edit locally.",
+                sz
+            ),
+            None => "Read-only preview: file exceeds 256 KiB editor limit. Use Download to edit locally.".into(),
+        };
+        return LoadedFile {
+            path,
+            text: preview,
+            read_only: true,
+            read_only_reason: Some(reason),
+            total_size,
+        };
+    }
+    if !looks_textual(bytes) {
+        return LoadedFile {
+            path,
+            text: format!(
+                "[Binary file ({} bytes) — cannot be edited as UTF-8 text. Use Download to save locally.]",
+                bytes.len()
+            ),
+            read_only: true,
+            read_only_reason: Some(
+                "Read-only preview: binary file (contains NUL bytes). Use Download instead.".into(),
+            ),
+            total_size: total_size.or(Some(bytes.len() as u64)),
+        };
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(valid) => LoadedFile {
+            path,
+            text: valid.to_string(),
+            read_only: false,
+            read_only_reason: None,
+            total_size: total_size.or(Some(bytes.len() as u64)),
+        },
+        Err(_) => LoadedFile {
+            path,
+            text: String::from_utf8_lossy(bytes).to_string(),
+            read_only: true,
+            read_only_reason: Some(
+                "Read-only preview: file is not valid UTF-8. Editing is disabled to prevent byte corruption; use Download instead.".into(),
+            ),
+            total_size: total_size.or(Some(bytes.len() as u64)),
+        },
+    }
+}
+
+/// True when an account/session error means the saved refresh token is no
+/// longer valid and the controller should return to the Login screen.
+pub fn auth_error_requires_login(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("grant") {
+        return false;
+    }
+    lower.contains("sign in first")
+        || lower.contains("sign in again")
+        || lower.contains("refresh token")
+        || lower.contains("session expired")
+        || lower.contains("invalid refresh")
+        || lower.contains("authentication failed: invalid token")
+        || lower.contains("authentication failed: token expired")
+        || lower.contains("authentication failed: session")
+}
+
+/// Per-node local `SignedGrant` status shown in the Machines view (`DESK-10`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalGrantBadge {
+    Active { summary: String, policy: String },
+    Expired { summary: String },
+    GranteeMismatch { summary: String },
+    Missing,
+    Error(String),
+}
+
+/// Inspect `<config_dir>/grants/<node_id>.json` and verify `grantee_id` against
+/// the local controller identity so another device's grant never displays as Active.
+pub fn inspect_local_grant(
+    config_dir: &std::path::Path,
+    node_id: &str,
+    controller_id: Option<&str>,
+) -> LocalGrantBadge {
+    let now = agentlink_core::util::unix_now();
+    match agentlink_core::grant::load_grant(config_dir, node_id) {
+        Ok(Some(grant)) => {
+            let status = agentlink_core::grant::grant_status(
+                &grant,
+                Some(node_id),
+                controller_id,
+                now,
+            );
+            let label = agentlink_core::grant::format_grant_status(
+                &grant,
+                Some(node_id),
+                controller_id,
+                now,
+            );
+            match status {
+                agentlink_core::grant::GrantStatus::Active => LocalGrantBadge::Active {
+                    summary: label,
+                    policy: grant.policy.capability_summary(),
+                },
+                agentlink_core::grant::GrantStatus::Expired
+                | agentlink_core::grant::GrantStatus::NotYetValid => {
+                    LocalGrantBadge::Expired { summary: label }
+                }
+                agentlink_core::grant::GrantStatus::GranteeMismatch
+                | agentlink_core::grant::GrantStatus::NodeMismatch => {
+                    LocalGrantBadge::GranteeMismatch { summary: label }
+                }
+            }
+        }
+        Ok(None) => LocalGrantBadge::Missing,
+        Err(err) => LocalGrantBadge::Error(err.to_string()),
+    }
 }
 
 pub fn child_path(parent: &str, name: &str) -> String {
@@ -1088,5 +1313,53 @@ mod tests {
         let (one, outer) = connect_card_layout(250.0, 4);
         assert_eq!(one, 1);
         assert!(outer <= 250.0);
+    }
+
+    #[test]
+    fn enroll_commands_interpolate_relay_and_trust_without_example_domain() {
+        let (unix, ps) = enroll_commands(
+            "wss://relay.acme.test:7443",
+            "sha256:abcd",
+            "",
+            "tok'1",
+            "my box",
+            "full",
+        );
+        assert!(!unix.contains("relay.example.com"), "{unix}");
+        assert!(unix.contains("https://relay.acme.test:7443/install.sh"), "{unix}");
+        assert!(unix.contains("--relay 'wss://relay.acme.test:7443'"), "{unix}");
+        assert!(unix.contains("--pin 'sha256:abcd'"), "{unix}");
+        assert!(unix.contains("--token 'tok'\\''1'"), "{unix}");
+        assert!(!ps.contains("relay.example.com"), "{ps}");
+        assert!(ps.contains("https://relay.acme.test:7443/install.ps1"), "{ps}");
+        assert!(ps.contains("-Relay 'wss://relay.acme.test:7443'"), "{ps}");
+        assert!(ps.contains("-Pin 'sha256:abcd'"), "{ps}");
+        assert!(ps.contains("-Token 'tok''1'"), "{ps}");
+    }
+
+    #[test]
+    fn inspect_file_for_editor_marks_oversized_and_non_utf8_read_only() {
+        let ok = inspect_file_for_editor("a.txt".into(), b"hello\nworld", Some(11));
+        assert!(!ok.read_only);
+        assert_eq!(ok.text, "hello\nworld");
+
+        let big = inspect_file_for_editor("big.log".into(), b"prefix", Some(MAX_EDITABLE_FILE_BYTES + 1));
+        assert!(big.read_only);
+        assert!(big.read_only_reason.unwrap().contains("256 KiB"));
+
+        let bad_utf8 = inspect_file_for_editor("latin1.txt".into(), &[0xff, 0xfe, b'a'], Some(3));
+        assert!(bad_utf8.read_only);
+        assert!(bad_utf8.read_only_reason.unwrap().contains("UTF-8"));
+
+        let binary = inspect_file_for_editor("bin.dat".into(), b"ELF\0\x01", Some(5));
+        assert!(binary.read_only);
+        assert!(binary.read_only_reason.unwrap().contains("binary"));
+    }
+
+    #[test]
+    fn auth_error_requires_login_excludes_grant_denials() {
+        assert!(auth_error_requires_login("refresh token expired; sign in again"));
+        assert!(auth_error_requires_login("Sign in first."));
+        assert!(!auth_error_requires_login("grant expired at unix 1234"));
     }
 }

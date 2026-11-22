@@ -4,13 +4,15 @@
 //! [`super::worker`] on the same client the phone uses. Visual tokens live in
 //! [`super::theme`].
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentlink_core::{NodeInfo, NodePolicy};
+use agentlink_core::{Identity, NodeInfo, NodePolicy};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -22,16 +24,15 @@ use super::chrome::{
 };
 use super::model::{
     self, access_summary, card_buttons, connection_label, display_note, has_saved_session,
-    node_presence_label, Action, CardButtonKind,
+    node_presence_label, Action, CardButtonKind, LocalGrantBadge,
 };
 use super::term::Emulator;
 use super::theme;
 use super::viewport::{
-    content_rect_excluding_pad, content_uv_excluding_pad, hit_content, native_zoom, viewport_rect,
+    content_rect_excluding_pad, content_uv_excluding_pad, hit_content, native_zoom_for_dpi,
+    viewport_rect,
 };
-use super::worker::{Cmd, LiveHud, MonitorEntry, Picture, Shared, UiEvent};
-
-use std::collections::HashSet;
+use super::worker::{Cmd, LiveHud, MonitorEntry, Shared, UiEvent};
 
 /// Rect recorded from a real egui `Response` / layout pass (`[x, y, w, h]`).
 #[derive(Clone, Debug, Default)]
@@ -253,6 +254,97 @@ enum Screen {
 struct Editor {
     path: String,
     text: String,
+    saved_text: String,
+    read_only: bool,
+    read_only_reason: Option<String>,
+    total_size: Option<u64>,
+}
+
+impl Editor {
+    fn editable(path: String, text: String) -> Self {
+        let len = text.len() as u64;
+        Self {
+            path,
+            saved_text: text.clone(),
+            text,
+            read_only: false,
+            read_only_reason: None,
+            total_size: Some(len),
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        !self.read_only && self.text != self.saved_text
+    }
+}
+
+struct ParkedTerminal {
+    emulator: Emulator,
+    size: (u16, u16),
+    gen: u64,
+    open: Option<Instant>,
+    got_output: bool,
+    alive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnrollTab {
+    Unix,
+    PowerShell,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeskScaleMode {
+    Auto,
+    Native100,
+    Scale75,
+    Scale50,
+}
+
+impl DeskScaleMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (fit)",
+            Self::Native100 => "100% Native",
+            Self::Scale75 => "75%",
+            Self::Scale50 => "50%",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PendingFileNav {
+    OpenFile { node: String, path: String, size: Option<u64> },
+    OpenDir { node: String, path: String },
+    CloseEditor,
+    LeaveFiles,
+    SwitchNode(NodeInfo),
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ControllerPrefs {
+    #[serde(default)]
+    allow_osc52: bool,
+    #[serde(default)]
+    desk_clipboard_sync: bool,
+    #[serde(default)]
+    font_hint_dismissed: bool,
+}
+
+fn load_controller_prefs(config_dir: &std::path::Path) -> ControllerPrefs {
+    let path = config_dir.join("controller-prefs.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_controller_prefs(config_dir: &std::path::Path, prefs: &ControllerPrefs) {
+    let _ = std::fs::create_dir_all(config_dir);
+    let path = config_dir.join("controller-prefs.json");
+    if let Ok(json) = serde_json::to_string_pretty(prefs) {
+        let _ = std::fs::write(&path, json);
+    }
 }
 
 pub struct ControllerApp {
@@ -277,10 +369,21 @@ pub struct ControllerApp {
     trust: String,
     user: Option<String>,
     nodes: Vec<NodeInfo>,
-    control: std::collections::HashMap<String, bool>,
+    /// True once the first `UiEvent::Nodes` response has arrived so a 0-node
+    /// account stops the `"Loading machines..."` spinner cleanly (`DESK-09`).
+    nodes_loaded: bool,
+    control: HashMap<String, bool>,
     error: String,
     notice: String,
     pins: Vec<String>,
+    /// Persisted user preferences (`allow_osc52`, `desk_clipboard_sync`, `font_hint_dismissed`).
+    prefs: ControllerPrefs,
+    /// Local controller Ed25519 public identity hex (for grant grantee verification & offer UI).
+    controller_id: Option<String>,
+    /// Paste buffer for importing a SignedGrant JSON or GrantOffer on Machine Detail.
+    grant_paste_input: String,
+    /// Backgrounded live terminal sessions keyed by node id (`DESK-10`).
+    term_parked: HashMap<String, ParkedTerminal>,
     terminal: Emulator,
     term_size: (u16, u16),
     /// Monotonic generation tag isolating events of the active shell from
@@ -293,13 +396,19 @@ pub struct ControllerApp {
     term_got_output: bool,
     term_alive: bool,
     file_path: String,
+    file_path_input: String,
     files: Vec<agentlink_core::DirEntry>,
     files_loading: bool,
     editor: Option<Editor>,
     folder_name: String,
     new_file_name: String,
+    file_upload_local: String,
+    file_download_dir: String,
+    /// Delete confirmation modal `(node_id, remote_path)` (`DESK-02`).
+    file_pending_delete: Option<(String, String)>,
+    /// Unsaved-changes confirmation modal (`DESK-02`).
+    file_pending_nav: Option<PendingFileNav>,
     link: String,
-    picture: Option<Picture>,
     texture: Option<egui::TextureHandle>,
     seen_seq: u64,
     enroll_open: bool,
@@ -307,13 +416,20 @@ pub struct ControllerApp {
     enroll_access: String,
     enroll_minutes: String,
     enroll_out: String,
+    enroll_out_ps: String,
+    enroll_token: String,
+    enroll_tab: EnrollTab,
     node_line: String,
     autostart: bool,
     last_node: Instant,
+    /// Async node-status / autostart poll slot so `pump()` never blocks the render thread (`DESK-11`).
+    bg_status: Arc<Mutex<Option<(String, bool)>>>,
+    bg_status_busy: Arc<AtomicBool>,
     // Remote desktop pane.
     desk_monitors: Vec<MonitorEntry>,
     desk_monitor: u32,
     desk_quality: u32,
+    desk_scale_mode: DeskScaleMode,
     desk_zoom: f32,
     desk_pan: egui::Vec2,
     desk_fit: bool,
@@ -329,7 +445,15 @@ pub struct ControllerApp {
     desk_last_move: Instant,
     desk_last_frame: Option<Instant>,
     desk_hud: LiveHud,
-    desk_await_paste: bool,
+    /// Cached remote cursor sprite texture keyed by `DeskCursor::rev` (`DESK-11`).
+    desk_cursor_tex: Option<(u64, egui::TextureHandle)>,
+    /// Tracks whether `ViewportCommand::IMEAllowed(true)` is currently active on Desktop (`DESK-01`).
+    desk_ime_allowed: bool,
+    /// Armed while Ctrl+Alt+Shift is held cleanly so releasing it ungrabs keyboard (`DESK-12`).
+    desk_ungrab_armed: bool,
+    /// Bounded frame countdown for one-shot `RequestPaste` (auto-expires if
+    /// local clipboard is empty/non-text so it never latches forever, `DESK-12`).
+    desk_await_paste_frames: u8,
     /// Ordered input adapter (mods / pointer / wheel / held) — STD core.
     desk_adapter: super::input_adapter::AdapterState,
     /// User hit Disconnect (or a fatal connect error); stay on the session page.
@@ -441,12 +565,18 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
     };
     let mut tray_ready = false;
     if opts.tray && !opts.mock {
-        tray_ready = super::indicator::spawn(Arc::clone(&flags.open), Arc::clone(&flags.quit));
+        tray_ready = super::indicator::spawn(
+            Arc::clone(&flags.open),
+            Arc::clone(&flags.quit),
+            opts.data_dir.clone(),
+            shared.egui_ctx_slot(),
+        );
         if !tray_ready {
             opts.background = false;
         }
     }
     let hide_on_close = model::hides_window_on_close(tray_ready, opts.background, false);
+    let egui_shared = Arc::clone(&shared);
     let mut app = ControllerApp::new_debug(
         tx,
         shared,
@@ -485,7 +615,8 @@ pub fn enter_with_opts(mut opts: EnterOpts) -> i32 {
     match eframe::run_native(
         "agentlink",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
+            egui_shared.set_egui_ctx(cc.egui_ctx.clone());
             theme::apply(&cc.egui_ctx);
             theme::apply_platform_zoom(&cc.egui_ctx);
             Ok(Box::new(app))
@@ -514,31 +645,61 @@ impl ControllerApp {
         preview_ui: bool,
         live: super::LiveHooks,
     ) -> Self {
-        let (relay, pin, trust, node_line, autostart, saved_session) = if preview_ui {
-            (
-                String::new(),
-                String::new(),
-                String::new(),
-                super::PREVIEW_NODE_LINE.to_string(),
-                false,
-                false,
-            )
-        } else {
-            let file = agentlink_core::config::load_file(&config_dir).unwrap_or_default();
-            let relay = file
-                .relay
-                .filter(|value| !value.is_empty())
-                .unwrap_or_default();
-            let pin = file.fingerprint.unwrap_or_default();
-            let trust = file.trust.unwrap_or_default();
-            let node_line = node_summary(&live, &data_dir, &config_dir);
-            let autostart = live.start_on_login();
-            let saved_session = {
+        let (relay, pin, trust, node_line, autostart, saved_session, prefs, controller_id) =
+            if preview_ui {
+                (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    super::PREVIEW_NODE_LINE.to_string(),
+                    false,
+                    false,
+                    ControllerPrefs::default(),
+                    None,
+                )
+            } else {
                 let file = agentlink_core::config::load_file(&config_dir).unwrap_or_default();
-                has_saved_session(file.refresh_token.as_deref())
+                // Pre-fill relay from AGENTLINK_RELAY when saved config has no relay (`DESK-09`).
+                let relay = file
+                    .relay
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        std::env::var("AGENTLINK_RELAY")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                    })
+                    .unwrap_or_default();
+                let pin = file.fingerprint.unwrap_or_default();
+                let trust = file.trust.unwrap_or_default();
+                let node_line = node_summary(&live, &data_dir, &config_dir);
+                let autostart = live.start_on_login();
+                let saved_session = has_saved_session(file.refresh_token.as_deref());
+                let prefs = load_controller_prefs(&config_dir);
+                let controller_id = Identity::load(&config_dir.join("identity.json"))
+                    .ok()
+                    .map(|id| id.public_hex().to_ascii_lowercase());
+                (
+                    relay,
+                    pin,
+                    trust,
+                    node_line,
+                    autostart,
+                    saved_session,
+                    prefs,
+                    controller_id,
+                )
             };
-            (relay, pin, trust, node_line, autostart, saved_session)
-        };
+        let terminal = Emulator::new(24, 80);
+        terminal.set_allow_osc52(prefs.allow_osc52);
+        if !preview_ui && prefs.desk_clipboard_sync {
+            let _ = tx.send(Cmd::ClipboardSync { enabled: true });
+        }
+        let default_download_dir = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .to_string_lossy()
+            .into_owned();
         Self {
             tx,
             shared,
@@ -557,17 +718,22 @@ impl ControllerApp {
             totp: String::new(),
             ask_totp: false,
             show_password: false,
-            advanced: !pin.is_empty() || trust_is_custom(&trust) || !relay.is_empty(),
+            advanced: !pin.is_empty() || trust_is_custom(&trust),
             relay,
             pin,
             trust,
             user: None,
             nodes: Vec::new(),
-            control: std::collections::HashMap::new(),
+            nodes_loaded: false,
+            control: HashMap::new(),
             error: String::new(),
             notice: String::new(),
             pins: Vec::new(),
-            terminal: Emulator::new(24, 80),
+            prefs,
+            controller_id,
+            grant_paste_input: String::new(),
+            term_parked: HashMap::new(),
+            terminal,
             term_size: (24, 80),
             term_gen: 0,
             term_node_id: None,
@@ -576,13 +742,17 @@ impl ControllerApp {
             term_got_output: false,
             term_alive: false,
             file_path: ".".into(),
+            file_path_input: ".".into(),
             files: Vec::new(),
             files_loading: false,
             editor: None,
             folder_name: String::new(),
             new_file_name: String::new(),
+            file_upload_local: String::new(),
+            file_download_dir: default_download_dir,
+            file_pending_delete: None,
+            file_pending_nav: None,
             link: "relay".into(),
-            picture: None,
             texture: None,
             seen_seq: 0,
             enroll_open: false,
@@ -590,12 +760,22 @@ impl ControllerApp {
             enroll_access: "exec".into(),
             enroll_minutes: "15".into(),
             enroll_out: String::new(),
+            enroll_out_ps: String::new(),
+            enroll_token: String::new(),
+            enroll_tab: if cfg!(windows) {
+                EnrollTab::PowerShell
+            } else {
+                EnrollTab::Unix
+            },
             node_line,
             autostart,
             last_node: Instant::now(),
+            bg_status: Arc::new(Mutex::new(None)),
+            bg_status_busy: Arc::new(AtomicBool::new(false)),
             desk_monitors: Vec::new(),
             desk_monitor: 0,
             desk_quality: 70,
+            desk_scale_mode: DeskScaleMode::Auto,
             desk_zoom: 1.0,
             desk_pan: egui::Vec2::ZERO,
             desk_fit: true,
@@ -609,7 +789,10 @@ impl ControllerApp {
             desk_last_move: Instant::now() - Duration::from_secs(1),
             desk_last_frame: None,
             desk_hud: LiveHud::default(),
-            desk_await_paste: false,
+            desk_cursor_tex: None,
+            desk_ime_allowed: false,
+            desk_ungrab_armed: false,
+            desk_await_paste_frames: 0,
             desk_adapter: super::input_adapter::AdapterState::default(),
             desk_user_stopped: false,
             desk_disconnect_reason: String::new(),
@@ -673,37 +856,74 @@ impl ControllerApp {
         let _ = self.tx.send(cmd);
     }
 
-    fn pump(&mut self, ctx: &egui::Context) {
-        if self.last_node.elapsed() > Duration::from_secs(2) {
-            self.last_node = Instant::now();
-            if !self.preview_ui {
-                self.node_line = node_summary(&self.live, &self.data_dir, &self.config_dir);
-                self.autostart = self.live.start_on_login();
+    fn poll_bg_status(&mut self) {
+        if let Ok(mut slot) = self.bg_status.try_lock() {
+            if let Some((node_line, autostart)) = slot.take() {
+                self.node_line = node_line;
+                self.autostart = autostart;
             }
         }
+        if !self.preview_ui
+            && !self.mock
+            && self.last_node.elapsed() > Duration::from_secs(5)
+            && !self.bg_status_busy.swap(true, Ordering::AcqRel)
+        {
+            self.last_node = Instant::now();
+            let live = self.live.clone();
+            let data_dir = self.data_dir.clone();
+            let config_dir = self.config_dir.clone();
+            let out = Arc::clone(&self.bg_status);
+            let busy = Arc::clone(&self.bg_status_busy);
+            let shared = Arc::clone(&self.shared);
+            let _ = std::thread::Builder::new()
+                .name("agentlink-ctrl-status".into())
+                .spawn(move || {
+                    let node_line = node_summary(&live, &data_dir, &config_dir);
+                    let autostart = live.start_on_login();
+                    if let Ok(mut slot) = out.lock() {
+                        *slot = Some((node_line, autostart));
+                    }
+                    busy.store(false, Ordering::Release);
+                    shared.request_repaint();
+                });
+        }
+    }
+
+    fn pump(&mut self, ctx: &egui::Context) {
+        self.poll_bg_status();
         for event in self.shared.drain() {
             match event {
                 UiEvent::Ready { user } => {
                     self.user = user.clone();
                     if user.is_some() {
+                        if !self.preview_ui && self.controller_id.is_none() {
+                            self.controller_id =
+                                Identity::load(&self.config_dir.join("identity.json"))
+                                    .ok()
+                                    .map(|id| id.public_hex().to_ascii_lowercase());
+                        }
                         if matches!(self.screen, Screen::Login | Screen::Restoring) {
                             self.screen = Screen::Machines;
                         }
                         self.password.clear();
                         self.totp.clear();
                     } else {
+                        self.nodes.clear();
+                        self.nodes_loaded = false;
+                        self.term_parked.clear();
                         self.term_gen = self.term_gen.wrapping_add(1);
                         self.term_node_id = None;
                         self.term_open = None;
                         self.term_alive = false;
                         self.clear_stale_terminal_notice();
-                        if matches!(self.screen, Screen::Restoring | Screen::Login) {
+                        if !self.preview_ui {
                             self.screen = Screen::Login;
                         }
                     }
                 }
                 UiEvent::Nodes(nodes) => {
                     self.nodes = nodes;
+                    self.nodes_loaded = true;
                     self.ensure_selection();
                     self.maybe_auto_open_desktop();
                 }
@@ -723,7 +943,26 @@ impl ControllerApp {
                         self.release_remote_input();
                         self.desk_input_blocked = true;
                     }
-                    if matches!(self.screen, Screen::Restoring) {
+                    if !self.preview_ui
+                        && !self.mock
+                        && model::auth_error_requires_login(&message)
+                    {
+                        self.release_remote_input();
+                        self.send(Cmd::LiveStop);
+                        self.send(Cmd::PtyClose);
+                        let parked_gens: Vec<u64> =
+                            self.term_parked.drain().map(|(_, p)| p.gen).collect();
+                        for gen in parked_gens {
+                            self.send(Cmd::PtyCloseGen { gen });
+                        }
+                        self.term_alive = false;
+                        self.term_open = None;
+                        self.user = None;
+                        self.nodes.clear();
+                        self.nodes_loaded = false;
+                        self.screen = Screen::Login;
+                        self.error = message;
+                    } else if matches!(self.screen, Screen::Restoring) {
                         self.screen = Screen::Login;
                         self.error = message;
                     } else if matches!(self.screen, Screen::Desktop { .. }) {
@@ -762,11 +1001,26 @@ impl ControllerApp {
                         if !replies.is_empty() {
                             self.send(Cmd::PtyWrite { data: replies });
                         }
+                    } else if let Some(parked) =
+                        self.term_parked.values_mut().find(|p| p.gen == gen)
+                    {
+                        if !bytes.is_empty() {
+                            parked.got_output = true;
+                            parked.open = None;
+                            parked.alive = true;
+                        }
+                        parked.emulator.feed(&bytes);
+                        let _ = parked.emulator.take_writes();
                     }
                 }
                 UiEvent::PtyExited { gen, code } => {
                     if gen == self.term_gen {
                         self.notice = format!("Shell exited ({code})");
+                    } else if let Some(parked) =
+                        self.term_parked.values_mut().find(|p| p.gen == gen)
+                    {
+                        parked.alive = false;
+                        parked.open = None;
                     }
                 }
                 UiEvent::PtyFailed { gen, message } => {
@@ -774,6 +1028,11 @@ impl ControllerApp {
                         self.term_open = None;
                         self.term_alive = false;
                         self.error = message;
+                    } else if let Some(parked) =
+                        self.term_parked.values_mut().find(|p| p.gen == gen)
+                    {
+                        parked.open = None;
+                        parked.alive = false;
                     }
                 }
                 UiEvent::PtyDone { gen } => {
@@ -787,18 +1046,39 @@ impl ControllerApp {
                             self.error =
                                 "The shell session ended before any output arrived.".into();
                         }
+                    } else if let Some(parked) =
+                        self.term_parked.values_mut().find(|p| p.gen == gen)
+                    {
+                        parked.open = None;
+                        parked.alive = false;
                     }
                 }
                 UiEvent::Dir { path, entries } => {
-                    self.file_path = path;
+                    self.file_path = path.clone();
+                    self.file_path_input = path;
                     self.files = entries;
                     self.files_loading = false;
                     self.forget_missing_editor();
                 }
-                UiEvent::File { path, text } => {
-                    self.editor = Some(Editor { path, text });
+                UiEvent::File(loaded) => {
+                    self.editor = Some(Editor {
+                        path: loaded.path,
+                        saved_text: loaded.text.clone(),
+                        text: loaded.text,
+                        read_only: loaded.read_only,
+                        read_only_reason: loaded.read_only_reason,
+                        total_size: loaded.total_size,
+                    });
                 }
-                UiEvent::Enrolled(text) => self.enroll_out = text,
+                UiEvent::Enrolled {
+                    unix,
+                    powershell,
+                    token,
+                } => {
+                    self.enroll_out = unix;
+                    self.enroll_out_ps = powershell;
+                    self.enroll_token = token;
+                }
                 UiEvent::Link(label) => self.link = label,
                 UiEvent::Pins(pins) => self.pins = pins,
                 UiEvent::Monitors(monitors) => {
@@ -875,27 +1155,23 @@ impl ControllerApp {
                 self.desk_last_frame = Some(Instant::now());
                 self.desk_connect_started = None;
                 self.desk_connect_failed = false;
-                // Only retain a debug snapshot when a screenshot may be needed —
-                // cloning full RGBA every frame was a third present-path copy.
+                // Only retain a debug snapshot when a screenshot may be needed.
                 if self.debug_inbox.is_some() {
                     self.debug_rgba = Some((w as u32, h as u32, rgba.clone()));
                 }
-                self.picture = Some(Picture {
-                    rgba,
-                    width: w,
-                    height: h,
-                    kind: picture.kind,
-                    path: picture.path,
-                    seq: picture.seq,
-                });
+                // Recycle the RGBA buffer back to the decoder pool instead of
+                // keeping a dead 4-33 MiB `self.picture` copy (`DESK-11`).
+                self.shared.recycle_rgba(rgba);
                 got_frame = true;
                 ctx.request_repaint();
+            } else {
+                self.shared.recycle_rgba(picture.rgba);
             }
         }
         self.check_connect_timeout();
         self.sync_window_title(ctx);
         self.maybe_write_perf_log();
-        if self.desk_await_paste {
+        if self.desk_await_paste_frames > 0 {
             let pasted = ctx.input(|input| {
                 input.events.iter().find_map(|event| match event {
                     egui::Event::Paste(text) => Some(text.clone()),
@@ -903,25 +1179,47 @@ impl ControllerApp {
                 })
             });
             if let Some(text) = pasted {
-                self.desk_await_paste = false;
+                self.desk_await_paste_frames = 0;
                 if let Screen::Desktop { id, .. } = &self.screen {
                     let id = id.clone();
                     if !text.is_empty() {
                         self.send(Cmd::Clipboard { node: id, text });
+                    } else {
+                        self.desk_toast = Some(("Local clipboard is empty.".into(), Instant::now()));
                     }
+                }
+            } else {
+                self.desk_await_paste_frames -= 1;
+                if self.desk_await_paste_frames == 0 {
+                    self.desk_toast = Some((
+                        "Local clipboard is empty or not text.".into(),
+                        Instant::now(),
+                    ));
+                } else {
+                    ctx.request_repaint();
                 }
             }
         }
-        // Follow frame arrivals; idle connecting still needs a slow poll.
+        // Event-driven repaints (`DESK-11`): `Shared` calls `ctx.request_repaint()`
+        // on every frame, cursor, and UI event. Only schedule a slow timer when an
+        // active UI animation/timeout needs wall-clock ticks (never burn 12.5fps idle!).
         if !got_frame {
-            let after = if matches!(self.screen, Screen::Desktop { .. })
-                && self.desk_last_frame.is_some()
+            if self.mock && matches!(self.screen, Screen::Desktop { .. }) && !self.desk_user_stopped
             {
-                Duration::from_millis(33)
-            } else {
-                Duration::from_millis(80)
-            };
-            ctx.request_repaint_after(after);
+                ctx.request_repaint_after(Duration::from_millis(33));
+            } else if self.desk_connect_started.is_some()
+                || self.term_open.is_some()
+                || self.desk_toast.is_some()
+                || self.files_loading
+                || matches!(self.screen, Screen::Restoring)
+                || (matches!(self.screen, Screen::Machines)
+                    && !self.nodes_loaded
+                    && self.user.is_some())
+            {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            } else if matches!(self.screen, Screen::Desktop { .. }) && self.desk_fullscreen {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
         }
     }
 
@@ -973,11 +1271,66 @@ impl ControllerApp {
         }
     }
 
+    fn park_active_terminal(&mut self) {
+        let Some(prev_id) = self.term_node_id.take() else {
+            return;
+        };
+        if self.term_alive || self.term_open.is_some() {
+            let replacement = Emulator::new(self.term_size.0, self.term_size.1);
+            replacement.set_allow_osc52(self.prefs.allow_osc52);
+            let old = std::mem::replace(&mut self.terminal, replacement);
+            self.term_parked.insert(
+                prev_id,
+                ParkedTerminal {
+                    emulator: old,
+                    size: self.term_size,
+                    gen: self.term_gen,
+                    open: self.term_open.take(),
+                    got_output: self.term_got_output,
+                    alive: self.term_alive,
+                },
+            );
+            self.term_alive = false;
+            self.term_got_output = false;
+        }
+    }
+
+    fn close_active_terminal(&mut self) {
+        let gen = self.term_gen;
+        if let Some(id) = self.term_node_id.take() {
+            self.term_parked.remove(&id);
+        }
+        self.term_gen = self.term_gen.wrapping_add(1);
+        self.term_open = None;
+        self.term_alive = false;
+        self.term_got_output = false;
+        self.clear_stale_terminal_notice();
+        if gen != 0 {
+            self.send(Cmd::PtyCloseGen { gen });
+        }
+    }
+
     fn start_terminal_session(&mut self, node: &NodeInfo) {
+        // Close any existing session for this same node (e.g. Restart shell),
+        // while parking any live session belonging to a different node (`DESK-10`).
+        if self.term_node_id.as_deref() == Some(node.id.as_str()) {
+            let old_gen = self.term_gen;
+            if old_gen != 0 && (self.term_alive || self.term_open.is_some()) {
+                self.send(Cmd::PtyCloseGen { gen: old_gen });
+            }
+        } else {
+            self.park_active_terminal();
+            if let Some(old) = self.term_parked.remove(&node.id) {
+                if old.gen != 0 && (old.alive || old.open.is_some()) {
+                    self.send(Cmd::PtyCloseGen { gen: old.gen });
+                }
+            }
+        }
         self.term_gen = self.term_gen.wrapping_add(1);
         let gen = self.term_gen;
         self.term_node_id = Some(node.id.clone());
         self.terminal = Emulator::new(self.term_size.0, self.term_size.1);
+        self.terminal.set_allow_osc52(self.prefs.allow_osc52);
         self.terminal.reset_local_echo(gen);
         self.terminal.focused = true;
         self.term_got_output = false;
@@ -1009,18 +1362,48 @@ impl ControllerApp {
             };
             self.terminal.focused = true;
             self.clear_stale_terminal_notice();
+            self.send(Cmd::PtySelect { gen: self.term_gen });
             if self.term_alive && self.term_open.is_none() {
                 self.send(Cmd::PtyProbe);
             }
             return;
         }
+        if let Some(parked) = self.term_parked.remove(&node.id) {
+            if parked.alive || parked.open.is_some() {
+                self.park_active_terminal();
+                self.terminal = parked.emulator;
+                self.terminal.set_allow_osc52(self.prefs.allow_osc52);
+                self.terminal.focused = true;
+                self.term_size = parked.size;
+                self.term_gen = parked.gen;
+                self.term_node_id = Some(node.id.clone());
+                self.term_open = parked.open;
+                self.term_got_output = parked.got_output;
+                self.term_alive = parked.alive;
+                self.selected_id = Some(node.id.clone());
+                self.screen = Screen::Terminal {
+                    id: node.id.clone(),
+                    name: node.name.clone(),
+                };
+                self.clear_stale_terminal_notice();
+                self.send(Cmd::PtySelect { gen: self.term_gen });
+                if self.term_alive && self.term_open.is_none() {
+                    self.send(Cmd::PtyProbe);
+                }
+                return;
+            }
+        }
         self.start_terminal_session(node);
     }
 
     fn open_files(&mut self, node: &NodeInfo) {
+        self.park_active_terminal();
         self.files.clear();
         self.editor = None;
         self.file_path = ".".into();
+        self.file_path_input = ".".into();
+        self.file_pending_delete = None;
+        self.file_pending_nav = None;
         self.files_loading = true;
         self.error.clear();
         self.send(Cmd::List {
@@ -1165,6 +1548,12 @@ impl ControllerApp {
     }
 
     fn live_scale_for_monitor(&self) -> f32 {
+        match self.desk_scale_mode {
+            DeskScaleMode::Native100 => return 1.0,
+            DeskScaleMode::Scale75 => return 0.75,
+            DeskScaleMode::Scale50 => return 0.50,
+            DeskScaleMode::Auto => {}
+        }
         let (win_w, win_h) = self.logical_size;
         let (src_w, src_h) = self
             .desk_monitors
@@ -1172,9 +1561,9 @@ impl ControllerApp {
             .find(|m| m.index == self.desk_monitor)
             .map(|m| (m.width.max(1) as f32, m.height.max(1) as f32))
             .unwrap_or((1920.0, 1080.0));
-        // Prefer fitting the controller window; also keep a 1280px encode cap so
-        // full-panel 2736×1824 sessions stay realtime on the pixel path.
-        let cap = 1280.0;
+        // Auto mode fits the controller window up to 1920px wide; user can
+        // choose 100% Native in the toolbar Stream/Zoom menu (`DESK-12`).
+        let cap = 1920.0;
         let scale_x = (win_w / src_w).min(cap / src_w).clamp(0.05, 1.0);
         let scale_y = (win_h / src_h).min(cap / src_h).clamp(0.05, 1.0);
         scale_x.min(scale_y).clamp(0.05, 1.0)
@@ -1182,7 +1571,13 @@ impl ControllerApp {
 
     fn reset_desktop_session(&mut self) {
         self.release_remote_input();
-        self.picture = None;
+        self.shared.reset_cursor();
+        self.desk_monitors.clear();
+        self.desk_monitor = 0;
+        self.desk_cursor_tex = None;
+        self.desk_ime_allowed = false;
+        self.desk_ungrab_armed = false;
+        self.desk_await_paste_frames = 0;
         self.texture = None;
         self.seen_seq = 0;
         self.desk_zoom = 1.0;
@@ -1193,7 +1588,6 @@ impl ControllerApp {
         self.desk_send_menu = false;
         self.desk_last_frame = None;
         self.desk_hud = LiveHud::default();
-        self.desk_await_paste = false;
         self.desk_sticky.clear();
         self.desk_user_stopped = false;
         self.desk_disconnect_reason.clear();
@@ -1208,12 +1602,11 @@ impl ControllerApp {
 
     fn back_to_machines(&mut self) {
         self.release_remote_input();
-        self.term_gen = self.term_gen.wrapping_add(1);
-        self.term_node_id = None;
-        self.term_open = None;
-        self.term_alive = false;
+        // Preserve active terminal sessions in `term_parked` so clicking
+        // "Back to machines" does not destroy running remote shells (`DESK-10`).
+        self.park_active_terminal();
         self.clear_stale_terminal_notice();
-        self.send(Cmd::PtyClose);
+        self.send(Cmd::PtySelect { gen: 0 });
         self.send(Cmd::LiveStop);
         if self.desk_fullscreen {
             // Caller must also clear fullscreen via viewport cmd when a ctx is handy.
@@ -1233,7 +1626,8 @@ impl ControllerApp {
 
     fn restart_live(&mut self, node: &str) {
         self.release_remote_input();
-        self.picture = None;
+        self.shared.reset_cursor();
+        self.desk_cursor_tex = None;
         self.texture = None;
         self.seen_seq = 0;
         self.desk_last_frame = None;
@@ -1279,7 +1673,8 @@ impl ControllerApp {
     fn stop_desktop_session(&mut self, reason: &str) {
         self.release_remote_input();
         self.send(Cmd::LiveStop);
-        self.picture = None;
+        self.shared.reset_cursor();
+        self.desk_cursor_tex = None;
         self.texture = None;
         self.seen_seq = 0;
         self.desk_last_frame = None;
@@ -1297,7 +1692,8 @@ impl ControllerApp {
     fn fail_desktop_session(&mut self, reason: &str) {
         self.release_remote_input();
         self.send(Cmd::LiveStop);
-        self.picture = None;
+        self.shared.reset_cursor();
+        self.desk_cursor_tex = None;
         self.texture = None;
         self.seen_seq = 0;
         self.desk_last_frame = None;
@@ -1453,7 +1849,18 @@ impl ControllerApp {
             self.send(Cmd::PtyProbe);
         }
         self.release_keyboard_if_ungated(ctx);
-        if matches!(self.screen, Screen::Terminal { .. }) && self.terminal.focused {
+        if self.desk_ime_allowed
+            && !(matches!(self.screen, Screen::Desktop { .. })
+                && self.desk_capture_keys
+                && !self.desk_input_blocked)
+        {
+            self.desk_ime_allowed = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
+        }
+        if matches!(self.screen, Screen::Terminal { .. })
+            && self.terminal.focused
+            && (self.term_alive || self.term_open.is_some())
+        {
             self.terminal.consume_focused_keys(ctx);
         }
         if self.mock {
@@ -1572,9 +1979,6 @@ impl ControllerApp {
         if !self.notice.is_empty() {
             banner(ui, &self.notice, false);
         }
-        if !super::fonts::report().loaded {
-            ui.label(theme::muted_text(super::fonts::missing_font_hint()));
-        }
     }
 
     fn paint_page(&mut self, ui: &mut egui::Ui) {
@@ -1681,19 +2085,27 @@ impl ControllerApp {
 
     fn login(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width().min(400.0);
+        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut submit = false;
         ui.vertical_centered(|ui| {
             ui.set_max_width(width);
             ui.add_space(theme::SPACE_XL);
             ui.label(theme::title_text("Sign in"));
             ui.add_space(theme::SPACE_SM);
             ui.label(theme::body_text(
-                "Username and password. Set the relay URL; nothing is selected for you.",
+                "Username, password, and relay URL. Nothing is selected for you.",
             ));
             ui.label(theme::muted_text(
                 "The sign-in stays for 30 days of use, same as the phone. An authenticator code appears when the account uses one.",
             ));
             ui.add_space(theme::SPACE_MD);
-            labeled(ui, "Username", &mut self.username, false);
+            if labeled(ui, "Relay URL", &mut self.relay, false).lost_focus() && enter_pressed {
+                submit = true;
+            }
+            ui.add_space(theme::SPACE_SM);
+            if labeled(ui, "Username", &mut self.username, false).lost_focus() && enter_pressed {
+                submit = true;
+            }
             ui.add_space(theme::SPACE_SM);
             ui.label(theme::muted_text("Password"));
             ui.horizontal(|ui| {
@@ -1712,7 +2124,9 @@ impl ControllerApp {
                     .desired_width((ui.available_width() - btn_w - theme::SPACE_SM).max(80.0))
                     .min_size(egui::vec2(0.0, theme::BTN_PRIMARY_H))
                     .margin(egui::Margin::symmetric(theme::BTN_PAD_X as i8, v));
-                style_text_edit(ui, edit);
+                if style_text_edit(ui, edit).lost_focus() && enter_pressed {
+                    submit = true;
+                }
                 if ui
                     .add_sized(
                         [btn_w, theme::BTN_PRIMARY_H],
@@ -1729,30 +2143,42 @@ impl ControllerApp {
             });
             if self.ask_totp || !self.totp.is_empty() {
                 ui.add_space(theme::SPACE_SM);
-                labeled(ui, "Authenticator code", &mut self.totp, false);
+                if labeled(ui, "Authenticator code", &mut self.totp, false).lost_focus()
+                    && enter_pressed
+                {
+                    submit = true;
+                }
             }
             ui.add_space(theme::SPACE_MD);
             if ui
                 .add_sized([width, theme::BTN_PRIMARY_H], theme::primary_button("Sign in"))
                 .clicked()
             {
-                self.submit_login();
+                submit = true;
             }
             ui.add_space(theme::SPACE_MD);
             let advanced = egui::CollapsingHeader::new(theme::muted_text("Advanced"))
                 .default_open(self.advanced)
                 .show(ui, |ui| {
                     ui.label(theme::muted_text(
-                        "Relay address, certificate pin, and trust. Pair a machine after you sign in.",
+                        "Certificate pin and TLS trust. Pair a machine after you sign in.",
                     ));
-                    labeled(ui, "Relay URL", &mut self.relay, false);
-                    labeled(ui, "Certificate pin", &mut self.pin, false);
-                    labeled(
+                    if labeled(ui, "Certificate pin", &mut self.pin, false).lost_focus()
+                        && enter_pressed
+                    {
+                        submit = true;
+                    }
+                    if labeled(
                         ui,
                         "Trust (system, webpki, or system+webpki)",
                         &mut self.trust,
                         false,
-                    );
+                    )
+                    .lost_focus()
+                        && enter_pressed
+                    {
+                        submit = true;
+                    }
                     ui.label(theme::muted_text(
                         "Leave the pin empty only when this relay uses public roots (system or webpki). Otherwise pin sha256:, spki:sha256:, or intermediate:sha256:.",
                     ));
@@ -1765,6 +2191,9 @@ impl ControllerApp {
                 ui.clip_rect(),
             );
         });
+        if submit {
+            self.submit_login();
+        }
     }
 
     fn submit_login(&mut self) {
@@ -1810,6 +2239,7 @@ impl ControllerApp {
 
         let loading = self.nodes.is_empty()
             && self.user.is_some()
+            && !self.nodes_loaded
             && (link_is_connecting(&self.link) || self.link == "relay");
         let rail = self.rail_visible_for(ui.ctx());
         let clip = ui.clip_rect();
@@ -1820,8 +2250,10 @@ impl ControllerApp {
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
                 |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.spinner();
-                        ui.add_space(theme::SPACE_SM);
+                        if loading {
+                            ui.spinner();
+                            ui.add_space(theme::SPACE_SM);
+                        }
                         ui.label(theme::muted_text(if loading {
                             "Loading machines…"
                         } else {
@@ -1893,6 +2325,7 @@ impl ControllerApp {
         self.autostart = false;
         self.user = Some("Preview (not signed in)".into());
         self.nodes = model::preview_fixture_nodes();
+        self.nodes_loaded = true;
         self.selected_id = self.nodes.first().map(|n| n.id.clone());
         self.screen = Screen::Machines;
         self.link = "isolated preview".into();
@@ -1958,6 +2391,10 @@ impl ControllerApp {
             }
             _ => false,
         };
+        let has_parked_shell = self
+            .term_parked
+            .get(&node.id)
+            .is_some_and(|p| p.alive || p.open.is_some());
         let hover_id = ui.id().with("machine-row-hover").with(&node.id);
         let hovered = ui.data(|d| d.get_temp::<bool>(hover_id).unwrap_or(false));
         let fill = if selected || session {
@@ -2008,6 +2445,8 @@ impl ControllerApp {
                         )));
                         if session {
                             ui.label(theme::muted_text("This session"));
+                        } else if has_parked_shell {
+                            ui.label(theme::muted_text("Shell open"));
                         }
                     })
                     .response;
@@ -2027,6 +2466,29 @@ impl ControllerApp {
         ui.data_mut(|d| d.insert_temp(hover_id, response.hovered()));
         if response.clicked() {
             self.selected_id = Some(node.id.clone());
+            // Clicking another node in `machine_rail` during Terminal/Files switches
+            // cleanly to that node instead of leaving mismatched selection (`DESK-10`).
+            match &self.screen {
+                Screen::Terminal { id, .. } if id != &node.id => {
+                    if model::terminal_action(node.online, node.effective).enabled {
+                        self.open_terminal(node);
+                    } else {
+                        self.back_to_machines();
+                        self.selected_id = Some(node.id.clone());
+                    }
+                }
+                Screen::Files { id, .. } if id != &node.id => {
+                    if self.editor.as_ref().is_some_and(Editor::is_dirty) {
+                        self.file_pending_nav = Some(PendingFileNav::SwitchNode(node.clone()));
+                    } else if model::files_action(node.online, node.effective).enabled {
+                        self.open_files(node);
+                    } else {
+                        self.back_to_machines();
+                        self.selected_id = Some(node.id.clone());
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2058,6 +2520,41 @@ impl ControllerApp {
                 "Access: {}",
                 access_summary(&node.access, node.effective)
             )));
+            if !self.preview_ui && !self.mock {
+                let badge = model::inspect_local_grant(
+                    &self.config_dir,
+                    &node.id,
+                    self.controller_id.as_deref(),
+                );
+                let (grant_text, grant_color, dot_color) = match &badge {
+                    LocalGrantBadge::Active { summary, policy } => (
+                        format!("Grant: {summary} · {policy}"),
+                        theme::TEXT_BODY,
+                        theme::SUCCESS,
+                    ),
+                    LocalGrantBadge::Expired { summary } => (
+                        format!("Grant: {summary}"),
+                        theme::WARN,
+                        theme::WARN,
+                    ),
+                    LocalGrantBadge::GranteeMismatch { summary } => (
+                        format!("Grant: {summary}"),
+                        theme::DANGER,
+                        theme::DANGER,
+                    ),
+                    LocalGrantBadge::Missing => (
+                        "Grant: missing — issue or paste a grant below".to_string(),
+                        theme::WARN,
+                        theme::WARN,
+                    ),
+                    LocalGrantBadge::Error(err) => (
+                        format!("Grant: unreadable ({err})"),
+                        theme::DANGER,
+                        theme::DANGER,
+                    ),
+                };
+                status_pill(ui, &grant_text, grant_color, Some(dot_color));
+            }
             if let Some(note) = display_note(node.has_display, node.effective) {
                 let resp = ui.add(egui::Label::new(theme::muted_text(note)).wrap());
                 self.debug_layout
@@ -2078,6 +2575,10 @@ impl ControllerApp {
             }
             ui.add_space(theme::SPACE_SM);
             self.session_actions(ui, node, false);
+            if !self.preview_ui && !self.mock {
+                ui.add_space(theme::SPACE_SM);
+                self.grant_panel(ui, node);
+            }
             ui.add_space(theme::SPACE_LG);
             let details = egui::CollapsingHeader::new("Details")
                 .default_open(false)
@@ -2224,20 +2725,41 @@ impl ControllerApp {
                     self.toggle_autostart();
                 }
                 ui.add_space(theme::SPACE_XS);
-                let osc_label = if self.terminal.allows_osc52() {
+                let osc_label = if self.prefs.allow_osc52 {
                     "Terminal OSC 52 clipboard: on (≤64 KiB)"
                 } else {
                     "Terminal OSC 52 clipboard: off"
                 };
                 let osc_resp = ui
                     .add(theme::secondary_button(osc_label))
-                    .on_hover_text("Allow remote terminal programs to copy up to 64 KiB to the local clipboard via OSC 52. Off by default.");
+                    .on_hover_text("Allow remote terminal programs to copy up to 64 KiB to the local clipboard via OSC 52. Off by default; persisted across sessions.");
                 self.debug_layout
                     .note_visible("settings_osc52", osc_resp.rect, clip);
                 self.debug_layout
                     .note_focus("settings_osc52", &osc_resp, clip);
                 if osc_resp.clicked() {
-                    self.terminal.set_allow_osc52(!self.terminal.allows_osc52());
+                    self.prefs.allow_osc52 = !self.prefs.allow_osc52;
+                    self.terminal.set_allow_osc52(self.prefs.allow_osc52);
+                    for parked in self.term_parked.values_mut() {
+                        parked.emulator.set_allow_osc52(self.prefs.allow_osc52);
+                    }
+                    save_controller_prefs(&self.config_dir, &self.prefs);
+                }
+                ui.add_space(theme::SPACE_XS);
+                let clip_label = if self.prefs.desk_clipboard_sync {
+                    "Desktop auto-sync clipboard: on"
+                } else {
+                    "Desktop auto-sync clipboard: off (manual only)"
+                };
+                let clip_resp = ui
+                    .add(theme::secondary_button(clip_label))
+                    .on_hover_text("When enabled, copies made after connecting sync automatically during control sessions (pre-existing clipboard text is never pushed on connect).");
+                if clip_resp.clicked() {
+                    self.prefs.desk_clipboard_sync = !self.prefs.desk_clipboard_sync;
+                    save_controller_prefs(&self.config_dir, &self.prefs);
+                    self.send(Cmd::ClipboardSync {
+                        enabled: self.prefs.desk_clipboard_sync,
+                    });
                 }
             }
             ui.add_space(theme::SPACE_XS);
@@ -2420,20 +2942,216 @@ impl ControllerApp {
                     minutes,
                 });
             }
-            if !self.enroll_out.is_empty() {
+            if !self.enroll_out.is_empty() || !self.enroll_out_ps.is_empty() {
+                ui.add_space(theme::SPACE_SM);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.enroll_tab == EnrollTab::Unix, "Linux / macOS")
+                        .clicked()
+                    {
+                        self.enroll_tab = EnrollTab::Unix;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.enroll_tab == EnrollTab::PowerShell,
+                            "Windows PowerShell",
+                        )
+                        .clicked()
+                    {
+                        self.enroll_tab = EnrollTab::PowerShell;
+                    }
+                });
+                let active_cmd = match self.enroll_tab {
+                    EnrollTab::Unix => &mut self.enroll_out,
+                    EnrollTab::PowerShell => &mut self.enroll_out_ps,
+                };
                 ui.label(theme::muted_text("Install command"));
                 ui.add(
-                    egui::TextEdit::multiline(&mut self.enroll_out)
+                    egui::TextEdit::multiline(active_cmd)
                         .desired_width(f32::INFINITY)
-                        .desired_rows(5)
+                        .desired_rows(4)
                         .font(egui::TextStyle::Monospace),
                 );
-                if ui.add(theme::secondary_button("Copy")).clicked() {
-                    ui.ctx().copy_text(self.enroll_out.clone());
-                    self.notice = "Copied.".into();
-                }
+                let to_copy = active_cmd.clone();
+                ui.horizontal(|ui| {
+                    if ui.add(theme::secondary_button("Copy command")).clicked() {
+                        ui.ctx().copy_text(to_copy);
+                        self.notice = "Install command copied.".into();
+                    }
+                    if !self.enroll_token.is_empty()
+                        && ui.add(theme::secondary_button("Copy token")).clicked()
+                    {
+                        ui.ctx().copy_text(self.enroll_token.clone());
+                        self.notice = "Enrollment token copied.".into();
+                    }
+                });
             }
         });
+    }
+
+    fn grant_panel(&mut self, ui: &mut egui::Ui, node: &NodeInfo) {
+        egui::CollapsingHeader::new("Grant & identity")
+            .id_salt(("grant-panel", node.id.as_str()))
+            .default_open(false)
+            .show(ui, |ui| {
+                let ctrl_hex = self.controller_id.clone().unwrap_or_default();
+                if !ctrl_hex.is_empty() {
+                    let fp = agentlink_core::grant_offer::sha256_ssh_fingerprint(&ctrl_hex)
+                        .unwrap_or_else(|_| "SHA256:?".into());
+                    ui.label(theme::muted_text(format!("Controller fingerprint: {fp}")));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add(theme::secondary_button("Copy identity code (grant offer)"))
+                            .on_hover_text("Create a signed grant offer code to paste on the target node.")
+                            .clicked()
+                        {
+                            match Identity::load_or_create(&self.config_dir.join("identity.json")) {
+                                Ok(id) => {
+                                    let now = agentlink_core::util::unix_now();
+                                    let cfg = agentlink_core::config::load_file(&self.config_dir)
+                                        .unwrap_or_default();
+                                    let relay_fp =
+                                        cfg.fingerprint.as_deref().filter(|s| !s.trim().is_empty());
+                                    match agentlink_core::grant_offer::issue_offer(
+                                        &id,
+                                        node.effective,
+                                        7 * 24 * 3600,
+                                        now,
+                                        600,
+                                        Some(&node.id),
+                                        relay_fp,
+                                    )
+                                    .and_then(|offer| agentlink_core::grant_offer::encode_offer(&offer))
+                                    {
+                                        Ok(code) => {
+                                            ui.ctx().copy_text(code);
+                                            self.notice = format!(
+                                                "Copied signed grant offer code for {} (valid 10m).",
+                                                node.name
+                                            );
+                                        }
+                                        Err(err) => self.error = err.to_string(),
+                                    }
+                                }
+                                Err(err) => self.error = err.to_string(),
+                            }
+                        }
+                        if ui.add(theme::secondary_button("Copy CLI issue command")).clicked() {
+                            let cmd = format!(
+                                "agentlink grant issue --node {} --grantee {} --access {} --ttl 30d",
+                                model::shell_quote(&node.name),
+                                ctrl_hex,
+                                model::access_summary(&node.access, node.effective),
+                            );
+                            ui.ctx().copy_text(cmd);
+                            self.notice = "Copied `agentlink grant issue` command.".into();
+                        }
+                    });
+                    // Local self-node or operator-issuer issuance when `grant-issuer.json`
+                    // exists locally and matches this node.
+                    let local_node_matches =
+                        agentlink_core::grant_request::node_public_hex(&self.data_dir)
+                            .ok()
+                            .is_some_and(|hex| hex.eq_ignore_ascii_case(&node.id));
+                    if local_node_matches
+                        && ui
+                            .add(theme::secondary_button("Issue local grant (this machine)"))
+                            .clicked()
+                    {
+                        match agentlink_core::grant::issue_local_grant(
+                            &self.data_dir,
+                            &node.id,
+                            &ctrl_hex,
+                        )
+                        .and_then(|grant| agentlink_core::grant::save_grant(&self.config_dir, &grant))
+                        {
+                            Ok(_) => {
+                                self.notice = format!("Issued and saved local grant for {}.", node.name);
+                                self.error.clear();
+                            }
+                            Err(err) => self.error = err.to_string(),
+                        }
+                    }
+                }
+                ui.add_space(theme::SPACE_XS);
+                ui.label(theme::muted_text(
+                    "Paste a SignedGrant JSON (to authorize this controller) or a GrantOffer code (to record a request on a local node):",
+                ));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.grant_paste_input)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3)
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui
+                    .add(theme::secondary_button("Import grant / paste offer"))
+                    .clicked()
+                {
+                    let raw = self.grant_paste_input.trim().to_string();
+                    if raw.is_empty() {
+                        self.error = "Paste a SignedGrant JSON or grant offer code first.".into();
+                    } else if raw.starts_with('{') {
+                        match serde_json::from_str::<agentlink_core::grant::SignedGrant>(&raw) {
+                            Ok(grant) => {
+                                let now = agentlink_core::util::unix_now();
+                                let check = grant.verify_signature().and_then(|()| {
+                                    if let Some(ctrl) = self.controller_id.as_deref() {
+                                        agentlink_core::grant::validate_grant_for(
+                                            &grant, &node.id, ctrl, now,
+                                        )
+                                    } else {
+                                        Ok(())
+                                    }
+                                });
+                                match check.and_then(|()| {
+                                    agentlink_core::grant::save_grant(&self.config_dir, &grant)
+                                }) {
+                                    Ok(_) => {
+                                        self.grant_paste_input.clear();
+                                        self.error.clear();
+                                        self.notice = format!("Imported signed grant for {}.", node.name);
+                                    }
+                                    Err(err) => self.error = err.to_string(),
+                                }
+                            }
+                            Err(err) => self.error = format!("Invalid SignedGrant JSON: {err}"),
+                        }
+                    } else {
+                        match agentlink_core::grant_offer::decode_offer(&raw) {
+                            Ok(offer) => {
+                                let now = agentlink_core::util::unix_now();
+                                match agentlink_core::grant_request::node_public_hex(&self.data_dir)
+                                    .and_then(|local_node_id| {
+                                        let relay_fp =
+                                            agentlink_core::grant_offer::load_node_relay_fingerprint(
+                                                &self.data_dir,
+                                            )
+                                            .ok()
+                                            .flatten();
+                                        agentlink_core::grant_offer::paste_offer_as_request(
+                                            &self.data_dir,
+                                            &offer,
+                                            &local_node_id,
+                                            relay_fp.as_deref(),
+                                            now,
+                                        )
+                                    }) {
+                                    Ok(req) => {
+                                        self.grant_paste_input.clear();
+                                        self.error.clear();
+                                        self.notice = format!(
+                                            "Recorded pending grant request {} on this node.",
+                                            req.request_id
+                                        );
+                                    }
+                                    Err(err) => self.error = err.to_string(),
+                                }
+                            }
+                            Err(err) => self.error = format!("Invalid grant offer code: {err}"),
+                        }
+                    }
+                }
+            });
     }
 
     fn session_back_row(&mut self, ui: &mut egui::Ui, title: String) {
@@ -2445,7 +3163,13 @@ impl ControllerApp {
             self.debug_layout
                 .note_visible("back", back.rect, ui.clip_rect());
             if back.clicked() {
-                self.back_to_machines();
+                if matches!(self.screen, Screen::Files { .. })
+                    && self.editor.as_ref().is_some_and(Editor::is_dirty)
+                {
+                    self.file_pending_nav = Some(PendingFileNav::LeaveFiles);
+                } else {
+                    self.back_to_machines();
+                }
             }
             ui.label(theme::section_text(title));
         });
@@ -2495,6 +3219,7 @@ impl ControllerApp {
         };
         self.session_back_row(ui, format!("{name} · terminal"));
         let mut restart_target = None;
+        let mut close_shell = false;
         ui.horizontal_wrapped(|ui| {
             ui.label(theme::muted_text(
                 "Type in the terminal. Ctrl+Shift+C copies, Ctrl+Shift+V pastes. Ctrl+C sends interrupt.",
@@ -2509,10 +3234,36 @@ impl ControllerApp {
                 if restart.clicked() {
                     restart_target = Some(self.terminal_target_node(&id, &name));
                 }
+                let close = ui
+                    .add(theme::secondary_button("Close shell"))
+                    .on_hover_text("End this remote shell session.");
+                if close.has_focus() {
+                    close.surrender_focus();
+                }
+                if close.clicked() {
+                    close_shell = true;
+                }
             }
         });
+        if !super::fonts::report().loaded && !self.prefs.font_hint_dismissed {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(theme::muted_text(super::fonts::missing_font_hint()));
+                let dismiss = ui.add(theme::secondary_button("Dismiss"));
+                if dismiss.has_focus() {
+                    dismiss.surrender_focus();
+                }
+                if dismiss.clicked() {
+                    self.prefs.font_hint_dismissed = true;
+                    if !self.preview_ui {
+                        save_controller_prefs(&self.config_dir, &self.prefs);
+                    }
+                }
+            });
+        }
         if let Some(node) = restart_target {
             self.start_terminal_session(&node);
+        } else if close_shell {
+            self.close_active_terminal();
         }
         if let Some(started) = self.term_open {
             if !self.term_got_output {
@@ -2580,8 +3331,50 @@ impl ControllerApp {
         let _ = id;
     }
 
+    fn apply_file_nav(&mut self, nav: PendingFileNav) {
+        match nav {
+            PendingFileNav::OpenFile { node, path, size } => {
+                self.send(Cmd::Read {
+                    node,
+                    path,
+                    size_hint: size,
+                });
+            }
+            PendingFileNav::OpenDir { node, path } => {
+                self.editor = None;
+                self.files_loading = true;
+                self.file_path_input = path.clone();
+                self.send(Cmd::List { node, path });
+            }
+            PendingFileNav::CloseEditor => {
+                self.editor = None;
+            }
+            PendingFileNav::LeaveFiles => {
+                self.editor = None;
+                self.back_to_machines();
+            }
+            PendingFileNav::SwitchNode(node) => {
+                self.editor = None;
+                if model::files_action(node.online, node.effective).enabled {
+                    self.open_files(&node);
+                } else {
+                    self.back_to_machines();
+                    self.selected_id = Some(node.id);
+                }
+            }
+        }
+    }
+
+    fn request_file_nav(&mut self, nav: PendingFileNav) {
+        if self.editor.as_ref().is_some_and(Editor::is_dirty) {
+            self.file_pending_nav = Some(nav);
+        } else {
+            self.apply_file_nav(nav);
+        }
+    }
+
     fn files(&mut self, ui: &mut egui::Ui) {
-        let (id, name, can_write) = match &self.screen {
+        let (id, name, can_write, can_read) = match &self.screen {
             Screen::Files { id, name } => {
                 let policy = self
                     .nodes
@@ -2589,16 +3382,40 @@ impl ControllerApp {
                     .find(|node| node.id == *id)
                     .map(|node| node.effective);
                 let can_write = policy.is_some_and(|policy| policy.allow_write);
-                (id.clone(), name.clone(), can_write)
+                let can_read = policy.map_or(true, |policy| policy.allow_read);
+                (id.clone(), name.clone(), can_write, can_read)
             }
             _ => return,
         };
         self.session_back_row(ui, format!("{name} · files"));
+
+        // Drag-and-drop local files onto the Files page to upload (`DESK-02`).
+        if can_write {
+            let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+            for local_path in dropped {
+                if let Some(fname) = local_path.file_name().and_then(|s| s.to_str()) {
+                    let remote_path = model::child_path(&self.file_path, fname);
+                    self.send(Cmd::Upload {
+                        node: id.clone(),
+                        local_path,
+                        remote_path,
+                    });
+                }
+            }
+        }
+
+        // Editable path bar + navigation buttons (`DESK-02`).
+        let mut pending_nav: Option<PendingFileNav> = None;
         ui.horizontal_wrapped(|ui| {
             if ui.add(theme::secondary_button("Up")).clicked() {
                 let path = model::parent_path(&self.file_path);
-                self.files_loading = true;
-                self.send(Cmd::List {
+                pending_nav = Some(PendingFileNav::OpenDir {
                     node: id.clone(),
                     path,
                 });
@@ -2610,8 +3427,68 @@ impl ControllerApp {
                     path: self.file_path.clone(),
                 });
             }
-            ui.label(theme::mono_text(&self.file_path));
+            let path_edit = ui.add(
+                egui::TextEdit::singleline(&mut self.file_path_input)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width((ui.available_width() - 60.0).clamp(120.0, 380.0)),
+            );
+            let go_enter =
+                path_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if go_enter || ui.add(theme::secondary_button("Go")).clicked() {
+                let target = self.file_path_input.trim();
+                let target = if target.is_empty() { "." } else { target };
+                pending_nav = Some(PendingFileNav::OpenDir {
+                    node: id.clone(),
+                    path: target.to_string(),
+                });
+            }
         });
+
+        // Clickable path breadcrumbs (`DESK-02`).
+        {
+            let cur = self.file_path.clone();
+            let sep = if cur.contains('\\') && !cur.contains('/') {
+                '\\'
+            } else {
+                '/'
+            };
+            let parts: Vec<&str> = cur
+                .split(sep)
+                .filter(|p| !p.is_empty() && *p != ".")
+                .collect();
+            if !parts.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button(".").clicked() {
+                        pending_nav = Some(PendingFileNav::OpenDir {
+                            node: id.clone(),
+                            path: ".".into(),
+                        });
+                    }
+                    let mut acc = if cur.starts_with(sep) {
+                        sep.to_string()
+                    } else {
+                        String::new()
+                    };
+                    for (idx, part) in parts.iter().enumerate() {
+                        ui.label(theme::muted_text("/"));
+                        if idx > 0 || (!acc.is_empty() && !acc.ends_with(sep)) {
+                            if !acc.ends_with(sep) && !acc.is_empty() {
+                                acc.push(sep);
+                            }
+                        }
+                        acc.push_str(part);
+                        let target = acc.clone();
+                        if ui.small_button(*part).clicked() {
+                            pending_nav = Some(PendingFileNav::OpenDir {
+                                node: id.clone(),
+                                path: target,
+                            });
+                        }
+                    }
+                });
+            }
+        }
+
         if self.files_loading {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -2620,8 +3497,14 @@ impl ControllerApp {
         } else if self.files.is_empty() && self.error.is_empty() {
             ui.label(theme::muted_text("This folder is empty."));
         }
-        let list_h = (ui.available_height() - 160.0).max(160.0);
+        let has_editor = self.editor.is_some();
+        let list_h = if has_editor {
+            (ui.available_height() * 0.34).clamp(110.0, 240.0)
+        } else {
+            (ui.available_height() - 120.0).max(160.0)
+        };
         let list = egui::ScrollArea::vertical()
+            .id_salt("files-list-scroll")
             .max_height(list_h)
             .show(ui, |ui| {
                 let mut entries = self.files.clone();
@@ -2636,31 +3519,44 @@ impl ControllerApp {
                         let label = if entry.is_dir {
                             format!("{}/", entry.name)
                         } else {
-                            format!("{}  {}", entry.name, entry.size)
+                            format!("{}  ({} B)", entry.name, entry.size)
                         };
                         if ui.add(theme::secondary_button(&label)).clicked() {
                             let path = model::child_path(&self.file_path, &entry.name);
                             if entry.is_dir {
-                                self.editor = None;
-                                self.files_loading = true;
-                                self.send(Cmd::List {
+                                pending_nav = Some(PendingFileNav::OpenDir {
                                     node: id.clone(),
                                     path,
                                 });
                             } else {
-                                self.send(Cmd::Read {
+                                pending_nav = Some(PendingFileNav::OpenFile {
                                     node: id.clone(),
                                     path,
+                                    size: Some(entry.size),
                                 });
                             }
                         }
+                        if !entry.is_dir
+                            && can_read
+                            && ui.add(theme::secondary_button("Download")).clicked()
+                        {
+                            let remote_path = model::child_path(&self.file_path, &entry.name);
+                            let dir = self.file_download_dir.trim();
+                            let local_dir = if dir.is_empty() {
+                                std::path::PathBuf::from(".")
+                            } else {
+                                std::path::PathBuf::from(dir)
+                            };
+                            let local_path = local_dir.join(&entry.name);
+                            self.send(Cmd::Download {
+                                node: id.clone(),
+                                remote_path,
+                                local_path,
+                            });
+                        }
                         if can_write && ui.add(theme::secondary_button("Delete")).clicked() {
                             let path = model::child_path(&self.file_path, &entry.name);
-                            self.clear_editor_if_deleted(&path);
-                            self.send(Cmd::Remove {
-                                node: id.clone(),
-                                path,
-                            });
+                            self.file_pending_delete = Some((id.clone(), path));
                         }
                     });
                 }
@@ -2672,7 +3568,7 @@ impl ControllerApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.folder_name)
                         .hint_text("New folder name")
-                        .desired_width(180.0),
+                        .desired_width(150.0),
                 );
                 if ui.add(theme::secondary_button("Create folder")).clicked()
                     && !self.folder_name.trim().is_empty()
@@ -2687,45 +3583,202 @@ impl ControllerApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_file_name)
                         .hint_text("New file name")
-                        .desired_width(180.0),
+                        .desired_width(150.0),
                 );
                 if ui.add(theme::secondary_button("New file")).clicked()
                     && !self.new_file_name.trim().is_empty()
                 {
                     let path = model::child_path(&self.file_path, self.new_file_name.trim());
                     self.new_file_name.clear();
-                    self.editor = Some(Editor {
-                        path,
-                        text: String::new(),
-                    });
+                    self.editor = Some(Editor::editable(path, String::new()));
                 }
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.file_upload_local)
+                        .hint_text("Local file path to upload (or drag-and-drop file here)")
+                        .desired_width(260.0),
+                );
+                if ui.add(theme::secondary_button("Upload")).clicked()
+                    && !self.file_upload_local.trim().is_empty()
+                {
+                    let local_path = std::path::PathBuf::from(self.file_upload_local.trim());
+                    match local_path.file_name().and_then(|s| s.to_str()) {
+                        Some(fname) => {
+                            let remote_path = model::child_path(&self.file_path, fname);
+                            self.file_upload_local.clear();
+                            self.send(Cmd::Upload {
+                                node: id.clone(),
+                                local_path,
+                                remote_path,
+                            });
+                        }
+                        None => self.error = "Enter a valid local file path to upload.".into(),
+                    }
+                }
+                if can_read {
+                    ui.label(theme::muted_text("Save downloads to:"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.file_download_dir)
+                            .desired_width(180.0),
+                    );
+                }
+            });
+        } else if can_read {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(theme::muted_text("Save downloads to:"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.file_download_dir)
+                        .desired_width(220.0),
+                );
+            });
         }
-        let save = if let Some(editor) = &mut self.editor {
-            ui.label(&editor.path);
-            let edit = ui.add(
-                egui::TextEdit::multiline(&mut editor.text)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(12)
-                    .font(egui::TextStyle::Monospace),
-            );
-            self.debug_layout
-                .note_visible("editor", edit.rect, ui.clip_rect());
-            page = page.union(visible_rect(edit.rect, ui.clip_rect()));
-            can_write
-                .then(|| ui.add(theme::primary_button("Save")).clicked())
-                .unwrap_or(false)
-                .then(|| (editor.path.clone(), editor.text.clone()))
-        } else {
-            None
-        };
+
+        // Scrollable multiline editor with sticky Save / Download / Close bar (`DESK-02`).
+        let mut save: Option<(String, String)> = None;
+        let mut download_open_file: Option<String> = None;
+        if let Some(editor) = &mut self.editor {
+            let dirty = editor.is_dirty();
+            let ro = editor.read_only;
+            let header = if ro {
+                format!("{} (read-only)", editor.path)
+            } else if dirty {
+                format!("{} (unsaved changes)", editor.path)
+            } else {
+                editor.path.clone()
+            };
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(header).strong().color(theme::TEXT_PRIMARY));
+                if can_write && !ro {
+                    if ui
+                        .add_enabled(dirty || editor.saved_text.is_empty(), theme::primary_button("Save"))
+                        .clicked()
+                    {
+                        save = Some((editor.path.clone(), editor.text.clone()));
+                    }
+                }
+                if can_read && ui.add(theme::secondary_button("Download")).clicked() {
+                    download_open_file = Some(editor.path.clone());
+                }
+                if ui.add(theme::secondary_button("Close")).clicked() {
+                    pending_nav = Some(PendingFileNav::CloseEditor);
+                }
+            });
+            if let Some(reason) = &editor.read_only_reason {
+                banner(ui, reason, true);
+            }
+            let editor_h = ui.available_height().max(120.0);
+            let scroll = egui::ScrollArea::vertical()
+                .id_salt("file-editor-scroll")
+                .max_height(editor_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let edit = ui.add(
+                        egui::TextEdit::multiline(&mut editor.text)
+                            .interactive(!ro && can_write)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(12)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    self.debug_layout
+                        .note_visible("editor", edit.rect, ui.clip_rect());
+                    edit
+                });
+            page = page.union(visible_rect(scroll.inner_rect, clip));
+        }
         self.debug_layout.page_rect = rect_xywh(page);
+
         if let Some((path, text)) = save {
             self.send(Cmd::Write {
-                node: id,
+                node: id.clone(),
                 path,
                 text,
             });
+        }
+        if let Some(remote_path) = download_open_file {
+            let fname = remote_path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("download.bin")
+                .to_string();
+            let dir = self.file_download_dir.trim();
+            let local_dir = if dir.is_empty() {
+                std::path::PathBuf::from(".")
+            } else {
+                std::path::PathBuf::from(dir)
+            };
+            self.send(Cmd::Download {
+                node: id.clone(),
+                remote_path,
+                local_path: local_dir.join(fname),
+            });
+        }
+        if let Some(nav) = pending_nav {
+            self.request_file_nav(nav);
+        }
+
+        // Delete confirmation modal (`DESK-02`).
+        if let Some((del_node, del_path)) = self.file_pending_delete.clone() {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("Confirm delete")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!("Permanently delete `{del_path}`?"));
+                    ui.label(theme::muted_text("This cannot be undone."));
+                    ui.add_space(theme::SPACE_SM);
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::primary_button("Delete permanently")).clicked() {
+                            confirm = true;
+                        }
+                        if ui.add(theme::secondary_button("Cancel")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if confirm {
+                self.file_pending_delete = None;
+                self.clear_editor_if_deleted(&del_path);
+                self.send(Cmd::Remove {
+                    node: del_node,
+                    path: del_path,
+                });
+            } else if cancel || !open {
+                self.file_pending_delete = None;
+            }
+        }
+
+        // Unsaved-changes guard modal (`DESK-02`).
+        if let Some(nav) = self.file_pending_nav.clone() {
+            let mut open = true;
+            let mut discard = false;
+            let mut cancel = false;
+            egui::Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.label("You have unsaved edits in the open file.");
+                    ui.add_space(theme::SPACE_SM);
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::primary_button("Discard changes")).clicked() {
+                            discard = true;
+                        }
+                        if ui.add(theme::secondary_button("Keep editing")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if discard {
+                self.file_pending_nav = None;
+                self.apply_file_nav(nav);
+            } else if cancel || !open {
+                self.file_pending_nav = None;
+            }
         }
     }
 
@@ -2907,9 +3960,16 @@ impl ControllerApp {
         let mut one_to_one = false;
         let mut toggle_fs = false;
         let mut toggle_keys = false;
+        let mut toggle_mode = false;
+        let mut clip_sync_changed: Option<bool> = None;
         let mut paste = false;
         let mut shot = false;
         let mut cad = false;
+        let can_control_policy = self
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .is_some_and(|n| n.effective.allows_remote_control());
 
         ui.spacing_mut().item_spacing = egui::vec2(theme::SPACE_XS, 0.0);
         ui.spacing_mut().button_padding = egui::vec2(theme::SPACE_SM, 0.0);
@@ -2995,8 +4055,11 @@ impl ControllerApp {
                     status_dot(ui, phase.dot(), tip);
 
                     if density != BarDensity::Minimal {
-                        let mode_badge = mode_badge_widget(ui, control);
+                        let mode_badge = mode_badge_widget(ui, control, can_control_policy);
                         self.debug_layout.note_item("mode", mode_badge.rect);
+                        if can_control_policy && mode_badge.clicked() {
+                            toggle_mode = true;
+                        }
                         chrome_vsep(ui);
                     }
 
@@ -3155,14 +4218,16 @@ impl ControllerApp {
                     if shot_btn.clicked() {
                         shot = true;
                     }
-                    let clip_tip = if control {
-                        "Clipboard is shared automatically in a control session. Click to send the current local text now."
-                    } else {
+                    let clip_tip = if !control {
                         "Clipboard sharing needs a control session, not view-only."
+                    } else if self.prefs.desk_clipboard_sync {
+                        "Auto-sync clipboard is ON (toggle in Zoom/Stream menu). Click to send current local text now."
+                    } else {
+                        "Auto-sync clipboard is OFF (toggle in Zoom/Stream menu). Click to send current local text now."
                     };
                     let clip_btn = ui.add_enabled(
                         control,
-                        theme::icon_button(clip_l, false),
+                        theme::icon_button(clip_l, self.prefs.desk_clipboard_sync),
                     );
                     let clip_btn = clip_btn.on_hover_text(clip_tip);
                     self.debug_layout.note_item("clipboard", clip_btn.rect);
@@ -3170,7 +4235,7 @@ impl ControllerApp {
                         paste = true;
                     }
                     let key_tip = if self.desk_capture_keys {
-                        "Keyboard captured — Esc releases"
+                        "Keyboard captured — Ctrl+Alt+Shift or Keys releases (Esc goes to remote)"
                     } else {
                         "Capture keyboard for the remote session"
                     };
@@ -3205,7 +4270,12 @@ impl ControllerApp {
                     }
                     match density {
                         BarDensity::Full => {
-                            let zoom_btn = chrome_bar_button(ui, &zoom_label, "Zoom", false);
+                            let zoom_btn = chrome_bar_button(
+                                ui,
+                                &zoom_label,
+                                "Zoom, stream scale/quality, mode & clipboard sync",
+                                false,
+                            );
                             let zoom_popup = ui.make_persistent_id("desk-zoom-popup");
                             if zoom_btn.clicked() {
                                 ui.memory_mut(|mem| mem.toggle_popup(zoom_popup));
@@ -3217,7 +4287,7 @@ impl ControllerApp {
                                 egui::popup::PopupCloseBehavior::CloseOnClickOutside,
                                 |ui| {
                                     theme::panel_frame().show(ui, |ui| {
-                                        ui.set_min_width(180.0);
+                                        ui.set_min_width(220.0);
                                         ui.label(theme::muted_text("Zoom"));
                                         let slider = ui.add(
                                             egui::Slider::new(&mut self.desk_zoom, 0.25..=4.0)
@@ -3227,6 +4297,81 @@ impl ControllerApp {
                                         );
                                         if slider.changed() {
                                             self.desk_fit = false;
+                                        }
+                                        ui.separator();
+                                        ui.label(theme::muted_text("Stream scale"));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for mode in [
+                                                DeskScaleMode::Auto,
+                                                DeskScaleMode::Native100,
+                                                DeskScaleMode::Scale75,
+                                                DeskScaleMode::Scale50,
+                                            ] {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.desk_scale_mode,
+                                                        mode,
+                                                        mode.label(),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    restart = true;
+                                                }
+                                            }
+                                        });
+                                        ui.label(theme::muted_text("Quality / FPS"));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (lbl, q) in
+                                                [("Low", 30u32), ("Med", 55), ("High", 75), ("Ultra", 90)]
+                                            {
+                                                if ui
+                                                    .selectable_value(&mut self.desk_quality, q, lbl)
+                                                    .changed()
+                                                {
+                                                    restart = true;
+                                                }
+                                            }
+                                        });
+                                        ui.horizontal_wrapped(|ui| {
+                                            for fps in [15u32, 30, 60] {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.max_fps,
+                                                        fps,
+                                                        format!("{fps} fps"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    restart = true;
+                                                }
+                                            }
+                                        });
+                                        ui.separator();
+                                        if can_control_policy {
+                                            let mode_lbl = if control {
+                                                "Switch to View only"
+                                            } else {
+                                                "Switch to Control"
+                                            };
+                                            if ui.add(theme::secondary_button(mode_lbl)).clicked() {
+                                                toggle_mode = true;
+                                            }
+                                        }
+                                        if control {
+                                            let mut sync_on = self.prefs.desk_clipboard_sync;
+                                            if ui
+                                                .checkbox(&mut sync_on, "Auto-sync clipboard")
+                                                .changed()
+                                            {
+                                                self.prefs.desk_clipboard_sync = sync_on;
+                                                if !self.preview_ui {
+                                                    save_controller_prefs(
+                                                        &self.config_dir,
+                                                        &self.prefs,
+                                                    );
+                                                }
+                                                clip_sync_changed = Some(sync_on);
+                                            }
                                         }
                                     });
                                 },
@@ -3268,6 +4413,18 @@ impl ControllerApp {
             self.stop_desktop_session("Disconnected");
             return;
         }
+        if let Some(enabled) = clip_sync_changed {
+            self.send(Cmd::ClipboardSync { enabled });
+        }
+        if toggle_mode && can_control_policy {
+            let next_control = !control;
+            self.control.insert(id.to_string(), next_control);
+            if !next_control {
+                self.desk_capture_keys = false;
+                self.release_remote_input_on(id);
+            }
+            restart = true;
+        }
         if fit {
             self.desk_fit = true;
             self.desk_zoom = 1.0;
@@ -3277,7 +4434,11 @@ impl ControllerApp {
             self.desk_fit = false;
             if let Some(texture) = &self.texture {
                 let avail = ui.ctx().available_rect().size() - egui::vec2(0.0, BAR_HEIGHT);
-                self.desk_zoom = native_zoom(texture.size_vec2(), avail);
+                self.desk_zoom = native_zoom_for_dpi(
+                    texture.size_vec2(),
+                    avail,
+                    ui.ctx().pixels_per_point(),
+                );
             } else {
                 self.desk_zoom = 1.0;
             }
@@ -3298,7 +4459,9 @@ impl ControllerApp {
             }
         }
         if paste {
-            self.desk_await_paste = true;
+            // Bounded 4-frame window so empty/non-text clipboards never stay
+            // latched waiting for `Event::Paste` (`DESK-12`).
+            self.desk_await_paste_frames = 4;
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
         }
@@ -3307,6 +4470,7 @@ impl ControllerApp {
             self.send(Cmd::Shot {
                 node: id.to_string(),
                 path,
+                monitor: Some(self.desk_monitor),
             });
         }
         if cad {
@@ -3356,7 +4520,11 @@ impl ControllerApp {
             .fit_to_exact_size(content.size())
             .paint_at(ui, content);
 
-        // Ctrl+wheel zooms; shift+primary (or middle) pans when not capturing input.
+        // Local gestures (Ctrl+wheel zoom, Shift/middle pan, capture-pill click,
+        // and Ctrl+Alt+Shift ungrab chord) are consumed BEFORE `desktop_input()`
+        // so they never double-fire on the remote desktop (`DESK-12`).
+        let mut consumed_local_pointer = false;
+        let mut ungrabbed_now = false;
         if response.hovered() {
             let (zoom_delta, scroll, ctrl) = ui.ctx().input(|input| {
                 (
@@ -3368,20 +4536,150 @@ impl ControllerApp {
             if ctrl && (zoom_delta - 1.0).abs() > 0.001 {
                 self.desk_fit = false;
                 self.desk_zoom = (self.desk_zoom * zoom_delta).clamp(0.25, 8.0);
+                ui.ctx().input_mut(|input| {
+                    input.events.retain(|ev| {
+                        !matches!(
+                            ev,
+                            egui::Event::MouseWheel { modifiers, .. }
+                                if modifiers.ctrl || modifiers.command
+                        )
+                    });
+                });
             } else if ctrl && scroll.y.abs() > 0.1 {
                 self.desk_fit = false;
                 let factor = if scroll.y > 0.0 { 1.1 } else { 1.0 / 1.1 };
                 self.desk_zoom = (self.desk_zoom * factor).clamp(0.25, 8.0);
+                ui.ctx().input_mut(|input| {
+                    input.events.retain(|ev| {
+                        !matches!(
+                            ev,
+                            egui::Event::MouseWheel { modifiers, .. }
+                                if modifiers.ctrl || modifiers.command
+                        )
+                    });
+                });
             }
         }
-        if response.dragged() {
-            let pan_gesture = ui.ctx().input(|i| {
-                i.pointer.middle_down() || (i.modifiers.shift && i.pointer.primary_down())
-            });
-            if pan_gesture && (!control || !self.desk_capture_keys) {
+        let pan_gesture_active = ui.ctx().input(|i| {
+            i.pointer.middle_down() || (i.modifiers.shift && i.pointer.primary_down())
+        });
+        if pan_gesture_active && (!control || !self.desk_capture_keys) {
+            consumed_local_pointer = true;
+            if response.dragged() {
                 self.desk_fit = false;
                 self.desk_pan += response.drag_delta();
             }
+        }
+
+        // Pre-compute capture hint pill rect so clicking the pill consumes the
+        // primary click before `desktop_input()` rather than clicking remotely (`DESK-12`).
+        let pill_info = if !control || !self.desk_capture_keys {
+            let painter = ui.painter_at(pane_rect);
+            let label = if !control || self.desk_input_blocked {
+                "View only — keyboard and mouse stay local"
+            } else {
+                "Click to capture keyboard · Ctrl+Alt+Shift or Keys releases"
+            };
+            let galley = painter.layout_no_wrap(
+                label.to_string(),
+                egui::FontId::proportional(theme::SECONDARY_SIZE),
+                theme::TEXT_BODY,
+            );
+            let pad = egui::vec2(theme::SPACE_MD, theme::SPACE_SM);
+            let size = galley.size() + pad * 2.0;
+            let rect = egui::Rect::from_center_size(pane_rect.center(), size);
+            Some((rect, pad, galley))
+        } else {
+            None
+        };
+
+        if control && !self.desk_input_blocked && !self.desk_capture_keys {
+            if let Some((pill_rect, _, _)) = &pill_info {
+                let primary_on_pill = ui.ctx().input(|input| {
+                    input.events.iter().any(|ev| {
+                        matches!(
+                            ev,
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                ..
+                            } if pill_rect.contains(*pos)
+                        )
+                    })
+                });
+                if primary_on_pill {
+                    consumed_local_pointer = true;
+                    let pressed_on_pill = ui.ctx().input(|input| {
+                        input.events.iter().any(|ev| {
+                            matches!(
+                                ev,
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: true,
+                                    ..
+                                } if pill_rect.contains(*pos)
+                            )
+                        })
+                    });
+                    if pressed_on_pill {
+                        self.desk_capture_keys = true;
+                    }
+                }
+            }
+        }
+
+        // Explicit ungrab chord while captured: Ctrl+Alt+Shift (press+release
+        // cleanly or Ctrl+Alt+Shift+Esc/U) releases keyboard capture (`DESK-12`).
+        if control && self.desk_capture_keys && !self.desk_input_blocked {
+            let (all_three, has_non_mod_key, immediate_ungrab) = ui.ctx().input(|input| {
+                let m = input.modifiers;
+                let all_three = m.ctrl && m.alt && m.shift;
+                let mut any_key = false;
+                let mut imm = false;
+                for ev in &input.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = ev
+                    {
+                        any_key = true;
+                        if modifiers.ctrl
+                            && modifiers.alt
+                            && modifiers.shift
+                            && matches!(key, egui::Key::Escape | egui::Key::U)
+                        {
+                            imm = true;
+                        }
+                    }
+                }
+                (all_three, any_key, imm)
+            });
+            if immediate_ungrab {
+                ungrabbed_now = true;
+            } else if all_three && !has_non_mod_key {
+                self.desk_ungrab_armed = true;
+            } else if has_non_mod_key {
+                self.desk_ungrab_armed = false;
+            } else if self.desk_ungrab_armed && !all_three {
+                ungrabbed_now = true;
+            }
+            if ungrabbed_now {
+                self.desk_ungrab_armed = false;
+                self.desk_capture_keys = false;
+                self.release_remote_input_on(id);
+                self.desk_toast = Some((
+                    "Keyboard released (click canvas or Keys to capture)".into(),
+                    Instant::now(),
+                ));
+                ui.ctx().input_mut(|input| {
+                    input.events.retain(|ev| !egui_event_is_keyboard(ev));
+                });
+            }
+        } else {
+            self.desk_ungrab_armed = false;
         }
 
         // Local session menu: toolbar always; letterbox / view-only pane OK.
@@ -3471,9 +4769,15 @@ impl ControllerApp {
             // Ordered mouse (+ keys when captured) via STD input_policy reducer.
             // Plain / Shift / Ctrl right-click over the image all go remote;
             // toolbar / letterbox keep the local menu above.
-            self.desktop_input(&id, ui, &response, content);
-            self.apply_negotiated_cursor(ui, over_image);
-            if !self.desk_capture_keys && response.clicked() {
+            if !consumed_local_pointer && !ungrabbed_now {
+                self.desktop_input(&id, ui, &response, content);
+            }
+            self.apply_negotiated_cursor(ui, over_image, content, src_w, src_h);
+            if !self.desk_capture_keys
+                && !consumed_local_pointer
+                && !ungrabbed_now
+                && response.clicked_by(egui::PointerButton::Primary)
+            {
                 self.desk_capture_keys = true;
             }
         } else if control {
@@ -3489,29 +4793,18 @@ impl ControllerApp {
 
         // View-only: quiet centered pill. Control without capture: click hint pill.
         if !control || !self.desk_capture_keys {
-            let painter = ui.painter_at(pane_rect);
-            let label = if !control || self.desk_input_blocked {
-                "View only — keyboard and mouse stay local"
-            } else {
-                "Click to capture keyboard · Keys or unfocus releases"
-            };
-            let galley = painter.layout_no_wrap(
-                label.to_string(),
-                egui::FontId::proportional(theme::SECONDARY_SIZE),
-                theme::TEXT_BODY,
-            );
-            let pad = egui::vec2(theme::SPACE_MD, theme::SPACE_SM);
-            let size = galley.size() + pad * 2.0;
-            let rect = egui::Rect::from_center_size(pane_rect.center(), size);
-            let fill = egui::Color32::from_rgba_unmultiplied(0x19, 0x1a, 0x1b, 217);
-            painter.rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_CONTROL), fill);
-            painter.rect_stroke(
-                rect,
-                egui::CornerRadius::same(theme::RADIUS_CONTROL),
-                theme::stroke_border_subtle(),
-                egui::StrokeKind::Inside,
-            );
-            painter.galley(rect.min + pad, galley, theme::TEXT_BODY);
+            if let Some((rect, pad, galley)) = pill_info {
+                let painter = ui.painter_at(pane_rect);
+                let fill = egui::Color32::from_rgba_unmultiplied(0x19, 0x1a, 0x1b, 217);
+                painter.rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_CONTROL), fill);
+                painter.rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(theme::RADIUS_CONTROL),
+                    theme::stroke_border_subtle(),
+                    egui::StrokeKind::Inside,
+                );
+                painter.galley(rect.min + pad, galley, theme::TEXT_BODY);
+            }
         }
     }
 
@@ -3621,7 +4914,11 @@ impl ControllerApp {
             DeskMenuAction::OneToOne => {
                 self.desk_fit = false;
                 if let Some(texture) = &self.texture {
-                    self.desk_zoom = native_zoom(texture.size_vec2(), pane_rect.size());
+                    self.desk_zoom = native_zoom_for_dpi(
+                        texture.size_vec2(),
+                        pane_rect.size(),
+                        ui.ctx().pixels_per_point(),
+                    );
                 } else {
                     self.desk_zoom = 1.0;
                 }
@@ -3831,7 +5128,14 @@ impl ControllerApp {
     ///   the pre-b7 OS cursor so the user cannot lose the only pointer.
     /// - custom/unknown stock without a bitmap falls back to Default — never
     ///   CursorIcon::None as a "success" for an unknown shape.
-    fn apply_negotiated_cursor(&self, ui: &mut egui::Ui, over_image: bool) {
+    fn apply_negotiated_cursor(
+        &mut self,
+        ui: &mut egui::Ui,
+        over_image: bool,
+        content: egui::Rect,
+        src_w: u32,
+        src_h: u32,
+    ) {
         if !over_image {
             return;
         }
@@ -3855,28 +5159,45 @@ impl ControllerApp {
             remote.bitmap_h,
         ) {
             if w > 0 && h > 0 && rgba.len() >= (w as usize) * (h as usize) * 4 {
-                // Paint a local sprite at the pointer with the remote hotspot.
-                // egui has no arbitrary-bitmap CursorIcon; overlay + hide OS.
+                // Paint a cached local sprite at the pointer scaled by the
+                // content display/zoom ratio (`DESK-11`).
                 ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-                if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                    let origin = egui::pos2(
-                        pos.x - remote.hotspot_x as f32,
-                        pos.y - remote.hotspot_y as f32,
-                    );
-                    // Wire RGBA is straight (C bridge un-premultiplies Mutter
-                    // premul BGRA). Match with from_rgba_unmultiplied.
+                let needs_upload = self
+                    .desk_cursor_tex
+                    .as_ref()
+                    .map(|(rev, _)| *rev != remote.rev)
+                    .unwrap_or(true);
+                if needs_upload {
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [w as usize, h as usize],
                         &rgba[..(w as usize) * (h as usize) * 4],
                     );
-                    let tex = ui.ctx().load_texture(
-                        "agentlink-remote-cursor",
-                        color_image,
-                        egui::TextureOptions::NEAREST,
+                    if let Some((rev, tex)) = &mut self.desk_cursor_tex {
+                        tex.set(color_image, egui::TextureOptions::NEAREST);
+                        *rev = remote.rev;
+                    } else {
+                        let tex = ui.ctx().load_texture(
+                            "agentlink-remote-cursor",
+                            color_image,
+                            egui::TextureOptions::NEAREST,
+                        );
+                        self.desk_cursor_tex = Some((remote.rev, tex));
+                    }
+                }
+                if let (Some((_, tex)), Some(pos)) =
+                    (self.desk_cursor_tex.as_ref(), ui.ctx().pointer_interact_pos())
+                {
+                    let scale_x = (content.width() / src_w.max(1) as f32).clamp(0.25, 4.0);
+                    let scale_y = (content.height() / src_h.max(1) as f32).clamp(0.25, 4.0);
+                    let draw_w = w as f32 * scale_x;
+                    let draw_h = h as f32 * scale_y;
+                    let origin = egui::pos2(
+                        pos.x - remote.hotspot_x as f32 * scale_x,
+                        pos.y - remote.hotspot_y as f32 * scale_y,
                     );
                     ui.painter().image(
                         tex.id(),
-                        egui::Rect::from_min_size(origin, egui::vec2(w as f32, h as f32)),
+                        egui::Rect::from_min_size(origin, egui::vec2(draw_w, draw_h)),
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
@@ -3904,6 +5225,24 @@ impl ControllerApp {
 
         if self.desk_capture_keys {
             ui.memory_mut(|mem| mem.request_focus(egui::Id::new("desk-key-capture")));
+            // Enable OS CJK/compose IME on Desktop canvas (`DESK-01`).
+            if !self.desk_ime_allowed {
+                self.desk_ime_allowed = true;
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
+            }
+            let ime_anchor = ui
+                .ctx()
+                .pointer_hover_pos()
+                .filter(|p| content.contains(*p))
+                .unwrap_or_else(|| egui::pos2(content.min.x + 16.0, content.max.y - 32.0));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::IMERect(
+                egui::Rect::from_min_size(ime_anchor, egui::vec2(2.0, 20.0)),
+            ));
+        } else if self.desk_ime_allowed {
+            self.desk_ime_allowed = false;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
         }
 
         let capture_keys = self.desk_capture_keys;
@@ -3919,11 +5258,13 @@ impl ControllerApp {
             (clip.min.x, clip.min.y, clip.max.x, clip.max.y),
         );
 
+        // On Windows/Linux, egui sets `m.command = m.ctrl`. Map `command` from
+        // `m.mac_cmd` ONLY so Ctrl+<key> never injects Win/Super (`DESK-01`).
         let snap = |m: egui::Modifiers| ModSnapshot {
             ctrl: m.ctrl,
             alt: m.alt,
             shift: m.shift,
-            command: m.command || m.mac_cmd,
+            command: m.mac_cmd,
         };
 
         let target_os = self
@@ -4271,14 +5612,6 @@ impl ControllerApp {
             self.mock_frame_window_start = Instant::now();
             self.mock_frame_window_count = 0;
         }
-        self.picture = Some(Picture {
-            rgba,
-            width: frame.width as usize,
-            height: frame.height as usize,
-            kind: "mock".into(),
-            path: "mock".into(),
-            seq: self.seen_seq + 1,
-        });
         self.seen_seq += 1;
     }
 
@@ -4702,13 +6035,13 @@ fn chrome_vsep(ui: &mut egui::Ui) {
     ui.painter().rect_filled(rect, 0.0, theme::BORDER_SUBTLE);
 }
 
-fn mode_badge_widget(ui: &mut egui::Ui, control: bool) -> egui::Response {
+fn mode_badge_widget(ui: &mut egui::Ui, control: bool, can_toggle: bool) -> egui::Response {
     let (label, text) = if control {
         ("CONTROL", theme::ACCENT)
     } else {
         ("VIEW", theme::TEXT_MUTED)
     };
-    let response = egui::Frame::new()
+    let frame_resp = egui::Frame::new()
         .fill(egui::Color32::TRANSPARENT)
         .stroke(theme::stroke_border())
         .inner_margin(egui::Margin::symmetric(6, 2))
@@ -4722,10 +6055,20 @@ fn mode_badge_widget(ui: &mut egui::Ui, control: bool) -> egui::Response {
             );
         })
         .response;
-    response.on_hover_text(if control {
-        "Control session"
+    let response = if can_toggle {
+        ui.interact(
+            frame_resp.rect,
+            ui.id().with("mode-badge-toggle"),
+            egui::Sense::click(),
+        )
     } else {
-        "View-only session"
+        frame_resp
+    };
+    response.on_hover_text(match (control, can_toggle) {
+        (true, true) => "Control session — click to switch to View only",
+        (false, true) => "View-only session — click to switch to Control",
+        (true, false) => "Control session",
+        (false, false) => "View-only session",
     })
 }
 
@@ -5066,10 +6409,10 @@ fn action_card(
     response
 }
 
-fn labeled(ui: &mut egui::Ui, name: &str, text: &mut String, secret: bool) {
+fn labeled(ui: &mut egui::Ui, name: &str, text: &mut String, secret: bool) -> egui::Response {
     ui.label(theme::muted_text(name));
     let edit = centered_singleline(ui, text, secret);
-    style_text_edit(ui, edit);
+    style_text_edit(ui, edit)
 }
 
 /// Shared TextEdit for Username / Password / Relay / Certificate pin / Trust /
@@ -5457,10 +6800,10 @@ mod geometry_tests {
                     mode: None,
                 },
             ];
-            self.app.editor = Some(Editor {
-                path: "readme.txt".into(),
-                text: "hello from geometry test\n".into(),
-            });
+            self.app.editor = Some(Editor::editable(
+                "readme.txt".into(),
+                "hello from geometry test\n".into(),
+            ));
         }
 
         fn press_key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
@@ -7520,5 +8863,196 @@ mod geometry_tests {
             }
         }
         assert!(saw_restart_open, "Restart shell did not send Cmd::PtyOpen!");
+    }
+
+    #[test]
+    fn desktop_ctrl_key_does_not_set_meta_modifier_desk_01() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let desk = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "workstation")
+            .cloned()
+            .expect("workstation");
+        harn.app.open_desktop(&desk, true);
+        harn.app.desk_capture_keys = true;
+        harn.pass();
+        while harn.cmd_rx.try_recv().is_ok() {}
+
+        // On Windows/Linux egui sets BOTH `ctrl: true` AND `command: true` while `mac_cmd: false`.
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            mac_cmd: false,
+            ..Default::default()
+        };
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            modifiers,
+            events: vec![egui::Event::Key {
+                key: egui::Key::D,
+                physical_key: Some(egui::Key::D),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let _ = harn.ctx.run(raw.take(), |ctx| harn.app.ui_frame(ctx));
+        let keys = drain_key_inputs(&mut harn.cmd_rx);
+        assert!(
+            keys.iter().any(|(k, down)| k == "ctrl" && *down == Some(true))
+                && keys.iter().any(|(k, down)| k == "d" && *down == Some(true)),
+            "Ctrl+D on Windows/Linux must press 'ctrl' and 'd' without 'meta': {keys:?}"
+        );
+        assert!(
+            keys.iter().all(|(k, _)| !k.contains("meta") && !k.contains("super") && !k.contains("win")),
+            "Ctrl+D must NEVER emit Win/Meta modifier: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn desktop_ungrab_chord_releases_capture_without_remote_injection_desk_12() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let desk = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "workstation")
+            .cloned()
+            .expect("workstation");
+        harn.app.open_desktop(&desk, true);
+        harn.app.desk_capture_keys = true;
+        harn.pass();
+        while harn.cmd_rx.try_recv().is_ok() {}
+
+        // Arm the Ctrl+Alt+Shift chord, then release modifiers to trigger ungrab.
+        let chord = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            command: true,
+            mac_cmd: false,
+        };
+        let mut arm = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            modifiers: chord,
+            ..Default::default()
+        };
+        let _ = harn.ctx.run(arm.take(), |ctx| harn.app.ui_frame(ctx));
+        assert!(harn.app.desk_capture_keys);
+
+        let mut release = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            modifiers: egui::Modifiers::default(),
+            ..Default::default()
+        };
+        let _ = harn.ctx.run(release.take(), |ctx| harn.app.ui_frame(ctx));
+        assert!(
+            !harn.app.desk_capture_keys,
+            "Releasing Ctrl+Alt+Shift must release keyboard capture"
+        );
+    }
+
+    #[test]
+    fn nodes_loaded_and_parked_terminal_switch_preserve_session_desk_09_10() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        let template = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "workstation")
+            .cloned()
+            .expect("workstation fixture");
+        harn.app.nodes_loaded = false;
+        harn.app.shared.push(UiEvent::Nodes(Vec::new()));
+        harn.pass();
+        assert!(
+            harn.app.nodes_loaded,
+            "Empty UiEvent::Nodes must flip nodes_loaded=true so spinner stops"
+        );
+
+        let mut node_a = template.clone();
+        node_a.id = "node-a".into();
+        node_a.name = "Alpha".into();
+        node_a.online = true;
+        let mut node_b = template;
+        node_b.id = "node-b".into();
+        node_b.name = "Beta".into();
+        node_b.online = true;
+        harn.app.nodes = vec![node_a.clone(), node_b.clone()];
+        harn.app.prefs.allow_osc52 = true;
+        harn.app.open_terminal(&node_a);
+        let gen_a = harn.app.term_gen;
+        assert!(harn.app.terminal.allows_osc52());
+        harn.app.shared.push(UiEvent::Pty {
+            gen: gen_a,
+            bytes: b"alpha$ ".to_vec(),
+        });
+        harn.pass();
+        assert!(harn.app.term_alive);
+        while harn.cmd_rx.try_recv().is_ok() {}
+
+        // Switch to node B terminal -> node A must be parked, NOT closed!
+        harn.app.open_terminal(&node_b);
+        let gen_b = harn.app.term_gen;
+        assert_ne!(gen_a, gen_b);
+        while let Ok(cmd) = harn.cmd_rx.try_recv() {
+            assert!(
+                !matches!(cmd, Cmd::PtyClose | Cmd::PtyCloseGen { .. }),
+                "switching nodes must park node A instead of closing its PTY"
+            );
+        }
+
+        // Switch back to node A -> must restore gen_a without reopening a new PTY!
+        harn.app.open_terminal(&node_a);
+        assert_eq!(harn.app.term_gen, gen_a);
+        assert!(harn.app.term_alive);
+        assert!(harn.app.terminal.allows_osc52());
+        while let Ok(cmd) = harn.cmd_rx.try_recv() {
+            assert!(
+                !matches!(cmd, Cmd::PtyOpen { .. }),
+                "returning to parked node A must not spawn a duplicate PTY"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_file_preview_and_auth_expiry_redirect_desk_02_10() {
+        let mut harn = Harness::new(1280.0, 800.0);
+        harn.app.shared.push(UiEvent::File(super::model::LoadedFile {
+            path: "/tmp/huge.log".into(),
+            text: "preview only".into(),
+            total_size: Some(512 * 1024),
+            read_only: true,
+            read_only_reason: Some("File exceeds 256 KiB.".into()),
+        }));
+        harn.pass();
+        let ed = harn.app.editor.as_ref().expect("editor loaded");
+        assert!(ed.read_only);
+        assert_eq!(ed.saved_text, "preview only");
+
+        // Auth expiry error must kick the user back to Screen::Login (`DESK-10`).
+        harn.app.mock = false;
+        harn.app.preview_ui = false;
+        harn.app.screen = Screen::Machines;
+        harn.app
+            .shared
+            .push(UiEvent::Failed("401 unauthorized: refresh token expired".into()));
+        harn.pass();
+        assert!(
+            matches!(harn.app.screen, Screen::Login),
+            "expired auth error must return to Screen::Login"
+        );
     }
 }

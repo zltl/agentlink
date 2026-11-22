@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use unicode_width::UnicodeWidthChar;
@@ -135,9 +135,9 @@ impl SpeculativeEcho {
 
     pub fn sync_cursor_from_term(&mut self, term: &Term<TermHost>) {
         if self.pending.is_empty() {
-            let content = term.renderable_content();
-            self.cursor_line = content.cursor.point.line.0;
-            self.cursor_col = content.cursor.point.column.0;
+            let point = term.grid().cursor.point;
+            self.cursor_line = point.line.0;
+            self.cursor_col = point.column.0;
         }
     }
 
@@ -160,8 +160,10 @@ impl SpeculativeEcho {
     }
 
     /// UI-frame housekeeping (TTL). Never introduces painted cells.
-    pub fn tick(&mut self, term: &Term<TermHost>) -> bool {
-        let _ = term;
+    pub fn tick(&mut self, _term: &Term<TermHost>) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
         let before = self.pending.len();
         self.expire_ttl();
         before != self.pending.len()
@@ -257,20 +259,23 @@ impl SpeculativeEcho {
     /// remaining expects to painted (that was E1b challenge 2).
     pub fn reconcile(&mut self, term: &Term<TermHost>, _remote_drove: bool) {
         self.observe_modes(term);
-        if self.blocked {
+        if self.blocked || self.pending.is_empty() {
             return;
         }
         self.expire_ttl();
+        if self.pending.is_empty() {
+            self.sync_cursor_from_term(term);
+            return;
+        }
 
-        let now_cursor = {
-            let content = term.renderable_content();
-            (content.cursor.point.line.0, content.cursor.point.column.0)
-        };
+        let cursor_point = term.grid().cursor.point;
+        let now_cursor = (cursor_point.line.0, cursor_point.column.0);
 
         while let Some(front) = self.pending.front() {
-            let cell = cell_at(term, front.line, front.col);
-            let Some((ch, _wide)) = cell else {
-                break;
+            let Some((ch, _wide)) = cell_at(term, front.line, front.col) else {
+                self.invalidate();
+                self.sync_cursor_from_term(term);
+                return;
             };
             if ch == ' ' || ch == '\0' {
                 break;
@@ -326,18 +331,17 @@ pub fn cell_width(ch: char) -> usize {
 }
 
 fn cell_at(term: &Term<TermHost>, line: i32, col: usize) -> Option<(char, bool)> {
-    let content = term.renderable_content();
-    let target = Point::new(Line(line), Column(col));
-    for indexed in content.display_iter {
-        if indexed.point == target {
-            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                return Some((' ', false));
-            }
-            let wide = indexed.cell.flags.contains(Flags::WIDE_CHAR);
-            return Some((indexed.cell.c, wide));
-        }
+    let grid = term.grid();
+    let cols = grid.columns();
+    let min_line = grid.topmost_line().0;
+    let max_line = grid.bottommost_line().0;
+    if col >= cols || line < min_line || line > max_line {
+        return None;
     }
-    let cell = &term.grid()[Line(line)][Column(col)];
+    let cell = &grid[Line(line)][Column(col)];
+    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        return Some((' ', false));
+    }
     let wide = cell.flags.contains(Flags::WIDE_CHAR);
     Some((cell.c, wide))
 }
@@ -503,6 +507,50 @@ mod tests {
         assert!(emu.viewport_text().contains("hi"));
         assert!(emu.local_echo().overlay_cells(emu.term_ref()).is_empty());
     }
+
+    #[test]
+    fn cell_at_returns_none_for_out_of_bounds_without_panicking() {
+        let mut emu = Emulator::new(24, 80);
+        // No scrollback yet: negative lines are out of bounds.
+        assert_eq!(cell_at(emu.term_ref(), -1, 0), None);
+        assert_eq!(cell_at(emu.term_ref(), -10_000, 0), None);
+        assert_eq!(cell_at(emu.term_ref(), i32::MIN, 0), None);
+        // Past bottom screen line or past rightmost column.
+        assert_eq!(cell_at(emu.term_ref(), 24, 0), None);
+        assert_eq!(cell_at(emu.term_ref(), 100, 0), None);
+        assert_eq!(cell_at(emu.term_ref(), i32::MAX, 0), None);
+        assert_eq!(cell_at(emu.term_ref(), 0, 80), None);
+        assert_eq!(cell_at(emu.term_ref(), 0, 999), None);
+
+        // In-bounds narrow, wide, and spacer cells.
+        emu.feed_raw("A中".as_bytes());
+        assert_eq!(cell_at(emu.term_ref(), 0, 0), Some(('A', false)));
+        assert_eq!(cell_at(emu.term_ref(), 0, 1), Some(('中', true)));
+        assert_eq!(cell_at(emu.term_ref(), 0, 2), Some((' ', false)));
+
+        // Scroll lines into history and verify negative history bounds.
+        for i in 0..30 {
+            emu.feed_raw(format!("line{i}\r\n").as_bytes());
+        }
+        let hist = emu.history_lines() as i32;
+        assert!(hist > 0);
+        assert!(cell_at(emu.term_ref(), -1, 0).is_some());
+        assert!(cell_at(emu.term_ref(), -hist, 0).is_some());
+        assert_eq!(cell_at(emu.term_ref(), -hist - 1, 0), None);
+    }
+
+    #[test]
+    fn reconcile_invalidates_out_of_bounds_prediction_without_panicking() {
+        let mut emu = Emulator::new(24, 80);
+        emu.note_local_echo_outbound(b"x");
+        assert_eq!(emu.local_echo().pending_len(), 1);
+        if let Some(front) = emu.local_echo_mut().pending_front_mut() {
+            front.line = -500;
+            front.col = 500;
+        }
+        emu.reconcile_local_echo();
+        assert_eq!(emu.local_echo().pending_len(), 0);
+    }
 }
 
 /// Isolated local PTY via Python's `pty` + `stty -echo`. Typed stand-in glyphs
@@ -522,7 +570,7 @@ mod pty_stty_echo_off_tests {
             eprintln!("skipping: python not on PATH");
             return;
         };
-        let mut child = Command::new(python)
+        let mut child = Command::new(python) // no-window-reviewed: unix-only test
             .arg("-u")
             .arg("-c")
             .arg(
