@@ -1479,6 +1479,7 @@ fn run_entry(is_gui_binary: bool) {
             std::process::exit(controller::enter_preview());
         }
         if !args.check {
+            propagate_controller_relay_env(&cli);
             let config_dir = match config_dir(&cli) {
                 Ok(dir) => dir,
                 Err(err) => {
@@ -1509,6 +1510,33 @@ fn run_entry(is_gui_binary: bool) {
         .build()
         .expect("tokio runtime");
     runtime.block_on(async_main(cli));
+}
+
+fn propagate_controller_relay_env(cli: &Cli) {
+    if let Some(relay) = cli
+        .relay
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        std::env::set_var("AGENTLINK_RELAY", relay);
+    }
+    if let Some(fingerprint) = cli
+        .fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        std::env::set_var("AGENTLINK_FINGERPRINT", fingerprint);
+    }
+    if let Some(trust) = cli
+        .trust
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        std::env::set_var("AGENTLINK_TRUST", trust);
+    }
 }
 
 fn argv_has_json_flag(argv: &[std::ffi::OsString]) -> bool {
@@ -2248,22 +2276,25 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
         Command::Controller(args) if args.preview_ui && !args.check => {
             Ok(controller::enter_preview())
         }
-        Command::Controller(args) => Ok(controller::enter_args(controller::EnterArgs {
-            config_dir: config_dir(cli)?,
-            data_dir: args.data_dir.clone(),
-            tray: true,
-            background: args.background,
-            check: args.check,
-            debug_socket: args.debug_socket.clone(),
-            mock: args.mock,
-            headless: args.headless,
-            fail_connect: args.fail_connect,
-            connect_timeout_secs: args.connect_timeout_secs,
-            max_fps: args.max_fps,
-            perf_log: args.perf_log.clone(),
-            open_desktop: args.open_desktop.clone(),
-            preview_ui: args.preview_ui,
-        })),
+        Command::Controller(args) => {
+            propagate_controller_relay_env(cli);
+            Ok(controller::enter_args(controller::EnterArgs {
+                config_dir: config_dir(cli)?,
+                data_dir: args.data_dir.clone(),
+                tray: true,
+                background: args.background,
+                check: args.check,
+                debug_socket: args.debug_socket.clone(),
+                mock: args.mock,
+                headless: args.headless,
+                fail_connect: args.fail_connect,
+                connect_timeout_secs: args.connect_timeout_secs,
+                max_fps: args.max_fps,
+                perf_log: args.perf_log.clone(),
+                open_desktop: args.open_desktop.clone(),
+                preview_ui: args.preview_ui,
+            }))
+        }
         Command::Tray(args) => {
             let action = match &args.action {
                 None => tray::TrayAction::Run,

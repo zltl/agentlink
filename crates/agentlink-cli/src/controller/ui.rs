@@ -669,8 +669,24 @@ impl ControllerApp {
                             .filter(|v| !v.trim().is_empty())
                     })
                     .unwrap_or_default();
-                let pin = file.fingerprint.unwrap_or_default();
-                let trust = file.trust.unwrap_or_default();
+                let pin = file
+                    .fingerprint
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        std::env::var("AGENTLINK_FINGERPRINT")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                    })
+                    .unwrap_or_default();
+                let trust = file
+                    .trust
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        std::env::var("AGENTLINK_TRUST")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                    })
+                    .unwrap_or_default();
                 let node_line = node_summary(&live, &data_dir, &config_dir);
                 let autostart = live.start_on_login();
                 let saved_session = has_saved_session(file.refresh_token.as_deref());
