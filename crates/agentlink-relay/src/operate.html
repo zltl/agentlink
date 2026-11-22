@@ -229,6 +229,37 @@
   const $ = (id) => document.getElementById(id);
   const DEFAULT_RELAY = "";
 
+  function safeRelayOrigin(relay) {
+    const raw = String(relay == null ? "" : relay).trim();
+    if (!raw || /[\s'"`\\;$|&<>()]/.test(raw)) return null;
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol !== "wss:" || !parsed.host || parsed.username || parsed.password) {
+        return null;
+      }
+      if ((parsed.pathname && parsed.pathname !== "/" && parsed.pathname !== "/v1/connect") || parsed.search || parsed.hash) {
+        return null;
+      }
+      return "https://" + parsed.host;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function safeHttpsOrigin(raw) {
+    const text = String(raw == null ? "" : raw).trim();
+    if (!text || /[\s'"`\\;$|&<>()]/.test(text)) return null;
+    try {
+      const parsed = new URL(text);
+      if (parsed.protocol !== "https:" || !parsed.host || parsed.username || parsed.password) {
+        return null;
+      }
+      return parsed.origin;
+    } catch (err) {
+      return null;
+    }
+  }
+
   function decodeGuide(hash) {
     let raw = String(hash || "").replace(/^#/, "");
     const cut = raw.indexOf(".");
@@ -241,6 +272,7 @@
       const bytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
       const guide = JSON.parse(new TextDecoder().decode(bytes));
       if (!guide || guide.v !== 1 || !guide.relay || !guide.node_id) return null;
+      if (!safeRelayOrigin(guide.relay)) return null;
       return guide;
     } catch (err) {
       return null;
@@ -249,7 +281,7 @@
 
   function shellQuote(value) {
     const text = String(value == null ? "" : value);
-    if (/^[A-Za-z0-9._:\/@%+,\[\]-]+$/.test(text)) return text;
+    if (/^[A-Za-z0-9._:\/@%+,-]+$/.test(text)) return text;
     return "'" + text.replace(/'/g, "'\\''") + "'";
   }
 
@@ -307,7 +339,12 @@
   }
 
   function render(guide) {
-    const origin = location.protocol === "https:" ? location.origin : (guide.relay.replace(/^wss:\/\//, "https://"));
+    const relayOrigin = safeRelayOrigin(guide.relay);
+    if (!relayOrigin) {
+      renderFallback();
+      return;
+    }
+    const origin = (location.protocol === "https:" && safeHttpsOrigin(location.origin)) || relayOrigin;
     const node = nodeArg(guide);
     const relayFlag = String(guide.relay || "").trim() !== DEFAULT_RELAY ? " --relay " + shellQuote(guide.relay) : "";
     const policy = suggestedPolicy(guide);
@@ -350,7 +387,7 @@
     }
 
     $("install-cmds").replaceChildren();
-    commandRow($("install-cmds"), "curl -fsSL " + origin + "/install.sh | sh");
+    commandRow($("install-cmds"), "curl -fsSL " + shellQuote(origin + "/install.sh") + " | sh");
     commandRow($("install-cmds"), "agentlink update");
 
     $("login-cmds").replaceChildren();

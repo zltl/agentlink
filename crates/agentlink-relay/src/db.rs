@@ -67,6 +67,7 @@ struct UserRow {
     totp_pending: Option<String>,
     failed_attempts: i64,
     locked_until_unix: i64,
+    last_totp_step: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -415,7 +416,7 @@ impl Database {
     pub async fn list_users(&self) -> Result<Vec<UserAccount>> {
         let rows: Vec<UserRow> = fetch_all!(
             self,
-            "SELECT username, password_hash, created_unix, disabled, user_role, totp_secret, totp_pending, failed_attempts, locked_until_unix FROM users ORDER BY username",
+            "SELECT username, password_hash, created_unix, disabled, user_role, totp_secret, totp_pending, failed_attempts, locked_until_unix, last_totp_step FROM users ORDER BY username",
         )?;
         Ok(rows.into_iter().map(account_from).collect())
     }
@@ -545,6 +546,16 @@ impl Database {
         password: &str,
         totp: Option<&str>,
     ) -> Result<UserAccount> {
+        self.check_login_at(username, password, totp, unix_now()).await
+    }
+
+    pub(crate) async fn check_login_at(
+        &self,
+        username: &str,
+        password: &str,
+        totp: Option<&str>,
+        now: i64,
+    ) -> Result<UserAccount> {
         let username = username.trim().to_ascii_lowercase();
         let row = self.user_row(&username).await?;
         let encoded = row
@@ -560,33 +571,75 @@ impl Database {
             failed: row.failed_attempts.max(0) as u32,
             locked_until: row.locked_until_unix,
         };
-        if lock.is_locked(unix_now()) {
+        if lock.is_locked(now) {
             return Err(Error::Auth("account is temporarily locked".into()));
         }
         if !password_ok {
             self.note_failure(&row.username).await?;
+            if row.username == ADMIN_USER && self.bootstrap_password_exists() {
+                return Err(Error::Auth(format!(
+                    "bootstrap admin password must be rotated first; run `agentlink relay --data-dir {} user passwd admin`",
+                    self.data_dir.display()
+                )));
+            }
             return Err(Error::Auth("invalid username or password".into()));
         }
         if row.disabled != 0 {
             return Err(Error::Auth("account is disabled".into()));
         }
-        if row.totp_secret.as_deref().is_some() {
+        if row
+            .totp_secret
+            .as_deref()
+            .is_some_and(|secret| !secret.is_empty())
+        {
             match totp.map(str::trim).filter(|code| !code.is_empty()) {
                 None => return Err(Error::Auth("totp code required".into())),
-                Some(code)
-                    if !accounts::totp_verify(
-                        row.totp_secret.as_deref().unwrap_or(""),
-                        code,
-                        unix_now(),
-                    ) =>
-                {
-                    self.note_failure(&row.username).await?;
-                    return Err(Error::Auth("invalid totp code".into()));
+                Some(code) => {
+                    if !self.verify_and_consume_totp(&row, code, now).await? {
+                        self.note_failure(&row.username).await?;
+                        return Err(Error::Auth("invalid totp code".into()));
+                    }
                 }
-                Some(_) => {}
             }
         }
         Ok(account_from(row))
+    }
+
+    /// Re-authenticate an already-logged-in user for sensitive account actions
+    /// (self password change, disabling TOTP). Enforces lockout, password check,
+    /// and replay-protected TOTP when TOTP is enabled on the account.
+    pub async fn verify_reauth(
+        &self,
+        username: &str,
+        current_password: &str,
+        totp: Option<&str>,
+    ) -> Result<UserAccount> {
+        let account = self.check_login(username, current_password, totp).await?;
+        self.note_success(&account.username).await?;
+        Ok(account)
+    }
+
+    fn bootstrap_password_exists(&self) -> bool {
+        self.data_dir.join("bootstrap.password").is_file()
+    }
+
+    async fn verify_and_consume_totp(&self, row: &UserRow, code: &str, now: i64) -> Result<bool> {
+        let Some(secret) = row.totp_secret.as_deref().filter(|s| !s.is_empty()) else {
+            return Ok(true);
+        };
+        let Some(step) = find_matching_totp_step(secret, code, now) else {
+            return Ok(false);
+        };
+        if row.last_totp_step.is_some_and(|last| step <= last) {
+            return Ok(false);
+        }
+        let affected = exec!(
+            self,
+            "UPDATE users SET last_totp_step = ?1 WHERE username = ?2 AND (last_totp_step IS NULL OR last_totp_step < ?1)",
+            step,
+            &row.username,
+        )?;
+        Ok(affected == 1)
     }
 
     pub async fn note_success(&self, username: &str) -> Result<()> {
@@ -633,6 +686,10 @@ impl Database {
     }
 
     pub async fn confirm_totp(&self, username: &str, code: &str) -> Result<()> {
+        self.confirm_totp_at(username, code, unix_now()).await
+    }
+
+    pub(crate) async fn confirm_totp_at(&self, username: &str, code: &str, now: i64) -> Result<()> {
         let Some(row) = self.user_row(username).await? else {
             return Err(Error::NotFound(format!("user '{username}'")));
         };
@@ -641,13 +698,14 @@ impl Database {
                 "totp enrollment has not been started".into(),
             ));
         };
-        if !accounts::totp_verify(&pending, code, unix_now()) {
+        let Some(step) = find_matching_totp_step(&pending, code, now) else {
             return Err(Error::Auth("invalid totp code".into()));
-        }
+        };
         exec!(
             self,
-            "UPDATE users SET totp_secret = ?1, totp_pending = NULL WHERE username = ?2",
+            "UPDATE users SET totp_secret = ?1, totp_pending = NULL, last_totp_step = ?2 WHERE username = ?3",
             &pending,
+            step,
             username,
         )?;
         Ok(())
@@ -659,7 +717,7 @@ impl Database {
         }
         exec!(
             self,
-            "UPDATE users SET totp_secret = NULL, totp_pending = NULL WHERE username = ?1",
+            "UPDATE users SET totp_secret = NULL, totp_pending = NULL, last_totp_step = NULL WHERE username = ?1",
             username,
         )?;
         Ok(())
@@ -685,21 +743,66 @@ impl Database {
         } else {
             device_name.trim().chars().take(64).collect()
         };
-        exec!(
-            self,
-            "INSERT INTO devices (id, username, name, created_unix, last_seen_unix, revoked) VALUES (?1, ?2, ?3, ?4, ?4, 0) ON CONFLICT (id) DO UPDATE SET username = ?2, name = ?3, last_seen_unix = ?4, revoked = 0",
-            &device_id,
-            username,
-            &name,
-            now,
-        )?;
+        // Never allow a login upsert to steal another user's device row or
+        // un-revoke a previously revoked device identity (SEC-16).
+        if let Some(existing) = self.device(&device_id).await? {
+            if existing.user != account.username {
+                return Err(Error::Auth("device belongs to another user".into()));
+            }
+            if existing.revoked {
+                return Err(Error::Auth("device is revoked".into()));
+            }
+            let updated = exec!(
+                self,
+                "UPDATE devices SET name = ?1, last_seen_unix = ?2 WHERE id = ?3 AND username = ?4 AND revoked = 0",
+                &name,
+                now,
+                &device_id,
+                &account.username,
+            )?;
+            if updated != 1 {
+                return Err(Error::Auth("device is revoked".into()));
+            }
+        } else {
+            let inserted = exec!(
+                self,
+                "INSERT INTO devices (id, username, name, created_unix, last_seen_unix, revoked) VALUES (?1, ?2, ?3, ?4, ?4, 0) ON CONFLICT (id) DO NOTHING",
+                &device_id,
+                &account.username,
+                &name,
+                now,
+            )?;
+            if inserted != 1 {
+                // Concurrent login race on the same device id: re-verify ownership & non-revocation.
+                let Some(existing) = self.device(&device_id).await? else {
+                    return Err(Error::Auth("device registration failed".into()));
+                };
+                if existing.user != account.username {
+                    return Err(Error::Auth("device belongs to another user".into()));
+                }
+                if existing.revoked {
+                    return Err(Error::Auth("device is revoked".into()));
+                }
+                let updated = exec!(
+                    self,
+                    "UPDATE devices SET name = ?1, last_seen_unix = ?2 WHERE id = ?3 AND username = ?4 AND revoked = 0",
+                    &name,
+                    now,
+                    &device_id,
+                    &account.username,
+                )?;
+                if updated != 1 {
+                    return Err(Error::Auth("device is revoked".into()));
+                }
+            }
+        }
         let access = format!("atk.{}", util::random_token());
         let refresh = format!("rtk.{}", util::random_token());
         let access_expires = now + ACCESS_TTL_SECS;
         // Inactivity window, not a hard cap from the original login. Refresh slides it.
         let refresh_expires = now + REFRESH_TTL_SECS;
         self.insert_session_tokens(
-            username,
+            &account.username,
             &device_id,
             &access,
             access_expires,
@@ -726,7 +829,7 @@ impl Database {
         let now = unix_now();
         let rows: Vec<AccessJoin> = fetch_all!(
             self,
-            "SELECT a.username, u.user_role, a.device_id, a.expires_unix, d.revoked, u.disabled, a.refresh_hash FROM access_tokens a JOIN devices d ON d.id = a.device_id JOIN users u ON u.username = a.username WHERE a.token_hash = ?1",
+            "SELECT a.username, u.user_role, a.device_id, a.expires_unix, d.revoked, u.disabled, a.refresh_hash FROM access_tokens a JOIN devices d ON d.id = a.device_id AND d.username = a.username JOIN users u ON u.username = a.username WHERE a.token_hash = ?1",
             token_hash,
         )?;
         let Some(row) = rows.into_iter().next() else {
@@ -771,7 +874,7 @@ impl Database {
         let now = unix_now();
         let rows: Vec<AccessJoin> = fetch_all!(
             self,
-            "SELECT a.username, u.user_role, a.device_id, a.expires_unix, d.revoked, u.disabled, a.refresh_hash FROM access_tokens a JOIN devices d ON d.id = a.device_id JOIN users u ON u.username = a.username WHERE a.token_hash = ?1",
+            "SELECT a.username, u.user_role, a.device_id, a.expires_unix, d.revoked, u.disabled, a.refresh_hash FROM access_tokens a JOIN devices d ON d.id = a.device_id AND d.username = a.username JOIN users u ON u.username = a.username WHERE a.token_hash = ?1",
             token_hash,
         )?;
         let Some(initial) = rows.into_iter().next() else {
@@ -783,7 +886,7 @@ impl Database {
         let fresh_cutoff = now.saturating_sub(ACCESS_SKEW_SECS);
         let live: Vec<AccessJoin> = fetch_all!(
             self,
-            "SELECT a.username, u.user_role, a.device_id, a.expires_unix, d.revoked, u.disabled, a.refresh_hash FROM access_tokens a JOIN devices d ON d.id = a.device_id JOIN users u ON u.username = a.username WHERE a.username = ?1 AND a.device_id = ?2 AND a.expires_unix > ?3 LIMIT 1",
+            "SELECT a.username, u.user_role, a.device_id, a.expires_unix, d.revoked, u.disabled, a.refresh_hash FROM access_tokens a JOIN devices d ON d.id = a.device_id AND d.username = a.username JOIN users u ON u.username = a.username WHERE a.username = ?1 AND a.device_id = ?2 AND a.expires_unix > ?3 LIMIT 1",
             &initial.username,
             &initial.device_id,
             fresh_cutoff,
@@ -899,7 +1002,8 @@ impl Database {
 
     /// The client presented a refresh token that already minted a successor.
     /// If that successor was never used, the response was lost: revoke it and
-    /// issue another pair. If it was used, this is a replay.
+    /// issue another pair. If it was used, rotated, or revoked, this is a
+    /// replay — revoke the entire device session family (SEC-16).
     async fn replace_unused_successor(
         &self,
         parent: &RefreshRow,
@@ -908,14 +1012,18 @@ impl Database {
         now: i64,
     ) -> Result<IssuedSession> {
         let Some(successor) = self.refresh_row(successor_hash).await? else {
+            self.revoke_device_family(device_id).await?;
             return Err(refresh_rejected());
         };
         if successor.device_id != device_id
             || successor.acknowledged != 0
             || successor.revoked != 0
             || filled(successor.replaced_by.as_deref()).is_some()
-            || successor.expires_unix <= now
         {
+            self.revoke_device_family(device_id).await?;
+            return Err(refresh_rejected());
+        }
+        if successor.expires_unix <= now {
             return Err(refresh_rejected());
         }
         let account = self
@@ -928,6 +1036,14 @@ impl Database {
             now,
         )?;
         if claimed != 1 {
+            if let Some(fresh) = self.refresh_row(successor_hash).await? {
+                if fresh.acknowledged != 0
+                    || fresh.revoked != 0
+                    || filled(fresh.replaced_by.as_deref()).is_some()
+                {
+                    self.revoke_device_family(device_id).await?;
+                }
+            }
             return Err(refresh_rejected());
         }
         let access = format!("atk.{}", util::random_token());
@@ -985,6 +1101,21 @@ impl Database {
             refresh_token: refresh,
             refresh_expires_unix: refresh_expires,
         })
+    }
+
+    async fn revoke_device_family(&self, device_id: &str) -> Result<()> {
+        exec!(self, "UPDATE devices SET revoked = 1 WHERE id = ?1", device_id)?;
+        exec!(
+            self,
+            "DELETE FROM access_tokens WHERE device_id = ?1",
+            device_id
+        )?;
+        exec!(
+            self,
+            "UPDATE refresh_tokens SET revoked = 1 WHERE device_id = ?1",
+            device_id,
+        )?;
+        Ok(())
     }
 
     async fn active_device_account(
@@ -2030,7 +2161,7 @@ impl Database {
     async fn user_row(&self, username: &str) -> Result<Option<UserRow>> {
         let rows: Vec<UserRow> = fetch_all!(
             self,
-            "SELECT username, password_hash, created_unix, disabled, user_role, totp_secret, totp_pending, failed_attempts, locked_until_unix FROM users WHERE username = ?1",
+            "SELECT username, password_hash, created_unix, disabled, user_role, totp_secret, totp_pending, failed_attempts, locked_until_unix, last_totp_step FROM users WHERE username = ?1",
             username,
         )?;
         Ok(rows.into_iter().next())
@@ -2178,6 +2309,26 @@ struct LegacyClient {
     revoked: bool,
     #[serde(default)]
     grants: HashMap<String, NodePolicy>,
+}
+
+fn find_matching_totp_step(secret: &str, code: &str, now: i64) -> Option<i64> {
+    let provided = code.trim();
+    if provided.len() != 6 || !provided.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let base_step = now.max(0) / 30;
+    let mut matched = None;
+    for delta in [-1_i64, 0, 1] {
+        let step = base_step.saturating_add(delta);
+        if step < 0 {
+            continue;
+        }
+        let expect = accounts::totp_at(secret, step.saturating_mul(30)).unwrap_or_default();
+        if util::ct_eq(provided, &expect) {
+            matched = Some(step);
+        }
+    }
+    matched
 }
 
 fn account_from(row: UserRow) -> UserAccount {
@@ -2786,9 +2937,14 @@ mod tests {
             .fetch_all(pool)
             .await
             .unwrap();
+        let user_cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('users')")
+            .fetch_all(pool)
+            .await
+            .unwrap();
         assert!(refresh_cols.iter().any(|c| c == "replaced_by"));
         assert!(refresh_cols.iter().any(|c| c == "acknowledged"));
         assert!(node_cols.iter().any(|c| c == "has_display"));
+        assert!(user_cols.iter().any(|c| c == "last_totp_step"));
         sqlx::query("INSERT INTO meta(name, value) VALUES ('after-migrate', 'ok')")
             .execute(pool)
             .await
@@ -2804,5 +2960,163 @@ mod tests {
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
         drop(migrated);
+    }
+
+    #[tokio::test]
+    async fn totp_replay_is_rejected_and_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+        let db = open_sqlite(dir.path()).await;
+        db.create_user("alice", "password-alice", "user")
+            .await
+            .unwrap();
+        let (secret, _url) = db.begin_totp("alice").await.unwrap();
+        let t0 = 1_700_000_000_i64;
+        let confirm_code = accounts::totp_at(&secret, t0).unwrap();
+        db.confirm_totp_at("alice", &confirm_code, t0)
+            .await
+            .unwrap();
+
+        // Confirmation code at step t0/30 cannot be replayed immediately at t0.
+        let replay_confirm = db
+            .check_login_at("alice", "password-alice", Some(&confirm_code), t0)
+            .await;
+        assert!(
+            replay_confirm.is_err(),
+            "TOTP enrollment confirmation code must not be replayable on login"
+        );
+
+        // Next 30s window succeeds.
+        let t1 = t0 + 30;
+        let code1 = accounts::totp_at(&secret, t1).unwrap();
+        db.check_login_at("alice", "password-alice", Some(&code1), t1)
+            .await
+            .expect("fresh TOTP step must succeed");
+        db.note_success("alice").await.unwrap();
+
+        // Reopen SQLite from disk: last_totp_step must be persisted, blocking replay!
+        drop(db);
+        let db2 = open_sqlite(dir.path()).await;
+        let replayed = db2
+            .check_login_at("alice", "password-alice", Some(&code1), t1)
+            .await
+            .unwrap_err();
+        assert!(
+            replayed.to_string().contains("invalid totp code"),
+            "replayed TOTP after DB reopen must fail: {replayed}"
+        );
+
+        // Previous window (t0) also fails even within +/-1 clock skew of t1.
+        let older = db2
+            .check_login_at("alice", "password-alice", Some(&confirm_code), t1)
+            .await;
+        assert!(older.is_err(), "older TOTP step must remain rejected");
+
+        // Advancing to t2 = t1 + 30 succeeds cleanly.
+        let t2 = t1 + 30;
+        let code2 = accounts::totp_at(&secret, t2).unwrap();
+        db2.check_login_at("alice", "password-alice", Some(&code2), t2)
+            .await
+            .expect("next TOTP step must succeed");
+    }
+
+    #[tokio::test]
+    async fn session_by_hash_enforces_device_owner_and_upsert_cannot_hijack_or_unrevoke() {
+        let dir = tempdir().unwrap();
+        let db = open_sqlite(dir.path()).await;
+        db.create_user("alice", "password-alice", "user")
+            .await
+            .unwrap();
+        db.create_user("bob", "password-bob", "user").await.unwrap();
+
+        let dev_key = util::random_hex(32);
+        let alice_sess = db.issue_session("alice", &dev_key, "laptop").await.unwrap();
+
+        // Bob cannot steal Alice's device id via login upsert.
+        let hijack = db
+            .issue_session("bob", &dev_key, "evil")
+            .await
+            .unwrap_err();
+        assert!(
+            hijack.to_string().contains("another user"),
+            "cross-user device upsert must be rejected: {hijack}"
+        );
+        assert_eq!(db.device(&dev_key).await.unwrap().unwrap().user, "alice");
+
+        // Even if a corrupt DB row mismatches devices.username != access_tokens.username,
+        // session_by_hash and active_socket_session_valid must fail closed.
+        sqlx::query("UPDATE devices SET username = 'bob' WHERE id = ?1")
+            .bind(&dev_key)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+        let hash = accounts::token_hash(&alice_sess.access_token);
+        assert!(
+            db.session_by_hash(&hash).await.unwrap().is_none(),
+            "session_by_hash must reject mismatched device/access username"
+        );
+        assert!(
+            !db.active_socket_session_valid(&hash).await.unwrap(),
+            "active_socket_session_valid must reject mismatched device/access username"
+        );
+
+        // Restore owner, revoke the device, and verify re-login cannot un-revoke it!
+        sqlx::query("UPDATE devices SET username = 'alice' WHERE id = ?1")
+            .bind(&dev_key)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+        db.revoke_device(&dev_key, Some("alice")).await.unwrap();
+        let unrevoke = db
+            .issue_session("alice", &dev_key, "laptop-again")
+            .await
+            .unwrap_err();
+        assert!(
+            unrevoke.to_string().contains("revoked"),
+            "login upsert must not un-revoke a revoked device: {unrevoke}"
+        );
+        assert!(db.device(&dev_key).await.unwrap().unwrap().revoked);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_admin_failed_login_returns_actionable_rotation_hint() {
+        let dir = tempdir().unwrap();
+        let opened = Database::open(OpenOptions {
+            data_dir: dir.path(),
+            database_url: None,
+            schema: None,
+            bootstrap_admin: true,
+            mint_legacy_admin: false,
+        })
+        .await
+        .unwrap();
+        assert!(dir.path().join("bootstrap.password").is_file());
+        let db = opened.db;
+
+        let err = db
+            .check_login("admin", "wrong-password", None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bootstrap admin password must be rotated first"),
+            "{msg}"
+        );
+        assert!(msg.contains("agentlink relay --data-dir"), "{msg}");
+        assert!(msg.contains("user passwd admin"), "{msg}");
+
+        // After rotation, bootstrap.password is deleted and wrong password gives standard error.
+        db.set_password("admin", "new-strong-password")
+            .await
+            .unwrap();
+        assert!(!dir.path().join("bootstrap.password").exists());
+        let err2 = db
+            .check_login("admin", "wrong-password", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err2.to_string().contains("invalid username or password"),
+            "{err2}"
+        );
+        assert!(!err2.to_string().contains("bootstrap"), "{err2}");
     }
 }

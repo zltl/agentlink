@@ -7,6 +7,8 @@
 //! The browser keeps an HttpOnly session cookie; device-bound access and
 //! refresh tokens stay on the CLI and the phone. Nothing is loaded from a CDN.
 
+use std::path::PathBuf;
+
 use agentlink_core::accounts::WEB_TTL_SECS;
 use agentlink_core::util::{self, unix_now};
 use agentlink_core::{
@@ -29,6 +31,7 @@ pub struct HttpReply {
 }
 
 impl HttpReply {
+    #[allow(dead_code)]
     pub fn encode(&self) -> Vec<u8> {
         self.encode_for_method("GET")
     }
@@ -37,13 +40,23 @@ impl HttpReply {
     /// Content-Length still reflects the would-be entity size.
     pub fn encode_for_method(&self, method: &str) -> Vec<u8> {
         let length = self.content_length.unwrap_or_else(|| self.body.len());
+        let has_csp = self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-security-policy"));
         let mut header = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: frame-ancestors 'none'; base-uri 'self'; object-src 'none'\r\nConnection: close\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n",
             self.status,
             self.reason,
             self.content_type,
             length
         );
+        if !has_csp {
+            header.push_str(
+                "Content-Security-Policy: frame-ancestors 'none'; base-uri 'self'; object-src 'none'\r\n",
+            );
+        }
+        header.push_str("Connection: close\r\n");
         for (name, value) in &self.headers {
             header.push_str(name);
             header.push_str(": ");
@@ -62,6 +75,12 @@ impl HttpReply {
 pub enum WebOutcome {
     Reply(HttpReply),
     Events { user: String, admin: bool },
+    StreamFile {
+        path: PathBuf,
+        filename: String,
+        len: u64,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
 }
 
 pub async fn handle(
@@ -78,6 +97,10 @@ pub async fn handle(
     let head = method.eq_ignore_ascii_case("HEAD");
     let method = if head { "GET" } else { method };
     match (method, path) {
+        ("GET", "/healthz") => Ok(Some(WebOutcome::Reply(json_reply(
+            200,
+            json!({"status": "ok"}),
+        )))),
         ("POST", "/auth/login") => Ok(Some(WebOutcome::Reply(
             login(hub, headers, body, audit_ip).await?,
         ))),
@@ -125,7 +148,9 @@ pub async fn handle(
             "Gone",
             "browser control is disabled; use a sealed client with a node-local grant",
         )))),
-        ("GET", path) if path.starts_with("/dl/") => Ok(Some(download(hub, path, headers, head))),
+        ("GET", path) if path.starts_with("/dl/") => {
+            Ok(Some(download(hub, path, headers, head).await))
+        }
         _ => Ok(None),
     }
 }
@@ -244,15 +269,9 @@ async fn login(
             Ok(reply)
         }
         Err(err) => {
-            server::audit_auth(
-                hub.audit_path(),
-                "web.login",
-                username,
-                "web",
-                false,
-                &err.to_string(),
-            );
-            Ok(text(401, "Unauthorized", &err.to_string()))
+            let msg = server::auth_err_message(&err);
+            server::audit_auth(hub.audit_path(), "web.login", username, "web", false, &msg);
+            Ok(text(401, "Unauthorized", &msg))
         }
     }
 }
@@ -322,6 +341,10 @@ async fn create_token(hub: &Hub, headers: &[(String, String)], body: &[u8]) -> R
         Ok(policy) => policy,
         Err(err) => return Ok(text(400, "Bad Request", &err.to_string())),
     };
+    let target = match resolve_enroll_target(hub, headers) {
+        Ok(target) => target,
+        Err(reply) => return Ok(reply),
+    };
     let issued = match hub
         .db()
         .create_token(&session.user, name, policy, ttl, uses)
@@ -338,7 +361,6 @@ async fn create_token(hub: &Hub, headers: &[(String, String)], body: &[u8]) -> R
         true,
         "",
     );
-    let target = enroll_target(&host_header(headers), &fingerprint_of(hub));
     let access = issued.policy.preset_name();
     let android = format!(
         "agentlink://enroll?relay={}&fingerprint={}&token={}&name={}&access={}",
@@ -477,12 +499,59 @@ async fn ice_config(
         return Ok(text(429, "Too Many Requests", "too many ice requests"));
     }
     let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let requested_node = payload["node"]
+        .as_str()
+        .or_else(|| payload["node_id"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    // 1. Native clients (CLI / desktop controller / mobile) authenticate via
+    //    `Authorization: Bearer <access_token>` (no CSRF required for Bearer).
+    if let Some(token) = bearer_token(headers) {
+        if let Some(access) = hub.db().access_session(&token).await? {
+            let caller = Caller {
+                user: access.user.clone(),
+                admin: access.role == "admin",
+            };
+            if let Some(reply) = ensure_ice_node_access(hub, &caller, requested_node).await? {
+                return Ok(reply);
+            }
+            let subject = format!("user:{}", access.user);
+            server::audit_auth(hub.audit_path(), "ice.mint", &subject, "bearer", true, "");
+            return Ok(ice_reply(&subject));
+        }
+        if server::presented_legacy(hub, &token) {
+            let caller = Caller {
+                user: "admin".into(),
+                admin: true,
+            };
+            if let Some(reply) = ensure_ice_node_access(hub, &caller, requested_node).await? {
+                return Ok(reply);
+            }
+            let subject = "admin:admin";
+            server::audit_auth(hub.audit_path(), "ice.mint", subject, "legacy", true, "");
+            return Ok(ice_reply(subject));
+        }
+        if token.starts_with("view.") {
+            match server::turn_subject_for_ticket(hub, &token) {
+                Ok(subject) => {
+                    server::audit_auth(hub.audit_path(), "ice.mint", &subject, "ticket", true, "");
+                    return Ok(ice_reply(&subject));
+                }
+                Err(err) => {
+                    return Ok(text(401, "Unauthorized", &server::auth_err_message(&err)));
+                }
+            }
+        }
+        return Ok(text(401, "Unauthorized", "invalid or expired access token"));
+    }
+
+    // 2. Legacy view-ticket body field (retired, kept fail-closed).
     let ticket = payload["ticket"]
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| bearer_token(headers));
+        .map(str::to_string);
     let bound = payload["session"]
         .as_str()
         .map(str::trim)
@@ -501,17 +570,55 @@ async fn ice_config(
                 return Ok(ice_reply(&subject));
             }
             Err(err) => {
-                return Ok(text(401, "Unauthorized", &err.to_string()));
+                return Ok(text(401, "Unauthorized", &server::auth_err_message(&err)));
             }
         }
     }
+
+    // 3. Dashboard session cookie + CSRF header.
     let session = match gate(hub, headers, true).await? {
         Gate::Out(reply) => return Ok(reply),
         Gate::In(session) => session,
     };
+    let caller = Caller {
+        user: session.user.clone(),
+        admin: session.role == "admin",
+    };
+    if let Some(reply) = ensure_ice_node_access(hub, &caller, requested_node).await? {
+        return Ok(reply);
+    }
     let subject = format!("web:{}", session.user);
     server::audit_auth(hub.audit_path(), "ice.mint", &subject, "session", true, "");
     Ok(ice_reply(&subject))
+}
+
+/// Gate `POST /api/ice` on the caller owning or having access to at least one
+/// node (and, if a specific node was named, access to that node). Prevents
+/// 0-node accounts from abusing relay coturn bandwidth (SEC-16).
+async fn ensure_ice_node_access(
+    hub: &Hub,
+    caller: &Caller,
+    requested_node: Option<&str>,
+) -> Result<Option<HttpReply>> {
+    if let Some(node_query) = requested_node {
+        if hub.db().access_to(caller, node_query).await.is_err() {
+            return Ok(Some(text(
+                403,
+                "Forbidden",
+                "no access to the requested node",
+            )));
+        }
+        return Ok(None);
+    }
+    let visible = hub.db().visible(caller).await?;
+    if visible.is_empty() {
+        return Ok(Some(text(
+            403,
+            "Forbidden",
+            "at least one accessible node is required to request ICE credentials",
+        )));
+    }
+    Ok(None)
 }
 
 fn ice_reply(subject: &str) -> HttpReply {
@@ -562,7 +669,10 @@ async fn qr(hub: &Hub, headers: &[(String, String)], body: &[u8]) -> Result<Http
 }
 
 fn install_sh(hub: &Hub, headers: &[(String, String)]) -> HttpReply {
-    let target = enroll_target(&host_header(headers), &fingerprint_of(hub));
+    let target = match resolve_enroll_target(hub, headers) {
+        Ok(target) => target,
+        Err(reply) => return reply,
+    };
     let mut body = script_prelude(&target).into_bytes();
     body.extend_from_slice(include_bytes!("../../../install.sh"));
     HttpReply {
@@ -576,7 +686,10 @@ fn install_sh(hub: &Hub, headers: &[(String, String)]) -> HttpReply {
 }
 
 fn install_ps1(hub: &Hub, headers: &[(String, String)]) -> HttpReply {
-    let target = enroll_target(&host_header(headers), &fingerprint_of(hub));
+    let target = match resolve_enroll_target(hub, headers) {
+        Ok(target) => target,
+        Err(reply) => return reply,
+    };
     let relay = target.relay.replace('"', "");
     let fingerprint = target.fingerprint.replace('"', "");
     let download = target.download.replace('"', "");
@@ -611,9 +724,11 @@ fn install_ps1(hub: &Hub, headers: &[(String, String)]) -> HttpReply {
     }
 }
 
-fn download(hub: &Hub, path: &str, headers: &[(String, String)], head_only: bool) -> WebOutcome {
+async fn download(hub: &Hub, path: &str, headers: &[(String, String)], head_only: bool) -> WebOutcome {
     let name = path.trim_start_matches("/dl/");
     if name.is_empty()
+        || name == "."
+        || name == ".."
         || name.contains('/')
         || name.contains('\\')
         || !name
@@ -633,33 +748,38 @@ fn download(hub: &Hub, path: &str, headers: &[(String, String)], head_only: bool
         return WebOutcome::Reply(install_ps1(hub, headers));
     }
     let local = hub.data_dir().join("dist").join(name);
-    if local.is_file() {
-        let disposition = (
-            "Content-Disposition".into(),
-            format!("attachment; filename=\"{name}\""),
-        );
-        if head_only {
-            let len = std::fs::metadata(&local)
-                .map(|meta| meta.len() as usize)
-                .unwrap_or(0);
-            return WebOutcome::Reply(HttpReply {
-                status: 200,
-                reason: "OK",
-                content_type: "application/octet-stream",
-                body: Vec::new(),
-                headers: vec![disposition],
-                content_length: Some(len),
-            });
+    if let Ok(meta) = tokio::fs::metadata(&local).await {
+        if meta.is_file() {
+            let disposition = (
+                "Content-Disposition".into(),
+                format!("attachment; filename=\"{name}\""),
+            );
+            if head_only {
+                return WebOutcome::Reply(HttpReply {
+                    status: 200,
+                    reason: "OK",
+                    content_type: "application/octet-stream",
+                    body: Vec::new(),
+                    headers: vec![disposition],
+                    content_length: Some(meta.len() as usize),
+                });
+            }
+            let Some(permit) = hub.try_acquire_download_permit() else {
+                let mut reply = text(
+                    503,
+                    "Service Unavailable",
+                    "too many concurrent downloads; retry shortly",
+                );
+                reply.headers.push(("Retry-After".into(), "5".into()));
+                return WebOutcome::Reply(reply);
+            };
+            return WebOutcome::StreamFile {
+                path: local,
+                filename: name.to_string(),
+                len: meta.len(),
+                permit,
+            };
         }
-        let bytes = std::fs::read(&local).unwrap_or_default();
-        return WebOutcome::Reply(HttpReply {
-            status: 200,
-            reason: "OK",
-            content_type: "application/octet-stream",
-            body: bytes,
-            headers: vec![disposition],
-            content_length: None,
-        });
     }
     let location = release_download_url(name);
     WebOutcome::Reply(HttpReply {
@@ -889,16 +1009,124 @@ fn cookie(headers: &[(String, String)], name: &str) -> Option<String> {
     None
 }
 
-fn host_header(headers: &[(String, String)]) -> String {
-    let host = header(headers, "host").unwrap_or("localhost");
-    if host.is_empty()
-        || !host
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ':' | '-' | '[' | ']'))
-    {
-        return "localhost".into();
+/// Validate and normalize an explicit `--public-url` / `AGENTLINK_PUBLIC_URL`
+/// value (`https://<host>[:<port>]`, no path/query/fragment/credentials).
+pub(crate) fn parse_public_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return Err(Error::Message(
+            "AGENTLINK_PUBLIC_URL must start with https://".into(),
+        ));
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(Error::Message(
+            "AGENTLINK_PUBLIC_URL must use the https:// scheme".into(),
+        ));
     }
-    host.to_string()
+    let authority = rest.trim_end_matches('/');
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('?')
+        || authority.contains('#')
+        || authority.contains('@')
+    {
+        return Err(Error::Message(
+            "AGENTLINK_PUBLIC_URL must be an https:// origin without path, query, or credentials"
+                .into(),
+        ));
+    }
+    let valid = validate_authority(authority).ok_or_else(|| {
+        Error::Message(format!("invalid host in AGENTLINK_PUBLIC_URL: '{authority}'"))
+    })?;
+    Ok(format!("https://{valid}"))
+}
+
+fn validate_authority(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 255 {
+        return None;
+    }
+    if raw.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace()) {
+        return None;
+    }
+    let bracketed = raw.starts_with('[');
+    let (host, port) = split_host_port(raw)?;
+    if bracketed {
+        let addr: std::net::Ipv6Addr = host.parse().ok()?;
+        let normalized = match port {
+            Some(p) => format!("[{addr}]:{p}"),
+            None => format!("[{addr}]"),
+        };
+        return Some(normalized);
+    }
+    if host.contains(':') || host.contains('[') || host.contains(']') {
+        return None;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        let normalized = match port {
+            Some(p) => format!("{v4}:{p}"),
+            None => v4.to_string(),
+        };
+        return Some(normalized);
+    }
+    if !valid_dns_hostname(&host) {
+        return None;
+    }
+    let lower = host.to_ascii_lowercase();
+    let normalized = match port {
+        Some(p) => format!("{lower}:{p}"),
+        None => lower,
+    };
+    Some(normalized)
+}
+
+fn valid_dns_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return false;
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_host_header(headers: &[(String, String)]) -> Option<String> {
+    let mut hosts = headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.as_str());
+    let first = hosts.next()?;
+    if hosts.next().is_some() {
+        // Reject ambiguous duplicate Host headers.
+        return None;
+    }
+    validate_authority(first)
+}
+
+fn resolve_enroll_target(
+    hub: &Hub,
+    headers: &[(String, String)],
+) -> std::result::Result<EnrollTarget, HttpReply> {
+    if let Some(origin) = hub.public_url() {
+        let host = origin.strip_prefix("https://").unwrap_or(origin);
+        return Ok(enroll_target(host, &fingerprint_of(hub)));
+    }
+    let Some(host) = validate_host_header(headers) else {
+        return Err(text(400, "Bad Request", "invalid or missing Host header"));
+    };
+    Ok(enroll_target(&host, &fingerprint_of(hub)))
 }
 
 struct EnrollTarget {
@@ -1396,5 +1624,63 @@ mod tests {
             lower.contains("content-security-policy:") && lower.contains("frame-ancestors 'none'"),
             "{raw}"
         );
+    }
+
+    #[test]
+    fn public_url_and_strict_host_validation_reject_untrusted_inputs() {
+        assert_eq!(
+            parse_public_url("https://relay.example.com/").unwrap(),
+            "https://relay.example.com"
+        );
+        assert_eq!(
+            parse_public_url("https://Relay.Example.COM:7443").unwrap(),
+            "https://relay.example.com:7443"
+        );
+        assert_eq!(
+            parse_public_url("https://[::1]:7443").unwrap(),
+            "https://[::1]:7443"
+        );
+        assert!(parse_public_url("http://relay.example.com").is_err());
+        assert!(parse_public_url("https://user:pass@relay.example.com").is_err());
+        assert!(parse_public_url("https://relay.example.com/subpath").is_err());
+        assert!(parse_public_url("https://relay.example.com?q=1").is_err());
+        assert!(parse_public_url("https://evil.com;rm -rf /").is_err());
+
+        assert_eq!(
+            validate_host_header(&login_headers(&[("host", "relay.example.com:443")])).as_deref(),
+            Some("relay.example.com:443")
+        );
+        assert_eq!(
+            validate_host_header(&login_headers(&[("host", "127.0.0.1:7443")])).as_deref(),
+            Some("127.0.0.1:7443")
+        );
+        assert_eq!(
+            validate_host_header(&login_headers(&[("host", "[::1]:7443")])).as_deref(),
+            Some("[::1]:7443")
+        );
+        // Duplicate Host headers must be rejected.
+        assert!(validate_host_header(&login_headers(&[
+            ("host", "a.example"),
+            ("host", "b.example"),
+        ]))
+        .is_none());
+        // Malformed Host headers must be rejected.
+        for bad in [
+            "",
+            ":::",
+            "host:notaport",
+            "host:0",
+            "host:99999",
+            "-bad.example",
+            "bad..example",
+            "[not-ipv6]:443",
+            "evil.com/path",
+            "evil.com;id",
+        ] {
+            assert!(
+                validate_host_header(&login_headers(&[("host", bad)])).is_none(),
+                "host `{bad}` should have been rejected"
+            );
+        }
     }
 }

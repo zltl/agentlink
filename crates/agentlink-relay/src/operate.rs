@@ -20,7 +20,7 @@ pub fn response_for(head: &str) -> Option<Vec<u8>> {
     }
     let body = PAGE.as_bytes();
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut out = header.into_bytes();
@@ -86,6 +86,21 @@ mod tests {
 
     fn text_of_page() -> String {
         String::from_utf8(PAGE.as_bytes().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn operate_page_validates_and_shell_quotes_install_origin() {
+        let page = text_of_page();
+        assert!(page.contains("function safeRelayOrigin("), "{page}");
+        assert!(page.contains("function safeHttpsOrigin("), "{page}");
+        assert!(
+            page.contains(r#"commandRow($("install-cmds"), "curl -fsSL " + shellQuote(origin + "/install.sh") + " | sh")"#),
+            "{page}"
+        );
+        assert!(
+            !page.contains(r#"commandRow($("install-cmds"), "curl -fsSL " + origin + "/install.sh | sh")"#),
+            "install command must shell-quote origin"
+        );
     }
 
     #[test]

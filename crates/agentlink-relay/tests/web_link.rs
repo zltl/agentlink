@@ -185,6 +185,59 @@ async fn public_ice_still_mints_for_dashboard_session_without_view_tickets() {
     let session = cookie(&login, "agentlink_session");
     let csrf = cookie(&login, "agentlink_csrf");
 
+    // A 0-node account must be denied TURN credential minting (SEC-16).
+    let zero_node = exchange(
+        &relay,
+        "POST",
+        "/api/ice",
+        &format!(
+            "Content-Type: application/json\r\nCookie: agentlink_session={session}\r\nX-CSRF-Token: {csrf}"
+        ),
+        "{}",
+    )
+    .await;
+    assert!(
+        zero_node.contains("403"),
+        "0-node user must be rejected with 403 on /api/ice: {zero_node}"
+    );
+
+    // Enroll a node owned by alice; now /api/ice succeeds with both legacy and
+    // native `ice_servers` + `ttl_secs` fields.
+    let relay_url = format!("wss://127.0.0.1:{}", relay.local_addr.port());
+    let alice_key = agentlink_core::Identity::generate();
+    let alice_session = agentlink_core::client::login_user(
+        &relay_url,
+        &relay.fingerprint,
+        None,
+        &alice_key,
+        "alice",
+        "password-alice",
+        None,
+        "desktop",
+    )
+    .await
+    .unwrap();
+    let alice_client = agentlink_core::Client::connect_identity(
+        &agentlink_core::ClientSettings {
+            relay: relay_url,
+            token: alice_session.access_token.clone(),
+            fingerprint: relay.fingerprint.clone(),
+            trust: None,
+        },
+        alice_key,
+        true,
+    )
+    .await
+    .unwrap();
+    alice_client
+        .enroll_self(
+            "alice-desk",
+            &agentlink_core::Identity::generate(),
+            Some(agentlink_core::NodePolicy::full()),
+        )
+        .await
+        .unwrap();
+
     let authed = exchange(
         &relay,
         "POST",
@@ -199,6 +252,13 @@ async fn public_ice_still_mints_for_dashboard_session_without_view_tickets() {
     let ice: serde_json::Value = serde_json::from_str(body_of(&authed)).unwrap();
     assert_eq!(ice["media"], "dtls-srtp");
     assert_eq!(ice["turn_auth"], "rest");
+    assert_eq!(ice["ttl_secs"], 600);
+    assert!(
+        ice["ice_servers"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty()),
+        "{ice}"
+    );
     let username = ice["turn"][0]["username"].as_str().unwrap();
     let credential = ice["turn"][0]["credential"].as_str().unwrap();
     assert!(username.ends_with(":web:alice"), "{username}");
