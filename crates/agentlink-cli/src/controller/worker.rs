@@ -2037,13 +2037,29 @@ fn build_ice_refresh_cb(
         };
         let relay = settings.relay.clone();
         let token = settings.token.clone();
-        let fetched = handle.block_on(async move {
-            tokio::time::timeout(
+        // `agentlink-view` invokes `ice_refresh` from inside
+        // `tokio::task::spawn_blocking`, which runs with a Tokio runtime
+        // context entered. Calling `handle.block_on(...)` there panics with
+        // "Cannot start a runtime from within a runtime". Dispatch onto
+        // `handle` via `spawn` and wait on a plain `std::sync::mpsc` channel.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        handle.spawn(async move {
+            let res = tokio::time::timeout(
                 Duration::from_secs(5),
                 fetch_relay_ice_servers(&relay, &trust, &token),
             )
-            .await
+            .await;
+            let _ = tx.send(res);
         });
+        let fetched = match rx.recv_timeout(Duration::from_secs(6)) {
+            Ok(res) => res,
+            Err(_) => {
+                tracing::debug!(
+                    "relay /api/ice channel wait timed out or disconnected; falling back to env/STUN"
+                );
+                return env_fallback();
+            }
+        };
         match fetched {
             Ok(Ok(ice_cfg)) => {
                 let servers = ice_cfg.to_json_servers();
@@ -5849,5 +5865,83 @@ mod pty_fairness_tests {
         let recycled = shared.take_rgba_buf().expect("recycled buffer available");
         assert!(recycled.is_empty());
         assert_eq!(recycled.capacity(), cap);
+    }
+
+    #[test]
+    fn ice_refresh_cb_works_inside_spawn_blocking_on_separate_tokio_runtime_desk_03() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let worker_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("worker runtime");
+        let view_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("separate view runtime");
+
+        let addr = worker_rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback /api/ice stub");
+            let addr = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                // Handle two requests: one from the separate view runtime and one from worker_rt.
+                for _ in 0..2 {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let mut req_buf = [0u8; 2048];
+                    let _ = sock.read(&mut req_buf).await;
+                    let body = r#"{"ice_servers":[{"urls":["turn:198.51.100.7:3478?transport=udp"],"username":"u1","credential":"p1"}],"ttl_secs":3600}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                }
+            });
+            addr
+        });
+
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let cfg = serde_json::json!({
+            "relay": format!("ws://{addr}"),
+            "token": "test-ice-token",
+            "trust": "system",
+        });
+        std::fs::write(dir.path().join("config.json"), cfg.to_string()).expect("write config.json");
+
+        let cb = super::build_ice_refresh_cb(dir.path().to_path_buf(), worker_rt.handle().clone());
+
+        // 1) Invoke inside `tokio::task::spawn_blocking` on a SEPARATE Tokio runtime
+        //    (matches `agentlink-view::session::{resolve_offer_servers_async,refresh_ice_servers_for_restart}`).
+        let cb_other = Arc::clone(&cb);
+        let servers_other = view_rt
+            .block_on(async move { tokio::task::spawn_blocking(move || cb_other()).await })
+            .expect("ice_refresh inside separate runtime spawn_blocking must not panic");
+        assert!(
+            servers_other.iter().any(|entry| {
+                entry.get("username").and_then(|v| v.as_str()) == Some("u1")
+                    && entry.get("credential").and_then(|v| v.as_str()) == Some("p1")
+            }),
+            "expected fetched TURN server from /api/ice via separate runtime spawn_blocking, got {servers_other:?}"
+        );
+
+        // 2) Also verify same-runtime `spawn_blocking` does not panic.
+        let cb_same = Arc::clone(&cb);
+        let servers_same = worker_rt
+            .block_on(async move { tokio::task::spawn_blocking(move || cb_same()).await })
+            .expect("ice_refresh inside same runtime spawn_blocking must not panic");
+        assert!(
+            servers_same.iter().any(|entry| {
+                entry.get("username").and_then(|v| v.as_str()) == Some("u1")
+            }),
+            "expected fetched TURN server from /api/ice via same runtime spawn_blocking, got {servers_same:?}"
+        );
     }
 }

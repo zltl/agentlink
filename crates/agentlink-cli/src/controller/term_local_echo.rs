@@ -570,7 +570,7 @@ mod pty_stty_echo_off_tests {
             eprintln!("skipping: python not on PATH");
             return;
         };
-        let mut child = Command::new(python)
+        let mut child = Command::new(python) // no-window-reviewed: unix-only test
             .arg("-u")
             .arg("-c")
             .arg(
