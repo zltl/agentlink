@@ -549,13 +549,14 @@ async fn live_node_handler_rejects_wire_replayed_e2e_frames_and_hello_flood() {
 
     let marker_file = dir.path().join("once.txt");
     let marker_s = marker_file.to_string_lossy().to_string();
+    #[cfg(windows)]
+    let append_cmd = format!("(<nul set /p =x>>\"{marker_s}\") & exit /b 0");
+    #[cfg(not(windows))]
+    let append_cmd = format!("printf x >> '{marker_s}'");
     let out = admin
         .exec_collect(
             "replay-box",
-            ExecRequest::shell(
-                &format!("printf x >> '{marker_s}'"),
-                Some(Duration::from_secs(10)),
-            ),
+            ExecRequest::shell(&append_cmd, Some(Duration::from_secs(10))),
             None,
         )
         .await
@@ -735,13 +736,17 @@ async fn long_idle_pty_and_tunnel_bind_survive_periodic_reap_and_cross_origin_pr
         .expect("grant");
 
     // 1. Open a real interactive PTY session on `idle-box`.
+    #[cfg(windows)]
+    const PTY_ENTER: &[u8] = b"\r\n";
+    #[cfg(not(windows))]
+    const PTY_ENTER: &[u8] = b"\n";
     let mut pty = admin
         .open_pty("idle-box", None, None, 24, 80)
         .await
         .expect("open_pty");
-    pty.write(b"echo BEFORE_LONG_IDLE\n")
-        .await
-        .expect("pty write 1");
+    let mut cmd1 = b"echo BEFORE_LONG_IDLE".to_vec();
+    cmd1.extend_from_slice(PTY_ENTER);
+    pty.write(&cmd1).await.expect("pty write 1");
     let mut initial_out = String::new();
     let until = std::time::Instant::now() + Duration::from_secs(10);
     while !initial_out.contains("BEFORE_LONG_IDLE") {
@@ -808,9 +813,9 @@ async fn long_idle_pty_and_tunnel_bind_survive_periodic_reap_and_cross_origin_pr
     let _ = other_client.list_nodes().await.expect("other list");
 
     // 5. Verify real PTY command STILL receives Chunk AND End { exit_code: Some(0) }!
-    pty.write(b"echo AFTER_2H_SILENCE && exit\n")
-        .await
-        .expect("pty write after 2h idle");
+    let mut cmd2 = b"echo AFTER_2H_SILENCE && exit".to_vec();
+    cmd2.extend_from_slice(PTY_ENTER);
+    pty.write(&cmd2).await.expect("pty write after 2h idle");
     let mut after_out = String::new();
     let mut saw_exit_zero = false;
     let until = std::time::Instant::now() + Duration::from_secs(5);

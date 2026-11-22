@@ -10,14 +10,17 @@
 
 use std::fs;
 use std::io::{self, ErrorKind, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentlink_core::e2e::{self, Direction};
 use agentlink_core::engine::sweep_stale_partials;
 use agentlink_core::extensions::{dispatch_extension_as, NodeExtension};
-use agentlink_core::paths::{resolve_lexical, resolve_path};
+use agentlink_core::paths::{
+    ensure_path_stays_in_sandbox_at_sink, is_inside_root, is_link_entry, resolve_path,
+    strip_verbatim_prefix,
+};
 use agentlink_core::protocol::{DirEntry, Envelope, FileStat, Op};
 use agentlink_core::sandbox::CommandPolicy;
 use agentlink_core::util::{
@@ -149,6 +152,8 @@ pub struct OpContext<'a> {
     pub peer_id: &'a str,
     pub grant_jti: Option<&'a str>,
     pub grant_exp_unix: Option<i64>,
+    /// Optional pre-enqueued PTY I/O ticket preserving wire arrival order across `tokio::spawn`.
+    pub pty_ticket: Option<crate::pty_session::PtyIoTicket>,
 }
 
 struct Finished {
@@ -171,7 +176,12 @@ fn ready(outcome: Outcome) -> Finished {
     }
 }
 
-pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: OpContext<'_>) {
+pub async fn dispatch(
+    op: Op,
+    resp: Responder,
+    cancel: CancellationToken,
+    mut ctx: OpContext<'_>,
+) {
     let started = Instant::now();
     let kind = op.kind();
     let category = audit::category_of(&op);
@@ -275,16 +285,31 @@ pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: O
         Op::PtyInput {
             session_id,
             data_b64,
-        } => pty_input(&resp, ctx.pty, ctx.peer_id, &session_id, &data_b64)
-            .await
-            .map(|()| already(Outcome::ok(Value::Null))),
+        } => pty_input(
+            &resp,
+            ctx.pty,
+            ctx.peer_id,
+            &session_id,
+            &data_b64,
+            ctx.pty_ticket.take(),
+        )
+        .await
+        .map(|()| already(Outcome::ok(Value::Null))),
         Op::PtyResize {
             session_id,
             rows,
             cols,
-        } => pty_resize(&resp, ctx.pty, ctx.peer_id, &session_id, rows, cols)
-            .await
-            .map(|()| already(Outcome::ok(Value::Null))),
+        } => pty_resize(
+            &resp,
+            ctx.pty,
+            ctx.peer_id,
+            &session_id,
+            rows,
+            cols,
+            ctx.pty_ticket.take(),
+        )
+        .await
+        .map(|()| already(Outcome::ok(Value::Null))),
         Op::PtyClose { session_id } => pty_close(&resp, ctx.pty, ctx.peer_id, &session_id)
             .await
             .map(|()| already(Outcome::ok(Value::Null))),
@@ -371,12 +396,12 @@ pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: O
             limit,
         } => ctx
             .watches
-            .poll(&watch_id, cursor, timeout_ms, limit)
+            .poll(&watch_id, ctx.peer_id, cursor, timeout_ms, limit)
             .await
             .map(|value| ready(Outcome::ok(value))),
         Op::WatchStop { watch_id } => ctx
             .watches
-            .stop(&watch_id)
+            .stop(&watch_id, ctx.peer_id)
             .map(|value| ready(Outcome::ok(value))),
         Op::BgStart {
             program,
@@ -397,7 +422,10 @@ pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: O
             )
             .await
         }
-        Op::BgList => ctx.procs.list().map(|value| ready(Outcome::ok(value))),
+        Op::BgList => ctx
+            .procs
+            .list(ctx.peer_id)
+            .map(|value| ready(Outcome::ok(value))),
         Op::BgOutput {
             id,
             stdout_cursor,
@@ -405,15 +433,15 @@ pub async fn dispatch(op: Op, resp: Responder, cancel: CancellationToken, ctx: O
             max_bytes,
         } => ctx
             .procs
-            .output(&id, stdout_cursor, stderr_cursor, max_bytes)
+            .output(&id, ctx.peer_id, stdout_cursor, stderr_cursor, max_bytes)
             .map(|(value, process)| ready(Outcome::ok(value).with_process(process))),
         Op::BgStatus { id } => ctx
             .procs
-            .status(&id)
+            .status(&id, ctx.peer_id)
             .map(|(value, process)| ready(Outcome::ok(value).with_process(process))),
         Op::BgKill { id } => ctx
             .procs
-            .kill(&id)
+            .kill(&id, ctx.peer_id)
             .await
             .map(|(value, process)| ready(Outcome::ok(value).with_process(process))),
         Op::SysInfo => crate::system::system_info()
@@ -678,20 +706,53 @@ fn missing_path_error(operation: &str, path_display: &str) -> Error {
 }
 
 async fn list_op(resp: &Responder, root: Option<&Path>, path: &str) -> Result<()> {
-    // Do not follow the final component: `ls` on a dangling symlink should
-    // report "broken symbolic link", and `ls` on a symlink-to-dir still works
-    // because `directory_for_list` uses `metadata` (which follows).
+    // Do not follow the final component yet so dangling symlinks inside `--root`
+    // can still report "broken symbolic link", while `list_dir_entries` checks
+    // any symlink target canonically against `--root` before opening/listing.
     let full = agentlink_core::paths::resolve_path_no_follow(root, path)?;
     let path_display = path.to_string();
-    let entries = tokio::task::spawn_blocking(move || list_dir_entries(full, path_display))
-        .await
-        .map_err(|err| Error::Message(format!("list task: {err}")))??;
+    let root_owned = root.map(Path::to_path_buf);
+    let entries = tokio::task::spawn_blocking(move || {
+        list_dir_entries(root_owned.as_deref(), full, path_display)
+    })
+    .await
+    .map_err(|err| Error::Message(format!("list task: {err}")))??;
     resp.ok(serde_json::to_value(entries)?).await?;
     Ok(())
 }
 
-fn list_dir_entries(full: PathBuf, path_display: String) -> Result<Vec<DirEntry>> {
+fn list_dir_entries(
+    root: Option<&Path>,
+    full: PathBuf,
+    path_display: String,
+) -> Result<Vec<DirEntry>> {
+    let root_c = match root {
+        Some(r) => Some(strip_verbatim_prefix(
+            &fs::canonicalize(r).map_err(|e| Error::Message(format!("sandbox root: {e}")))?,
+        )),
+        None => None,
+    };
+    if let Some(root_path) = root {
+        if let Ok(sm) = fs::symlink_metadata(&full) {
+            if is_link_entry(&sm) {
+                // Reject both live and dangling symlinks whose resolved target
+                // escapes `--root` before following `fs::metadata` / `read_dir`.
+                ensure_path_stays_in_sandbox_at_sink(Some(root_path), &full)?;
+            }
+        }
+    }
     let full = directory_for_list(&full, &path_display)?;
+    let full = if let Some(ref rc) = root_c {
+        let canon = strip_verbatim_prefix(&fs::canonicalize(&full)?);
+        if !is_inside_root(rc, &canon) {
+            return Err(Error::PermissionDenied(format!(
+                "path escapes sandbox: {path_display}"
+            )));
+        }
+        canon
+    } else {
+        full
+    };
     // Drop abandoned resume litter so `ls` does not keep showing multi-day
     // `.*.agentlink-partial` junk left after interrupted copies.
     let _ = sweep_stale_partials(&full);
@@ -703,9 +764,9 @@ fn list_dir_entries(full: PathBuf, path_display: String) -> Result<Vec<DirEntry>
             Ok(meta) => meta,
             Err(_) => continue,
         };
-        // is_dir/is_file follow the target so `cp`/`ls` treat junctions and
-        // symlink-to-dir like Unix directory roots; is_symlink stays true.
-        let (is_dir, is_file) = entry_dir_file(&meta, &item.path());
+        // is_dir/is_file follow the target only when inside `--root` so `ls`
+        // never probes targets outside the sandbox.
+        let (is_dir, is_file) = entry_dir_file_confined(&meta, &item.path(), root_c.as_deref());
         entries.push(DirEntry {
             name,
             is_dir,
@@ -807,22 +868,113 @@ async fn write_op(
     Ok(())
 }
 
-/// Audit snapshot taken before a write. Missing or unreadable files yield
-/// `None`; files over the audit cap are skipped without being read.
-async fn audit_before_snapshot(path: &Path) -> Option<Vec<u8>> {
+/// Bounded file read for audit snapshots: checks `metadata.len()` BEFORE
+/// opening and caps the read via `.take()` so sparse/growing files never OOM.
+async fn read_audit_snapshot_bounded(path: &Path) -> Option<Vec<u8>> {
     let meta = tokio::fs::metadata(path).await.ok()?;
     if meta.len() > MAX_WRITE as u64 {
         return None;
     }
-    tokio::fs::read(path).await.ok()
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(MAX_WRITE));
+    file.take((MAX_WRITE as u64) + 1)
+        .read_to_end(&mut buf)
+        .await
+        .ok()?;
+    if buf.len() > MAX_WRITE {
+        return None;
+    }
+    Some(buf)
 }
 
-/// Audit snapshot taken after a write: read first, then drop over-cap files.
+/// Audit snapshot taken before a write. Missing or unreadable files yield
+/// `None`; files over the audit cap are skipped without being read.
+async fn audit_before_snapshot(path: &Path) -> Option<Vec<u8>> {
+    read_audit_snapshot_bounded(path).await
+}
+
+/// Audit snapshot taken after a write: checks `metadata.len()` before reading
+/// so large sparse writes never OOM the node.
 async fn audit_after_snapshot(path: &Path) -> Option<Vec<u8>> {
-    tokio::fs::read(path)
-        .await
-        .ok()
-        .filter(|bytes| bytes.len() <= MAX_WRITE)
+    read_audit_snapshot_bounded(path).await
+}
+
+/// Create `target` and any missing ancestors while verifying every existing and
+/// created component stays inside `root` (never trusting `resolve_lexical` on
+/// missing parents or traversing escaping symlinks).
+pub(crate) fn create_dir_all_confined(root: Option<&Path>, target: &Path) -> Result<()> {
+    let Some(root_path) = root else {
+        return agentlink_core::util::create_dir_all_as_dir(target);
+    };
+    let root_c = strip_verbatim_prefix(
+        &fs::canonicalize(root_path).map_err(|e| Error::Message(format!("sandbox root: {e}")))?,
+    );
+    let checked = ensure_path_stays_in_sandbox_at_sink(Some(root_path), target)?;
+    let rel = checked.strip_prefix(&root_c).map_err(|_| {
+        Error::PermissionDenied(format!("path escapes sandbox: {}", target.display()))
+    })?;
+    let mut cur = root_c.clone();
+    for comp in rel.components() {
+        let Component::Normal(name) = comp else {
+            return Err(Error::PermissionDenied(format!(
+                "path escapes sandbox: {}",
+                target.display()
+            )));
+        };
+        cur.push(name);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if is_link_entry(&meta) => {
+                let resolved = ensure_path_stays_in_sandbox_at_sink(Some(root_path), &cur)?;
+                match fs::metadata(&resolved) {
+                    Ok(m) if m.is_dir() => {
+                        let canon = strip_verbatim_prefix(&fs::canonicalize(&resolved)?);
+                        if !is_inside_root(&root_c, &canon) {
+                            return Err(Error::PermissionDenied(format!(
+                                "path escapes sandbox: {}",
+                                target.display()
+                            )));
+                        }
+                        cur = canon;
+                    }
+                    _ => {
+                        return Err(Error::Message(mkdir_not_dir_message(&cur, true)));
+                    }
+                }
+            }
+            Ok(meta) if meta.is_dir() => {
+                let canon = strip_verbatim_prefix(&fs::canonicalize(&cur)?);
+                if !is_inside_root(&root_c, &canon) {
+                    return Err(Error::PermissionDenied(format!(
+                        "path escapes sandbox: {}",
+                        target.display()
+                    )));
+                }
+                cur = canon;
+            }
+            Ok(_) => {
+                return Err(Error::Message(mkdir_not_dir_message(&cur, true)));
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                match fs::create_dir(&cur) {
+                    Ok(()) => {}
+                    Err(create_err)
+                        if create_err.kind() == ErrorKind::AlreadyExists
+                            && fs::metadata(&cur).is_ok_and(|m| m.is_dir()) => {}
+                    Err(create_err) => return Err(diagnose_mkdir_io(&cur, true, create_err)),
+                }
+                let canon = strip_verbatim_prefix(&fs::canonicalize(&cur)?);
+                if !is_inside_root(&root_c, &canon) {
+                    return Err(Error::PermissionDenied(format!(
+                        "path escapes sandbox: {}",
+                        target.display()
+                    )));
+                }
+                cur = canon;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 async fn mkdir_op(
@@ -832,18 +984,39 @@ async fn mkdir_op(
     recursive: bool,
 ) -> Result<()> {
     let full = if recursive {
-        resolve_lexical(root, path)?
+        agentlink_core::paths::resolve_lexical(root, path)?
     } else {
         resolve_path(root, path)?
     };
     let create_path = full.clone();
+    let root_owned = root.map(Path::to_path_buf);
     tokio::task::spawn_blocking(move || {
-        let created = if recursive {
-            fs::create_dir_all(&create_path)
+        if recursive {
+            create_dir_all_confined(root_owned.as_deref(), &create_path)
+                .map_err(|err| match err {
+                    Error::Io(io_err) => diagnose_mkdir_io(&create_path, true, io_err),
+                    other => other,
+                })
         } else {
-            fs::create_dir(&create_path)
-        };
-        created.map_err(|err| diagnose_mkdir_io(&create_path, recursive, err))
+            if let Some(root_ref) = root_owned.as_deref() {
+                let checked = ensure_path_stays_in_sandbox_at_sink(Some(root_ref), &create_path)?;
+                let root_c = strip_verbatim_prefix(&fs::canonicalize(root_ref)?);
+                if let Some(parent) = checked.parent() {
+                    let parent_c = strip_verbatim_prefix(&fs::canonicalize(parent)?);
+                    if !is_inside_root(&root_c, &parent_c) {
+                        return Err(Error::PermissionDenied(format!(
+                            "path escapes sandbox: {}",
+                            create_path.display()
+                        )));
+                    }
+                }
+                fs::create_dir(&checked)
+                    .map_err(|err| diagnose_mkdir_io(&checked, false, err))
+            } else {
+                fs::create_dir(&create_path)
+                    .map_err(|err| diagnose_mkdir_io(&create_path, false, err))
+            }
+        }
     })
     .await
     .map_err(|err| Error::Message(format!("mkdir task: {err}")))??;
@@ -958,6 +1131,15 @@ fn diagnose_read_io(full: &Path, err: io::Error) -> Error {
 fn remove_path(full: &Path, recursive: bool) -> Result<()> {
     let meta = fs::symlink_metadata(full)?;
     if agentlink_core::paths::is_link_entry(&meta) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+            if meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                fs::remove_dir(full)?;
+                return Ok(());
+            }
+        }
         agentlink_core::paths::remove_link_entry(full, &meta)?;
         return Ok(());
     }
@@ -1273,7 +1455,13 @@ async fn pump(
 
 fn watch_start(ctx: &OpContext<'_>, path: &str, recursive: bool) -> Result<Outcome> {
     let full = resolve_path(ctx.root, path)?;
-    let value = ctx.watches.start(&full, recursive)?;
+    let value = ctx.watches.start(
+        &full,
+        recursive,
+        ctx.peer_id,
+        ctx.grant_jti.unwrap_or(""),
+        ctx.grant_exp_unix,
+    )?;
     Ok(Outcome::ok(value))
 }
 
@@ -1298,6 +1486,9 @@ async fn bg_start(
             &origin_of(ctx),
             ctx.audit.clone(),
             Some(ctx.client_id.to_string()),
+            ctx.peer_id,
+            ctx.grant_jti.unwrap_or(""),
+            ctx.grant_exp_unix,
             program,
             args,
             cwd_path.as_deref(),
@@ -1310,6 +1501,23 @@ async fn bg_start(
     Ok(ready(Outcome::ok(value).with_process(process)))
 }
 
+fn check_pty_command_policy(commands: &CommandPolicy, command: Option<&str>) -> Result<String> {
+    match command {
+        Some(line) => {
+            allow_command(commands, line, &[], true)?;
+            Ok(line.to_string())
+        }
+        None => {
+            // Check the interactive $SHELL binary directly against CommandPolicy
+            // rather than wrapping it in `("sh", ["-c", shell])`, so `--allow-cmd`
+            // and `--deny-cmd` match the actual shell binary (e.g. `bash`, `zsh`).
+            let shell = default_shell_name();
+            allow_command(commands, &shell, &[], false)?;
+            Ok(shell)
+        }
+    }
+}
+
 async fn pty_open(
     resp: &Responder,
     ctx: &OpContext<'_>,
@@ -1318,9 +1526,7 @@ async fn pty_open(
     rows: u16,
     cols: u16,
 ) -> Result<Finished> {
-    let command_line = command.clone().unwrap_or_else(|| default_shell_name());
-    let (program, args) = shell_parts(&command_line);
-    allow_command(ctx.commands, &program, &args, command.is_some())?;
+    let command_line = check_pty_command_policy(ctx.commands, command.as_deref())?;
     let (cwd_path, cwd_display) = confine_cwd(ctx.root, cwd.as_deref())?;
     let session_id = ctx
         .pty
@@ -1362,17 +1568,22 @@ async fn pty_input(
     peer: &str,
     session_id: &str,
     data_b64: &str,
+    pre_enqueued: Option<crate::pty_session::PtyIoTicket>,
 ) -> Result<()> {
     let data = util::b64_decode(data_b64)?;
+    if data.len() > crate::pty_session::MAX_PTY_INPUT_BYTES {
+        return Err(Error::Message(format!(
+            "pty input exceeds {} byte limit",
+            crate::pty_session::MAX_PTY_INPUT_BYTES
+        )));
+    }
     let nbytes = data.len();
-    // Large pastes into a stalled child must not block a Tokio worker on
-    // synchronous PTY write_all/flush.
-    let pty = pty.clone();
-    let session_id = session_id.to_string();
-    let peer = peer.to_string();
-    tokio::task::spawn_blocking(move || pty.write(&session_id, &data, &peer))
-        .await
-        .map_err(|err| Error::Message(format!("pty write join: {err}")))??;
+    // Route through the bounded per-session ordered I/O channel so keystroke
+    // order is preserved and stalled writes never block a Tokio worker.
+    match pre_enqueued {
+        Some(ticket) => ticket.finish().await?,
+        None => pty.write_async(session_id, data, peer).await?,
+    }
     resp.ok(serde_json::json!({"bytes": nbytes})).await?;
     Ok(())
 }
@@ -1384,8 +1595,13 @@ async fn pty_resize(
     session_id: &str,
     rows: u16,
     cols: u16,
+    pre_enqueued: Option<crate::pty_session::PtyIoTicket>,
 ) -> Result<()> {
-    pty.resize(session_id, rows, cols, peer)?;
+    // Runs on the same per-session ordered I/O thread off Tokio async workers.
+    match pre_enqueued {
+        Some(ticket) => ticket.finish().await?,
+        None => pty.resize_async(session_id, rows, cols, peer).await?,
+    }
     resp.ok(serde_json::json!({"rows": rows, "cols": cols}))
         .await?;
     Ok(())
@@ -1439,7 +1655,23 @@ fn file_stat(path: &Path) -> Result<FileStat> {
 /// Directory/file flags for listing and stat. Symlinks report the target's
 /// kind when it resolves; broken links stay non-dir/non-file with is_symlink.
 fn entry_dir_file(meta: &fs::Metadata, path: &Path) -> (bool, bool) {
+    entry_dir_file_confined(meta, path, None)
+}
+
+fn entry_dir_file_confined(
+    meta: &fs::Metadata,
+    path: &Path,
+    root_c: Option<&Path>,
+) -> (bool, bool) {
     if meta.file_type().is_symlink() {
+        if let Some(rc) = root_c {
+            let Ok(canon) = fs::canonicalize(path) else {
+                return (false, false);
+            };
+            if !is_inside_root(rc, &strip_verbatim_prefix(&canon)) {
+                return (false, false);
+            }
+        }
         match fs::metadata(path) {
             Ok(target) => (target.is_dir(), target.is_file()),
             Err(_) => (false, false),
@@ -2448,6 +2680,7 @@ mod tests {
             peer_id: "alice",
             grant_jti: Some("jti-alice"),
             grant_exp_unix: None,
+            pty_ticket: None,
         };
         dispatch(
             Op::Extension {
@@ -2465,5 +2698,68 @@ mod tests {
             Some("bob"),
             "forged client_id may still ride in the payload; the handler peer must be the seal identity"
         );
+    }
+
+    #[tokio::test]
+    async fn audit_after_snapshot_skips_oversized_sparse_file_without_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("sparse.bin");
+        let file = fs::File::create(&huge).unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        drop(file);
+        assert!(
+            audit_after_snapshot(&huge).await.is_none(),
+            "1 GiB sparse file must be skipped before reading"
+        );
+        let small = dir.path().join("small.bin");
+        fs::write(&small, b"hello").unwrap();
+        assert_eq!(audit_after_snapshot(&small).await, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn interactive_pty_checks_shell_directly_against_command_policy() {
+        let shell = default_shell_name();
+        let base = shell.rsplit(['/', '\\']).next().unwrap_or(&shell).to_string();
+        let allow_only_shell = CommandPolicy {
+            allow: vec![base.clone()],
+            deny: vec![],
+        };
+        assert!(
+            check_pty_command_policy(&allow_only_shell, None).is_ok(),
+            "allow-cmd {base} must allow interactive shell {shell}"
+        );
+        let deny_shell = CommandPolicy {
+            allow: vec![],
+            deny: vec![base.clone()],
+        };
+        assert!(
+            check_pty_command_policy(&deny_shell, None).is_err(),
+            "deny-cmd {base} must deny interactive shell {shell}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_and_mkdir_reject_escaping_symlinks_under_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&sandbox).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"top-secret").unwrap();
+        std::os::unix::fs::symlink(&outside, sandbox.join("esc")).unwrap();
+
+        let full = agentlink_core::paths::resolve_path_no_follow(Some(&sandbox), "esc").unwrap();
+        let err = list_dir_entries(Some(&sandbox), full, "esc".into())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes"), "{err}");
+
+        let esc_sub = sandbox.join("esc").join("newdir").join("nested");
+        let err = create_dir_all_confined(Some(&sandbox), &esc_sub)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes"), "{err}");
+        assert!(!outside.join("newdir").exists());
     }
 }

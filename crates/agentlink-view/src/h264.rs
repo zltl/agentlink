@@ -405,12 +405,28 @@ pub struct AccessUnit {
 
 pub const MAX_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Result of feeding one RTP packet into [`H264Depacketizer::push_rtp`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PushOutcome {
+    /// Complete Annex-B access unit(s) produced by this packet (0, 1, or 2
+    /// when a missing marker flushed the prior intact AU on timestamp change).
+    pub units: Vec<AccessUnit>,
+    /// True when RTP loss, mid-FU-A discontinuity, or malformed framing
+    /// dropped/corrupted data and the caller should drop deltas until IDR and
+    /// request a keyframe.
+    pub corrupted: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct H264Depacketizer {
     nals: Vec<Vec<u8>>,
     nals_bytes: usize,
     fu: Vec<u8>,
     fu_open: bool,
+    last_seq: Option<u16>,
+    au_timestamp: Option<u32>,
+    au_corrupted: bool,
+    synth_seq: u16,
 }
 
 impl H264Depacketizer {
@@ -425,38 +441,136 @@ impl H264Depacketizer {
         self.fu_open = false;
     }
 
-    fn push_nal(&mut self, nal: Vec<u8>) {
+    fn push_nal(&mut self, nal: Vec<u8>) -> bool {
         let added = nal.len().saturating_add(4);
         if self.nals_bytes.saturating_add(self.fu.len()).saturating_add(added)
             > MAX_ACCESS_UNIT_BYTES
         {
             self.reset_corrupt();
-            return;
+            self.au_corrupted = true;
+            return false;
         }
         self.nals_bytes += added;
         self.nals.push(nal);
+        true
     }
 
-    /// Push one RTP payload. `marker` ends the access unit.
-    pub fn push(&mut self, payload: &[u8], marker: bool) -> Option<AccessUnit> {
-        if !payload.is_empty() {
-            let kind = payload[0] & 0x1f;
-            if kind == 24 {
-                self.stap_a(payload);
-            } else if kind == 28 {
-                self.fu_a(payload);
-            } else if (1..24).contains(&kind) {
-                self.push_nal(payload.to_vec());
+    /// Push one RTP packet with sequence number and timestamp tracking.
+    ///
+    /// - Mid-FU-A sequence gaps or timestamp mismatches drop the corrupted
+    ///   incomplete FU-A fragment and set [`PushOutcome::corrupted`].
+    /// - When the RTP marker bit is missing and the timestamp changes cleanly
+    ///   (no sequence gap, no open FU-A), the prior access unit is flushed
+    ///   before starting the new one so two frames are never glued together.
+    /// - When a timestamp changes after a sequence gap or open FU-A, the
+    ///   incomplete prior access unit is reset/dropped and `corrupted` is set.
+    pub fn push_rtp(
+        &mut self,
+        seq: u16,
+        timestamp: u32,
+        payload: &[u8],
+        marker: bool,
+    ) -> PushOutcome {
+        let mut outcome = PushOutcome::default();
+
+        let mut seq_gap = false;
+        if let Some(prev) = self.last_seq {
+            let expected = prev.wrapping_add(1);
+            let diff = seq.wrapping_sub(expected);
+            if diff == 0 {
+                self.last_seq = Some(seq);
+            } else if diff < 0x8000 {
+                seq_gap = true;
+                outcome.corrupted = true;
+                self.last_seq = Some(seq);
+            } else {
+                // Duplicate or stale out-of-order packet behind last_seq:
+                // drop so it cannot splice into the active access unit.
+                return outcome;
+            }
+        } else {
+            self.last_seq = Some(seq);
+        }
+
+        let ts_changed = self.au_timestamp.is_some_and(|prev_ts| prev_ts != timestamp);
+        if ts_changed {
+            if !seq_gap && !self.fu_open && !self.au_corrupted && !self.nals.is_empty() {
+                if let Some(unit) = self.finish() {
+                    outcome.units.push(unit);
+                }
+            } else {
+                if self.fu_open || !self.nals.is_empty() || self.au_corrupted {
+                    outcome.corrupted = true;
+                }
+                self.reset_corrupt();
+            }
+            self.au_timestamp = Some(timestamp);
+            self.au_corrupted = false;
+        } else {
+            if self.au_timestamp.is_none() {
+                self.au_timestamp = Some(timestamp);
+                self.au_corrupted = false;
+            }
+            if seq_gap {
+                let had_open_au = self.fu_open || !self.nals.is_empty();
+                self.reset_corrupt();
+                if had_open_au {
+                    self.au_corrupted = true;
+                }
             }
         }
-        if marker {
-            self.finish()
-        } else {
-            None
+
+        if !self.au_corrupted && !payload.is_empty() {
+            let kind = payload[0] & 0x1f;
+            if kind == 24 {
+                if self.fu_open {
+                    self.reset_corrupt();
+                    self.au_corrupted = true;
+                    outcome.corrupted = true;
+                } else if !self.stap_a(payload) {
+                    outcome.corrupted = true;
+                }
+            } else if kind == 28 {
+                if !self.fu_a(payload) {
+                    outcome.corrupted = true;
+                }
+            } else if (1..24).contains(&kind) {
+                if self.fu_open {
+                    self.reset_corrupt();
+                    self.au_corrupted = true;
+                    outcome.corrupted = true;
+                } else if !self.push_nal(payload.to_vec()) {
+                    outcome.corrupted = true;
+                }
+            }
         }
+
+        if marker {
+            if self.au_corrupted || self.fu_open {
+                if self.fu_open {
+                    outcome.corrupted = true;
+                }
+                self.reset_corrupt();
+            } else if let Some(unit) = self.finish() {
+                outcome.units.push(unit);
+            }
+            self.au_timestamp = None;
+            self.au_corrupted = false;
+        }
+
+        outcome
     }
 
-    fn stap_a(&mut self, payload: &[u8]) {
+    /// Push one RTP payload without explicit sequence/timestamp metadata.
+    /// Kept for unit tests exercising payload parsing directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn push(&mut self, payload: &[u8], marker: bool) -> Option<AccessUnit> {
+        let seq = self.synth_seq;
+        self.synth_seq = self.synth_seq.wrapping_add(1);
+        self.push_rtp(seq, 0, payload, marker).units.pop()
+    }
+
+    fn stap_a(&mut self, payload: &[u8]) -> bool {
         let mut offset = 1;
         while offset + 2 <= payload.len() {
             let len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
@@ -464,27 +578,37 @@ impl H264Depacketizer {
             if len == 0 || offset + len > payload.len() {
                 break;
             }
-            self.push_nal(payload[offset..offset + len].to_vec());
+            if !self.push_nal(payload[offset..offset + len].to_vec()) {
+                return false;
+            }
             offset += len;
         }
+        true
     }
 
-    fn fu_a(&mut self, payload: &[u8]) {
+    fn fu_a(&mut self, payload: &[u8]) -> bool {
         if payload.len() < 2 {
             self.reset_corrupt();
-            return;
+            self.au_corrupted = true;
+            return false;
         }
         let indicator = payload[0];
         let header = payload[1];
         let start = header & 0x80 != 0;
         let end = header & 0x40 != 0;
         if start {
+            if self.fu_open {
+                self.reset_corrupt();
+                self.au_corrupted = true;
+                return false;
+            }
             self.fu.clear();
             self.fu.push((indicator & 0xe0) | (header & 0x1f));
             self.fu_open = true;
         }
         if !self.fu_open {
-            return;
+            self.au_corrupted = true;
+            return false;
         }
         let frag = &payload[2..];
         if self
@@ -495,14 +619,16 @@ impl H264Depacketizer {
             > MAX_ACCESS_UNIT_BYTES
         {
             self.reset_corrupt();
-            return;
+            self.au_corrupted = true;
+            return false;
         }
         self.fu.extend_from_slice(frag);
         if end {
             self.fu_open = false;
             let nal = std::mem::take(&mut self.fu);
-            self.push_nal(nal);
+            return self.push_nal(nal);
         }
+        true
     }
 
     fn finish(&mut self) -> Option<AccessUnit> {
@@ -571,32 +697,81 @@ fn nal_bodies(bytes: &[u8]) -> Vec<&[u8]> {
     nals
 }
 
+const LOSS_WINDOW_MAX_TRACKED: usize = 1024;
+const LOSS_WINDOW_MAX_REORDER_DIST: u16 = 1024;
+
 /// RTP sequence gaps this window, plus frames the viewer dropped locally.
+/// Tracks recently skipped sequence numbers so single-packet out-of-order
+/// arrivals undo their provisional loss rather than double-counting.
 #[derive(Debug, Default)]
 pub struct LossWindow {
     next: Option<u16>,
     received: u64,
     lost: u64,
+    missing: std::collections::HashSet<u16>,
+    recent_order: std::collections::VecDeque<u16>,
+    recent_set: std::collections::HashSet<u16>,
 }
 
 impl LossWindow {
+    fn record_recent(&mut self, seq: u16) {
+        if self.recent_set.insert(seq) {
+            self.recent_order.push_back(seq);
+            while self.recent_order.len() > LOSS_WINDOW_MAX_TRACKED {
+                if let Some(old) = self.recent_order.pop_front() {
+                    self.recent_set.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn prune_missing(&mut self, next: u16) {
+        if self.missing.is_empty() {
+            return;
+        }
+        self.missing.retain(|&seq| {
+            let behind = next.wrapping_sub(seq);
+            behind > 0 && behind <= LOSS_WINDOW_MAX_REORDER_DIST
+        });
+    }
+
     pub fn observe(&mut self, seq: u16) {
         match self.next {
             None => {
                 self.received += 1;
+                self.record_recent(seq);
                 self.next = Some(seq.wrapping_add(1));
             }
             Some(expected) => {
                 let gap = seq.wrapping_sub(expected);
                 if gap == 0 {
                     self.received += 1;
-                    self.next = Some(seq.wrapping_add(1));
+                    self.record_recent(seq);
+                    let next = seq.wrapping_add(1);
+                    self.next = Some(next);
+                    self.prune_missing(next);
                 } else if gap < 0x8000 {
                     self.lost += u64::from(gap);
+                    let track_count = (gap as usize).min(LOSS_WINDOW_MAX_TRACKED);
+                    let start_missing = seq.wrapping_sub(track_count as u16);
+                    for offset in 0..track_count {
+                        let m = start_missing.wrapping_add(offset as u16);
+                        self.missing.insert(m);
+                    }
                     self.received += 1;
-                    self.next = Some(seq.wrapping_add(1));
-                } else {
+                    self.record_recent(seq);
+                    let next = seq.wrapping_add(1);
+                    self.next = Some(next);
+                    self.prune_missing(next);
+                } else if self.missing.remove(&seq) {
+                    // Late out-of-order arrival of a previously skipped packet:
+                    // decrement provisional loss instead of double-counting.
+                    self.lost = self.lost.saturating_sub(1);
                     self.received += 1;
+                    self.record_recent(seq);
+                } else if !self.recent_set.contains(&seq) {
+                    self.received += 1;
+                    self.record_recent(seq);
                 }
             }
         }
@@ -678,13 +853,36 @@ mod tests {
         window.observe(1);
         window.observe(4);
         window.observe(2);
+        // Only seq 3 is genuinely lost out of {1, 2, 3, 4}.
         let ratio = window.take_ratio().unwrap();
-        assert!((ratio - 2.0 / 5.0).abs() < 0.001);
+        assert!((ratio - 1.0 / 4.0).abs() < 0.001, "got {ratio}");
         assert!(window.take_ratio().is_none());
         assert!((feedback_ratio(0.0, 1, 3) - 0.25).abs() < 0.001);
         assert_eq!(feedback_ratio(0.5, 0, 0), 0.5);
         assert_eq!(clamp_offer(0, 1), (1, 100_000));
         assert_eq!(clamp_offer(90, 20_000_000), (60, 12_000_000));
+    }
+
+    #[test]
+    fn loss_window_single_packet_reorder_and_wraparound_report_zero_loss() {
+        let mut window = LossWindow::default();
+        // Single-packet reorder: 1, 3, 2 -> all 3 arrived.
+        window.observe(1);
+        window.observe(3);
+        window.observe(2);
+        assert_eq!(window.take_ratio().unwrap(), 0.0);
+
+        // Duplicate packet does not skew counts or cause underflow.
+        window.observe(4);
+        window.observe(4);
+        assert_eq!(window.take_ratio().unwrap(), 0.0);
+
+        // Reorder across u16 wraparound: 65534, 0, 65535 -> 0% loss.
+        let mut wrap = LossWindow::default();
+        wrap.observe(65534);
+        wrap.observe(0);
+        wrap.observe(65535);
+        assert_eq!(wrap.take_ratio().unwrap(), 0.0);
     }
 
     #[test]
@@ -799,6 +997,7 @@ mod tests {
         assert!(!inv.contains("relay:"), "{inv}");
     }
 
+    #[test]
     fn screenshot_fallback_matches_the_phone_node() {
         let body = serde_json::json!({
             "status": "unavailable",
@@ -808,6 +1007,74 @@ mod tests {
         assert!(!is_screenshot_fallback(
             &serde_json::json!({"status": "ok"})
         ));
+    }
+
+    #[test]
+    fn depacketizer_drops_mid_fua_on_seq_gap_and_signals_corruption() {
+        let mut dep = H264Depacketizer::new();
+        let indicator = 0x7c; // FU-A, NRI=3
+        // seq 10: FU-A start (IDR slice type 5)
+        let r1 = dep.push_rtp(10, 9000, &[indicator, 0x85, 0xaa, 0xbb], false);
+        assert!(r1.units.is_empty());
+        assert!(!r1.corrupted);
+
+        // seq 11 LOST -> seq 12 arrives as FU-A end with marker=true
+        let r2 = dep.push_rtp(12, 9000, &[indicator, 0x45, 0xcc, 0xdd], true);
+        assert!(
+            r2.units.is_empty(),
+            "corrupted FU-A with missing middle packet must not be emitted"
+        );
+        assert!(r2.corrupted, "mid-FU-A sequence gap must request IDR");
+
+        // Next clean IDR frame (seq 13, new ts) must assemble cleanly.
+        let r3 = dep.push_rtp(13, 12000, &[0x65, 0x11, 0x22], true);
+        assert!(!r3.corrupted);
+        assert_eq!(r3.units.len(), 1);
+        assert!(r3.units[0].keyframe);
+        assert_eq!(r3.units[0].bytes, vec![0, 0, 0, 1, 0x65, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn depacketizer_drops_mid_fua_on_timestamp_mismatch() {
+        let mut dep = H264Depacketizer::new();
+        let indicator = 0x7c;
+        let r1 = dep.push_rtp(20, 9000, &[indicator, 0x85, 0xaa], false);
+        assert!(r1.units.is_empty() && !r1.corrupted);
+
+        // Next packet has consecutive seq 21, but timestamp changed mid-FU-A!
+        let r2 = dep.push_rtp(21, 12000, &[0x65, 0x99], true);
+        assert!(r2.corrupted, "timestamp mismatch mid-FU-A must signal corruption");
+        // Must NOT glue the incomplete ts=9000 fragment onto the ts=12000 IDR.
+        assert_eq!(r2.units.len(), 1);
+        assert_eq!(r2.units[0].bytes, vec![0, 0, 0, 1, 0x65, 0x99]);
+    }
+
+    #[test]
+    fn depacketizer_flushes_cleanly_on_lost_marker_and_resets_on_gap() {
+        let mut dep = H264Depacketizer::new();
+        // Frame 1 (ts=9000) arrives completely but marker bit is false.
+        let r1 = dep.push_rtp(30, 9000, &[0x65, 0x01, 0x02], false);
+        assert!(r1.units.is_empty() && !r1.corrupted);
+
+        // Frame 2 (ts=12000, consecutive seq 31) arrives with marker=true.
+        // Frame 1 must be flushed separately, NEVER glued to Frame 2.
+        let r2 = dep.push_rtp(31, 12000, &[0x41, 0x03, 0x04], true);
+        assert!(!r2.corrupted);
+        assert_eq!(r2.units.len(), 2);
+        assert!(r2.units[0].keyframe);
+        assert_eq!(r2.units[0].bytes, vec![0, 0, 0, 1, 0x65, 0x01, 0x02]);
+        assert!(!r2.units[1].keyframe);
+        assert_eq!(r2.units[1].bytes, vec![0, 0, 0, 1, 0x41, 0x03, 0x04]);
+
+        // Frame 3 (ts=15000): SPS arrives at seq 32 (marker=false), slice at seq 33 LOST.
+        let r3 = dep.push_rtp(32, 15000, &[0x67, 0x42, 0x00, 0x1f], false);
+        assert!(r3.units.is_empty() && !r3.corrupted);
+
+        // Frame 4 (ts=18000): seq 34 (gap!) arrives -> incomplete Frame 3 must be dropped, NOT flushed.
+        let r4 = dep.push_rtp(34, 18000, &[0x41, 0x05], true);
+        assert!(r4.corrupted);
+        assert_eq!(r4.units.len(), 1);
+        assert_eq!(r4.units[0].bytes, vec![0, 0, 0, 1, 0x41, 0x05]);
     }
 
     #[test]

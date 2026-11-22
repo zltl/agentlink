@@ -73,6 +73,10 @@ impl AuditExtra {
     }
 }
 
+const MAX_LEGACY_AUDIT_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_MAX_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
+const S3_PRUNE_INTERVAL_SECS: i64 = 3600;
+
 struct ChainState {
     seq: u64,
     prev: String,
@@ -83,11 +87,15 @@ pub struct AuditService {
     node_name: String,
     root: PathBuf,
     policy: RwLock<AuditPolicy>,
+    /// Single lock serializing hash-chain numbering, blob writes, `chain.state`
+    /// updates, local JSONL appends, and `audit.log` writes so concurrent ops
+    /// can never fork or reorder the hash chain.
     chain: Mutex<ChainState>,
     tx: Mutex<Option<mpsc::Sender<Outbound>>>,
     batch: Mutex<Vec<AuditRecord>>,
     activity: AtomicI64,
     gui_until: AtomicI64,
+    last_s3_prune: AtomicI64,
 }
 
 impl AuditService {
@@ -100,41 +108,28 @@ impl AuditService {
     }
 
     pub fn open(data_dir: &Path, node_id: &str, node_name: &str) -> Arc<Self> {
-        let root = data_dir.join("audit");
-        let _ = fs::create_dir_all(root.join("logs"));
-        let _ = fs::create_dir_all(root.join("blobs"));
-        let _ = fs::create_dir_all(root.join("recordings"));
-        let _ = fs::create_dir_all(root.join("spool"));
-        let policy = load_policy(data_dir);
-        let chain = load_chain(&root);
-        let service = Arc::new(Self {
-            node_id: node_id.to_string(),
-            node_name: node_name.to_string(),
-            root,
-            policy: RwLock::new(policy),
-            chain: Mutex::new(chain),
-            tx: Mutex::new(None),
-            batch: Mutex::new(Vec::new()),
-            activity: AtomicI64::new(0),
-            gui_until: AtomicI64::new(0),
-        });
+        let service = Self::open_without_bg(data_dir, node_id, node_name);
         Self::install(service.clone());
-        let background = service.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                background.flush();
-            }
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let background = service.clone();
+            handle.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let svc = background.clone();
+                    let _ = tokio::task::spawn_blocking(move || svc.flush()).await;
+                }
+            });
+        }
         service
     }
 
-    /// Same files as [`Self::open`] without the flush task, for tests that
-    /// must return.
-    #[cfg(test)]
-    pub fn open_quiet(data_dir: &Path, node_id: &str, node_name: &str) -> Arc<Self> {
+    fn open_without_bg(data_dir: &Path, node_id: &str, node_name: &str) -> Arc<Self> {
         let root = data_dir.join("audit");
-        let _ = fs::create_dir_all(root.join("logs"));
+        ensure_private_dir(&root);
+        ensure_private_dir(&root.join("logs"));
+        ensure_private_dir(&root.join("blobs"));
+        ensure_private_dir(&root.join("recordings"));
+        ensure_private_dir(&root.join("spool"));
         let policy = load_policy(data_dir);
         let chain = load_chain(&root);
         Arc::new(Self {
@@ -147,7 +142,15 @@ impl AuditService {
             batch: Mutex::new(Vec::new()),
             activity: AtomicI64::new(0),
             gui_until: AtomicI64::new(0),
+            last_s3_prune: AtomicI64::new(0),
         })
+    }
+
+    /// Same files as [`Self::open`] without the flush task, for tests that
+    /// must return.
+    #[cfg(test)]
+    pub fn open_quiet(data_dir: &Path, node_id: &str, node_name: &str) -> Arc<Self> {
+        Self::open_without_bg(data_dir, node_id, node_name)
     }
 
     pub fn set_tx(&self, tx: Option<mpsc::Sender<Outbound>>) {
@@ -201,55 +204,59 @@ impl AuditService {
         else {
             return;
         };
-        let (seq, prev, chain_on) = {
+        let record_for_alerts = {
             let Ok(mut chain) = self.chain.lock() else {
                 return;
             };
             chain.seq += 1;
             let seq = chain.seq;
             let prev = chain.prev.clone();
-            (seq, prev, policy.forward.chain)
-        };
-        if let Some(diff) = &draft.diff {
-            let name = format!("diff-{:016}.txt", seq);
-            let _ = fs::write(self.root.join("blobs").join(&name), diff);
-            draft.record.diff_ref = Some(format!("blobs/{name}"));
-        }
-        if let Some(output) = &draft.output {
-            let name = format!("output-{:016}.txt", seq);
-            let _ = fs::write(self.root.join("blobs").join(&name), output);
-            draft.record.output_ref = Some(format!("blobs/{name}"));
-        }
-        assign_chain(&mut draft.record, seq, &prev, chain_on);
-        if chain_on {
-            if let Ok(mut chain) = self.chain.lock() {
+            let chain_on = policy.forward.chain;
+            if let Some(diff) = &draft.diff {
+                let blobs = self.root.join("blobs");
+                ensure_private_dir(&blobs);
+                let name = format!("diff-{:016}.txt", seq);
+                let _ = write_private_file(&blobs.join(&name), diff);
+                draft.record.diff_ref = Some(format!("blobs/{name}"));
+            }
+            if let Some(output) = &draft.output {
+                let blobs = self.root.join("blobs");
+                ensure_private_dir(&blobs);
+                let name = format!("output-{:016}.txt", seq);
+                let _ = write_private_file(&blobs.join(&name), output);
+                draft.record.output_ref = Some(format!("blobs/{name}"));
+            }
+            assign_chain(&mut draft.record, seq, &prev, chain_on);
+            if chain_on {
                 chain.prev = draft.record.hash.clone();
                 save_chain(&self.root, &chain);
             }
-        }
-        self.write_local(&draft);
-        self.append_legacy(&event);
-        if let Ok(mut batch) = self.batch.lock() {
-            batch.push(draft.record.clone());
-        }
+            self.write_local_locked(&policy, &draft);
+            self.append_legacy_locked(&policy, &event);
+            if let Ok(mut batch) = self.batch.lock() {
+                batch.push(draft.record.clone());
+            }
+            draft.record
+        };
         for rule in &policy.alerts {
-            if alert_matches(rule, &draft.record) {
-                if let Ok(payload) = serde_json::to_value(&draft.record) {
+            if alert_matches(rule, &record_for_alerts) {
+                if let Ok(payload) = serde_json::to_value(&record_for_alerts) {
                     audit::fire_webhook(&rule.webhook, &payload);
                 }
             }
         }
     }
 
-    fn append_legacy(&self, event: &AuditEvent) {
+    fn append_legacy_locked(&self, policy: &AuditPolicy, event: &AuditEvent) {
         let Some(parent) = self.root.parent() else {
             return;
         };
-        let detail = event
+        let raw_detail = event
             .args
             .get("detail")
             .and_then(|value| value.as_str())
             .unwrap_or("");
+        let detail = policy.redact.apply(raw_detail);
         let Ok(line) = serde_json::to_string(&serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339(),
             "op": event.action,
@@ -260,17 +267,25 @@ impl AuditService {
         })) else {
             return;
         };
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(parent.join("audit.log"))
-        {
+        let log_path = parent.join("audit.log");
+        let cap = if policy.retention.max_log_bytes > 0 {
+            policy.retention.max_log_bytes.min(MAX_LEGACY_AUDIT_LOG_BYTES)
+        } else {
+            MAX_LEGACY_AUDIT_LOG_BYTES
+        };
+        if let Ok(meta) = fs::metadata(&log_path) {
+            if meta.len().saturating_add(line.len() as u64 + 1) > cap {
+                let rotated = parent.join("audit.log.1");
+                let _ = fs::remove_file(&rotated);
+                let _ = fs::rename(&log_path, &rotated);
+            }
+        }
+        if let Ok(mut file) = open_private_append(&log_path) {
             let _ = writeln!(file, "{line}");
         }
     }
 
-    fn write_local(&self, draft: &AuditDraft) {
-        let policy = self.policy();
+    fn write_local_locked(&self, policy: &AuditPolicy, draft: &AuditDraft) {
         let sinks: Vec<SinkSpec> = policy
             .sinks
             .iter()
@@ -283,12 +298,12 @@ impl AuditService {
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = self.root.join("logs").join(format!("{day}.jsonl"));
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            ensure_private_dir(parent);
         }
         let Ok(line) = serde_json::to_string(&draft.record) else {
             return;
         };
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut file) = open_private_append(&path) {
             let _ = writeln!(file, "{line}");
         }
     }
@@ -368,9 +383,9 @@ impl AuditService {
 
     fn spool(&self, sink: &str, body: &[u8]) {
         let dir = self.root.join("spool").join(sink);
-        let _ = fs::create_dir_all(&dir);
-        let name = format!("{}-0.jsonl.gz", now_secs());
-        let _ = fs::write(dir.join(name), body);
+        ensure_private_dir(&dir);
+        let name = format!("{}-{}.jsonl.gz", now_secs(), uuid::Uuid::new_v4().simple());
+        let _ = write_private_file(&dir.join(name), body);
     }
 
     fn retry_spool(&self) {
@@ -451,6 +466,29 @@ impl AuditService {
             policy.retention.recording_days,
             policy.retention.max_recording_bytes,
         );
+        let spool_cap = if policy.retention.max_log_bytes > 0 {
+            policy.retention.max_log_bytes
+        } else {
+            DEFAULT_MAX_SPOOL_BYTES
+        };
+        prune_dir(
+            &self.root.join("spool"),
+            policy.retention.log_days.max(1),
+            spool_cap,
+        );
+        // S3 list+delete pruning runs at most once per hour (off the async runtime).
+        let now = now_secs();
+        let last = self.last_s3_prune.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < S3_PRUNE_INTERVAL_SECS {
+            return;
+        }
+        if self
+            .last_s3_prune
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         for sink in &policy.sinks {
             if sink.kind != "s3" {
                 continue;
@@ -515,9 +553,9 @@ impl AuditService {
             .join(day)
             .join(format!("{session_id}-{}.bin", now_secs()));
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            ensure_private_dir(parent);
         }
-        let _ = fs::write(path, &segment.bytes);
+        let _ = write_private_file(&path, &segment.bytes);
         let policy = self.policy();
         for sink in &policy.sinks {
             if sink.kind == "s3" && sink.accepts("recordings") {
@@ -634,10 +672,54 @@ fn load_chain(root: &Path) -> ChainState {
 }
 
 fn save_chain(root: &Path, chain: &ChainState) {
-    let _ = fs::write(
-        root.join("chain.state"),
-        format!("{} {}\n", chain.seq, chain.prev),
+    let _ = write_private_file(
+        &root.join("chain.state"),
+        format!("{} {}\n", chain.seq, chain.prev).as_bytes(),
     );
+}
+
+fn ensure_private_dir(path: &Path) {
+    let _ = fs::create_dir_all(path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 fn gzip_jsonl(records: &[AuditRecord]) -> Option<Vec<u8>> {
@@ -676,7 +758,7 @@ fn prune_dir(dir: &Path, days: u64, max_bytes: u64) {
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        if meta.modified().ok().filter(|time| *time < cutoff).is_some() {
+        if days > 0 && meta.modified().ok().filter(|time| *time < cutoff).is_some() {
             let _ = fs::remove_file(&path);
             continue;
         }
@@ -852,5 +934,118 @@ mod tests {
             svc.recording_active(),
             "touch_gui overflowed or wrapped negative on extreme idle_secs!"
         );
+    }
+
+    #[test]
+    fn concurrent_submit_keeps_hash_chain_strictly_serial_and_verifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AuditService::open_quiet(dir.path(), "n1", "box");
+        let mut handles = Vec::new();
+        for t in 0..8usize {
+            let s = svc.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25usize {
+                    s.submit(crate::audit::event_for(
+                        "exec",
+                        "exec",
+                        "alice",
+                        &format!("t{t}-i{i}"),
+                        serde_json::json!({"detail": format!("t{t}-i{i}")}),
+                        true,
+                        None,
+                        Duration::from_millis(1),
+                    ));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut records = Vec::new();
+        for entry in fs::read_dir(dir.path().join("audit").join("logs")).unwrap() {
+            let text = fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in text.lines() {
+                records.push(serde_json::from_str::<AuditRecord>(line).unwrap());
+            }
+        }
+        assert_eq!(records.len(), 200);
+        // Must already be in strictly ascending `seq` order on disk without sorting!
+        for (idx, rec) in records.iter().enumerate() {
+            assert_eq!(rec.seq as usize, idx + 1, "out-of-order seq at line {idx}");
+        }
+        agentlink_core::audit::verify_chain(&records).expect("concurrent chain must verify");
+    }
+
+    #[test]
+    fn legacy_audit_log_redacts_secrets_and_rotates_and_spool_does_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AuditService::open_quiet(dir.path(), "n1", "box");
+        let mut pol = svc.policy();
+        pol.retention.max_log_bytes = 512;
+        svc.replace_policy(pol, false);
+
+        for i in 0..10 {
+            svc.submit(crate::audit::event_for(
+                "exec",
+                "exec",
+                "alice",
+                &format!("run-{i} Bearer sk-secret-token-1234567890"),
+                serde_json::json!({"detail": format!("run-{i} Bearer sk-secret-token-1234567890")}),
+                true,
+                None,
+                Duration::ZERO,
+            ));
+        }
+        let legacy = fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        assert!(
+            !legacy.contains("sk-secret-token-1234567890"),
+            "legacy audit.log leaked unredacted token: {legacy}"
+        );
+        assert!(
+            dir.path().join("audit.log.1").exists(),
+            "legacy audit.log must rotate once exceeding cap"
+        );
+
+        // Two spools in the same second must produce distinct files.
+        svc.spool("s3-test", b"batch-1");
+        svc.spool("s3-test", b"batch-2");
+        let count = fs::read_dir(dir.path().join("audit").join("spool").join("s3-test"))
+            .unwrap()
+            .count();
+        assert_eq!(count, 2, "same-second spools collided");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_dirs_and_files_enforce_0700_and_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AuditService::open_quiet(dir.path(), "n1", "box");
+        svc.submit(crate::audit::event_for(
+            "exec",
+            "exec",
+            "alice",
+            "echo hi",
+            serde_json::json!({"detail": "echo hi"}),
+            true,
+            None,
+            Duration::ZERO,
+        ));
+        for sub in ["audit", "audit/logs", "audit/blobs", "audit/recordings", "audit/spool"] {
+            let mode = fs::metadata(dir.path().join(sub)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{sub} mode was {mode:o}");
+        }
+        let legacy_mode = fs::metadata(dir.path().join("audit.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(legacy_mode, 0o600);
+        let chain_mode = fs::metadata(dir.path().join("audit/chain.state"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(chain_mode, 0o600);
     }
 }

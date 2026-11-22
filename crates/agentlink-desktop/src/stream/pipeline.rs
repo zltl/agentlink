@@ -66,9 +66,10 @@ pub struct Pump {
     encode_h: Arc<AtomicU32>,
     last_error: Arc<Mutex<String>>,
     last_encoded_at: Instant,
-    /// Consecutive identical full-frame hashes (cheap fingerprint).
-    same_hash_streak: u32,
-    last_frame_hash: u64,
+    /// Last bitrate applied to `encoder` so we only call `set_bitrate` on real changes.
+    last_bitrate: u32,
+    /// Consecutive capture or encode errors for exponential backoff.
+    error_streak: u32,
 }
 
 #[derive(Clone)]
@@ -179,7 +180,8 @@ impl Pump {
         session_id: String,
         bitrate: u32,
     ) -> (Self, PumpControl) {
-        let bitrate = Arc::new(AtomicU32::new(bitrate.max(100_000)));
+        let initial_bitrate = bitrate.max(100_000);
+        let bitrate = Arc::new(AtomicU32::new(initial_bitrate));
         let keyframe = Arc::new(AtomicBool::new(true));
         let frames_sent = Arc::new(AtomicU64::new(0));
         let bytes_sent = Arc::new(AtomicU64::new(0));
@@ -218,8 +220,8 @@ impl Pump {
             encode_h: encode_h.clone(),
             last_error: last_error.clone(),
             last_encoded_at: Instant::now() - HEARTBEAT,
-            same_hash_streak: 0,
-            last_frame_hash: 0,
+            last_bitrate: initial_bitrate,
+            error_streak: 0,
         };
         (
             pump,
@@ -252,9 +254,11 @@ impl Pump {
             Ok(None) => return Err(crate::error::msg("capture session ended")),
             Err(err) => {
                 // One failed grab used to kill the encode thread. The client
-                // then stopped the session at 8s with frames=0.
+                // then stopped the session at 8s with frames=0. Back off on
+                // persistent capture errors so the pump thread does not hot-spin.
                 self.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 self.note(&err);
+                self.sleep_error_backoff(timeout);
                 return Ok(None);
             }
         };
@@ -268,8 +272,13 @@ impl Pump {
         self.capture_w.store(frame.width, Ordering::Relaxed);
         self.capture_h.store(frame.height, Ordering::Relaxed);
 
-        self.encoder
-            .set_bitrate(self.bitrate.load(Ordering::Relaxed));
+        // Only forward real bitrate changes (e.g. from AIMD) — never oscillate
+        // between base and a quiet/idle multiplier every tick.
+        let target_bitrate = self.bitrate.load(Ordering::Relaxed).max(100_000);
+        if target_bitrate != self.last_bitrate {
+            self.encoder.set_bitrate(target_bitrate);
+            self.last_bitrate = target_bitrate;
+        }
         // Encoder name can change after hardware→minih264 fallback.
         let live_name = self.encoder.info().name;
         if let Ok(mut slot) = self.encoder_name.lock() {
@@ -284,21 +293,11 @@ impl Pump {
         let force_idr = client_force || sent == 0;
 
         if frame.unchanged && !force_idr && !need_heartbeat {
+            self.error_streak = 0;
             return Ok(None);
         }
 
         let convert_started = Instant::now();
-        // Cheap fingerprint for QP adaptation. Skipping identical frames entirely
-        // would tank static-desktop fps below the 28fps target; only the
-        // platform `unchanged` flag (plus a 2s heartbeat) drops encodes.
-        let fingerprint = quick_frame_hash(&frame);
-        if fingerprint == self.last_frame_hash && sent > 0 {
-            self.same_hash_streak = self.same_hash_streak.saturating_add(1);
-        } else {
-            self.same_hash_streak = 0;
-            self.last_frame_hash = fingerprint;
-        }
-
         let dirty = if frame.unchanged {
             Vec::new()
         } else {
@@ -314,15 +313,9 @@ impl Pump {
             need_heartbeat,
             sent,
         ) else {
+            self.error_streak = 0;
             return Ok(None);
         };
-
-        // Still / low-change frames: raise QP (lower bitrate) so VAAPI CQP stays cheap.
-        let base_bitrate = self.bitrate.load(Ordering::Relaxed);
-        if dirty.is_empty() || self.same_hash_streak >= 2 {
-            let quiet = (base_bitrate as f32 * 0.55) as u32;
-            self.encoder.set_bitrate(quiet.max(800_000).min(base_bitrate));
-        }
 
         let encode_started = Instant::now();
         let packet = match self.encoder.encode(&frame, force) {
@@ -334,9 +327,11 @@ impl Pump {
             Err(err) => {
                 self.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 self.note(&err);
+                self.sleep_error_backoff(timeout);
                 return Ok(None);
             }
         };
+        self.error_streak = 0;
         let encode_us = encode_started.elapsed().as_micros() as u64;
         update_encode_ema(&self.encode_us_ema, encode_us);
         if force {
@@ -371,12 +366,30 @@ impl Pump {
         }
     }
 
+    fn sleep_error_backoff(&mut self, timeout: Duration) {
+        self.error_streak = self.error_streak.saturating_add(1);
+        let delay = error_backoff(self.error_streak).min(timeout);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+
     /// Test-only: pretend the last successful encode was `ago` in the past so
     /// the next quiet frame hits the heartbeat path without sleeping.
     #[cfg(test)]
     fn backdate_last_encoded_for_test(&mut self, ago: Duration) {
         self.last_encoded_at = Instant::now() - ago;
     }
+}
+
+/// Bounded exponential backoff on consecutive capture/encode errors
+/// (15ms -> 30ms -> 60ms -> 120ms -> 240ms -> 480ms, capped at 500ms).
+pub(crate) fn error_backoff(streak: u32) -> Duration {
+    if streak == 0 {
+        return Duration::ZERO;
+    }
+    let shift = streak.saturating_sub(1).min(6);
+    Duration::from_millis((15u64 << shift).min(500))
 }
 
 /// EMA with α ≈ 1/8 so recent frames dominate without wild spikes.
@@ -388,40 +401,6 @@ fn update_encode_ema(slot: &AtomicU64, sample_us: u64) {
         prev - (prev >> 3) + (sample_us >> 3)
     };
     slot.store(next, Ordering::Relaxed);
-}
-
-/// Sampled FNV-1a over a sparse pixel grid — enough to detect a still desktop
-/// without walking every tile like [`DamageTracker`].
-fn quick_frame_hash(frame: &crate::capture::Frame) -> u64 {
-    let pixels = frame.pixels();
-    let stride = frame.stride as usize;
-    let mut hash = 0xcbf29ce484222325u64;
-    let step_x = (frame.width / 32).max(1) as usize;
-    let step_y = (frame.height / 18).max(1) as usize;
-    let mut y = 0usize;
-    while y < frame.height as usize {
-        let row = y * stride;
-        let mut x = 0usize;
-        while x < frame.width as usize {
-            let i = row + x * 4;
-            if i + 4 <= pixels.len() {
-                let value = u32::from_le_bytes([
-                    pixels[i],
-                    pixels[i + 1],
-                    pixels[i + 2],
-                    pixels[i + 3],
-                ]);
-                hash ^= value as u64;
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-            x += step_x;
-        }
-        y += step_y;
-    }
-    hash ^= frame.width as u64;
-    hash = hash.wrapping_mul(0x100000001b3);
-    hash ^= frame.height as u64;
-    hash
 }
 
 /// Test helper: encode a sequence of frames with no platform capture.
@@ -746,5 +725,72 @@ mod tests {
         let dirty = pump.next(Duration::from_millis(1)).unwrap().unwrap();
         assert!(!dirty.keyframe, "content change is a delta, not a forced IDR");
         assert_eq!(forces.lock().unwrap().as_slice(), &[true, false]);
+    }
+
+    #[test]
+    fn pump_does_not_oscillate_bitrate_on_quiet_heartbeat() {
+        struct BitrateSpy {
+            calls: Arc<Mutex<Vec<u32>>>,
+        }
+        impl crate::stream::encode::VideoEncoder for BitrateSpy {
+            fn info(&self) -> crate::stream::encode::EncoderInfo {
+                crate::stream::encode::EncoderInfo {
+                    name: "spy".into(),
+                    codec: Codec::H264,
+                    hardware: false,
+                }
+            }
+            fn encode(
+                &mut self,
+                frame: &Frame,
+                force_keyframe: bool,
+            ) -> Result<crate::stream::encode::EncodedAccessUnit> {
+                Ok(crate::stream::encode::EncodedAccessUnit {
+                    codec: Codec::H264,
+                    bytes: vec![0, 0, 0, 1, if force_keyframe { 0x65 } else { 0x41 }],
+                    keyframe: force_keyframe,
+                    width: frame.width,
+                    height: frame.height,
+                    captured_unix_ms: frame.captured_unix_ms,
+                })
+            }
+            fn set_bitrate(&mut self, bitrate: u32) {
+                self.calls.lock().unwrap().push(bitrate);
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut quiet = solid();
+        quiet.mark_unchanged();
+        let (mut pump, control) = Pump::start(
+            Box::new(Seq {
+                frames: vec![solid(), quiet.clone(), quiet.clone(), solid_color(55)],
+            }),
+            Box::new(BitrateSpy {
+                calls: calls.clone(),
+            }),
+            "s".into(),
+            2_000_000,
+        );
+        let _ = pump.next(Duration::from_millis(1)).unwrap();
+        let _ = pump.next(Duration::from_millis(1)).unwrap();
+        pump.backdate_last_encoded_for_test(HEARTBEAT + Duration::from_millis(1));
+        let _ = pump.next(Duration::from_millis(1)).unwrap();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "quiet/heartbeat frames must not oscillate set_bitrate: {:?}",
+            calls.lock().unwrap()
+        );
+        // An explicit AIMD change is forwarded once.
+        control.bitrate.store(1_200_000, Ordering::Relaxed);
+        let _ = pump.next(Duration::from_millis(1)).unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), &[1_200_000]);
+    }
+
+    #[test]
+    fn error_backoff_grows_and_caps() {
+        assert_eq!(error_backoff(0), Duration::ZERO);
+        assert_eq!(error_backoff(1), Duration::from_millis(15));
+        assert!(error_backoff(3) > error_backoff(1));
+        assert_eq!(error_backoff(10), Duration::from_millis(500));
     }
 }

@@ -632,15 +632,29 @@ async fn display_monitors(conn: &Connection) -> Result<Vec<MonitorInfo>> {
         .map_err(|err| msg(format!("DisplayConfig state: {err}")))?;
 
     let mut out = Vec::new();
-    for (index, (x, y, _scale, _transform, primary, specs, _props)) in logicals.iter().enumerate() {
+    for (index, (x, y, scale, transform, primary, specs, _props)) in logicals.iter().enumerate() {
         let Some(spec) = specs.first() else {
             continue;
         };
-        let (width, height) = monitors
+        let (raw_w, raw_h) = monitors
             .iter()
             .find(|monitor| monitor.0 .0 == spec.0)
             .and_then(current_mode)
             .unwrap_or((0, 0));
+        // Mutter DisplayConfig transform: odd values (1=90°, 3=270°, 5/7 flipped)
+        // swap logical width and height.
+        let (rot_w, rot_h) = if transform % 2 == 1 {
+            (raw_h, raw_w)
+        } else {
+            (raw_w, raw_h)
+        };
+        let scale = if scale.is_finite() && *scale > 0.0 {
+            *scale
+        } else {
+            1.0
+        };
+        let width = ((rot_w as f64) / scale).round().max(0.0) as u32;
+        let height = ((rot_h as f64) / scale).round().max(0.0) as u32;
         out.push(MonitorInfo {
             index: index as u32,
             name: spec.0.clone(),
@@ -717,9 +731,15 @@ pub async fn notify_button(
 }
 
 pub async fn notify_axis(conn: &Connection, session: &str, dx: f64, dy: f64) -> Result<()> {
+    // Mutter `NotifyPointerAxis` takes logical pixels (wl_pointer::axis).
+    // Protocol `dx`/`dy` are wheel notches; standard GTK/Wayland step is 15.0 px/notch.
+    const PIXELS_PER_NOTCH: f64 = 15.0;
     remote_session(conn, session)
         .await?
-        .call::<_, _, ()>("NotifyPointerAxis", &(dx, dy, 0u32))
+        .call::<_, _, ()>(
+            "NotifyPointerAxis",
+            &(dx * PIXELS_PER_NOTCH, dy * PIXELS_PER_NOTCH, 0u32),
+        )
         .await
         .map_err(|err| msg(format!("pointer axis: {err}")))
 }

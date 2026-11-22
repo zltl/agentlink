@@ -13,6 +13,11 @@
 
 typedef struct VtEnc {
     VTCompressionSessionRef session;
+    VTPixelTransferSessionRef transfer;
+    CVPixelBufferRef dst_pixel;
+    CVPixelBufferRef src_pixel;
+    int src_pixel_w;
+    int src_pixel_h;
     int width;
     int height;
     int hevc;
@@ -136,7 +141,7 @@ static CFDictionaryRef encoder_spec(void) {
 int al_vt_open(int width, int height, int fps, int bitrate, int hevc, void **out) {
     VtEnc *enc;
     OSStatus status;
-    CFMutableDictionaryRef props;
+    CFDictionaryRef spec;
     CFNumberRef num;
     int32_t interval;
     int32_t rate;
@@ -156,20 +161,36 @@ int al_vt_open(int width, int height, int fps, int bitrate, int hevc, void **out
     enc->hevc = hevc ? 1 : 0;
     enc->timescale = fps > 0 ? fps : 30;
     codec = hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
+    spec = encoder_spec();
     status = VTCompressionSessionCreate(
         kCFAllocatorDefault,
         width,
         height,
         codec,
-        encoder_spec(),
+        spec,
         NULL,
         kCFAllocatorDefault,
         output_callback,
         enc,
         &enc->session);
+    if (spec) {
+        CFRelease(spec);
+    }
     if (status != noErr || !enc->session) {
         free(enc);
         return (int)status;
+    }
+    if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &enc->transfer) != noErr) {
+        enc->transfer = NULL;
+    }
+    if (CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            NULL,
+            &enc->dst_pixel) != kCVReturnSuccess) {
+        enc->dst_pixel = NULL;
     }
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
@@ -189,16 +210,105 @@ int al_vt_open(int width, int height, int fps, int bitrate, int hevc, void **out
     num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &interval);
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, num);
     CFRelease(num);
-    (void)props;
     VTCompressionSessionPrepareToEncodeFrames(enc->session);
     *out = enc;
     return 0;
 }
 
+static void copy_bounded_bgra(
+    CVPixelBufferRef pixel,
+    const unsigned char *bgra,
+    int src_w,
+    int src_h,
+    int src_stride,
+    int dst_w,
+    int dst_h
+) {
+    CVPixelBufferLockBaseAddress(pixel, 0);
+    {
+        uint8_t *base = CVPixelBufferGetBaseAddress(pixel);
+        size_t row = CVPixelBufferGetBytesPerRow(pixel);
+        int rows = src_h < dst_h ? src_h : dst_h;
+        size_t copy_w = (size_t)(src_w < dst_w ? src_w : dst_w) * 4u;
+        int y;
+        if (copy_w > (size_t)src_stride) {
+            copy_w = (size_t)src_stride;
+        }
+        if (copy_w > row) {
+            copy_w = row;
+        }
+        memset(base, 0, row * (size_t)dst_h);
+        for (y = 0; y < rows; y++) {
+            memcpy(base + (size_t)y * row, bgra + (size_t)y * (size_t)src_stride, copy_w);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pixel, 0);
+}
+
+static void scale_bounded_bgra(
+    CVPixelBufferRef pixel,
+    const unsigned char *bgra,
+    int src_w,
+    int src_h,
+    int src_stride,
+    int dst_w,
+    int dst_h
+) {
+    CVPixelBufferLockBaseAddress(pixel, 0);
+    {
+        uint8_t *base = CVPixelBufferGetBaseAddress(pixel);
+        size_t dst_row = CVPixelBufferGetBytesPerRow(pixel);
+        int y;
+        memset(base, 0, dst_row * (size_t)dst_h);
+        for (y = 0; y < dst_h; y++) {
+            int sy = (int)(((int64_t)y * (int64_t)src_h) / (int64_t)dst_h);
+            const uint8_t *srow;
+            uint8_t *drow;
+            int x;
+            if (sy >= src_h) sy = src_h - 1;
+            srow = bgra + (size_t)sy * (size_t)src_stride;
+            drow = base + (size_t)y * dst_row;
+            for (x = 0; x < dst_w; x++) {
+                int sx = (int)(((int64_t)x * (int64_t)src_w) / (int64_t)dst_w);
+                if (sx >= src_w) sx = src_w - 1;
+                memcpy(drow + (size_t)x * 4u, srow + (size_t)sx * 4u, 4);
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pixel, 0);
+}
+
+static int ensure_src_pixel(VtEnc *enc, int src_w, int src_h) {
+    if (enc->src_pixel && enc->src_pixel_w == src_w && enc->src_pixel_h == src_h) {
+        return 1;
+    }
+    if (enc->src_pixel) {
+        CFRelease(enc->src_pixel);
+        enc->src_pixel = NULL;
+        enc->src_pixel_w = 0;
+        enc->src_pixel_h = 0;
+    }
+    if (CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            src_w,
+            src_h,
+            kCVPixelFormatType_32BGRA,
+            NULL,
+            &enc->src_pixel) != kCVReturnSuccess || !enc->src_pixel) {
+        enc->src_pixel = NULL;
+        return 0;
+    }
+    enc->src_pixel_w = src_w;
+    enc->src_pixel_h = src_h;
+    return 1;
+}
+
 int al_vt_encode(
     void *raw,
     const unsigned char *bgra,
-    int stride,
+    int src_w,
+    int src_h,
+    int src_stride,
     int force_key,
     unsigned char *dst,
     int dst_cap,
@@ -206,37 +316,45 @@ int al_vt_encode(
 ) {
     VtEnc *enc = raw;
     CVPixelBufferRef pixel = NULL;
+    int owns_pixel = 0;
     CFDictionaryRef frame_props = NULL;
     OSStatus status;
     VTEncodeInfoFlags flags = 0;
+    int only_mb_pad;
 
-    if (!enc || !bgra || !dst || dst_cap <= 0) {
+    if (!enc || !bgra || !dst || dst_cap <= 0 || src_w <= 0 || src_h <= 0 || src_stride < src_w * 4) {
         return -1;
     }
     enc->annexb_len = 0;
     enc->failed = 0;
     enc->keyframe = 0;
-    status = CVPixelBufferCreate(
-        kCFAllocatorDefault,
-        enc->width,
-        enc->height,
-        kCVPixelFormatType_32BGRA,
-        NULL,
-        &pixel);
-    if (status != kCVReturnSuccess || !pixel) {
-        return -2;
-    }
-    CVPixelBufferLockBaseAddress(pixel, 0);
-    {
-        uint8_t *base = CVPixelBufferGetBaseAddress(pixel);
-        size_t row = CVPixelBufferGetBytesPerRow(pixel);
-        int y;
-        int copy = stride < (int)row ? stride : (int)row;
-        for (y = 0; y < enc->height; y++) {
-            memcpy(base + y * row, bgra + y * stride, (size_t)copy);
+    if (enc->dst_pixel) {
+        pixel = enc->dst_pixel;
+    } else {
+        status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            enc->width,
+            enc->height,
+            kCVPixelFormatType_32BGRA,
+            NULL,
+            &pixel);
+        if (status != kCVReturnSuccess || !pixel) {
+            return -2;
         }
+        owns_pixel = 1;
     }
-    CVPixelBufferUnlockBaseAddress(pixel, 0);
+    only_mb_pad = (src_w <= enc->width && src_h <= enc->height &&
+                   (enc->width - src_w) < 16 && (enc->height - src_h) < 16);
+    if (only_mb_pad) {
+        copy_bounded_bgra(pixel, bgra, src_w, src_h, src_stride, enc->width, enc->height);
+    } else if (enc->transfer && ensure_src_pixel(enc, src_w, src_h)) {
+        copy_bounded_bgra(enc->src_pixel, bgra, src_w, src_h, src_stride, src_w, src_h);
+        if (VTPixelTransferSessionTransferImage(enc->transfer, enc->src_pixel, pixel) != noErr) {
+            scale_bounded_bgra(pixel, bgra, src_w, src_h, src_stride, enc->width, enc->height);
+        }
+    } else {
+        scale_bounded_bgra(pixel, bgra, src_w, src_h, src_stride, enc->width, enc->height);
+    }
     if (force_key) {
         const void *keys[] = {kVTEncodeFrameOptionKey_ForceKeyFrame};
         const void *vals[] = {kCFBooleanTrue};
@@ -253,12 +371,17 @@ int al_vt_encode(
     if (frame_props) {
         CFRelease(frame_props);
     }
-    CFRelease(pixel);
+    if (owns_pixel) {
+        CFRelease(pixel);
+    }
     if (status == noErr) {
         status = VTCompressionSessionCompleteFrames(enc->session, kCMTimeInvalid);
     }
-    if (status != noErr || enc->failed || enc->annexb_len == 0 || (int)enc->annexb_len > dst_cap) {
+    if (status != noErr || enc->failed || enc->annexb_len == 0) {
         return status != noErr ? (int)status : -3;
+    }
+    if ((int)enc->annexb_len > dst_cap) {
+        return -4;
     }
     memcpy(dst, enc->annexb, enc->annexb_len);
     if (keyframe) {
@@ -291,6 +414,16 @@ void al_vt_close(void *raw) {
         VTCompressionSessionCompleteFrames(enc->session, kCMTimeInvalid);
         VTCompressionSessionInvalidate(enc->session);
         CFRelease(enc->session);
+    }
+    if (enc->transfer) {
+        VTPixelTransferSessionInvalidate(enc->transfer);
+        CFRelease(enc->transfer);
+    }
+    if (enc->dst_pixel) {
+        CFRelease(enc->dst_pixel);
+    }
+    if (enc->src_pixel) {
+        CFRelease(enc->src_pixel);
     }
     free(enc->annexb);
     free(enc);

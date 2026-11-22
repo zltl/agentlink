@@ -15,14 +15,15 @@
 //! Pointer coordinates are pixels of the captured framebuffer (top-left of the
 //! virtual desktop). They are converted to Quartz points with the display scale.
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::a11y::{A11yBackend, ElementOp, UiNode};
 use crate::capture::{
-    frame_interval, scale_frame, stream_interval, wait_until_due, CaptureBackend, CaptureRequest,
-    CaptureTarget, Frame, FrameSource, MonitorInfo, Rect as DeskRect, StreamMode,
+    scale_frame, stream_interval, wait_until_due, CaptureBackend, CaptureRequest, CaptureTarget,
+    Frame, FrameSource, MonitorInfo, Rect as DeskRect, StreamMode,
 };
 use crate::error::{msg, Result};
 use crate::input::{perform, HidBackend, InputAction, MouseButton, Pointer};
@@ -107,6 +108,7 @@ extern "C" {
     ) -> *mut c_void;
     fn CGEventCreateKeyboardEvent(source: *mut c_void, keycode: u16, down: bool) -> *mut c_void;
     fn CGEventKeyboardSetUnicodeString(event: *mut c_void, length: usize, text: *const u16);
+    fn CGEventSetFlags(event: *mut c_void, flags: u64);
     fn CGEventPost(tap: u32, event: *mut c_void);
     fn CGEventCreateScrollWheelEvent(
         source: *mut c_void,
@@ -142,6 +144,13 @@ const ALPHA_MASK: u32 = 0x1f;
 const ORDER_MASK: u32 = 0x7000;
 const ORDER_32_LITTLE: u32 = 2 << 12;
 
+// Quartz CGEventFlags masks
+const FLAG_ALPHA_SHIFT: u64 = 0x0001_0000;
+const FLAG_SHIFT: u64 = 0x0002_0000;
+const FLAG_CONTROL: u64 = 0x0004_0000;
+const FLAG_ALTERNATE: u64 = 0x0008_0000;
+const FLAG_COMMAND: u64 = 0x0010_0000;
+
 struct DisplayGeom {
     id: DisplayId,
     /// Pixel origin of this display in the virtual desktop.
@@ -158,20 +167,14 @@ struct DisplayGeom {
     name: String,
 }
 
-struct MacState {
+struct MacCaptureState {
     displays: Vec<DisplayGeom>,
-    ax: Vec<*mut c_void>,
-    /// Last Quartz point posted by `mouse_move`. Button events reuse it so a
-    /// click does not jump to the origin.
-    cursor: CgPoint,
 }
 
-impl MacState {
+impl MacCaptureState {
     fn new() -> Self {
         Self {
             displays: Vec::new(),
-            ax: Vec::new(),
-            cursor: CgPoint { x: 0.0, y: 0.0 },
         }
     }
 
@@ -194,9 +197,74 @@ impl MacState {
     }
 }
 
-impl Drop for MacState {
+struct MacHidState {
+    displays: Vec<DisplayGeom>,
+    last_refresh: Instant,
+    /// Last Quartz point posted by `mouse_move`. Button events reuse it so a
+    /// click does not jump to the origin.
+    cursor: CgPoint,
+    /// Mouse buttons currently held down so `mouse_move` posts Dragged events.
+    held_buttons: Vec<MouseButton>,
+    /// Canonical modifier names currently held down so `CGEventSetFlags` sets
+    /// the right Quartz modifier bitmask on keyboard and mouse events.
+    held_modifiers: HashSet<String>,
+}
+
+impl MacHidState {
+    fn new() -> Self {
+        Self {
+            displays: Vec::new(),
+            last_refresh: Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now),
+            cursor: CgPoint { x: 0.0, y: 0.0 },
+            held_buttons: Vec::new(),
+            held_modifiers: HashSet::new(),
+        }
+    }
+
+    fn ensure_displays(&mut self) {
+        if self.displays.is_empty() || self.last_refresh.elapsed() >= Duration::from_secs(2) {
+            self.displays = display_list();
+            self.last_refresh = Instant::now();
+        }
+    }
+
+    fn modifier_flags(&self) -> u64 {
+        let mut flags = 0u64;
+        for name in &self.held_modifiers {
+            flags |= modifier_flag_for(name);
+        }
+        flags
+    }
+}
+
+struct MacA11yState {
+    ax: Vec<*mut c_void>,
+}
+
+impl MacA11yState {
+    fn new() -> Self {
+        Self { ax: Vec::new() }
+    }
+}
+
+impl Drop for MacA11yState {
     fn drop(&mut self) {
         release_ax(&mut self.ax);
+    }
+}
+
+fn modifier_flag_for(name: &str) -> u64 {
+    match name.to_ascii_lowercase().as_str() {
+        "shift" | "lshift" | "rshift" | "shift_l" | "shift_r" => FLAG_SHIFT,
+        "ctrl" | "control" | "lctrl" | "rctrl" | "control_l" | "control_r" => FLAG_CONTROL,
+        "alt" | "option" | "opt" | "lalt" | "ralt" | "alt_l" | "alt_r" => FLAG_ALTERNATE,
+        "meta" | "cmd" | "command" | "super" | "win" | "gui" | "lgui" | "rgui" | "lcmd"
+        | "rcmd" | "lmeta" | "rmeta" | "lsuper" | "rsuper" | "lwin" | "rwin" | "super_l"
+        | "super_r" => FLAG_COMMAND,
+        "capslock" | "caps_lock" | "caps-lock" => FLAG_ALPHA_SHIFT,
+        _ => 0,
     }
 }
 
@@ -212,6 +280,17 @@ fn display_list() -> Vec<DisplayGeom> {
     let mut raw: Vec<DisplayGeom> = (0..count as usize)
         .map(|index| geom(ids[index], index as u32, ids[index] == main))
         .collect();
+    // Scale all Quartz point origins by the maximum scale across active
+    // displays so mixed-DPI setups (e.g. 2x Retina + 1x external) never
+    // produce overlapping pixel origins.
+    let max_scale = raw
+        .iter()
+        .map(|item| item.scale)
+        .fold(1.0_f64, f64::max);
+    for item in &mut raw {
+        item.x = (item.point_x * max_scale).round() as i32;
+        item.y = (item.point_y * max_scale).round() as i32;
+    }
     let min_x = raw.iter().map(|item| item.x).min().unwrap_or(0);
     let min_y = raw.iter().map(|item| item.y).min().unwrap_or(0);
     for item in &mut raw {
@@ -442,17 +521,31 @@ fn pack_bgra(
     Frame::from_bgra(width, height, width * 4, &out, backend)
 }
 
-impl Pointer for MacState {
+impl Pointer for MacHidState {
     fn mouse_move(&mut self, x: i32, y: i32) -> Result<()> {
-        if self.displays.is_empty() {
-            self.refresh();
-        }
+        self.ensure_displays();
         let point = self.to_point(x, y);
         self.cursor = point;
-        post_mouse(5, point, 0)
+        let (kind, button) = if self.held_buttons.contains(&MouseButton::Left) {
+            (6, 0) // kCGEventLeftMouseDragged
+        } else if self.held_buttons.contains(&MouseButton::Right) {
+            (7, 1) // kCGEventRightMouseDragged
+        } else if self.held_buttons.contains(&MouseButton::Middle) {
+            (27, 2) // kCGEventOtherMouseDragged
+        } else {
+            (5, 0) // kCGEventMouseMoved
+        };
+        post_mouse(kind, point, button, self.modifier_flags())
     }
 
     fn mouse_button(&mut self, button: MouseButton, down: bool) -> Result<()> {
+        if down {
+            if !self.held_buttons.contains(&button) {
+                self.held_buttons.push(button);
+            }
+        } else {
+            self.held_buttons.retain(|b| *b != button);
+        }
         let (kind, which) = match (button, down) {
             (MouseButton::Left, true) => (1, 0),
             (MouseButton::Left, false) => (2, 0),
@@ -461,16 +554,20 @@ impl Pointer for MacState {
             (MouseButton::Middle, true) => (25, 2),
             (MouseButton::Middle, false) => (26, 2),
         };
-        post_mouse(kind, self.cursor, which)
+        post_mouse(kind, self.cursor, which, self.modifier_flags())
     }
 
     fn scroll(&mut self, dx: i32, dy: i32) -> Result<()> {
+        let flags = self.modifier_flags();
         unsafe {
             let event = CGEventCreateScrollWheelEvent(std::ptr::null_mut(), 1, 2, dy, dx);
             if event.is_null() {
                 return Err(msg(
                     "CGEventCreateScrollWheelEvent failed. Grant Accessibility to this process.",
                 ));
+            }
+            if flags != 0 {
+                CGEventSetFlags(event, flags);
             }
             CGEventPost(0, event);
             CFRelease(event);
@@ -479,11 +576,25 @@ impl Pointer for MacState {
     }
 
     fn key_down(&mut self, key: &str) -> Result<()> {
-        post_key(key, true)
+        if modifier_flag_for(key) != 0 {
+            self.held_modifiers.insert(key.to_ascii_lowercase());
+        }
+        let mut flags = self.modifier_flags();
+        if crate::keys::key_requires_shift(key) {
+            flags |= FLAG_SHIFT;
+        }
+        post_key(key, true, flags)
     }
 
     fn key_up(&mut self, key: &str) -> Result<()> {
-        post_key(key, false)
+        if modifier_flag_for(key) != 0 {
+            self.held_modifiers.remove(&key.to_ascii_lowercase());
+        }
+        let mut flags = self.modifier_flags();
+        if crate::keys::key_requires_shift(key) {
+            flags |= FLAG_SHIFT;
+        }
+        post_key(key, false, flags)
     }
 
     fn type_text(&mut self, text: &str) -> Result<()> {
@@ -492,8 +603,8 @@ impl Pointer for MacState {
                 continue;
             }
             if ch == '\n' {
-                post_key("enter", true)?;
-                post_key("enter", false)?;
+                post_key("enter", true, 0)?;
+                post_key("enter", false, 0)?;
                 continue;
             }
             post_unicode(ch, true)?;
@@ -503,7 +614,7 @@ impl Pointer for MacState {
     }
 }
 
-impl MacState {
+impl MacHidState {
     fn to_point(&self, x: i32, y: i32) -> CgPoint {
         for display in &self.displays {
             let inside = x >= display.x
@@ -527,7 +638,7 @@ impl MacState {
     }
 }
 
-fn post_mouse(kind: u32, point: CgPoint, button: u32) -> Result<()> {
+fn post_mouse(kind: u32, point: CgPoint, button: u32, flags: u64) -> Result<()> {
     unsafe {
         let event = CGEventCreateMouseEvent(std::ptr::null_mut(), kind, point, button);
         if event.is_null() {
@@ -535,22 +646,29 @@ fn post_mouse(kind: u32, point: CgPoint, button: u32) -> Result<()> {
                 "CGEventCreateMouseEvent failed. Grant Accessibility to the process that launches the node.",
             ));
         }
+        if flags != 0 {
+            CGEventSetFlags(event, flags);
+        }
         CGEventPost(0, event);
         CFRelease(event);
     }
     Ok(())
 }
 
-fn post_key(name: &str, down: bool) -> Result<()> {
-    let code = key_info(name)
-        .map(|info| info.mac)
-        .ok_or_else(|| msg(format!("unknown key '{name}'")))?;
+fn post_key(name: &str, down: bool, flags: u64) -> Result<()> {
+    let info = key_info(name).ok_or_else(|| msg(format!("unknown key '{name}'")))?;
+    let code = info
+        .mac
+        .ok_or_else(|| msg(format!("key '{name}' is not supported on macOS")))?;
     unsafe {
         let event = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, down);
         if event.is_null() {
             return Err(msg(
                 "CGEventCreateKeyboardEvent failed. Grant Accessibility to this process.",
             ));
+        }
+        if flags != 0 {
+            CGEventSetFlags(event, flags);
         }
         CGEventPost(0, event);
         CFRelease(event);
@@ -574,7 +692,7 @@ fn post_unicode(ch: char, down: bool) -> Result<()> {
     Ok(())
 }
 
-fn ui_tree(state: &mut MacState, max_depth: u32, max_nodes: u32) -> Result<UiNode> {
+fn ui_tree(state: &mut MacA11yState, max_depth: u32, max_nodes: u32) -> Result<UiNode> {
     if !unsafe { AXIsProcessTrusted() } {
         return Err(msg(
             "macOS Accessibility permission is off. Enable it for the terminal or app that launches the node, then restart the node.",
@@ -591,7 +709,7 @@ fn ui_tree(state: &mut MacState, max_depth: u32, max_nodes: u32) -> Result<UiNod
 }
 
 fn walk_ax(
-    state: &mut MacState,
+    state: &mut MacA11yState,
     element: *mut c_void,
     depth: u32,
     budget: &mut u32,
@@ -637,7 +755,7 @@ fn walk_ax(
     Ok(Some(node))
 }
 
-fn ui_act(state: &mut MacState, id: &str, op: ElementOp, value: Option<&str>) -> Result<()> {
+fn ui_act(state: &mut MacA11yState, id: &str, op: ElementOp, value: Option<&str>) -> Result<()> {
     let index = id
         .strip_prefix("ax|")
         .and_then(|rest| rest.parse::<usize>().ok())
@@ -856,7 +974,7 @@ fn release_ax(elements: &mut Vec<*mut c_void>) {
 }
 
 struct MacSession {
-    worker: Worker<MacState>,
+    worker: Worker<MacCaptureState>,
     request: CaptureRequest,
     interval: Duration,
     last: Instant,
@@ -880,12 +998,16 @@ impl FrameSource for MacSession {
 
 #[derive(Clone)]
 struct MacDesktop {
-    worker: Worker<MacState>,
+    capture_worker: Worker<MacCaptureState>,
+    hid_worker: Worker<MacHidState>,
+    a11y_worker: Worker<MacA11yState>,
 }
 
 pub fn open() -> Arc<Desktop> {
     let backend = Arc::new(MacDesktop {
-        worker: Worker::spawn(MacState::new),
+        capture_worker: Worker::spawn_named("agentlink-mac-capture", MacCaptureState::new),
+        hid_worker: Worker::spawn_named("agentlink-mac-hid", MacHidState::new),
+        a11y_worker: Worker::spawn_named("agentlink-mac-a11y", MacA11yState::new),
     });
     Arc::new(Desktop {
         capture: backend.clone(),
@@ -900,7 +1022,7 @@ impl CaptureBackend for MacDesktop {
     }
 
     fn list_monitors(&self) -> Result<Vec<MonitorInfo>> {
-        self.worker.call(|state| {
+        self.capture_worker.call(|state| {
             state.refresh();
             Ok(state
                 .displays
@@ -921,7 +1043,8 @@ impl CaptureBackend for MacDesktop {
 
     fn capture(&self, request: &CaptureRequest) -> Result<Frame> {
         let request = request.clone();
-        self.worker.call(move |state| state.capture(&request))
+        self.capture_worker
+            .call(move |state| state.capture(&request))
     }
 
     fn open_session(&self, request: &CaptureRequest) -> Result<Box<dyn FrameSource>> {
@@ -930,7 +1053,7 @@ impl CaptureBackend for MacDesktop {
             Err(err) => {
                 tracing::info!(error = %err, "ScreenCaptureKit unavailable; streaming with CoreGraphics");
                 Ok(Box::new(MacSession {
-                    worker: self.worker.clone(),
+                    worker: self.capture_worker.clone(),
                     request: request.clone(),
                     interval: stream_interval(request.max_fps),
                     last: Instant::now()
@@ -949,7 +1072,7 @@ impl HidBackend for MacDesktop {
 
     fn inject(&self, action: &InputAction) -> Result<()> {
         let action = action.clone();
-        self.worker.call(move |state| perform(state, &action))
+        self.hid_worker.call(move |state| perform(state, &action))
     }
 }
 
@@ -959,14 +1082,14 @@ impl A11yBackend for MacDesktop {
     }
 
     fn tree(&self, max_depth: u32, max_nodes: u32) -> Result<UiNode> {
-        self.worker
+        self.a11y_worker
             .call(move |state| ui_tree(state, max_depth, max_nodes))
     }
 
     fn act(&self, id: &str, op: ElementOp, value: Option<&str>) -> Result<()> {
         let id = id.to_string();
         let value = value.map(str::to_string);
-        self.worker
+        self.a11y_worker
             .call(move |state| ui_act(state, &id, op, value.as_deref()))
     }
 }

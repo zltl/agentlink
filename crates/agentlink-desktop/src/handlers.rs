@@ -255,7 +255,68 @@ pub(crate) fn resolve_input_coords(
     resolve_input_coords_on(monitors.as_deref(), action, payload)
 }
 
+/// Resolve coordinates using a caller-supplied cached monitor list (avoids
+/// querying OS monitors at 60Hz on live WebRTC mouse moves).
+pub(crate) fn resolve_input_coords_with_monitors(
+    monitors: &[MonitorInfo],
+    action: &str,
+    payload: &Value,
+) -> Result<Value> {
+    resolve_input_coords_on(Some(monitors), action, payload)
+}
+
+/// True when the payload's coordinate fields should be interpreted as
+/// `0.0..=1.0` monitor fractions (including JSON integers `0`/`1` produced by
+/// JavaScript `JSON.stringify(0.0)` / `JSON.stringify(1.0)` when paired with
+/// a float fraction, an explicit `monitor`, or an explicit coordinate-space tag).
+fn payload_uses_fractions(action: &str, payload: &Value) -> bool {
+    if let Some(space) = payload.get("coord_space").and_then(Value::as_str) {
+        if space.eq_ignore_ascii_case("fraction") || space.eq_ignore_ascii_case("normalized") {
+            return true;
+        }
+        if space.eq_ignore_ascii_case("pixel") || space.eq_ignore_ascii_case("pixels") {
+            return false;
+        }
+    }
+    if payload.get("normalized").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let (x_fields, y_fields) = coord_fields(action);
+    let mut any_present = false;
+    let mut any_float_fraction = false;
+    let mut all_in_unit_range = true;
+    for field in x_fields.iter().chain(y_fields.iter()) {
+        let Some(value) = payload.get(*field) else {
+            continue;
+        };
+        any_present = true;
+        if is_fraction(value) {
+            any_float_fraction = true;
+        }
+        if !is_unit_number(value) {
+            all_in_unit_range = false;
+        }
+    }
+    if !any_present || !all_in_unit_range {
+        return false;
+    }
+    any_float_fraction || payload.get("monitor").is_some()
+}
+
+fn is_unit_number(value: &Value) -> bool {
+    if let Some(i) = value.as_i64() {
+        return i == 0 || i == 1;
+    }
+    value
+        .as_f64()
+        .map(|f| f.is_finite() && (0.0..=1.0).contains(&f))
+        .unwrap_or(false)
+}
+
 fn needs_monitor_rect(action: &str, payload: &Value) -> bool {
+    if payload_uses_fractions(action, payload) {
+        return true;
+    }
     let (x_fields, y_fields) = coord_fields(action);
     x_fields
         .iter()
@@ -273,11 +334,14 @@ fn resolve_input_coords_on(
     let Some(map) = out.as_object_mut() else {
         return Ok(out);
     };
-    // Lower layers do not understand `monitor`; drop it either way.
+    // Lower layers do not understand `monitor` / coordinate-space metadata.
     map.remove("monitor");
+    map.remove("coord_space");
+    map.remove("normalized");
     if x_fields.is_empty() {
         return Ok(out);
     }
+    let force_fraction = payload_uses_fractions(action, payload);
     let monitor = if needs_monitor_rect(action, payload) {
         let list = monitors.unwrap_or(&[]);
         Some(
@@ -293,7 +357,7 @@ fn resolve_input_coords_on(
         if let Some(value) = payload.get(*field) {
             map.insert(
                 (*field).to_string(),
-                json!(resolve_coord(value, origin_x, width)?),
+                json!(resolve_coord_in_space(value, origin_x, width, force_fraction)?),
             );
         }
     }
@@ -301,7 +365,7 @@ fn resolve_input_coords_on(
         if let Some(value) = payload.get(*field) {
             map.insert(
                 (*field).to_string(),
-                json!(resolve_coord(value, origin_y, height)?),
+                json!(resolve_coord_in_space(value, origin_y, height, force_fraction)?),
             );
         }
     }
@@ -347,12 +411,21 @@ fn is_fraction(value: &Value) -> bool {
 
 /// Resolve one axis of a JSON number to pixels.
 ///
-/// An integer JSON number is already a pixel (including `0` and `1`). A
-/// non-integer in `0.0..=1.0` is a fraction of `origin..origin + span`,
-/// clamped to that span; any other finite number rounds to a pixel.
-fn resolve_coord(value: &Value, origin: i32, span: u32) -> Result<i32> {
-    if let Some(pixel) = value.as_i64() {
-        return Ok(pixel.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+/// An integer JSON number is already a pixel unless `force_fraction` is set
+/// (e.g. JSON `0` or `1` serialized from a JS fractional edge coordinate).
+/// Fractions in `0.0..=1.0` map onto `origin..=origin + span - 1` so `1.0`
+/// stays inside the target monitor instead of spilling 1px onto an adjacent
+/// display.
+fn resolve_coord_in_space(
+    value: &Value,
+    origin: i32,
+    span: u32,
+    force_fraction: bool,
+) -> Result<i32> {
+    if !force_fraction {
+        if let Some(pixel) = value.as_i64() {
+            return Ok(pixel.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
     }
     let fraction = value
         .as_f64()
@@ -362,10 +435,37 @@ fn resolve_coord(value: &Value, origin: i32, span: u32) -> Result<i32> {
     }
     if (0.0..=1.0).contains(&fraction) {
         let start = origin as f64;
-        let end = start + span as f64;
-        return Ok((start + (fraction * span as f64).round()).clamp(start, end) as i32);
+        let max_coord = start + span.saturating_sub(1) as f64;
+        return Ok((start + (fraction * span as f64).round()).clamp(start, max_coord) as i32);
     }
     Ok(fraction.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32)
+}
+
+#[cfg(test)]
+fn resolve_coord(value: &Value, origin: i32, span: u32) -> Result<i32> {
+    resolve_coord_in_space(value, origin, span, false)
+}
+
+/// Parse an integer or float scroll delta (`dx`/`dy`) without silently
+/// collapsing non-zero floats (e.g. `1.5`, `-0.5`, `1.0`) to `0`.
+pub(crate) fn parse_scroll_delta(value: Option<&Value>) -> i32 {
+    let Some(value) = value else {
+        return 0;
+    };
+    if let Some(i) = value.as_i64() {
+        return i.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+    if let Some(f) = value.as_f64() {
+        if !f.is_finite() || f == 0.0 {
+            return 0;
+        }
+        let rounded = f.round();
+        if rounded == 0.0 {
+            return if f > 0.0 { 1 } else { -1 };
+        }
+        return rounded.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+    }
+    0
 }
 
 fn parse_input(action: &str, payload: &Value) -> Result<InputAction> {
@@ -410,8 +510,8 @@ fn parse_input(action: &str, payload: &Value) -> Result<InputAction> {
                 } else {
                     None
                 },
-                dx: payload.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32,
-                dy: payload.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32,
+                dx: parse_scroll_delta(payload.get("dx")),
+                dy: parse_scroll_delta(payload.get("dy")),
             })
         },
         "type" => Ok(InputAction::Type {
@@ -555,15 +655,15 @@ mod tests {
         assert_eq!(resolve_coord(&json!(0.5), 0, 1920).unwrap(), 960);
         assert_eq!(resolve_coord(&json!(0.5), 0, 1080).unwrap(), 540);
         assert_eq!(resolve_coord(&json!(0.0), 0, 1920).unwrap(), 0);
-        assert_eq!(resolve_coord(&json!(1.0), 0, 1920).unwrap(), 1920);
+        assert_eq!(resolve_coord(&json!(1.0), 0, 1920).unwrap(), 1919);
         // A monitor to the right of the origin keeps its offset.
         assert_eq!(resolve_coord(&json!(0.5), 1920, 1280).unwrap(), 2560);
         // Offset second display: mid-point lands at origin + half span.
         assert_eq!(resolve_coord(&json!(0.5), 100, 1920).unwrap(), 1060);
         assert_eq!(resolve_coord(&json!(0.5), 100, 1080).unwrap(), 640);
-        // 0/1 fractions clamp to the monitor edges (including offset).
+        // 0/1 fractions clamp to the monitor's inclusive bounds [origin, origin + span - 1].
         assert_eq!(resolve_coord(&json!(0.0), 100, 1920).unwrap(), 100);
-        assert_eq!(resolve_coord(&json!(1.0), 100, 1920).unwrap(), 2020);
+        assert_eq!(resolve_coord(&json!(1.0), 100, 1920).unwrap(), 2019);
     }
 
     #[test]
@@ -589,7 +689,7 @@ mod tests {
         .unwrap();
         assert_eq!(resolved["x"], 160);
         assert_eq!(resolved["to_x"], 480);
-        assert_eq!(resolved["to_y"], 480);
+        assert_eq!(resolved["to_y"], 479);
 
         // Absolute pixels pass through untouched, even for 0 and 1.
         let resolved = resolve_input_coords(&desktop, "click", &json!({"x": 1, "y": 0})).unwrap();
@@ -701,6 +801,53 @@ mod tests {
         .unwrap();
         assert_eq!(resolved["x"], 1060);
         assert_eq!(resolved["y"], 580);
+
+        // JS-serialized integer edge fractions 0 / 1 on monitor 1 stay on monitor 1
+        // instead of teleporting to monitor 0's (0, y) / (1, y).
+        let edge_left = resolve_input_coords_on(
+            Some(&monitors),
+            "click",
+            &json!({"x": 0, "y": 0.5, "monitor": 1}),
+        )
+        .unwrap();
+        assert_eq!(edge_left["x"], 100);
+        assert_eq!(edge_left["y"], 580);
+
+        let edge_right = resolve_input_coords_on(
+            Some(&monitors),
+            "click",
+            &json!({"x": 1, "y": 1, "monitor": 1}),
+        )
+        .unwrap();
+        assert_eq!(edge_right["x"], 2019);
+        assert_eq!(edge_right["y"], 1119);
+
+        // Explicit coord_space="pixel" forces integer 0/1 to stay raw pixels.
+        let raw_px = resolve_input_coords_on(
+            Some(&monitors),
+            "click",
+            &json!({"x": 0, "y": 1, "monitor": 1, "coord_space": "pixel"}),
+        )
+        .unwrap();
+        assert_eq!(raw_px["x"], 0);
+        assert_eq!(raw_px["y"], 1);
+    }
+
+    #[test]
+    fn float_scroll_deltas_are_not_silently_dropped_to_zero() {
+        let action = parse_input("scroll", &json!({"dx": 0.5, "dy": -1.5})).unwrap();
+        assert_eq!(
+            action,
+            InputAction::Scroll {
+                x: None,
+                y: None,
+                dx: 1,
+                dy: -2,
+            }
+        );
+        assert_eq!(parse_scroll_delta(Some(&json!(0.0))), 0);
+        assert_eq!(parse_scroll_delta(Some(&json!(1.0))), 1);
+        assert_eq!(parse_scroll_delta(Some(&json!(-0.2))), -1);
     }
 
     #[test]

@@ -4,13 +4,15 @@
 //! named `input`, `cursor`, and `meta`, then `offer` / `ice` / `keyframe` /
 //! `close`. RTP is reassembled here. The platform only sees Annex-B.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rtc::peer_connection::configuration::RTCOfferOptions;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
-use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind, TYPE_RTCP_FB_NACK,
+};
 use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -36,6 +38,15 @@ use crate::h264::{
 use crate::queue::{FrameBus, Queued};
 
 const GATHER_WAIT: Duration = Duration::from_millis(1500);
+const ICE_RESTART_GATHER_WAIT: Duration = Duration::from_millis(3000);
+const ICE_RESTART_TRIGGER_AFTER: Duration = Duration::from_secs(1);
+const ICE_RESTART_COOLDOWN: Duration = Duration::from_secs(8);
+const ICE_RESTART_MAX_ATTEMPTS: u32 = 3;
+const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOSE_SIGNAL_TIMEOUT: Duration = Duration::from_millis(1500);
+
+type IceRefreshCb = Arc<dyn Fn() -> Vec<Value> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct LiveOptions {
@@ -57,6 +68,10 @@ pub struct LiveOptions {
     pub ice_fault: IceFault,
     /// Optional handshake reporter (Controller HUD / tests). Not a media path.
     pub on_stage: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Optional ICE/TURN server refresh hook (e.g. fetching fresh short-lived
+    /// TURN REST credentials). Invoked on a blocking thread during initial
+    /// connect when `ice_servers` is empty and before every `ice_restart`.
+    pub ice_refresh: Option<Arc<dyn Fn() -> Vec<Value> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LiveOptions {
@@ -72,6 +87,7 @@ impl std::fmt::Debug for LiveOptions {
             .field("cursor_mode", &self.cursor_mode)
             .field("ice_fault", &self.ice_fault)
             .field("on_stage", &self.on_stage.is_some())
+            .field("ice_refresh", &self.ice_refresh.is_some())
             .finish()
     }
 }
@@ -104,6 +120,7 @@ impl Default for LiveOptions {
             cursor_mode: "metadata".into(),
             ice_fault: IceFault::None,
             on_stage: None,
+            ice_refresh: None,
         }
     }
 }
@@ -228,6 +245,63 @@ enum Cmd {
     Close,
 }
 
+struct CloseSignal {
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl CloseSignal {
+    fn new() -> Self {
+        Self {
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn mark_done(&self) {
+        let mut done = self.done.lock().unwrap_or_else(|err| err.into_inner());
+        *done = true;
+        self.cv.notify_all();
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let mut done = self.done.lock().unwrap_or_else(|err| err.into_inner());
+        if *done {
+            return true;
+        }
+        let (guard, _) = self
+            .cv
+            .wait_timeout(done, timeout)
+            .unwrap_or_else(|err| err.into_inner());
+        done = guard;
+        *done
+    }
+}
+
+fn wait_for_close_flush(
+    stopped: &AtomicBool,
+    cmd: &mpsc::Sender<Cmd>,
+    close_done: &CloseSignal,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stopped.load(Ordering::Acquire) || cmd.is_closed() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        // Cap individual condvar waits so unit tests that set `stopped`
+        // directly still observe completion promptly.
+        let slice = remaining.min(Duration::from_millis(20));
+        if close_done.wait_timeout(slice) {
+            return true;
+        }
+    }
+}
+
 pub struct Viewer {
     cmd: mpsc::Sender<Cmd>,
     frames: Arc<FrameBus>,
@@ -244,6 +318,8 @@ pub struct Viewer {
     stop: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     close_notify: Arc<tokio::sync::Notify>,
+    close_done: Arc<CloseSignal>,
+    close_done_async: Arc<tokio::sync::Notify>,
     closed: AtomicBool,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
 }
@@ -271,6 +347,8 @@ impl Viewer {
             stop: built.stop,
             stopped: built.stopped,
             close_notify: built.close_notify,
+            close_done: built.close_done,
+            close_done_async: built.close_done_async,
             closed: built.closed,
             runtime: Mutex::new(Some(runtime)),
         })
@@ -322,9 +400,15 @@ impl Viewer {
         })
     }
 
-    /// After a slow decode, discard backlog and keep only the newest unit.
+    /// After a slow decode, discard backlog safely (either jumping to an IDR
+    /// or dropping until the next IDR and requesting a keyframe).
     pub fn drain_keep_latest(&self) -> Option<LiveFrame> {
-        let queued = self.frames.drain_keep_latest()?;
+        let queued = self.frames.drain_keep_latest();
+        if queued.is_none() && self.frames.is_dropping_until_idr() {
+            self.request_keyframe();
+            return None;
+        }
+        let queued = queued?;
         if let Ok(mut stats) = self.stats.lock() {
             stats.frames += 1;
             stats.bytes += queued.bytes.len() as u64;
@@ -412,15 +496,40 @@ impl Viewer {
     pub fn close(&self) {
         self.request_close();
         // 0111/0133 panicked here on the controller worker runtime:
-        // `blocking_send` and `thread::sleep` cannot run on
-        // `agentlink-controller-net` (session.rs:214, Cmd::PtyOpen
-        // calls stop_live → Viewer::close). Wait only off-runtime.
+        // blocking waits cannot run on `agentlink-controller-net`. When
+        // called from inside an outer Tokio runtime, `Drop` hands teardown
+        // to a dedicated shutdown thread so `action: "close"` still flushes
+        // cleanly without blocking or panicking the caller's runtime.
         if in_tokio_runtime() {
             return;
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !self.stopped.load(Ordering::Relaxed) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+        let _ = wait_for_close_flush(
+            &self.stopped,
+            &self.cmd,
+            &self.close_done,
+            CLOSE_FLUSH_TIMEOUT,
+        );
+    }
+
+    /// Request shutdown and asynchronously await (up to 2s) for `action: "close"`
+    /// and peer teardown to flush without blocking the caller's Tokio runtime.
+    pub async fn close_async(&self) {
+        self.request_close();
+        let deadline = tokio::time::Instant::now() + CLOSE_FLUSH_TIMEOUT;
+        loop {
+            if self.stopped.load(Ordering::Acquire) || self.cmd.is_closed() {
+                return;
+            }
+            let notified = self.close_done_async.notified();
+            if self.stopped.load(Ordering::Acquire) || self.cmd.is_closed() {
+                return;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let slice = (deadline - now).min(Duration::from_millis(20));
+            let _ = tokio::time::timeout(slice, notified).await;
         }
     }
 
@@ -433,7 +542,9 @@ impl Viewer {
         // Never use blocking_send. A full queue still wakes `drive` via
         // stop + Notify, so Close cannot be lost.
         if self.cmd.try_send(Cmd::Close).is_err() && self.cmd.is_closed() {
-            self.stopped.store(true, Ordering::Relaxed);
+            self.stopped.store(true, Ordering::Release);
+            self.close_done.mark_done();
+            self.close_done_async.notify_waiters();
         }
     }
 }
@@ -447,13 +558,49 @@ impl Drop for Viewer {
             .unwrap_or_else(|err| err.into_inner())
             .take()
         {
-            // shutdown_timeout also parks the thread and panics inside a
-            // runtime. The viewer runtime is not the current one, but Tokio
-            // still forbids blocking on agentlink-controller-net.
+            // Never call `runtime.shutdown_background()` immediately before
+            // `drive` has flushed `action: "close"` — that aborts the close
+            // RPC and leaks capture/encode on the node. When dropped from an
+            // outer Tokio runtime thread, hand the bounded flush wait and
+            // `shutdown_timeout` to a dedicated OS thread so we neither panic
+            // nor block the caller's runtime.
             if in_tokio_runtime() {
-                runtime.shutdown_background();
+                let stopped = Arc::clone(&self.stopped);
+                let cmd = self.cmd.clone();
+                let close_done = Arc::clone(&self.close_done);
+                let slot = Arc::new(Mutex::new(Some(runtime)));
+                let slot_bg = Arc::clone(&slot);
+                if std::thread::Builder::new()
+                    .name("agentlink-view-shutdown".into())
+                    .spawn(move || {
+                        let _ = wait_for_close_flush(
+                            &stopped,
+                            &cmd,
+                            &close_done,
+                            CLOSE_FLUSH_TIMEOUT,
+                        );
+                        if let Some(rt) = slot_bg
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .take()
+                        {
+                            rt.shutdown_timeout(CLOSE_FLUSH_TIMEOUT);
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(rt) = slot.lock().unwrap_or_else(|err| err.into_inner()).take() {
+                        rt.shutdown_background();
+                    }
+                }
             } else {
-                runtime.shutdown_timeout(Duration::from_secs(2));
+                let _ = wait_for_close_flush(
+                    &self.stopped,
+                    &self.cmd,
+                    &self.close_done,
+                    CLOSE_FLUSH_TIMEOUT,
+                );
+                runtime.shutdown_timeout(CLOSE_FLUSH_TIMEOUT);
             }
         }
     }
@@ -477,7 +624,85 @@ struct Built {
     stop: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     close_notify: Arc<tokio::sync::Notify>,
+    close_done: Arc<CloseSignal>,
+    close_done_async: Arc<tokio::sync::Notify>,
     closed: AtomicBool,
+}
+
+fn dual_stack_udp_addrs_with(ipv6_available: bool) -> Vec<String> {
+    if ipv6_available {
+        vec!["[::]:0".to_string(), "0.0.0.0:0".to_string()]
+    } else {
+        vec!["0.0.0.0:0".to_string()]
+    }
+}
+
+fn dual_stack_udp_addrs() -> Vec<String> {
+    let ipv6_ok = std::net::UdpSocket::bind("[::]:0").is_ok();
+    dual_stack_udp_addrs_with(ipv6_ok)
+}
+
+async fn build_pc_once(
+    ice_servers: &[Value],
+    ice_fault: &IceFault,
+    handler: Arc<ViewHandler>,
+    udp_addrs: Vec<String>,
+) -> Result<impl PeerConnection, String> {
+    let runtime =
+        default_runtime().ok_or_else(|| "tokio runtime is required for WebRTC".to_string())?;
+    let mut media = MediaEngine::default();
+    media
+        .register_codec(h264_codec(), RtpCodecKind::Video)
+        .map_err(|err| err.to_string())?;
+    let registry = register_default_interceptors(Registry::new(), &mut media)
+        .map_err(|err| err.to_string())?;
+    let mut cfg = RTCConfigurationBuilder::new().with_ice_servers(rtc_ice(ice_servers));
+    if matches!(ice_fault, IceFault::RelayPolicyWithoutTurn) {
+        cfg = RTCConfigurationBuilder::new()
+            .with_ice_servers(Vec::new())
+            .with_ice_transport_policy(
+                rtc::peer_connection::configuration::RTCIceTransportPolicy::Relay,
+            );
+    }
+    let setting_engine = SettingEngineBuilder::new()
+        .with_host_acceptance_min_wait(Some(HOST_ACCEPTANCE_MIN_WAIT))
+        .build();
+    PeerConnectionBuilder::new()
+        .with_configuration(cfg.build())
+        .with_setting_engine(setting_engine)
+        .with_media_engine(media)
+        .with_interceptor_registry(registry)
+        .with_handler(handler as Arc<dyn PeerConnectionEventHandler>)
+        .with_runtime(runtime)
+        .with_udp_addrs(udp_addrs)
+        .build()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn build_peer_connection(
+    ice_servers: &[Value],
+    ice_fault: &IceFault,
+    handler: Arc<ViewHandler>,
+) -> Result<impl PeerConnection, String> {
+    let addrs = dual_stack_udp_addrs();
+    let tried_dual_stack = addrs.len() > 1;
+    match build_pc_once(ice_servers, ice_fault, handler.clone(), addrs).await {
+        Ok(pc) => Ok(pc),
+        Err(err) if tried_dual_stack => {
+            eprintln!(
+                "agentlink live-webrtc: dual-stack UDP bind failed ({err}); falling back to IPv4 0.0.0.0:0"
+            );
+            build_pc_once(
+                ice_servers,
+                ice_fault,
+                handler,
+                vec!["0.0.0.0:0".to_string()],
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Built, String> {
@@ -502,7 +727,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let ice_servers = if matches!(opts.ice_fault, IceFault::RelayPolicyWithoutTurn) {
         Vec::new()
     } else {
-        offer_servers(&opts.ice_servers)
+        resolve_offer_servers_async(&opts.ice_servers, opts.ice_refresh.as_ref()).await
     };
     let frames = Arc::new(FrameBus::new(3));
     let loss = Arc::new(Mutex::new(LossWindow::default()));
@@ -510,58 +735,37 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let cursor = Arc::new(Mutex::new(None));
     let clipboard = Arc::new(Mutex::new(None));
     let failed = Arc::new(AtomicBool::new(false));
+    let connected = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
     let close_notify = Arc::new(tokio::sync::Notify::new());
+    let close_done = Arc::new(CloseSignal::new());
+    let close_done_async = Arc::new(tokio::sync::Notify::new());
+    let keyframe_notify = Arc::new(tokio::sync::Notify::new());
     let input_open = Arc::new(AtomicBool::new(false));
     let captured = Arc::new(AtomicI64::new(0));
     let (ice_tx, mut ice_rx) = mpsc::unbounded_channel();
     let gather_done = Arc::new(AtomicBool::new(false));
     let input_slot: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
+    let ice_gen = Arc::new(AtomicU64::new(0));
 
-    let disconnected_at_ms = Arc::new(AtomicI64::new(0));
+    let disconnected_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let handler = Arc::new(ViewHandler {
         gather_done: gather_done.clone(),
         ice_tx,
         frames: frames.clone(),
         loss: loss.clone(),
         failed: failed.clone(),
+        connected: connected.clone(),
         stop: stop.clone(),
         captured: captured.clone(),
-        disconnected_at_ms: disconnected_at_ms.clone(),
+        disconnected_at: disconnected_at.clone(),
+        keyframe_notify: keyframe_notify.clone(),
+        allow_ice_restart_on_failed: matches!(opts.ice_fault, IceFault::None),
     });
 
     report_stage(&opts, "building peer connection");
-    let runtime =
-        default_runtime().ok_or_else(|| "tokio runtime is required for WebRTC".to_string())?;
-    let mut media = MediaEngine::default();
-    media
-        .register_codec(h264_codec(), RtpCodecKind::Video)
-        .map_err(|err| err.to_string())?;
-    let registry = register_default_interceptors(Registry::new(), &mut media)
-        .map_err(|err| err.to_string())?;
-    let mut cfg = RTCConfigurationBuilder::new().with_ice_servers(rtc_ice(&ice_servers));
-    if matches!(opts.ice_fault, IceFault::RelayPolicyWithoutTurn) {
-        cfg = RTCConfigurationBuilder::new()
-            .with_ice_servers(Vec::new())
-            .with_ice_transport_policy(
-                rtc::peer_connection::configuration::RTCIceTransportPolicy::Relay,
-            );
-    }
-    let setting_engine = SettingEngineBuilder::new()
-        .with_host_acceptance_min_wait(Some(HOST_ACCEPTANCE_MIN_WAIT))
-        .build();
-    let pc = PeerConnectionBuilder::new()
-        .with_configuration(cfg.build())
-        .with_setting_engine(setting_engine)
-        .with_media_engine(media)
-        .with_interceptor_registry(registry)
-        .with_handler(handler.clone() as Arc<dyn PeerConnectionEventHandler>)
-        .with_runtime(runtime)
-        .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
-        .build()
-        .await
-        .map_err(|err| err.to_string())?;
+    let pc = build_peer_connection(&ice_servers, &opts.ice_fault, handler.clone()).await?;
 
     let input = PeerConnection::create_data_channel(&pc, "input", None)
         .await
@@ -599,29 +803,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let local = PeerConnection::local_description(&pc)
         .await
         .ok_or_else(|| "local description was not set".to_string())?;
-    let stun_n = ice_servers
-        .iter()
-        .flat_map(|e| {
-            e.get("urls")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-        })
-        .filter(|u| u.as_str().unwrap_or("").starts_with("stun:"))
-        .count();
-    let turn_n = ice_servers
-        .iter()
-        .flat_map(|e| {
-            e.get("urls")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-        })
-        .filter(|u| {
-            let s = u.as_str().unwrap_or("");
-            s.starts_with("turn:") || s.starts_with("turns:")
-        })
-        .count();
+    let (stun_n, turn_n) = count_ice_url_schemes(&ice_servers);
     report_stage(
         &opts,
         &format!(
@@ -707,10 +889,7 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
                 .iter()
                 .filter_map(|item| item.get("candidate").and_then(|v| v.as_str()))
                 .collect::<Vec<_>>()
-                .join(
-                    "
-",
-                )
+                .join("\n")
         })
         .unwrap_or_default();
     report_stage(
@@ -794,47 +973,37 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         }
     }
 
-    let peer = Arc::new(OwnedPeer { inner: pc });
+    let peer: Arc<dyn LivePeer> = Arc::new(OwnedPeer { inner: pc });
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
-    let peer_loop = peer.clone();
-    let signal_loop = signal.clone();
-    let session_loop = session_id.clone();
-    let frames_loop = frames.clone();
-    let loss_loop = loss.clone();
-    let stats_loop = stats.clone();
-    let input_loop = input_slot.clone();
-    let input_flag = input_open.clone();
-    let stop_loop = stop.clone();
-    let stopped_loop = stopped.clone();
-    let close_notify_loop = close_notify.clone();
-    let failed_loop = failed.clone();
-    let gather_ice = gather_done.clone();
-    let disc_loop = disconnected_at_ms;
-    let info_loop = info.clone();
-    let transport_loop = transport.clone();
-    let ice_checks_loop = ice_checks.clone();
+    let drive_ctx = DriveCtx {
+        peer: peer.clone(),
+        cmd_rx,
+        signal: signal.clone(),
+        session_id: session_id.clone(),
+        frames: frames.clone(),
+        loss: loss.clone(),
+        stats: stats.clone(),
+        input: input_slot.clone(),
+        input_open: input_open.clone(),
+        connected: connected.clone(),
+        stop: stop.clone(),
+        stopped: stopped.clone(),
+        close_notify: close_notify.clone(),
+        close_done: close_done.clone(),
+        close_done_async: close_done_async.clone(),
+        keyframe_notify: keyframe_notify.clone(),
+        failed: failed.clone(),
+        gather_done: gather_done.clone(),
+        disconnected_at,
+        info: info.clone(),
+        transport: transport.clone(),
+        ice_checks: ice_checks.clone(),
+        ice_refresh: opts.ice_refresh.clone(),
+        ice_gen: ice_gen.clone(),
+        suppress_late_ice: no_pair_after_signaling,
+    };
     tokio::spawn(async move {
-        drive(
-            peer_loop,
-            cmd_rx,
-            signal_loop,
-            session_loop,
-            frames_loop,
-            loss_loop,
-            stats_loop,
-            input_loop,
-            input_flag,
-            stop_loop,
-            stopped_loop,
-            close_notify_loop,
-            failed_loop,
-            gather_ice,
-            disc_loop,
-            info_loop,
-            transport_loop,
-            ice_checks_loop,
-        )
-        .await;
+        drive(drive_ctx).await;
     });
 
     let signal_ice = signal.clone();
@@ -889,12 +1058,15 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
     let pull_session = session_id.clone();
     let pull_stop = stop.clone();
     let pull_peer = peer.clone();
+    let pull_gen = ice_gen.clone();
     tokio::spawn(async move {
         pull_late_ice(
             pull_signal,
             pull_session,
             pull_peer,
             pull_stop,
+            pull_gen,
+            0,
             pull_advertised,
             no_pair_after_signaling,
             pull_after,
@@ -903,12 +1075,9 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         .await;
     });
 
-    report_stage(&opts, "requesting keyframe");
-    let _ = roundtrip(
-        &signal,
-        json!({"action": "keyframe", "session_id": session_id}),
-    )
-    .await;
+    // Do not send a pre-ICE relay keyframe RPC here; `drive` requests a
+    // keyframe once the peer connection reaches `Connected` (preferring the
+    // open DataChannel and rate-limited to >=1s).
     report_stage(&opts, "signaling complete, waiting for ICE pair / video");
 
     Ok(Built {
@@ -925,13 +1094,15 @@ async fn connect_inner(signal: Arc<dyn Signal>, opts: LiveOptions) -> Result<Bui
         stop,
         stopped,
         close_notify,
+        close_done,
+        close_done_async,
         closed: AtomicBool::new(false),
     })
 }
 
-async fn drive(
+struct DriveCtx {
     peer: Arc<dyn LivePeer>,
-    mut cmd_rx: mpsc::Receiver<Cmd>,
+    cmd_rx: mpsc::Receiver<Cmd>,
     signal: Arc<dyn Signal>,
     session_id: String,
     frames: Arc<FrameBus>,
@@ -939,113 +1110,237 @@ async fn drive(
     stats: Arc<Mutex<LiveStats>>,
     input: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
     input_open: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     close_notify: Arc<tokio::sync::Notify>,
+    close_done: Arc<CloseSignal>,
+    close_done_async: Arc<tokio::sync::Notify>,
+    keyframe_notify: Arc<tokio::sync::Notify>,
     failed: Arc<AtomicBool>,
     gather_done: Arc<AtomicBool>,
-    disconnected_at_ms: Arc<AtomicI64>,
+    disconnected_at: Arc<Mutex<Option<Instant>>>,
     info: Arc<Mutex<LiveInfo>>,
     transport: Arc<Mutex<Option<TransportSnapshot>>>,
     ice_checks: Arc<Mutex<String>>,
-) {
+    ice_refresh: Option<IceRefreshCb>,
+    ice_gen: Arc<AtomicU64>,
+    suppress_late_ice: bool,
+}
+
+#[derive(Debug)]
+struct KeyframeThrottle {
+    last_sent: Option<Instant>,
+    min_interval: Duration,
+}
+
+impl KeyframeThrottle {
+    fn new(min_interval: Duration) -> Self {
+        Self {
+            last_sent: None,
+            min_interval,
+        }
+    }
+
+    fn try_acquire(&mut self, connected: bool, now: Instant) -> bool {
+        if !connected {
+            return false;
+        }
+        if let Some(prev) = self.last_sent {
+            if now.saturating_duration_since(prev) < self.min_interval {
+                return false;
+            }
+        }
+        self.last_sent = Some(now);
+        true
+    }
+}
+
+async fn drive(mut ctx: DriveCtx) {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.tick().await;
     let mut last_ice_restart = Instant::now() - Duration::from_secs(30);
+    let mut ice_restart_attempts = 0u32;
     let mut ice_restart_fails = 0u32;
     let mut last_ice_log = String::new();
     let mut last_ice_log_at = Instant::now() - Duration::from_secs(30);
+    let mut keyframe_throttle = KeyframeThrottle::new(KEYFRAME_MIN_INTERVAL);
+    let mut pending_keyframe = false;
     loop {
-        if stop.load(Ordering::Relaxed) {
-            stop.store(true, Ordering::Relaxed);
-            publish_ice_checks(&peer, &ice_checks, &mut last_ice_log, true).await;
-            let _ = roundtrip(
-                &signal,
-                json!({"action": "close", "session_id": session_id}),
+        if ctx.stop.load(Ordering::Acquire) {
+            ctx.stop.store(true, Ordering::Release);
+            publish_ice_checks(&ctx.peer, &ctx.ice_checks, &mut last_ice_log, true).await;
+            let _ = tokio::time::timeout(
+                CLOSE_SIGNAL_TIMEOUT,
+                roundtrip(
+                    &ctx.signal,
+                    json!({"action": "close", "session_id": ctx.session_id}),
+                ),
             )
             .await;
-            peer.close().await;
-            stopped.store(true, Ordering::Relaxed);
+            ctx.peer.close().await;
+            ctx.stopped.store(true, Ordering::Release);
+            ctx.close_done.mark_done();
+            ctx.close_done_async.notify_waiters();
             break;
         }
         tokio::select! {
-            cmd = cmd_rx.recv() => {
+            biased;
+            _ = ctx.close_notify.notified() => {
+                ctx.stop.store(true, Ordering::Release);
+            }
+            cmd = ctx.cmd_rx.recv() => {
                 match cmd {
                     Some(Cmd::Control(text)) => {
-                        let _ = send_text(&input, &input_open, &text).await;
+                        let _ = send_text(&ctx.input, &ctx.input_open, &text).await;
                     }
                     Some(Cmd::Keyframe) => {
-                        ask_keyframe(&signal, &session_id, &input, &input_open).await;
+                        pending_keyframe = true;
+                        if ask_keyframe(
+                            &ctx.connected,
+                            &mut keyframe_throttle,
+                            &ctx.signal,
+                            &ctx.session_id,
+                            &ctx.input,
+                            &ctx.input_open,
+                        )
+                        .await
+                        {
+                            pending_keyframe = false;
+                        }
                     }
                     Some(Cmd::Close) | None => {
-                        stop.store(true, Ordering::Relaxed);
+                        ctx.stop.store(true, Ordering::Release);
                     }
                 }
             }
-            _ = close_notify.notified() => {
-                stop.store(true, Ordering::Relaxed);
+            _ = ctx.keyframe_notify.notified() => {
+                pending_keyframe = true;
+                if ask_keyframe(
+                    &ctx.connected,
+                    &mut keyframe_throttle,
+                    &ctx.signal,
+                    &ctx.session_id,
+                    &ctx.input,
+                    &ctx.input_open,
+                )
+                .await
+                {
+                    pending_keyframe = false;
+                }
             }
             _ = tick.tick() => {
-                let (dropped, shown, needs) = frames.take_feedback();
-                let rtp = loss
+                let (dropped, shown, needs) = ctx.frames.take_feedback();
+                let rtp = ctx
+                    .loss
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .take_ratio();
                 if let Some(rtp) = rtp.or(if dropped > 0 { Some(0.0) } else { None }) {
                     let ratio = feedback_ratio(rtp, dropped, shown);
-                    if let Ok(mut stats) = stats.lock() {
+                    if let Ok(mut stats) = ctx.stats.lock() {
                         stats.loss = ratio;
                         stats.frames_dropped = stats.frames_dropped.saturating_add(dropped);
                     }
                     let _ = send_text(
-                        &input,
-                        &input_open,
+                        &ctx.input,
+                        &ctx.input_open,
                         &json!({"type": "feedback", "loss": ratio}).to_string(),
                     )
                     .await;
                 }
-                if needs || !frames.saw_keyframe() {
-                    ask_keyframe(&signal, &session_id, &input, &input_open).await;
+                if needs {
+                    pending_keyframe = true;
                 }
-                refresh_transport(&peer, &info, &transport).await;
+                if pending_keyframe
+                    || ctx.frames.is_dropping_until_idr()
+                    || !ctx.frames.saw_keyframe()
+                {
+                    if ask_keyframe(
+                        &ctx.connected,
+                        &mut keyframe_throttle,
+                        &ctx.signal,
+                        &ctx.session_id,
+                        &ctx.input,
+                        &ctx.input_open,
+                    )
+                    .await
+                    {
+                        pending_keyframe = false;
+                    }
+                }
+                refresh_transport(&ctx.peer, &ctx.info, &ctx.transport).await;
                 let force = last_ice_log_at.elapsed() >= Duration::from_secs(4);
-                if publish_ice_checks(&peer, &ice_checks, &mut last_ice_log, force).await {
+                if publish_ice_checks(&ctx.peer, &ctx.ice_checks, &mut last_ice_log, force).await {
                     last_ice_log_at = Instant::now();
                 }
-                // ICE/DTLS left Connected: restart within 1s (throttle 5s).
-                // A gone node session must be treated as a hard ICE/session
-                // loss so the Controller can resume JPEG — do not retry
-                // ice_restart in a tight loop.
-                let disc = disconnected_at_ms.load(Ordering::Relaxed);
-                if disc > 0 {
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0);
-                    if now_ms.saturating_sub(disc) >= 1000
-                        && last_ice_restart.elapsed() >= Duration::from_secs(5)
-                    {
-                        last_ice_restart = Instant::now();
-                        match ice_restart(&peer, &signal, &session_id, &gather_done).await
+                // ICE/DTLS left Connected: restart using monotonic Instant timing
+                // with a realistic recovery window and ICE/TURN refresh. A gone
+                // node session fails fast so Controller can resume JPEG.
+                if ctx.connected.load(Ordering::Acquire) {
+                    ice_restart_attempts = 0;
+                    ice_restart_fails = 0;
+                } else {
+                    let disc = *ctx
+                        .disconnected_at
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner());
+                    if let Some(since) = disc {
+                        if since.elapsed() >= ICE_RESTART_TRIGGER_AFTER
+                            && last_ice_restart.elapsed() >= ICE_RESTART_COOLDOWN
                         {
-                            Ok(()) => {
-                                disconnected_at_ms.store(0, Ordering::Relaxed);
-                                ask_keyframe(&signal, &session_id, &input, &input_open)
-                                    .await;
-                            }
-                            Err(err) if signaling_session_gone(&err) => {
+                            if ice_restart_attempts >= ICE_RESTART_MAX_ATTEMPTS {
                                 eprintln!(
-                                    "agentlink live-webrtc: session gone ({err}); ending live video"
+                                    "agentlink live-webrtc: ice_restart did not recover after {ice_restart_attempts} attempts; ending live video"
                                 );
-                                failed.store(true, Ordering::Relaxed);
-                            }
-                            Err(err) => {
-                                ice_restart_fails += 1;
-                                eprintln!(
-                                    "agentlink live-webrtc: ice_restart error ({ice_restart_fails}): {err}"
-                                );
-                                if ice_restart_fails >= 3 {
-                                    failed.store(true, Ordering::Relaxed);
+                                ctx.failed.store(true, Ordering::Release);
+                            } else {
+                                ice_restart_attempts += 1;
+                                last_ice_restart = Instant::now();
+                                match ice_restart(
+                                    &ctx.peer,
+                                    &ctx.signal,
+                                    &ctx.session_id,
+                                    &ctx.gather_done,
+                                    &ctx.stop,
+                                    ctx.ice_refresh.as_ref(),
+                                    &ctx.ice_gen,
+                                    ctx.suppress_late_ice,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        ice_restart_fails = 0;
+                                        pending_keyframe = true;
+                                        if ctx.connected.load(Ordering::Acquire)
+                                            && ask_keyframe(
+                                                &ctx.connected,
+                                                &mut keyframe_throttle,
+                                                &ctx.signal,
+                                                &ctx.session_id,
+                                                &ctx.input,
+                                                &ctx.input_open,
+                                            )
+                                            .await
+                                        {
+                                            pending_keyframe = false;
+                                        }
+                                    }
+                                    Err(err) if signaling_session_gone(&err) => {
+                                        eprintln!(
+                                            "agentlink live-webrtc: session gone ({err}); ending live video"
+                                        );
+                                        ctx.failed.store(true, Ordering::Release);
+                                    }
+                                    Err(err) => {
+                                        ice_restart_fails += 1;
+                                        eprintln!(
+                                            "agentlink live-webrtc: ice_restart error ({ice_restart_fails}): {err}"
+                                        );
+                                        if ice_restart_fails >= ICE_RESTART_MAX_ATTEMPTS {
+                                            ctx.failed.store(true, Ordering::Release);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1066,55 +1361,134 @@ fn signaling_session_gone(err: &str) -> bool {
         || lower.contains("already closed")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ice_restart(
     peer: &Arc<dyn LivePeer>,
     signal: &Arc<dyn Signal>,
     session_id: &str,
     gather_done: &Arc<AtomicBool>,
+    stop: &Arc<AtomicBool>,
+    ice_refresh: Option<&IceRefreshCb>,
+    ice_gen: &Arc<AtomicU64>,
+    suppress_late_ice: bool,
 ) -> Result<(), String> {
+    let refreshed_servers = refresh_ice_servers_for_restart(ice_refresh).await;
+    if !refreshed_servers.is_empty() {
+        if let Err(err) = peer.update_ice_servers(&refreshed_servers).await {
+            eprintln!(
+                "agentlink live-webrtc: ice_restart update_ice_servers warning: {err}"
+            );
+        }
+    }
     gather_done.store(false, Ordering::Relaxed);
     let sdp = peer.create_ice_restart_offer().await?;
-    let deadline = Instant::now() + Duration::from_millis(800);
-    while !gather_done.load(Ordering::Relaxed) && Instant::now() < deadline {
+    let deadline = Instant::now() + ICE_RESTART_GATHER_WAIT;
+    while !gather_done.load(Ordering::Relaxed)
+        && !stop.load(Ordering::Acquire)
+        && Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    if stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let sdp = peer.local_sdp().await.unwrap_or(sdp);
-    let answer = roundtrip(
-        signal,
-        json!({
-            "action": "ice_restart",
-            "session_id": session_id,
-            "sdp": sdp,
-        }),
-    )
-    .await?;
+    let mut payload = json!({
+        "action": "ice_restart",
+        "session_id": session_id,
+        "sdp": sdp,
+    });
+    if !refreshed_servers.is_empty() {
+        payload["ice_servers"] = Value::Array(refreshed_servers);
+    }
+    let answer = roundtrip(signal, payload).await?;
     let remote = answer
         .get("sdp")
         .and_then(Value::as_str)
         .ok_or_else(|| "ice_restart missing sdp".to_string())?;
+    let pull_ufrag = sdp_ice_ufrag(remote);
     peer.apply_remote_answer(remote).await?;
-    if let Some(candidates) = answer.get("candidates").and_then(Value::as_array) {
-        for candidate in candidates {
-            if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate.clone()) {
-                let _ = peer.add_ice_candidate(prefer_remote_ice(init)).await;
-            }
+    let batched = answer
+        .get("candidates")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for candidate in &batched {
+        if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate.clone()) {
+            let _ = peer.add_ice_candidate(prefer_remote_ice(init)).await;
         }
     }
+    // Re-run `pull_late_ice` for the restarted ICE generation (cancelling any
+    // previous generation's pull loop cleanly via `ice_gen`).
+    let next_gen = ice_gen.fetch_add(1, Ordering::AcqRel) + 1;
+    let pull_advertised = answer
+        .get("ice_pull")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let pull_after = batched.len() as u64;
+    let pull_signal = Arc::clone(signal);
+    let pull_session = session_id.to_string();
+    let pull_peer = Arc::clone(peer);
+    let pull_stop = Arc::clone(stop);
+    let pull_gen = Arc::clone(ice_gen);
+    tokio::spawn(async move {
+        pull_late_ice(
+            pull_signal,
+            pull_session,
+            pull_peer,
+            pull_stop,
+            pull_gen,
+            next_gen,
+            pull_advertised,
+            suppress_late_ice,
+            pull_after,
+            pull_ufrag,
+        )
+        .await;
+    });
     Ok(())
 }
 
-async fn ask_keyframe(
+async fn ask_keyframe_with<F, Fut>(
+    connected: &AtomicBool,
+    throttle: &mut KeyframeThrottle,
     signal: &Arc<dyn Signal>,
     session_id: &str,
-    input: &Mutex<Option<Arc<dyn DataChannel>>>,
-    input_open: &AtomicBool,
-) {
-    let _ = send_text(input, input_open, r#"{"type":"keyframe"}"#).await;
+    send_dc: F,
+) -> bool
+where
+    F: FnOnce(&'static str) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if !throttle.try_acquire(connected.load(Ordering::Acquire), Instant::now()) {
+        return false;
+    }
+    // Prefer the open DataChannel over relay WS signaling to avoid relay
+    // RPC traffic; only fall back to relay `action: "keyframe"` when the
+    // DataChannel is unavailable.
+    if send_dc(r#"{"type":"keyframe"}"#).await {
+        return true;
+    }
     let _ = roundtrip(
         signal,
         json!({"action": "keyframe", "session_id": session_id}),
     )
     .await;
+    true
+}
+
+async fn ask_keyframe(
+    connected: &AtomicBool,
+    throttle: &mut KeyframeThrottle,
+    signal: &Arc<dyn Signal>,
+    session_id: &str,
+    input: &Mutex<Option<Arc<dyn DataChannel>>>,
+    input_open: &AtomicBool,
+) -> bool {
+    ask_keyframe_with(connected, throttle, signal, session_id, |text| async move {
+        send_text(input, input_open, text).await
+    })
+    .await
 }
 
 async fn send_text(
@@ -1292,10 +1666,14 @@ struct ViewHandler {
     frames: Arc<FrameBus>,
     loss: Arc<Mutex<LossWindow>>,
     failed: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     captured: Arc<AtomicI64>,
-    /// Set when ICE/DTLS leave the connected state so drive can ice_restart fast.
-    disconnected_at_ms: Arc<AtomicI64>,
+    /// Monotonic timestamp set when ICE/DTLS leave the connected state so
+    /// `drive` can trigger `ice_restart` without depending on wall-clock time.
+    disconnected_at: Arc<Mutex<Option<Instant>>>,
+    keyframe_notify: Arc<tokio::sync::Notify>,
+    allow_ice_restart_on_failed: bool,
 }
 
 #[async_trait::async_trait]
@@ -1316,37 +1694,54 @@ impl PeerConnectionEventHandler for ViewHandler {
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         eprintln!("agentlink live-webrtc: peer connection state={state:?}");
-        if self.stop.load(Ordering::Relaxed) {
+        if self.stop.load(Ordering::Acquire) {
             return;
         }
         match state {
             RTCPeerConnectionState::Connected => {
-                self.disconnected_at_ms.store(0, Ordering::Relaxed);
+                self.connected.store(true, Ordering::Release);
+                self.failed.store(false, Ordering::Release);
+                *self
+                    .disconnected_at
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner()) = None;
+                if !self.frames.saw_keyframe() || self.frames.is_dropping_until_idr() {
+                    self.keyframe_notify.notify_one();
+                }
             }
             RTCPeerConnectionState::Disconnected => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let _ = self.disconnected_at_ms.compare_exchange(
-                    0,
-                    now,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
+                self.connected.store(false, Ordering::Release);
+                let mut guard = self
+                    .disconnected_at
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                if guard.is_none() {
+                    *guard = Some(Instant::now());
+                }
             }
-            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
-                self.failed.store(true, Ordering::Relaxed);
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let _ = self.disconnected_at_ms.compare_exchange(
-                    0,
-                    now,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
+            RTCPeerConnectionState::Failed => {
+                self.connected.store(false, Ordering::Release);
+                if !self.allow_ice_restart_on_failed {
+                    self.failed.store(true, Ordering::Release);
+                }
+                let mut guard = self
+                    .disconnected_at
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                if guard.is_none() {
+                    *guard = Some(Instant::now());
+                }
+            }
+            RTCPeerConnectionState::Closed => {
+                self.connected.store(false, Ordering::Release);
+                self.failed.store(true, Ordering::Release);
+                let mut guard = self
+                    .disconnected_at
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                if guard.is_none() {
+                    *guard = Some(Instant::now());
+                }
             }
             _ => {}
         }
@@ -1357,6 +1752,7 @@ impl PeerConnectionEventHandler for ViewHandler {
         let loss = self.loss.clone();
         let stop = self.stop.clone();
         let captured = self.captured.clone();
+        let keyframe_notify = self.keyframe_notify.clone();
         tokio::spawn(async move {
             let mut depay = H264Depacketizer::new();
             while !stop.load(Ordering::Relaxed) {
@@ -1365,9 +1761,17 @@ impl PeerConnectionEventHandler for ViewHandler {
                         loss.lock()
                             .unwrap_or_else(|err| err.into_inner())
                             .observe(packet.header.sequence_number);
-                        if let Some(AccessUnit { bytes, keyframe }) =
-                            depay.push(&packet.payload, packet.header.marker)
-                        {
+                        let outcome = depay.push_rtp(
+                            packet.header.sequence_number,
+                            packet.header.timestamp,
+                            &packet.payload,
+                            packet.header.marker,
+                        );
+                        if outcome.corrupted {
+                            frames.mark_loss();
+                            keyframe_notify.notify_one();
+                        }
+                        for AccessUnit { bytes, keyframe } in outcome.units {
                             frames.push(Queued {
                                 bytes,
                                 keyframe,
@@ -1386,6 +1790,7 @@ impl PeerConnectionEventHandler for ViewHandler {
 #[async_trait::async_trait]
 trait LivePeer: Send + Sync {
     async fn close(&self);
+    async fn update_ice_servers(&self, servers: &[Value]) -> Result<(), String>;
     async fn create_ice_restart_offer(&self) -> Result<String, String>;
     async fn local_sdp(&self) -> Option<String>;
     async fn apply_remote_answer(&self, sdp: &str) -> Result<(), String>;
@@ -1405,6 +1810,26 @@ where
 {
     async fn close(&self) {
         let _ = PeerConnection::close(&self.inner).await;
+    }
+
+    async fn update_ice_servers(&self, servers: &[Value]) -> Result<(), String> {
+        let rtc_servers = rtc_ice(servers);
+        if rtc_servers.is_empty() {
+            return Ok(());
+        }
+        let prev = PeerConnection::get_configuration(&self.inner).await;
+        let cfg = RTCConfigurationBuilder::new()
+            .with_ice_servers(rtc_servers)
+            .with_ice_transport_policy(prev.ice_transport_policy())
+            .with_bundle_policy(prev.bundle_policy())
+            .with_rtcp_mux_policy(prev.rtcp_mux_policy())
+            .with_peer_identitys(prev.peer_identity().to_string())
+            .with_certificates(prev.certificates().to_vec())
+            .with_ice_candidate_pool_size(prev.ice_candidate_pool_size())
+            .build();
+        PeerConnection::set_configuration(&self.inner, cfg)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     async fn create_ice_restart_offer(&self) -> Result<String, String> {
@@ -1542,11 +1967,14 @@ fn ice_ufrag_matches(remote_ufrag: Option<&str>, fragment: Option<&str>) -> bool
 /// Bounded request/response pull of candidates gathered after the answer.
 /// Old nodes that omit `ice_pull` are skipped once. A single "unknown
 /// action" error also stops the loop so a missing handler cannot storm.
+#[allow(clippy::too_many_arguments)]
 async fn pull_late_ice(
     signal: Arc<dyn Signal>,
     session_id: String,
     peer: Arc<dyn LivePeer>,
     stop: Arc<AtomicBool>,
+    ice_gen: Arc<AtomicU64>,
+    my_gen: u64,
     advertised: bool,
     suppress: bool,
     mut after: u64,
@@ -1564,13 +1992,16 @@ async fn pull_late_ice(
     let mut fails = 0u32;
     let mut empty_after_done = 0u32;
     for n in 0..PULL_MAX {
-        if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        if stop.load(Ordering::Relaxed)
+            || ice_gen.load(Ordering::Acquire) != my_gen
+            || Instant::now() >= deadline
+        {
             break;
         }
         if n > 0 {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || ice_gen.load(Ordering::Acquire) != my_gen {
             break;
         }
         let result = roundtrip(
@@ -1906,41 +2337,182 @@ fn h264_codec() -> RTCRtpCodecParameters {
             channels: 0,
             sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
                 .into(),
-            rtcp_feedback: Vec::new(),
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: TYPE_RTCP_FB_NACK.into(),
+                    parameter: String::new(),
+                },
+                RTCPFeedback {
+                    typ: TYPE_RTCP_FB_NACK.into(),
+                    parameter: "pli".into(),
+                },
+            ],
         },
         payload_type: 102,
     }
 }
 
-/// ICE servers from the caller, or `AGENTLINK_STUN_URLS` when the caller
-/// passed none. Unset uses the public STUN defaults. The same list goes in
-/// the offer so the node gathers against it.
-fn offer_servers(servers: &[Value]) -> Vec<Value> {
-    if !servers.is_empty() {
-        return servers.to_vec();
+fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
     }
-    let urls = agentlink_core::stun_urls_ready_for_ice();
-    if urls.is_empty() {
+    None
+}
+
+fn parse_turn_server(urls: Option<&str>, user: Option<&str>, pass: Option<&str>) -> Option<Value> {
+    let urls = urls?;
+    let parsed: Vec<String> = urls
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    let mut entry = json!({ "urls": parsed });
+    if let Some(username) = user.map(str::trim).filter(|s| !s.is_empty()) {
+        entry["username"] = json!(username);
+    }
+    if let Some(credential) = pass.map(str::trim).filter(|s| !s.is_empty()) {
+        entry["credential"] = json!(credential);
+    }
+    Some(entry)
+}
+
+fn turn_server_from_env() -> Option<Value> {
+    let urls = first_non_empty_env(&["AGENTLINK_TURN_URLS"]);
+    let user = first_non_empty_env(&["AGENTLINK_TURN_USER", "AGENTLINK_TURN_USERNAME"]);
+    let pass = first_non_empty_env(&["AGENTLINK_TURN_PASS", "AGENTLINK_TURN_CREDENTIAL"]);
+    parse_turn_server(urls.as_deref(), user.as_deref(), pass.as_deref())
+}
+
+fn offer_servers_with(
+    servers: &[Value],
+    stun_urls: Vec<String>,
+    turn_entry: Option<Value>,
+) -> Vec<Value> {
+    let mut out = if !servers.is_empty() {
+        servers.to_vec()
+    } else if stun_urls.is_empty() {
         Vec::new()
     } else {
-        vec![json!({ "urls": urls })]
+        vec![json!({ "urls": stun_urls })]
+    };
+    if let Some(turn) = turn_entry {
+        if !out.iter().any(|existing| existing == &turn) {
+            out.push(turn);
+        }
     }
+    out
+}
+
+/// ICE servers from the caller, or `AGENTLINK_STUN_URLS` when the caller
+/// passed none, plus any explicit `AGENTLINK_TURN_*` configuration.
+/// Unset uses the public STUN defaults. The same list goes in the offer
+/// so the node gathers against it.
+#[cfg_attr(not(test), allow(dead_code))]
+fn offer_servers(servers: &[Value]) -> Vec<Value> {
+    let stun = if servers.is_empty() {
+        agentlink_core::stun_urls_ready_for_ice()
+    } else {
+        Vec::new()
+    };
+    offer_servers_with(servers, stun, turn_server_from_env())
+}
+
+async fn stun_urls_ready_async() -> Vec<String> {
+    tokio::task::spawn_blocking(agentlink_core::stun_urls_ready_for_ice)
+        .await
+        .unwrap_or_default()
+}
+
+async fn resolve_offer_servers_async(
+    servers: &[Value],
+    ice_refresh: Option<&IceRefreshCb>,
+) -> Vec<Value> {
+    let mut base = servers.to_vec();
+    if base.is_empty() {
+        if let Some(cb) = ice_refresh {
+            let cb = Arc::clone(cb);
+            let refreshed = tokio::task::spawn_blocking(move || cb())
+                .await
+                .unwrap_or_default();
+            if !refreshed.is_empty() {
+                base = refreshed;
+            }
+        }
+    }
+    let stun = if base.is_empty() {
+        stun_urls_ready_async().await
+    } else {
+        Vec::new()
+    };
+    offer_servers_with(&base, stun, turn_server_from_env())
+}
+
+async fn refresh_ice_servers_for_restart(ice_refresh: Option<&IceRefreshCb>) -> Vec<Value> {
+    if let Some(cb) = ice_refresh {
+        let cb = Arc::clone(cb);
+        let refreshed = tokio::task::spawn_blocking(move || cb())
+            .await
+            .unwrap_or_default();
+        if !refreshed.is_empty() {
+            return offer_servers_with(&refreshed, Vec::new(), turn_server_from_env());
+        }
+    }
+    if let Some(turn) = turn_server_from_env() {
+        let stun = stun_urls_ready_async().await;
+        return offer_servers_with(&[], stun, Some(turn));
+    }
+    Vec::new()
+}
+
+fn entry_urls(entry: &Value) -> Vec<String> {
+    match entry.get("urls") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(item)) => {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn count_ice_url_schemes(servers: &[Value]) -> (usize, usize) {
+    let mut stun_n = 0usize;
+    let mut turn_n = 0usize;
+    for entry in servers {
+        for url in entry_urls(entry) {
+            if url.starts_with("stun:") || url.starts_with("stuns:") {
+                stun_n += 1;
+            } else if url.starts_with("turn:") || url.starts_with("turns:") {
+                turn_n += 1;
+            }
+        }
+    }
+    (stun_n, turn_n)
 }
 
 fn rtc_ice(servers: &[Value]) -> Vec<RTCIceServer> {
     let mut out = Vec::new();
     for entry in servers {
-        let urls = entry
-            .get("urls")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let urls = entry_urls(entry);
         if urls.is_empty() {
             continue;
         }
@@ -1972,13 +2544,19 @@ fn unknown_action(err: &str) -> bool {
     err.contains("unknown webrtc_signal action")
 }
 
-fn brief(value: &Value) -> String {
-    let text = value.to_string();
-    if text.len() > 180 {
-        format!("{}…", &text[..180])
-    } else {
-        text
+fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
     }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+fn brief(value: &Value) -> String {
+    truncate_utf8(&value.to_string(), 180)
 }
 
 fn json_u32(value: &Value, key: &str) -> u32 {
@@ -2062,6 +2640,14 @@ mod tests {
         assert!(sdp.contains("recvonly"), "{sdp}");
         assert!(sdp.contains("m=video"), "{sdp}");
         assert!(sdp.contains("m=application"), "{sdp}");
+        assert!(
+            sdp.contains("rtcp-fb:102 nack\r\n") || sdp.contains("rtcp-fb:102 nack\n"),
+            "offer SDP must negotiate RTCP nack: {sdp}"
+        );
+        assert!(
+            sdp.contains("rtcp-fb:102 nack pli"),
+            "offer SDP must negotiate RTCP nack pli: {sdp}"
+        );
     }
 
     fn test_viewer(cmd_cap: usize) -> (Viewer, mpsc::Receiver<Cmd>) {
@@ -2099,6 +2685,8 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             close_notify: Arc::new(tokio::sync::Notify::new()),
+            close_done: Arc::new(CloseSignal::new()),
+            close_done_async: Arc::new(tokio::sync::Notify::new()),
             closed: AtomicBool::new(false),
             runtime: Mutex::new(Some(runtime)),
         };
@@ -2275,5 +2863,618 @@ mod tests {
         assert!(super::ice_ufrag_matches(Some("genA"), None));
         assert!(super::ice_ufrag_matches(Some("genA"), Some("genA")));
         assert!(!super::ice_ufrag_matches(Some("genA"), Some("genB")));
+    }
+
+    #[test]
+    fn dual_stack_udp_addrs_helper_supports_ipv6_and_ipv4_fallback() {
+        assert_eq!(
+            super::dual_stack_udp_addrs_with(true),
+            vec!["[::]:0".to_string(), "0.0.0.0:0".to_string()]
+        );
+        assert_eq!(
+            super::dual_stack_udp_addrs_with(false),
+            vec!["0.0.0.0:0".to_string()]
+        );
+    }
+
+    #[test]
+    fn turn_env_parsing_and_offer_servers_merge_and_refresh_callback() {
+        assert!(super::parse_turn_server(None, Some("u"), Some("p")).is_none());
+        assert!(super::parse_turn_server(Some(" ,  , "), Some("u"), Some("p")).is_none());
+
+        let turn = super::parse_turn_server(
+            Some(" turn:turn.example:3478?transport=udp , turns:turn.example:5349 "),
+            Some("1700000600:alice"),
+            Some("secret-cred"),
+        )
+        .expect("turn server entry");
+        assert_eq!(
+            turn["urls"],
+            json!([
+                "turn:turn.example:3478?transport=udp",
+                "turns:turn.example:5349"
+            ])
+        );
+        assert_eq!(turn["username"], "1700000600:alice");
+        assert_eq!(turn["credential"], "secret-cred");
+
+        // Merges explicit TURN alongside default STUN when opts.ice_servers is empty.
+        let merged_stun = super::offer_servers_with(
+            &[],
+            vec!["stun:stun.example:3478".into()],
+            Some(turn.clone()),
+        );
+        assert_eq!(merged_stun.len(), 2);
+        assert_eq!(merged_stun[0]["urls"], json!(["stun:stun.example:3478"]));
+        assert_eq!(merged_stun[1], turn);
+
+        // Merges explicit TURN alongside caller-supplied opts.ice_servers without duplicating.
+        let passed = vec![json!({"urls": ["stun:custom.example:3478"]})];
+        let merged_passed = super::offer_servers_with(&passed, Vec::new(), Some(turn.clone()));
+        assert_eq!(merged_passed.len(), 2);
+        assert_eq!(merged_passed[0]["urls"], json!(["stun:custom.example:3478"]));
+        assert_eq!(merged_passed[1], turn);
+
+        // Already present TURN entry is not duplicated.
+        let dedup = super::offer_servers_with(&merged_passed, Vec::new(), Some(turn.clone()));
+        assert_eq!(dedup.len(), 2);
+
+        // rtc_ice accepts both array and string `urls` and preserves username/credential.
+        let parsed_rtc = super::rtc_ice(&[
+            turn.clone(),
+            json!({"urls": "stun:single.example:3478"}),
+        ]);
+        assert_eq!(parsed_rtc.len(), 2);
+        assert_eq!(parsed_rtc[0].username, "1700000600:alice");
+        assert_eq!(parsed_rtc[0].credential, "secret-cred");
+        assert_eq!(parsed_rtc[1].urls, vec!["stun:single.example:3478"]);
+
+        // LiveOptions::ice_refresh is Default + Clone + Debug and called on initial connect when ice_servers is empty.
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_cb = Arc::clone(&calls);
+        let refresh: IceRefreshCb = Arc::new(move || {
+            let n = calls_cb.fetch_add(1, Ordering::SeqCst) + 1;
+            vec![json!({
+                "urls": ["turn:fresh.example:3478"],
+                "username": format!("user-{n}"),
+                "credential": format!("cred-{n}"),
+            })]
+        });
+        let opts = LiveOptions {
+            ice_refresh: Some(refresh.clone()),
+            ..LiveOptions::default()
+        };
+        let dbg = format!("{opts:?}");
+        assert!(dbg.contains("ice_refresh: true"), "{dbg}");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let resolved = rt.block_on(super::resolve_offer_servers_async(
+            &opts.ice_servers,
+            opts.ice_refresh.as_ref(),
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolved[0]["username"], "user-1");
+        assert_eq!(resolved[0]["credential"], "cred-1");
+    }
+
+    #[test]
+    fn brief_truncates_utf8_cjk_and_emoji_without_panicking() {
+        // Test every leading ASCII offset 0..=4 so byte 180 hits every possible
+        // interior byte of both 3-byte CJK chars and 4-byte emoji.
+        for pad in 0..=4 {
+            let prefix = "a".repeat(pad);
+            let cjk = format!("{prefix}{}", "中".repeat(100));
+            let val = json!({"error": cjk});
+            let out = super::brief(&val);
+            assert!(out.ends_with('…'), "expected ellipsis: {out}");
+            assert!(
+                out.len() <= 180 + '…'.len_utf8(),
+                "truncated output exceeded cap: {} bytes",
+                out.len()
+            );
+
+            let emoji = format!("{prefix}{}", "🚀".repeat(80));
+            let val_emoji = json!({"error": emoji});
+            let out_emoji = super::brief(&val_emoji);
+            assert!(out_emoji.ends_with('…'), "expected ellipsis: {out_emoji}");
+            assert!(out_emoji.len() <= 180 + '…'.len_utf8());
+        }
+
+        // Short CJK payload passes through untruncated.
+        let short = json!({"error": "连接失败"});
+        let out = super::brief(&short);
+        assert!(!out.ends_with('…'));
+        assert!(out.contains("连接失败"));
+    }
+
+    #[test]
+    fn h264_codec_negotiates_rtcp_nack_and_pli() {
+        let codec = super::h264_codec();
+        assert!(
+            codec
+                .rtp_codec
+                .rtcp_feedback
+                .iter()
+                .any(|fb| fb.typ == "nack" && fb.parameter.is_empty()),
+            "missing generic nack: {:?}",
+            codec.rtp_codec.rtcp_feedback
+        );
+        assert!(
+            codec
+                .rtp_codec
+                .rtcp_feedback
+                .iter()
+                .any(|fb| fb.typ == "nack" && fb.parameter == "pli"),
+            "missing nack pli: {:?}",
+            codec.rtp_codec.rtcp_feedback
+        );
+    }
+
+    #[test]
+    fn ask_keyframe_gates_on_connected_prefers_dc_and_rate_limits() {
+        struct CountSignal {
+            calls: AtomicU64,
+        }
+        impl Signal for CountSignal {
+            fn signal(&self, payload: &Value) -> Result<Value, String> {
+                if payload.get("action").and_then(Value::as_str) == Some("keyframe") {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(json!({"ok": true}))
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let signal = Arc::new(CountSignal {
+                calls: AtomicU64::new(0),
+            });
+            let signal_dyn: Arc<dyn Signal> = signal.clone();
+            let connected = AtomicBool::new(false);
+            let mut throttle = KeyframeThrottle::new(Duration::from_secs(1));
+            let dc_calls = Arc::new(AtomicU64::new(0));
+
+            // 1. Not connected: must NOT call DC or relay WS.
+            let sent = super::ask_keyframe_with(
+                &connected,
+                &mut throttle,
+                &signal_dyn,
+                "sess-1",
+                |_| {
+                    let c = dc_calls.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }
+                },
+            )
+            .await;
+            assert!(!sent);
+            assert_eq!(dc_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(signal.calls.load(Ordering::SeqCst), 0);
+
+            // 2. Connected + open DataChannel: uses DC ONLY (0 relay calls).
+            connected.store(true, Ordering::Release);
+            let sent = super::ask_keyframe_with(
+                &connected,
+                &mut throttle,
+                &signal_dyn,
+                "sess-1",
+                |text| {
+                    let c = dc_calls.clone();
+                    async move {
+                        assert_eq!(text, r#"{"type":"keyframe"}"#);
+                        c.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }
+                },
+            )
+            .await;
+            assert!(sent);
+            assert_eq!(dc_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(signal.calls.load(Ordering::SeqCst), 0);
+
+            // 3. Immediate second request (< 1s): rate-limited!
+            let sent_again = super::ask_keyframe_with(
+                &connected,
+                &mut throttle,
+                &signal_dyn,
+                "sess-1",
+                |_| async { true },
+            )
+            .await;
+            assert!(!sent_again);
+            assert_eq!(dc_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(signal.calls.load(Ordering::SeqCst), 0);
+
+            // 4. After >= 1s with DC closed (returns false): falls back to relay WS once.
+            throttle.last_sent = Some(Instant::now() - Duration::from_millis(1100));
+            let sent_relay = super::ask_keyframe_with(
+                &connected,
+                &mut throttle,
+                &signal_dyn,
+                "sess-1",
+                |_| async { false },
+            )
+            .await;
+            assert!(sent_relay);
+            assert_eq!(signal.calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn connection_state_failed_allows_ice_restart_recovery_and_uses_monotonic_instant() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let (ice_tx, _ice_rx) = mpsc::unbounded_channel();
+            let handler = ViewHandler {
+                gather_done: Arc::new(AtomicBool::new(false)),
+                ice_tx,
+                frames: Arc::new(FrameBus::new(3)),
+                loss: Arc::new(Mutex::new(LossWindow::default())),
+                failed: Arc::new(AtomicBool::new(false)),
+                connected: Arc::new(AtomicBool::new(false)),
+                stop: Arc::new(AtomicBool::new(false)),
+                captured: Arc::new(AtomicI64::new(0)),
+                disconnected_at: Arc::new(Mutex::new(None)),
+                keyframe_notify: Arc::new(tokio::sync::Notify::new()),
+                allow_ice_restart_on_failed: true,
+            };
+
+            handler
+                .on_connection_state_change(RTCPeerConnectionState::Connected)
+                .await;
+            assert!(handler.connected.load(Ordering::Acquire));
+            assert!(!handler.failed.load(Ordering::Acquire));
+            assert!(handler.disconnected_at.lock().unwrap().is_none());
+
+            // Transient Failed must NOT immediately set `failed = true` before ice_restart runs.
+            handler
+                .on_connection_state_change(RTCPeerConnectionState::Failed)
+                .await;
+            assert!(!handler.connected.load(Ordering::Acquire));
+            assert!(
+                !handler.failed.load(Ordering::Acquire),
+                "transient Failed must allow ice_restart recovery"
+            );
+            assert!(handler.disconnected_at.lock().unwrap().is_some());
+
+            // Recovery back to Connected clears disconnected_at and failed.
+            handler
+                .on_connection_state_change(RTCPeerConnectionState::Connected)
+                .await;
+            assert!(handler.connected.load(Ordering::Acquire));
+            assert!(!handler.failed.load(Ordering::Acquire));
+            assert!(handler.disconnected_at.lock().unwrap().is_none());
+
+            // Terminal Closed sets failed = true.
+            handler
+                .on_connection_state_change(RTCPeerConnectionState::Closed)
+                .await;
+            assert!(handler.failed.load(Ordering::Acquire));
+        });
+    }
+
+    struct MockRestartPeer {
+        updated_servers: Mutex<Vec<Vec<Value>>>,
+        added_candidates: Mutex<Vec<String>>,
+        closed: AtomicBool,
+    }
+
+    impl MockRestartPeer {
+        fn new() -> Self {
+            Self {
+                updated_servers: Mutex::new(Vec::new()),
+                added_candidates: Mutex::new(Vec::new()),
+                closed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LivePeer for MockRestartPeer {
+        async fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+
+        async fn update_ice_servers(&self, servers: &[Value]) -> Result<(), String> {
+            self.updated_servers.lock().unwrap().push(servers.to_vec());
+            Ok(())
+        }
+
+        async fn create_ice_restart_offer(&self) -> Result<String, String> {
+            Ok("v=0\r\na=ice-ufrag:offer-gen2\r\n".into())
+        }
+
+        async fn local_sdp(&self) -> Option<String> {
+            Some("v=0\r\na=ice-ufrag:offer-gen2\r\n".into())
+        }
+
+        async fn apply_remote_answer(&self, _sdp: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn add_ice_candidate(&self, candidate: RTCIceCandidateInit) -> Result<(), String> {
+            self.added_candidates
+                .lock()
+                .unwrap()
+                .push(candidate.candidate);
+            Ok(())
+        }
+
+        async fn selected_ice_pair(&self) -> Option<(String, String, String, String, String)> {
+            None
+        }
+
+        async fn ice_check_snapshot(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn ice_restart_refreshes_turn_servers_and_reruns_pull_late_ice() {
+        struct RestartSignal {
+            seen_restart_servers: Mutex<Option<Value>>,
+            ice_pull_calls: AtomicU64,
+        }
+        impl Signal for RestartSignal {
+            fn signal(&self, payload: &Value) -> Result<Value, String> {
+                match payload.get("action").and_then(Value::as_str) {
+                    Some("ice_restart") => {
+                        *self.seen_restart_servers.lock().unwrap() =
+                            payload.get("ice_servers").cloned();
+                        Ok(json!({
+                            "session_id": "sess-r",
+                            "sdp": "v=0\r\na=ice-ufrag:ans-gen2\r\n",
+                            "candidates": [],
+                            "ice_pull": true,
+                        }))
+                    }
+                    Some("ice_pull") => {
+                        let n = self.ice_pull_calls.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            Ok(json!({
+                                "ok": true,
+                                "after": 1,
+                                "gather_done": true,
+                                "candidates": [{
+                                    "candidate": "candidate:9 1 udp 16777215 198.51.100.9 4444 typ relay",
+                                    "sdpMid": "",
+                                    "sdpMLineIndex": 0,
+                                    "usernameFragment": "ans-gen2"
+                                }]
+                            }))
+                        } else {
+                            Ok(json!({
+                                "ok": true,
+                                "after": 1,
+                                "gather_done": true,
+                                "candidates": []
+                            }))
+                        }
+                    }
+                    other => Err(format!("unexpected {other:?}")),
+                }
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let mock_peer = Arc::new(MockRestartPeer::new());
+            let peer: Arc<dyn LivePeer> = mock_peer.clone();
+            let restart_sig = Arc::new(RestartSignal {
+                seen_restart_servers: Mutex::new(None),
+                ice_pull_calls: AtomicU64::new(0),
+            });
+            let signal: Arc<dyn Signal> = restart_sig.clone();
+            let gather_done = Arc::new(AtomicBool::new(true));
+            let stop = Arc::new(AtomicBool::new(false));
+            let ice_gen = Arc::new(AtomicU64::new(0));
+            let refresh: IceRefreshCb = Arc::new(|| {
+                vec![json!({
+                    "urls": ["turn:rotated.example:3478"],
+                    "username": "1700001200:viewer",
+                    "credential": "fresh-hmac-cred",
+                })]
+            });
+
+            // Mark gather_done quickly from a background task (simulating ICE gather completion).
+            let gd = gather_done.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                gd.store(true, Ordering::Relaxed);
+            });
+
+            super::ice_restart(
+                &peer,
+                &signal,
+                "sess-r",
+                &gather_done,
+                &stop,
+                Some(&refresh),
+                &ice_gen,
+                false,
+            )
+            .await
+            .expect("ice_restart ok");
+
+            // 1. PeerConnection received refreshed TURN creds before restart offer.
+            let updated = mock_peer.updated_servers.lock().unwrap().clone();
+            assert_eq!(updated.len(), 1);
+            assert_eq!(updated[0][0]["username"], "1700001200:viewer");
+            assert_eq!(updated[0][0]["credential"], "fresh-hmac-cred");
+
+            // 2. `action: "ice_restart"` payload also forwarded refreshed `ice_servers`.
+            let sent_servers = restart_sig
+                .seen_restart_servers
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("ice_servers in restart payload");
+            assert_eq!(sent_servers[0]["username"], "1700001200:viewer");
+
+            // 3. Generation incremented and `pull_late_ice` re-ran for the restarted generation.
+            assert_eq!(ice_gen.load(Ordering::Acquire), 1);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while mock_peer.added_candidates.lock().unwrap().is_empty()
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let cands = mock_peer.added_candidates.lock().unwrap().clone();
+            assert!(
+                cands.iter().any(|c| c.contains("198.51.100.9")),
+                "restarted pull_late_ice must deliver gen2 candidate, got {cands:?}"
+            );
+            stop.store(true, Ordering::Release);
+        });
+    }
+
+    #[test]
+    fn close_and_drop_inside_tokio_runtime_flushes_action_close() {
+        struct CloseSpySignal {
+            closed_session: Mutex<Option<String>>,
+        }
+        impl Signal for CloseSpySignal {
+            fn signal(&self, payload: &Value) -> Result<Value, String> {
+                if payload.get("action").and_then(Value::as_str) == Some("close") {
+                    // Simulate a brief network roundtrip so `shutdown_background()`
+                    // would have aborted it before completion.
+                    std::thread::sleep(Duration::from_millis(40));
+                    *self.closed_session.lock().unwrap() = payload
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                Ok(json!({"ok": true}))
+            }
+        }
+
+        let outer_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("agentlink-controller-net")
+            .build()
+            .expect("outer runtime");
+
+        let spy = Arc::new(CloseSpySignal {
+            closed_session: Mutex::new(None),
+        });
+        let mock_peer = Arc::new(MockRestartPeer::new());
+
+        let viewer_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("agentlink-view-close-test")
+            .build()
+            .expect("viewer runtime");
+
+        let (cmd, cmd_rx) = mpsc::channel(4);
+        let frames = Arc::new(FrameBus::new(2));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let close_notify = Arc::new(tokio::sync::Notify::new());
+        let close_done = Arc::new(CloseSignal::new());
+        let close_done_async = Arc::new(tokio::sync::Notify::new());
+        let failed = Arc::new(AtomicBool::new(false));
+        let input_open = Arc::new(AtomicBool::new(false));
+        let info = Arc::new(Mutex::new(LiveInfo {
+            session_id: "sess-close-flush".into(),
+            codec: "h264".into(),
+            encoder: "test".into(),
+            hardware: false,
+            width: 1,
+            height: 1,
+            src_width: 1,
+            src_height: 1,
+            control: false,
+            path: "host".into(),
+            sdp_inventory: String::new(),
+            cursor_presentation: "legacy".into(),
+        }));
+        let transport = Arc::new(Mutex::new(None));
+        let ice_checks = Arc::new(Mutex::new(String::new()));
+        let stats = Arc::new(Mutex::new(LiveStats::default()));
+
+        let ctx = DriveCtx {
+            peer: mock_peer.clone(),
+            cmd_rx,
+            signal: spy.clone(),
+            session_id: "sess-close-flush".into(),
+            frames: frames.clone(),
+            loss: Arc::new(Mutex::new(LossWindow::default())),
+            stats: stats.clone(),
+            input: Arc::new(Mutex::new(None)),
+            input_open: input_open.clone(),
+            connected: Arc::new(AtomicBool::new(true)),
+            stop: stop.clone(),
+            stopped: stopped.clone(),
+            close_notify: close_notify.clone(),
+            close_done: close_done.clone(),
+            close_done_async: close_done_async.clone(),
+            keyframe_notify: Arc::new(tokio::sync::Notify::new()),
+            failed: failed.clone(),
+            gather_done: Arc::new(AtomicBool::new(true)),
+            disconnected_at: Arc::new(Mutex::new(None)),
+            info: info.clone(),
+            transport: transport.clone(),
+            ice_checks: ice_checks.clone(),
+            ice_refresh: None,
+            ice_gen: Arc::new(AtomicU64::new(0)),
+            suppress_late_ice: false,
+        };
+        viewer_rt.spawn(drive(ctx));
+
+        let viewer = Viewer {
+            cmd,
+            frames,
+            info,
+            transport,
+            cursor: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            stats,
+            ice_checks,
+            input_open,
+            failed,
+            stop,
+            stopped: stopped.clone(),
+            close_notify,
+            close_done,
+            close_done_async,
+            closed: AtomicBool::new(false),
+            runtime: Mutex::new(Some(viewer_rt)),
+        };
+
+        // Call close() AND drop() directly from inside the outer Tokio runtime thread.
+        outer_rt.block_on(async {
+            viewer.close();
+            drop(viewer);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while spy.closed_session.lock().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(
+            spy.closed_session.lock().unwrap().as_deref(),
+            Some("sess-close-flush"),
+            "action: close must flush cleanly even when close()+drop() happen inside a Tokio runtime"
+        );
+        assert!(mock_peer.closed.load(Ordering::SeqCst));
+        assert!(stopped.load(Ordering::Acquire));
+        outer_rt.shutdown_timeout(Duration::from_secs(2));
     }
 }

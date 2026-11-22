@@ -4,10 +4,10 @@
 //! Windows (`command-group`). Killing the group reaps grandchildren, which
 //! killing only the direct child does not.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::util;
@@ -296,7 +296,12 @@ struct ProcShared {
     origin: Origin,
     agent: Option<String>,
     audit: Arc<AuditService>,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
 }
+
+pub type ProcGrantHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct Slot {
     shared: Arc<ProcShared>,
@@ -323,6 +328,7 @@ impl Drop for ProcState {
 #[derive(Clone)]
 pub struct ProcManager {
     state: Arc<Mutex<ProcState>>,
+    grant_active: Arc<RwLock<Option<ProcGrantHook>>>,
 }
 
 impl Default for ProcManager {
@@ -337,14 +343,32 @@ impl ProcManager {
             state: Arc::new(Mutex::new(ProcState {
                 slots: HashMap::new(),
             })),
+            grant_active: Arc::new(RwLock::new(None)),
         }
     }
 
+    pub fn set_grant_active(&self, hook: Option<ProcGrantHook>) {
+        if let Ok(mut slot) = self.grant_active.write() {
+            *slot = hook;
+        }
+    }
+
+    fn grant_hook(&self) -> Option<ProcGrantHook> {
+        self.grant_active
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         origin: &Origin,
         audit: Arc<AuditService>,
         agent: Option<String>,
+        owner_peer: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
         program: &str,
         args: &[String],
         cwd: Option<&std::path::Path>,
@@ -418,6 +442,9 @@ impl ProcManager {
             origin: origin.clone(),
             agent,
             audit,
+            owner_peer: owner_peer.to_string(),
+            grant_jti: grant_jti.trim().to_string(),
+            grant_exp_unix,
         });
         spawn_reader(stdout, stdout_buf);
         spawn_reader(stderr, stderr_buf);
@@ -458,16 +485,26 @@ impl ProcManager {
                 log_natural_exit(&task_shared, code);
             }
         });
+        // Post-create check: a revoke landing during spawn must still tear it down.
+        if let Err(err) = require_proc_access(&shared, Some(owner_peer), self.grant_hook().as_deref()) {
+            let _ = self.kill(&id, owner_peer).await;
+            return Err(err);
+        }
         let body = describe(&shared);
         let audit = ProcessAudit::new(command, cwd_display, None, "");
         Ok((body, audit))
     }
 
-    pub fn list(&self) -> Result<Value> {
+    pub fn list(&self, peer: &str) -> Result<Value> {
+        let hook = self.grant_hook();
         let guard = self.lock()?;
         let mut processes: Vec<_> = guard
             .slots
             .values()
+            .filter(|slot| {
+                slot.shared.owner_peer == peer
+                    && require_proc_access(&slot.shared, Some(peer), hook.as_deref()).is_ok()
+            })
             .map(|slot| describe(&slot.shared))
             .collect();
         processes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -477,6 +514,7 @@ impl ProcManager {
     pub fn output(
         &self,
         id: &str,
+        peer: &str,
         stdout_cursor: u64,
         stderr_cursor: u64,
         max_bytes: u32,
@@ -486,11 +524,13 @@ impl ProcManager {
         } else {
             (max_bytes as usize).min(1024 * 1024)
         };
+        let hook = self.grant_hook();
         let guard = self.lock()?;
         let slot = guard
             .slots
             .get(id)
             .ok_or_else(|| Error::NotFound(format!("background process {id}")))?;
+        require_proc_access(&slot.shared, Some(peer), hook.as_deref())?;
         let (stdout_next, stdout, stdout_gap) =
             lock_buf(&slot.shared.stdout)?.read_from(stdout_cursor, max);
         let (stderr_next, stderr, stderr_gap) =
@@ -517,12 +557,14 @@ impl ProcManager {
         Ok((body, process))
     }
 
-    pub fn status(&self, id: &str) -> Result<(Value, ProcessAudit)> {
+    pub fn status(&self, id: &str, peer: &str) -> Result<(Value, ProcessAudit)> {
+        let hook = self.grant_hook();
         let guard = self.lock()?;
         let slot = guard
             .slots
             .get(id)
             .ok_or_else(|| Error::NotFound(format!("background process {id}")))?;
+        require_proc_access(&slot.shared, Some(peer), hook.as_deref())?;
         let body = describe(&slot.shared);
         let (stdout, stderr, exit_code) = snapshot_tail(&slot.shared)?;
         let process = ProcessAudit::new(
@@ -534,13 +576,14 @@ impl ProcManager {
         Ok((body, process))
     }
 
-    pub async fn kill(&self, id: &str) -> Result<(Value, ProcessAudit)> {
+    pub async fn kill(&self, id: &str, peer: &str) -> Result<(Value, ProcessAudit)> {
         let (shared, kill_tx) = {
             let guard = self.lock()?;
             let slot = guard
                 .slots
                 .get(id)
                 .ok_or_else(|| Error::NotFound(format!("background process {id}")))?;
+            require_proc_owner(&slot.shared.owner_peer, peer)?;
             let tx = slot
                 .kill
                 .lock()
@@ -567,10 +610,81 @@ impl ProcManager {
         Ok((body, process))
     }
 
+    pub fn close_all(&self) {
+        let victims: Vec<Slot> = {
+            let mut guard = match self.state.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.slots.drain().map(|(_, slot)| slot).collect()
+        };
+        for slot in victims {
+            terminate_slot(slot);
+        }
+    }
+
+    pub fn close_inactive(&self, revoked: &BTreeSet<String>) -> usize {
+        let hook = self.grant_hook();
+        let now = agentlink_core::util::unix_now();
+        let victims: Vec<Slot> = {
+            let mut guard = match self.state.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let ids: Vec<String> = guard
+                .slots
+                .iter()
+                .filter(|(_, slot)| proc_inactive(&slot.shared, revoked, hook.as_deref(), now))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| guard.slots.remove(&id))
+                .collect()
+        };
+        let n = victims.len();
+        for slot in victims {
+            terminate_slot(slot);
+        }
+        n
+    }
+
+    pub fn close_expired(&self) -> usize {
+        let now = agentlink_core::util::unix_now();
+        let victims: Vec<Slot> = {
+            let mut guard = match self.state.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let ids: Vec<String> = guard
+                .slots
+                .iter()
+                .filter(|(_, slot)| slot.shared.grant_exp_unix.is_some_and(|exp| now >= exp))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| guard.slots.remove(&id))
+                .collect()
+        };
+        let n = victims.len();
+        for slot in victims {
+            terminate_slot(slot);
+        }
+        n
+    }
+
+    #[cfg(test)]
+    pub fn has_running(&self, id: &str) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|g| g.slots.get(id).map(|s| s.shared.running.load(Ordering::SeqCst)))
+            .unwrap_or(false)
+    }
+
     fn alloc_id(&self) -> Result<String> {
         let guard = self.lock()?;
         for _ in 0..8 {
-            let candidate = util::random_hex(4);
+            let candidate = util::random_hex(16);
             if !guard.slots.contains_key(&candidate) {
                 return Ok(candidate);
             }
@@ -592,6 +706,74 @@ impl ProcManager {
             .lock()
             .map_err(|_| Error::Message("process map poisoned".into()))
     }
+}
+
+fn terminate_slot(slot: Slot) {
+    slot.shared.killed.store(true, Ordering::SeqCst);
+    if let Ok(mut kill) = slot.kill.lock() {
+        if let Some(tx) = kill.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+fn require_proc_owner(owner_peer: &str, peer: &str) -> Result<()> {
+    if owner_peer != peer {
+        return Err(Error::NotFound(
+            "background process not found for this peer".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_proc_access(
+    shared: &ProcShared,
+    peer: Option<&str>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+) -> Result<()> {
+    if let Some(peer) = peer {
+        require_proc_owner(&shared.owner_peer, peer)?;
+    }
+    if let Some(exp) = shared.grant_exp_unix {
+        if agentlink_core::util::unix_now() >= exp {
+            return Err(Error::Auth("grant expired".into()));
+        }
+    }
+    if let Some(hook) = hook {
+        let jti = shared.grant_jti.trim();
+        if jti.is_empty() {
+            return Err(Error::Auth("grant is required".into()));
+        }
+        if !hook(jti) {
+            return Err(Error::Auth("grant was revoked".into()));
+        }
+    }
+    Ok(())
+}
+
+fn proc_inactive(
+    shared: &ProcShared,
+    revoked: &BTreeSet<String>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    now: i64,
+) -> bool {
+    if shared.grant_exp_unix.is_some_and(|exp| now >= exp) {
+        return true;
+    }
+    let jti = shared.grant_jti.trim();
+    if !jti.is_empty()
+        && revoked
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(jti))
+    {
+        return true;
+    }
+    if let Some(hook) = hook {
+        if jti.is_empty() || !hook(jti) {
+            return true;
+        }
+    }
+    false
 }
 
 fn spawn_reader<R>(mut reader: R, buf: Arc<Mutex<OutputBuf>>)
@@ -868,20 +1050,28 @@ mod tests {
     #[tokio::test]
     async fn bg_kill_records_exit_code_and_killed_flag() {
         let dir = tempfile::tempdir().unwrap();
-        let audit = crate::pipeline::AuditService::open(dir.path(), "local", "local");
+        let audit = crate::pipeline::AuditService::open_quiet(dir.path(), "local", "local");
         let mgr = ProcManager::new();
         let origin = crate::audit::Origin {
             path: dir.path().to_path_buf(),
             node: "test".into(),
             node_id: "test".into(),
         };
+        let (prog, args): (&str, Vec<String>) = if cfg!(windows) {
+            ("cmd.exe", vec!["/D".into(), "/C".into(), "ping -n 30 127.0.0.1 >nul".into()])
+        } else {
+            ("sleep", vec!["30".into()])
+        };
         let (body, _) = mgr
             .start(
                 &origin,
                 audit,
                 Some("agent".into()),
-                "sleep",
-                &["30".into()],
+                "alice",
+                "jti-1",
+                None,
+                prog,
+                &args,
                 None,
                 None,
                 &[],
@@ -893,7 +1083,14 @@ mod tests {
         let id = body["id"].as_str().unwrap().to_string();
         assert_eq!(body["running"], true);
 
-        let (killed_body, _) = mgr.kill(&id).await.unwrap();
+        // Peer isolation: bob cannot list, inspect, read output, or kill alice's proc.
+        let bob_list = mgr.list("bob").unwrap();
+        assert_eq!(bob_list["processes"].as_array().unwrap().len(), 0);
+        assert!(mgr.status(&id, "bob").is_err());
+        assert!(mgr.output(&id, "bob", 0, 0, 1024).is_err());
+        assert!(mgr.kill(&id, "bob").await.is_err());
+
+        let (killed_body, _) = mgr.kill(&id, "alice").await.unwrap();
         assert_eq!(killed_body["running"], false, "{killed_body}");
         assert_eq!(killed_body["killed"], true, "{killed_body}");
         assert!(
@@ -901,9 +1098,50 @@ mod tests {
             "exit_code must be set after kill, got {killed_body}"
         );
 
-        let (status_body, _) = mgr.status(&id).unwrap();
+        let (status_body, _) = mgr.status(&id, "alice").unwrap();
         assert_eq!(status_body["killed"], true);
         assert!(status_body["exit_code"].as_i64().is_some(), "{status_body}");
+    }
+
+    #[tokio::test]
+    async fn bg_procs_close_on_grant_revoke_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::pipeline::AuditService::open_quiet(dir.path(), "local", "local");
+        let mgr = ProcManager::new();
+        let origin = crate::audit::Origin {
+            path: dir.path().to_path_buf(),
+            node: "test".into(),
+            node_id: "test".into(),
+        };
+        let (prog, args): (&str, Vec<String>) = if cfg!(windows) {
+            ("cmd.exe", vec!["/D".into(), "/C".into(), "ping -n 30 127.0.0.1 >nul".into()])
+        } else {
+            ("sleep", vec!["30".into()])
+        };
+        let (body, _) = mgr
+            .start(
+                &origin,
+                audit.clone(),
+                Some("alice".into()),
+                "alice",
+                "jti-rev",
+                None,
+                prog,
+                &args,
+                None,
+                None,
+                &[],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let id = body["id"].as_str().unwrap().to_string();
+        assert!(mgr.has_running(&id));
+        let mut revoked = BTreeSet::new();
+        revoked.insert("jti-rev".into());
+        assert_eq!(mgr.close_inactive(&revoked), 1);
+        assert!(mgr.status(&id, "alice").is_err());
     }
 
     #[test]

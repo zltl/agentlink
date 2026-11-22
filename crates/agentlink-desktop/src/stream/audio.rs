@@ -42,20 +42,26 @@ impl Drop for AudioCapture {
     }
 }
 
+/// Arguments for `pw-record` to capture desktop sink monitor audio (not the
+/// microphone). Setting `stream.capture.sink=true` directs PipeWire to link
+/// to the default sink monitor rather than the default audio source.
+pub(crate) fn pw_record_args() -> &'static [&'static str] {
+    &[
+        "-P",
+        "stream.capture.sink=true",
+        "--raw",
+        "--format",
+        "s16",
+        "--rate",
+        "8000",
+        "--channels",
+        "1",
+        "-",
+    ]
+}
+
 fn spawn_monitor() -> Option<Child> {
-    if let Some(child) = try_command(
-        "pw-record",
-        &[
-            "--raw",
-            "--format",
-            "s16",
-            "--rate",
-            "8000",
-            "--channels",
-            "1",
-            "-",
-        ],
-    ) {
+    if let Some(child) = try_command("pw-record", pw_record_args()) {
         return Some(child);
     }
     try_command(
@@ -109,5 +115,15 @@ mod tests {
     #[test]
     fn silence_is_ulaw_ff() {
         assert_eq!(ulaw(0), 0xff);
+    }
+
+    #[test]
+    fn pw_record_captures_desktop_sink_not_microphone() {
+        let args = pw_record_args();
+        let pos = args
+            .iter()
+            .position(|a| *a == "-P")
+            .expect("pw-record must pass -P stream property");
+        assert_eq!(args.get(pos + 1), Some(&"stream.capture.sink=true"));
     }
 }

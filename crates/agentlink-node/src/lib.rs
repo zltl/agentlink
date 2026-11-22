@@ -4,7 +4,7 @@
 //! command, PTY, search, edit, watch, and desktop operations. It reconnects
 //! on its own. Screenshot and input handlers come from `agentlink-desktop`.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod audit;
 mod daemon;

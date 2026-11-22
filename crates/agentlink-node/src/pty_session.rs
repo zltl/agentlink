@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::audit::{self, Origin};
 #[cfg(not(windows))]
@@ -19,14 +19,93 @@ use crate::proc::push_capped;
 use agentlink_core::util;
 use agentlink_core::{Error, Result};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use tokio::sync::{mpsc, oneshot};
+
+/// Maximum decoded bytes accepted in a single `PtyInput` request.
+pub const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
+const PTY_IO_CHANNEL_BOUND: usize = 128;
+const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(150);
+const POST_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum PtyReply {
+    Async(oneshot::Sender<Result<()>>),
+    #[cfg(test)]
+    Sync(std::sync::mpsc::Sender<Result<()>>),
+}
+
+impl PtyReply {
+    fn send(self, res: Result<()>) {
+        match self {
+            Self::Async(tx) => {
+                let _ = tx.send(res);
+            }
+            #[cfg(test)]
+            Self::Sync(tx) => {
+                let _ = tx.send(res);
+            }
+        }
+    }
+}
+
+enum PtyIoCmd {
+    Write { data: Vec<u8>, reply: PtyReply },
+    Resize { rows: u16, cols: u16, reply: PtyReply },
+}
+
+enum PtyIoTicketInner {
+    Queued(oneshot::Receiver<Result<()>>),
+    Backpressured {
+        tx: mpsc::Sender<PtyIoCmd>,
+        cmd: PtyIoCmd,
+        rx: oneshot::Receiver<Result<()>>,
+    },
+}
+
+/// Ticket returned by [`PtyManager::enqueue_write`] / [`PtyManager::enqueue_resize`].
+/// Fast-path calls enqueue synchronously in arrival order; backpressured calls
+/// send asynchronously off the WebSocket loop.
+pub struct PtyIoTicket(PtyIoTicketInner);
+
+impl PtyIoTicket {
+    pub async fn finish(self) -> Result<()> {
+        let rx = match self.0 {
+            PtyIoTicketInner::Queued(rx) => rx,
+            PtyIoTicketInner::Backpressured { tx, cmd, rx } => {
+                tx.send(cmd)
+                    .await
+                    .map_err(|_| Error::Message("pty session closed".into()))?;
+                rx
+            }
+        };
+        rx.await
+            .map_err(|_| Error::Message("pty session closed".into()))?
+    }
+}
 
 struct LivePty {
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    io_tx: mpsc::Sender<PtyIoCmd>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    pid: Option<u32>,
+    #[cfg(windows)]
+    job: Option<WindowsJob>,
     owner_peer: String,
     grant_jti: String,
     grant_exp_unix: Option<i64>,
+}
+
+impl LivePty {
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            kill_process_group(pid);
+        }
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            job.terminate();
+        }
+        let _ = self.pid;
+        let _ = self.killer.kill();
+    }
 }
 
 pub type PtyGrantHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -95,23 +174,11 @@ impl PtyManager {
             })
             .map_err(|e| Error::Message(format!("openpty: {e}")))?;
 
-        #[allow(unused_mut)]
-        let mut windows_pty_script: Option<PathBuf> = None;
         let mut cmd = match command {
             Some(line) => {
                 #[cfg(windows)]
                 {
-                    // portable-pty has no raw_arg; argv quoting would mangle user
-                    // quotes. Run the line from a temp .cmd instead.
-                    let bat = windows_pty_script_path(&session_id);
-                    std::fs::write(&bat, format!("{line}\r\n"))
-                        .map_err(|e| Error::Message(format!("pty script: {e}")))?;
-                    windows_pty_script = Some(bat.clone());
-                    let mut cmd = CommandBuilder::new("cmd.exe");
-                    cmd.arg("/D");
-                    cmd.arg("/C");
-                    cmd.arg(&bat);
-                    cmd
+                    build_windows_pty_cmd(&line)
                 }
                 #[cfg(not(windows))]
                 {
@@ -137,6 +204,10 @@ impl PtyManager {
             .map_err(|e| Error::Message(format!("pty spawn: {e}")))?;
         drop(pair.slave);
 
+        let pid = child.process_id();
+        #[cfg(windows)]
+        let job = pid.and_then(WindowsJob::attach_pid);
+
         let reader = pair
             .master
             .try_clone_reader()
@@ -146,7 +217,10 @@ impl PtyManager {
             .take_writer()
             .map_err(|e| Error::Message(format!("pty writer: {e}")))?;
         let killer = child.clone_killer();
-        let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
+        let master: Box<dyn MasterPty + Send> = pair.master;
+
+        let (io_tx, io_rx) = mpsc::channel::<PtyIoCmd>(PTY_IO_CHANNEL_BOUND);
+        spawn_pty_io_worker(&session_id, master, writer, io_rx)?;
 
         {
             let mut sessions = self
@@ -155,8 +229,18 @@ impl PtyManager {
                 .map_err(|_| Error::Message("pty map poisoned".into()))?;
             if sessions.len() >= MAX_PTY_SESSIONS {
                 drop(sessions);
-                let mut killer = killer;
-                let _ = killer.kill();
+                let mut live = LivePty {
+                    io_tx,
+                    killer,
+                    pid,
+                    #[cfg(windows)]
+                    job,
+                    owner_peer,
+                    grant_jti,
+                    grant_exp_unix,
+                };
+                live.terminate();
+                drop(live);
                 tokio::task::spawn_blocking(move || {
                     let _ = child.wait();
                 });
@@ -167,9 +251,11 @@ impl PtyManager {
             sessions.insert(
                 session_id.to_string(),
                 LivePty {
-                    master,
-                    writer: Arc::new(Mutex::new(writer)),
+                    io_tx,
                     killer,
+                    pid,
+                    #[cfg(windows)]
+                    job,
                     owner_peer: owner_peer.clone(),
                     grant_jti: grant_jti.clone(),
                     grant_exp_unix,
@@ -212,7 +298,7 @@ impl PtyManager {
         // return while the last bytes are still in the master buffer, and the
         // client stops on exit. A dead relay socket does not stop the read:
         // frames stay in the replay ring until the node redials.
-        let reader_done = tokio::task::spawn_blocking(move || {
+        let mut reader_done = tokio::task::spawn_blocking(move || {
             let mut reader = reader;
             let mut buf = [0u8; 4096];
             loop {
@@ -239,18 +325,35 @@ impl PtyManager {
         let id = session_id.to_string();
         tokio::spawn(async move {
             let status = tokio::task::spawn_blocking(move || child.wait()).await;
-            // ConPTY often keeps the master readable open after the child exits,
-            // so the reader never sees EOF and `shell --command` hangs forever.
-            // Dropping the live session closes the master/writer and unblocks it.
-            {
-                if let Ok(mut map) = sessions.lock() {
-                    map.remove(&id);
+            // Remove from the live map immediately so no further input/resize is
+            // accepted, while holding `live_owned` briefly so ConPTY/Unix master
+            // pipes can finish draining trailing bytes before teardown.
+            let mut live_owned = sessions.lock().ok().and_then(|mut map| map.remove(&id));
+            let drained_early = tokio::time::timeout(POST_EXIT_DRAIN_GRACE, &mut reader_done)
+                .await
+                .is_ok();
+            // Terminate any lingering grandchildren (process group / job object)
+            // and drop `live_owned` (closing the I/O worker's master/writer/HPCON)
+            // so ConPTY or inherited slave FDs unblock EOF cleanly.
+            if let Some(mut live) = live_owned.take() {
+                live.terminate();
+                drop(live);
+            } else {
+                #[cfg(unix)]
+                if let Some(p) = pid {
+                    kill_process_group(p);
                 }
             }
-            if let Some(bat) = windows_pty_script {
-                let _ = std::fs::remove_file(bat);
+            if !drained_early
+                && tokio::time::timeout(POST_CLOSE_DRAIN_TIMEOUT, &mut reader_done)
+                    .await
+                    .is_err()
+            {
+                tracing::warn!(
+                    session_id = %id,
+                    "pty reader did not reach EOF within post-exit drain timeout; emitting End"
+                );
             }
-            let _ = reader_done.await;
             let (code, error) = match status {
                 Ok(Ok(status)) => (Some(status.exit_code() as i32), None),
                 Ok(Err(err)) => (None, Some(err.to_string())),
@@ -283,50 +386,149 @@ impl PtyManager {
         Ok(session_id)
     }
 
-    pub fn write(&self, session_id: &str, data: &[u8], peer: &str) -> Result<()> {
-        let writer = {
-            let sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| Error::Message("pty map poisoned".into()))?;
-            let live = sessions
-                .get(session_id)
-                .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
-            require_pty_access(live, Some(peer), self.grant_hook().as_deref())?;
-            live.writer.clone()
+    pub fn enqueue_write(
+        &self,
+        session_id: &str,
+        data: Vec<u8>,
+        peer: &str,
+    ) -> Result<PtyIoTicket> {
+        if data.len() > MAX_PTY_INPUT_BYTES {
+            return Err(Error::Message(format!(
+                "pty input exceeds {MAX_PTY_INPUT_BYTES} byte limit"
+            )));
+        }
+        let io_tx = self.authorized_io_tx(session_id, peer)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = PtyIoCmd::Write {
+            data,
+            reply: PtyReply::Async(reply_tx),
         };
-        let mut guard = writer
-            .lock()
-            .map_err(|_| Error::Message("pty writer poisoned".into()))?;
-        guard.write_all(data)?;
-        guard.flush()?;
-        Ok(())
+        match io_tx.try_send(cmd) {
+            Ok(()) => Ok(PtyIoTicket(PtyIoTicketInner::Queued(reply_rx))),
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                Ok(PtyIoTicket(PtyIoTicketInner::Backpressured {
+                    tx: io_tx,
+                    cmd,
+                    rx: reply_rx,
+                }))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(Error::NotFound(format!("pty session {session_id}")))
+            }
+        }
     }
 
-    pub fn resize(&self, session_id: &str, rows: u16, cols: u16, peer: &str) -> Result<()> {
-        let master = {
-            let sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| Error::Message("pty map poisoned".into()))?;
-            let live = sessions
-                .get(session_id)
-                .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
-            require_pty_access(live, Some(peer), self.grant_hook().as_deref())?;
-            live.master.clone()
+    pub fn enqueue_resize(
+        &self,
+        session_id: &str,
+        rows: u16,
+        cols: u16,
+        peer: &str,
+    ) -> Result<PtyIoTicket> {
+        let io_tx = self.authorized_io_tx(session_id, peer)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = PtyIoCmd::Resize {
+            rows,
+            cols,
+            reply: PtyReply::Async(reply_tx),
         };
-        let guard = master
+        match io_tx.try_send(cmd) {
+            Ok(()) => Ok(PtyIoTicket(PtyIoTicketInner::Queued(reply_rx))),
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                Ok(PtyIoTicket(PtyIoTicketInner::Backpressured {
+                    tx: io_tx,
+                    cmd,
+                    rx: reply_rx,
+                }))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(Error::NotFound(format!("pty session {session_id}")))
+            }
+        }
+    }
+
+    pub async fn write_async(&self, session_id: &str, data: Vec<u8>, peer: &str) -> Result<()> {
+        self.enqueue_write(session_id, data, peer)?.finish().await
+    }
+
+    pub async fn resize_async(
+        &self,
+        session_id: &str,
+        rows: u16,
+        cols: u16,
+        peer: &str,
+    ) -> Result<()> {
+        self.enqueue_resize(session_id, rows, cols, peer)?
+            .finish()
+            .await
+    }
+
+    #[cfg(test)]
+    pub fn write(&self, session_id: &str, data: &[u8], peer: &str) -> Result<()> {
+        if data.len() > MAX_PTY_INPUT_BYTES {
+            return Err(Error::Message(format!(
+                "pty input exceeds {MAX_PTY_INPUT_BYTES} byte limit"
+            )));
+        }
+        let io_tx = self.authorized_io_tx(session_id, peer)?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let mut cmd = PtyIoCmd::Write {
+            data: data.to_vec(),
+            reply: PtyReply::Sync(reply_tx),
+        };
+        loop {
+            match io_tx.try_send(cmd) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    cmd = returned;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(Error::NotFound(format!("pty session {session_id}")));
+                }
+            }
+        }
+        reply_rx
+            .recv()
+            .map_err(|_| Error::Message("pty session closed".into()))?
+    }
+
+    #[cfg(test)]
+    pub fn resize(&self, session_id: &str, rows: u16, cols: u16, peer: &str) -> Result<()> {
+        let io_tx = self.authorized_io_tx(session_id, peer)?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let mut cmd = PtyIoCmd::Resize {
+            rows,
+            cols,
+            reply: PtyReply::Sync(reply_tx),
+        };
+        loop {
+            match io_tx.try_send(cmd) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    cmd = returned;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(Error::NotFound(format!("pty session {session_id}")));
+                }
+            }
+        }
+        reply_rx
+            .recv()
+            .map_err(|_| Error::Message("pty session closed".into()))?
+    }
+
+    fn authorized_io_tx(&self, session_id: &str, peer: &str) -> Result<mpsc::Sender<PtyIoCmd>> {
+        let sessions = self
+            .sessions
             .lock()
-            .map_err(|_| Error::Message("pty master poisoned".into()))?;
-        guard
-            .resize(PtySize {
-                rows: rows.max(1),
-                cols: cols.max(1),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| Error::Message(format!("pty resize: {e}")))?;
-        Ok(())
+            .map_err(|_| Error::Message("pty map poisoned".into()))?;
+        let live = sessions
+            .get(session_id)
+            .ok_or_else(|| Error::NotFound(format!("pty session {session_id}")))?;
+        require_pty_access(live, Some(peer), self.grant_hook().as_deref())?;
+        Ok(live.io_tx.clone())
     }
 
     pub fn close(&self, session_id: &str, peer: Option<&str>) -> Result<()> {
@@ -343,11 +545,12 @@ impl PtyManager {
             sessions.remove(session_id)
         };
         if let Some(live) = live.as_mut() {
-            live.killer.kill().ok();
+            live.terminate();
         }
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn close_for_jti(&self, jti: &str) -> usize {
         let jti = jti.trim();
         if jti.is_empty() {
@@ -369,7 +572,7 @@ impl PtyManager {
         };
         let n = victims.len();
         for mut live in victims {
-            live.killer.kill().ok();
+            live.terminate();
         }
         n
     }
@@ -392,7 +595,7 @@ impl PtyManager {
         };
         let n = victims.len();
         for mut live in victims {
-            live.killer.kill().ok();
+            live.terminate();
         }
         n
     }
@@ -429,11 +632,12 @@ impl PtyManager {
         };
         let n = victims.len();
         for mut live in victims {
-            live.killer.kill().ok();
+            live.terminate();
         }
         n
     }
 
+    #[cfg(test)]
     pub fn has_session(&self, id: &str) -> bool {
         let sessions = match self.sessions.lock() {
             Ok(guard) => guard,
@@ -448,7 +652,219 @@ impl PtyManager {
             Err(poison) => std::mem::take(&mut *poison.into_inner()),
         };
         for (_, mut live) in sessions {
-            live.killer.kill().ok();
+            live.terminate();
+        }
+    }
+}
+
+fn spawn_pty_io_worker(
+    session_id: &str,
+    master: Box<dyn MasterPty + Send>,
+    mut writer: Box<dyn Write + Send>,
+    mut rx: mpsc::Receiver<PtyIoCmd>,
+) -> Result<()> {
+    let prefix = session_id.get(..8).unwrap_or(session_id);
+    std::thread::Builder::new()
+        .name(format!("pty-io-{prefix}"))
+        .spawn(move || {
+            while let Some(cmd) = rx.blocking_recv() {
+                match cmd {
+                    PtyIoCmd::Write { data, reply } => {
+                        let res = writer
+                            .write_all(&data)
+                            .and_then(|()| writer.flush())
+                            .map_err(Error::Io);
+                        reply.send(res);
+                    }
+                    PtyIoCmd::Resize { rows, cols, reply } => {
+                        let res = master
+                            .resize(PtySize {
+                                rows: rows.max(1),
+                                cols: cols.max(1),
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            })
+                            .map_err(|e| Error::Message(format!("pty resize: {e}")));
+                        reply.send(res);
+                    }
+                }
+            }
+            drop(writer);
+            drop(master);
+        })
+        .map_err(|err| Error::Message(format!("pty io thread: {err}")))?;
+    Ok(())
+}
+
+/// Build a Windows `cmd.exe /D /S /C` command without creating temp `.cmd`
+/// files (which leak in `%TEMP%` and mangle `%` / UTF-8).
+///
+/// `portable-pty` applies MSVC `ArgvQuote` to every argument. When `line` has
+/// no embedded `"` or trailing `\`, `cmd.exe /D /S /C <line>` receives `"line"`
+/// cleanly and `/S` strips the outer quotes while preserving `%VAR%` and UTF-8.
+/// When `line` contains `"` or a trailing `\`, we pass it via `AGENTLINK_PTY_CMD`
+/// so `ArgvQuote` never injects `\"` escapes that `cmd.exe` does not unescape.
+#[cfg(any(windows, test))]
+fn build_windows_pty_cmd(line: &str) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new("cmd.exe");
+    cmd.arg("/D");
+    cmd.arg("/S");
+    cmd.arg("/C");
+    if !line.contains('"') && !line.ends_with('\\') && !line.contains('\r') && !line.contains('\n')
+    {
+        cmd.arg(line);
+    } else {
+        cmd.env("AGENTLINK_PTY_CMD", line);
+        cmd.arg("%AGENTLINK_PTY_CMD%");
+    }
+    cmd
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_process_group(pid: u32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    if let Ok(pgid) = i32::try_from(pid) {
+        if pgid > 0 {
+            // SAFETY: POSIX `kill(-pgid, SIGKILL)` targets the session/process group
+            // created by `portable-pty` (`setsid()`).
+            unsafe {
+                let _ = kill(-pgid, SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+struct WindowsJob {
+    handle: usize,
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+impl WindowsJob {
+    fn attach_pid(pid: u32) -> Option<Self> {
+        use core::ffi::c_void;
+
+        #[repr(C)]
+        struct JobObjectBasicLimitInformation {
+            per_process_user_time_limit: i64,
+            per_job_user_time_limit: i64,
+            limit_flags: u32,
+            minimum_working_set_size: usize,
+            maximum_working_set_size: usize,
+            active_process_limit: u32,
+            affinity: usize,
+            priority_class: u32,
+            scheduling_class: u32,
+        }
+
+        #[repr(C)]
+        struct IoCounters {
+            read_operation_count: u64,
+            write_operation_count: u64,
+            other_operation_count: u64,
+            read_transfer_count: u64,
+            write_transfer_count: u64,
+            other_transfer_count: u64,
+        }
+
+        #[repr(C)]
+        struct JobObjectExtendedLimitInformation {
+            basic_limit_information: JobObjectBasicLimitInformation,
+            io_info: IoCounters,
+            process_memory_limit: usize,
+            job_memory_limit: usize,
+            peak_process_memory_used: usize,
+            peak_job_memory_used: usize,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> *mut c_void;
+            fn SetInformationJobObject(
+                job: *mut c_void,
+                class: u32,
+                info: *const c_void,
+                len: u32,
+            ) -> i32;
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+
+        const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+        const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+        const PROCESS_SET_QUOTA: u32 = 0x0100;
+        const PROCESS_TERMINATE: u32 = 0x0001;
+
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JobObjectExtendedLimitInformation = std::mem::zeroed();
+            info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                (&info as *const JobObjectExtendedLimitInformation).cast::<c_void>(),
+                std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+            ) == 0
+            {
+                CloseHandle(job);
+                return None;
+            }
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if proc.is_null() {
+                CloseHandle(job);
+                return None;
+            }
+            let assigned = AssignProcessToJobObject(job, proc);
+            CloseHandle(proc);
+            if assigned == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self {
+                handle: job as usize,
+            })
+        }
+    }
+
+    fn terminate(self) {
+        use core::ffi::c_void;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+        }
+        if self.handle != 0 {
+            unsafe {
+                let _ = TerminateJobObject(self.handle as *mut c_void, 1);
+            }
+        }
+        drop(self);
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        use core::ffi::c_void;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        if self.handle != 0 {
+            let h = std::mem::replace(&mut self.handle, 0);
+            unsafe {
+                let _ = CloseHandle(h as *mut c_void);
+            }
         }
     }
 }
@@ -535,21 +951,6 @@ fn pty_access_error(
     Ok(())
 }
 
-/// Windows temp script name uses only a UUID stem. Client request ids, path
-/// separators, and `..` never reach `temp_dir().join`.
-fn windows_pty_script_path(session_id: &str) -> PathBuf {
-    let stem = safe_pty_script_stem(session_id);
-    std::env::temp_dir().join(format!("agentlink-pty-{stem}.cmd"))
-}
-
-fn safe_pty_script_stem(session_id: &str) -> String {
-    let trimmed = session_id.trim();
-    if uuid::Uuid::parse_str(trimmed).is_ok() {
-        return trimmed.to_ascii_lowercase();
-    }
-    uuid::Uuid::new_v4().to_string()
-}
-
 fn default_shell() -> String {
     if cfg!(windows) {
         "cmd.exe".into()
@@ -632,26 +1033,139 @@ mod tests {
     }
 
     #[test]
-    fn windows_pty_script_path_rejects_traversal_and_uses_uuid() {
-        let id = uuid::Uuid::new_v4().to_string();
-        let path = windows_pty_script_path(&id);
-        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
-        assert!(path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("agentlink-pty-"));
-        assert!(path.extension().and_then(|e| e.to_str()) == Some("cmd"));
-        let bad = windows_pty_script_path("..\\..\\evil");
-        assert_eq!(bad.parent(), Some(std::env::temp_dir().as_path()));
-        let name = bad.file_name().unwrap().to_string_lossy();
-        assert!(!name.contains("evil"), "{name}");
-        assert!(!name.contains(".."), "{name}");
-        assert!(uuid::Uuid::parse_str(
-            name.trim_start_matches("agentlink-pty-")
-                .trim_end_matches(".cmd")
-        )
-        .is_ok());
+    fn windows_pty_cmd_uses_cmd_d_s_c_without_temp_files() {
+        let simple = build_windows_pty_cmd("echo 100% && exit /b 9");
+        let argv: Vec<String> = simple
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            vec!["cmd.exe", "/D", "/S", "/C", "echo 100% && exit /b 9"]
+        );
+        assert!(simple.get_env("AGENTLINK_PTY_CMD").is_none());
+
+        let quoted = build_windows_pty_cmd(r#""C:\Program Files\tool.exe" --msg "你好""#);
+        let q_argv: Vec<String> = quoted
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(q_argv, vec!["cmd.exe", "/D", "/S", "/C", "%AGENTLINK_PTY_CMD%"]);
+        assert_eq!(
+            quoted.get_env("AGENTLINK_PTY_CMD").and_then(|v| v.to_str()),
+            Some(r#""C:\Program Files\tool.exe" --msg "你好""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_input_rejects_over_64kib_and_preserves_order() {
+        let mgr = PtyManager::default();
+        let (resp, dir) = test_responder();
+        let service = crate::pipeline::AuditService::open_quiet(dir.path(), "node", "box");
+        let origin = crate::audit::Origin {
+            path: dir.path().join("audit.log"),
+            node: "box".into(),
+            node_id: "node".into(),
+        };
+        let sid = mgr
+            .open(
+                Some("cat".into()),
+                None,
+                24,
+                80,
+                resp.clone(),
+                origin,
+                Some("alice".into()),
+                service,
+                "alice",
+                "jti-order",
+                None,
+            )
+            .await
+            .expect("open cat pty");
+        let oversize = vec![b'x'; MAX_PTY_INPUT_BYTES + 1];
+        let err = mgr.enqueue_write(&sid, oversize, "alice").err().expect("oversize must fail");
+        assert!(err.to_string().contains("limit"), "{err}");
+
+        // Enqueue multiple sequential chunks in order and verify FIFO arrival.
+        let mut tickets = Vec::new();
+        for ch in ["FIRST_", "SECOND_", "THIRD\n"] {
+            tickets.push(
+                mgr.enqueue_write(&sid, ch.as_bytes().to_vec(), "alice")
+                    .expect("enqueue"),
+            );
+        }
+        for ticket in tickets {
+            ticket.finish().await.expect("write finish");
+        }
+        let text = wait_transcript_contains(&resp, "FIRST_SECOND_THIRD", Duration::from_secs(3)).await;
+        let _ = mgr.close(&sid, Some("alice"));
+        assert!(
+            text.contains("FIRST_SECOND_THIRD"),
+            "ordered pty writes were scrambled: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_close_kills_grandchildren_via_group_or_job() {
+        let mgr = PtyManager::default();
+        let (resp, dir) = test_responder();
+        let service = crate::pipeline::AuditService::open_quiet(dir.path(), "node", "box");
+        let origin = crate::audit::Origin {
+            path: dir.path().join("audit.log"),
+            node: "box".into(),
+            node_id: "node".into(),
+        };
+        let started = dir.path().join("started.flag");
+        let leaked = dir.path().join("leaked.flag");
+        let cmd = if cfg!(windows) {
+            let child = dir.path().join("gc.bat");
+            std::fs::write(
+                &child,
+                format!(
+                    "@echo off\r\necho ok> \"{}\"\r\nping -n 3 127.0.0.1 >NUL\r\necho leaked> \"{}\"\r\n",
+                    started.display(),
+                    leaked.display()
+                ),
+            )
+            .unwrap();
+            format!("start \"\" /b cmd /c \"{}\" && ping -n 30 127.0.0.1 >NUL", child.display())
+        } else {
+            format!(
+                "(echo ok > '{}'; sleep 2; echo leaked > '{}') & sleep 30",
+                started.display(),
+                leaked.display()
+            )
+        };
+        let sid = mgr
+            .open(
+                Some(cmd),
+                None,
+                24,
+                80,
+                resp,
+                origin,
+                Some("alice".into()),
+                service,
+                "alice",
+                "jti-gc",
+                None,
+            )
+            .await
+            .expect("open grandchild pty");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(started.exists(), "grandchild never started");
+        mgr.close(&sid, Some("alice")).expect("close");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !leaked.exists(),
+            "grandchild survived PTY close/job termination!"
+        );
     }
 
     #[test]

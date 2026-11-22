@@ -74,6 +74,8 @@ typedef struct PwCapture {
     struct pw_context *context;
     struct pw_core *core;
     struct pw_stream *stream;
+    struct spa_hook stream_listener;
+    int stream_listener_added;
     int width;
     int height;
     int stride;
@@ -278,11 +280,14 @@ static void apply_cursor_meta(PwCapture *cap, struct spa_buffer *spa_buf) {
                         uint8_t g = px[1];
                         uint8_t b = is_bgr ? px[0] : px[2];
                         uint8_t a = force_opaque ? 255 : px[3];
-                        /* Un-premultiply Mutter premul → straight RGBA for wire. */
+                        /* Un-premultiply Mutter premul → straight RGBA for wire, clamping against u8 overflow. */
                         if (!force_opaque && a > 0 && a < 255) {
-                            r = (uint8_t)(((unsigned)r * 255u) / (unsigned)a);
-                            g = (uint8_t)(((unsigned)g * 255u) / (unsigned)a);
-                            b = (uint8_t)(((unsigned)b * 255u) / (unsigned)a);
+                            unsigned ur = ((unsigned)r * 255u + (unsigned)a / 2u) / (unsigned)a;
+                            unsigned ug = ((unsigned)g * 255u + (unsigned)a / 2u) / (unsigned)a;
+                            unsigned ub = ((unsigned)b * 255u + (unsigned)a / 2u) / (unsigned)a;
+                            r = (uint8_t)(ur > 255u ? 255u : ur);
+                            g = (uint8_t)(ug > 255u ? 255u : ug);
+                            b = (uint8_t)(ub > 255u ? 255u : ub);
                         }
                         drow[col * 4 + 0] = r;
                         drow[col * 4 + 1] = g;
@@ -468,6 +473,9 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
         cap->core = pw_context_connect(cap->context, NULL, 0);
     }
     if (!cap->core) {
+        if (fd >= 0) {
+            close(fd);
+        }
         pw_thread_loop_unlock(cap->loop);
         pw_thread_loop_stop(cap->loop);
         pw_context_destroy(cap->context);
@@ -498,6 +506,8 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
             spa_hook_remove(&hook);
             pw_proxy_destroy((struct pw_proxy *)registry);
             if (!wait.found) {
+                pw_core_disconnect(cap->core);
+                cap->core = NULL;
                 pw_thread_loop_unlock(cap->loop);
                 pw_thread_loop_stop(cap->loop);
                 pw_context_destroy(cap->context);
@@ -518,13 +528,14 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
         PW_KEY_MEDIA_CATEGORY, "Capture",
         PW_KEY_MEDIA_ROLE, "Screen",
         NULL);
-    cap->stream = pw_stream_new_simple(
-        pw_thread_loop_get_loop(cap->loop),
+    /* Attach the stream to cap->core so portal-provided fds are honored. */
+    cap->stream = pw_stream_new(
+        cap->core,
         "agentlink-screencast",
-        props,
-        &STREAM_EVENTS,
-        cap);
+        props);
     if (!cap->stream) {
+        pw_core_disconnect(cap->core);
+        cap->core = NULL;
         pw_thread_loop_unlock(cap->loop);
         pw_thread_loop_stop(cap->loop);
         pw_context_destroy(cap->context);
@@ -533,6 +544,8 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
         free(cap);
         return NULL;
     }
+    pw_stream_add_listener(cap->stream, &cap->stream_listener, &STREAM_EVENTS, cap);
+    cap->stream_listener_added = 1;
     /*
      * Without an EnumFormat the consumer port never negotiates and
      * param_changed/process never fire. Mutter offers BGRx/BGRA on memfd or
@@ -578,7 +591,14 @@ PwCapture *al_pw_open(int fd, unsigned int node_id) {
                 PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
                 params,
                 n_params) < 0) {
+            if (cap->stream_listener_added) {
+                spa_hook_remove(&cap->stream_listener);
+                cap->stream_listener_added = 0;
+            }
             pw_stream_destroy(cap->stream);
+            cap->stream = NULL;
+            pw_core_disconnect(cap->core);
+            cap->core = NULL;
             pw_thread_loop_unlock(cap->loop);
             pw_thread_loop_stop(cap->loop);
             pw_context_destroy(cap->context);
@@ -621,15 +641,6 @@ int al_pw_take(
                 pthread_mutex_unlock(&cap->mu);
                 return -1;
             }
-            if (size64 > (uint64_t)(uint32_t)dst_cap) {
-                /* Report the real geometry so the caller can resize. */
-                *width = cap->width;
-                *height = cap->height;
-                *stride = cap->stride;
-                *dma_buf = cap->dma_buf;
-                pthread_mutex_unlock(&cap->mu);
-                return -2;
-            }
             if (cap->target_width > 0 && cap->target_width < cap->width) {
                 int out_w = cap->target_width;
                 int out_h = (int)(((int64_t)cap->height * (int64_t)out_w + cap->width / 2) / cap->width);
@@ -652,6 +663,15 @@ int al_pw_take(
                 *height = out_h;
                 *stride = (int)out_stride64;
             } else {
+                if (size64 > (uint64_t)(uint32_t)dst_cap) {
+                    /* Report the real geometry so the caller can resize. */
+                    *width = cap->width;
+                    *height = cap->height;
+                    *stride = cap->stride;
+                    *dma_buf = cap->dma_buf;
+                    pthread_mutex_unlock(&cap->mu);
+                    return -2;
+                }
                 memcpy(dst, cap->bgra, (size_t)size64);
                 *width = cap->width;
                 *height = cap->height;
@@ -776,7 +796,16 @@ void al_pw_close(PwCapture *cap) {
     if (cap->loop) {
         pw_thread_loop_lock(cap->loop);
         if (cap->stream) {
+            if (cap->stream_listener_added) {
+                spa_hook_remove(&cap->stream_listener);
+                cap->stream_listener_added = 0;
+            }
             pw_stream_destroy(cap->stream);
+            cap->stream = NULL;
+        }
+        if (cap->core) {
+            pw_core_disconnect(cap->core);
+            cap->core = NULL;
         }
         pw_thread_loop_unlock(cap->loop);
         pw_thread_loop_stop(cap->loop);

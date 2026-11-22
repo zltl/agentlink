@@ -128,6 +128,10 @@ pub struct ClipboardWatchState {
     suppress_until: Option<Instant>,
     /// Remember a change we delayed because of the send rate limit.
     pending: bool,
+    /// False until the initial local clipboard contents have been observed and
+    /// recorded as a baseline. Prevents auto-sync from exfiltrating pre-existing
+    /// clipboard secrets (passwords/OTPs/SSH keys) on session connect.
+    seeded: bool,
 }
 
 impl Default for ClipboardWatchState {
@@ -146,7 +150,36 @@ impl ClipboardWatchState {
             last_sent_at: None,
             suppress_until: None,
             pending: false,
+            seeded: false,
         }
+    }
+
+    /// Create a watcher already seeded with the current OS clipboard so
+    /// pre-existing secrets are never pushed on connect; only subsequent local
+    /// copies will sync.
+    pub fn seeded() -> Self {
+        let mut state = Self::new();
+        state.seed_from_os();
+        state
+    }
+
+    /// Snapshot the current OS clipboard as the connect-time baseline without
+    /// pushing it to the peer.
+    pub fn seed_from_os(&mut self) {
+        let gen = platform_generation();
+        let current = read_clipboard().ok();
+        self.seed(current.as_ref().map(|c| c.text.as_str()), gen);
+    }
+
+    /// Record the current local clipboard as the connect-time baseline without
+    /// pushing it to the peer.
+    pub fn seed(&mut self, text: Option<&str>, generation: Option<u64>) {
+        if let Some(text) = text {
+            self.last_fp = fingerprint(text);
+        }
+        self.last_generation = generation;
+        self.pending = false;
+        self.seeded = true;
     }
 
     /// Record a clipboard we just wrote so the next poll does not echo it.
@@ -157,30 +190,61 @@ impl ClipboardWatchState {
         self.last_generation = platform_generation();
         self.suppress_until = Some(Instant::now() + CLIPBOARD_ECHO_SUPPRESS);
         self.pending = false;
+        self.seeded = true;
     }
 
     /// Read the local clipboard if it may have changed and return a payload
     /// worth sending. Unchanged, echoed, oversized, or too-frequent updates
     /// are skipped.
+    ///
+    /// If the watcher was constructed with [`Self::new`] and not yet seeded,
+    /// the first poll records the existing clipboard as the baseline and
+    /// returns `None` so pre-existing clipboard contents are never leaked on
+    /// connect.
     pub fn poll_outgoing(&mut self) -> Option<ClipboardText> {
-        if let Some(gen) = platform_generation() {
+        self.poll_outgoing_with(Instant::now(), platform_generation, read_clipboard)
+    }
+
+    pub(crate) fn poll_outgoing_with<G, R>(
+        &mut self,
+        now: Instant,
+        mut get_gen: G,
+        mut read: R,
+    ) -> Option<ClipboardText>
+    where
+        G: FnMut() -> Option<u64>,
+        R: FnMut() -> Result<ClipboardText>,
+    {
+        if !self.seeded {
+            let gen = get_gen();
+            let current = read().ok();
+            self.seed(current.as_ref().map(|c| c.text.as_str()), gen);
+            return None;
+        }
+        // Do NOT advance `last_generation` while echo-suppression is active:
+        // a real local copy made during the 500ms suppress window must remain
+        // visible to the first poll after `suppress_until` expires.
+        if self.suppress_until.is_some_and(|until| now < until) {
+            return None;
+        }
+        if let Some(gen) = get_gen() {
             if self.last_generation == Some(gen) && !self.pending {
                 return None;
             }
         }
-        let observed = match read_clipboard() {
+        let observed = match read() {
             Ok(clip) => Some(clip),
             Err(_) => {
                 // Image-only or empty clipboards are not text; remember the
                 // generation so we do not spin OpenClipboard / xclip.
-                self.last_generation = platform_generation();
+                self.last_generation = get_gen();
                 None
             }
         };
-        if let Some(gen) = platform_generation() {
+        if let Some(gen) = get_gen() {
             self.last_generation = Some(gen);
         }
-        self.take_outgoing(Instant::now(), observed)
+        self.take_outgoing(now, observed)
     }
 
     pub fn take_outgoing(
@@ -279,7 +343,7 @@ fn platform_write(text: &str) -> Result<()> {
     if write_stdin("wl-copy", &[], text).is_ok() {
         return Ok(());
     }
-    write_stdin("xclip", &["-selection", "clipboard"], text)
+    write_stdin("xclip", &["-selection", "clipboard", "-i"], text)
 }
 
 /// Process-lifetime clipboard handle so a set_text is not dropped (and
@@ -297,10 +361,14 @@ fn arboard_read() -> Result<String> {
     if slot.is_none() {
         *slot = Some(arboard::Clipboard::new().map_err(|err| msg(format!("clipboard: {err}")))?);
     }
-    slot.as_mut()
-        .expect("clipboard slot")
-        .get_text()
-        .map_err(|err| msg(format!("clipboard get: {err}")))
+    match slot.as_mut().expect("clipboard slot").get_text() {
+        Ok(text) => Ok(text),
+        Err(err) => {
+            // Reset stale display/clipboard handle so display restarts recover.
+            *slot = None;
+            Err(msg(format!("clipboard get: {err}")))
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -309,10 +377,43 @@ fn arboard_write(text: &str) -> Result<()> {
     if slot.is_none() {
         *slot = Some(arboard::Clipboard::new().map_err(|err| msg(format!("clipboard: {err}")))?);
     }
-    slot.as_mut()
+    match slot
+        .as_mut()
         .expect("clipboard slot")
         .set_text(text.to_string())
-        .map_err(|err| msg(format!("clipboard set: {err}")))
+    {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            *slot = None;
+            Err(msg(format!("clipboard set: {err}")))
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+const SUBPROCESS_CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(not(target_os = "windows"))]
+fn wait_child_bounded(
+    child: &mut std::process::Child,
+    program: &str,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(msg(format!("{program} timed out")));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(msg(format!("{program} wait: {err}"))),
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -326,15 +427,18 @@ fn write_stdin(program: &str, args: &[&str], text: &str) -> Result<()> {
         .spawn()
         .map_err(|err| msg(format!("{program}: {err}")))?;
     let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(msg(format!("{program}: no stdin")));
     };
-    stdin
-        .write_all(text.as_bytes())
-        .map_err(|err| msg(format!("{program} write: {err}")))?;
+    let write_res = stdin.write_all(text.as_bytes());
     drop(stdin);
-    let status = child
-        .wait()
-        .map_err(|err| msg(format!("{program} wait: {err}")))?;
+    if let Err(err) = write_res {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(msg(format!("{program} write: {err}")));
+    }
+    let status = wait_child_bounded(&mut child, program, SUBPROCESS_CLIPBOARD_TIMEOUT)?;
     if status.success() {
         Ok(())
     } else {
@@ -344,17 +448,36 @@ fn write_stdin(program: &str, args: &[&str], text: &str) -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn read_stdout(program: &str, args: &[&str]) -> Result<String> {
-    let output = agentlink_core::process::hidden(program)
+    use std::io::Read;
+    let mut child = agentlink_core::process::hidden(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .map_err(|err| msg(format!("{program}: {err}")))?;
-    if !output.status.success() {
-        return Err(msg(format!("{program} exited with {}", output.status)));
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(msg(format!("{program}: no stdout")));
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("agentlink-clip-read".into())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let res = stdout.read_to_end(&mut buf).map(|_| buf);
+            let _ = tx.send(res);
+        });
+    let status = wait_child_bounded(&mut child, program, SUBPROCESS_CLIPBOARD_TIMEOUT)?;
+    let bytes = rx
+        .recv_timeout(Duration::from_millis(500))
+        .map_err(|_| msg(format!("{program} stdout timed out")))?
+        .map_err(|err| msg(format!("{program} read: {err}")))?;
+    if !status.success() {
+        return Err(msg(format!("{program} exited with {status}")));
     }
-    String::from_utf8(output.stdout).map_err(|err| msg(format!("{program} utf8: {err}")))
+    String::from_utf8(bytes).map_err(|err| msg(format!("{program} utf8: {err}")))
 }
 
 #[cfg(target_os = "windows")]
@@ -365,13 +488,14 @@ mod windows_clip {
     use std::thread;
     use std::time::Duration;
 
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
         OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+    };
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
     pub fn sequence() -> Option<u64> {
@@ -413,12 +537,20 @@ mod windows_clip {
                     return Ok(String::new());
                 }
                 let hglobal = HGLOBAL(handle.0);
+                let byte_size = GlobalSize(hglobal);
+                if byte_size < 2 {
+                    return Ok(String::new());
+                }
                 let ptr = GlobalLock(hglobal);
                 if ptr.is_null() {
                     return Err(msg("GlobalLock failed for clipboard"));
                 }
-                let wide = PWSTR(ptr as *mut u16);
-                let text = wide.to_string().unwrap_or_default();
+                // Bounds-check against GlobalSize so a missing NUL terminator
+                // can never walk past the clipboard allocation.
+                let max_u16 = byte_size / 2;
+                let units = std::slice::from_raw_parts(ptr as *const u16, max_u16);
+                let end = units.iter().position(|&u| u == 0).unwrap_or(max_u16);
+                let text = String::from_utf16_lossy(&units[..end]);
                 let _ = GlobalUnlock(hglobal);
                 Ok(text)
             })();
@@ -439,12 +571,17 @@ mod windows_clip {
                     .map_err(|err| msg(format!("GlobalAlloc: {err}")))?;
                 let ptr = GlobalLock(hglobal);
                 if ptr.is_null() {
+                    let _ = GlobalFree(Some(hglobal));
                     return Err(msg("GlobalLock failed for clipboard write"));
                 }
                 std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr as *mut u16, wide.len());
                 let _ = GlobalUnlock(hglobal);
-                SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hglobal.0)))
-                    .map_err(|err| msg(format!("SetClipboardData: {err}")))?;
+                if let Err(err) =
+                    SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hglobal.0)))
+                {
+                    let _ = GlobalFree(Some(hglobal));
+                    return Err(msg(format!("SetClipboardData: {err}")));
+                }
                 // Ownership of hglobal transferred to the clipboard.
                 Ok(())
             })();
@@ -608,5 +745,70 @@ mod tests {
         }
         let got = read_clipboard().expect("read clipboard after write");
         assert_eq!(got.text, marker, "native/tool clipboard roundtrip");
+    }
+
+    #[test]
+    fn first_poll_seeds_without_exfiltrating_preexisting_secret() {
+        let mut state = ClipboardWatchState::new();
+        let t0 = Instant::now();
+        // Pre-existing password on clipboard before connecting must NEVER be sent.
+        let on_connect = state.poll_outgoing_with(
+            t0,
+            || Some(42),
+            || Ok(ClipboardText::capped("pre-existing-ssh-key".into())),
+        );
+        assert!(
+            on_connect.is_none(),
+            "first poll must seed baseline and not leak pre-existing secret"
+        );
+        // Same generation/content later is still not pushed.
+        let again = state.poll_outgoing_with(
+            t0 + Duration::from_secs(1),
+            || Some(42),
+            || Ok(ClipboardText::capped("pre-existing-ssh-key".into())),
+        );
+        assert!(again.is_none());
+        // A new local copy AFTER connect IS pushed.
+        let copied = state.poll_outgoing_with(
+            t0 + Duration::from_secs(2),
+            || Some(43),
+            || Ok(ClipboardText::capped("fresh-copy".into())),
+        );
+        assert_eq!(copied.expect("fresh copy").text, "fresh-copy");
+    }
+
+    #[test]
+    fn copy_during_echo_suppress_is_not_lost_on_generation_platforms() {
+        let mut state = ClipboardWatchState::new();
+        let t0 = Instant::now();
+        state.seed(Some("initial"), Some(10));
+        // Incoming sync applied at gen 11; suppress until t0 + 500ms.
+        state.note_applied("from-peer");
+        state.last_generation = Some(11);
+        state.suppress_until = Some(t0 + CLIPBOARD_ECHO_SUPPRESS);
+
+        // User copies a new secret at +150ms (gen 12) while still suppressed.
+        let during = state.poll_outgoing_with(
+            t0 + Duration::from_millis(150),
+            || Some(12),
+            || Ok(ClipboardText::capped("user-copy-during-suppress".into())),
+        );
+        assert!(during.is_none(), "must remain suppressed inside window");
+        assert_eq!(
+            state.last_generation,
+            Some(11),
+            "last_generation must not advance while suppressed"
+        );
+
+        // After suppress window expires, the user's copy at gen 12 MUST sync!
+        let after = state.poll_outgoing_with(
+            t0 + CLIPBOARD_ECHO_SUPPRESS + Duration::from_millis(10),
+            || Some(12),
+            || Ok(ClipboardText::capped("user-copy-during-suppress".into())),
+        );
+        assert_eq!(
+            after.expect("copy made during suppress must not be lost").text,
+            "user-copy-during-suppress"
+        );
     }
 }

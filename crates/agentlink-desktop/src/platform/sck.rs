@@ -1,7 +1,8 @@
 //! ScreenCaptureKit session. Frames arrive only when the display changes, so a
-//! quiet desktop does not copy pixels. The cursor is not burned into the video.
+//! quiet desktop does not copy pixels. The OS cursor stays embedded until
+//! macOS cursor metadata is wired end-to-end.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use screencapturekit::cm::CMSampleBufferExt;
@@ -20,7 +21,7 @@ struct Slot {
 }
 
 struct Handler {
-    slot: Arc<Mutex<Slot>>,
+    slot: Arc<(Mutex<Slot>, Condvar)>,
 }
 
 impl SCStreamOutputTrait for Handler {
@@ -43,16 +44,17 @@ impl SCStreamOutputTrait for Handler {
         let Ok(frame) = Frame::from_bgra(width, height, stride, bytes, "screencapturekit") else {
             return;
         };
-        if let Ok(mut slot) = self.slot.lock() {
+        if let Ok(mut slot) = self.slot.0.lock() {
             slot.seq = slot.seq.wrapping_add(1);
             slot.frame = Some(frame);
+            self.slot.1.notify_all();
         }
     }
 }
 
 pub struct SckSession {
     stream: SCStream,
-    slot: Arc<Mutex<Slot>>,
+    slot: Arc<(Mutex<Slot>, Condvar)>,
     seen: u64,
     interval: Duration,
     last: Instant,
@@ -83,16 +85,21 @@ impl SckSession {
         } else {
             request.max_fps.min(60.0) as u32
         };
+        // Keep the OS cursor visible in SCK video frames until macOS cursor
+        // metadata (position + shape + bitmap) is wired end-to-end.
         let config = SCStreamConfiguration::new()
             .with_width(width)
             .with_height(height)
             .with_pixel_format(PixelFormat::BGRA)
-            .with_shows_cursor(false)
+            .with_shows_cursor(true)
             .with_fps(fps.max(1));
-        let slot = Arc::new(Mutex::new(Slot {
-            frame: None,
-            seq: 0,
-        }));
+        let slot = Arc::new((
+            Mutex::new(Slot {
+                frame: None,
+                seq: 0,
+            }),
+            Condvar::new(),
+        ));
         let handler = Handler { slot: slot.clone() };
         let mut stream = SCStream::new(&filter, &config)
             .map_err(|err| msg(format!("ScreenCaptureKit stream: {err}")))?;
@@ -115,16 +122,37 @@ impl SckSession {
 }
 
 impl FrameSource for SckSession {
-    fn next_frame(&mut self, _timeout: Duration) -> Result<Option<Frame>> {
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
         wait_until_due(self.last, self.interval);
-        self.last = Instant::now();
-        let guard = self
+        let wait = timeout.max(Duration::from_millis(50));
+        let deadline = Instant::now() + wait;
+        let mut guard = self
             .slot
+            .0
             .lock()
             .map_err(|_| msg("ScreenCaptureKit slot poisoned"))?;
-        let Some(frame) = guard.frame.clone() else {
-            return Ok(Some(placeholder()));
-        };
+        // Never emit a synthetic 2x2 placeholder frame before the first real SCK
+        // callback arrives — wait up to `timeout` for a real frame instead.
+        while guard.frame.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(msg("ScreenCaptureKit has not delivered a frame yet"));
+            }
+            let (next_guard, wait_res) = self
+                .slot
+                .1
+                .wait_timeout(guard, remaining)
+                .map_err(|_| msg("ScreenCaptureKit slot poisoned"))?;
+            guard = next_guard;
+            if wait_res.timed_out() && guard.frame.is_none() {
+                return Err(msg("ScreenCaptureKit has not delivered a frame yet"));
+            }
+        }
+        self.last = Instant::now();
+        let frame = guard
+            .frame
+            .clone()
+            .ok_or_else(|| msg("ScreenCaptureKit has not delivered a frame yet"))?;
         if guard.seq == self.seen {
             let mut quiet = frame;
             quiet.mark_unchanged();
@@ -143,22 +171,5 @@ impl FrameSource for SckSession {
 impl Drop for SckSession {
     fn drop(&mut self) {
         let _ = self.stream.stop_capture();
-    }
-}
-
-fn placeholder() -> Frame {
-    Frame::from_bgra(2, 2, 8, &[0u8; 16], "screencapturekit")
-        .unwrap_or_else(|_| unreachable!("2x2 frame"))
-        .tap_unchanged()
-}
-
-trait TapUnchanged {
-    fn tap_unchanged(self) -> Self;
-}
-
-impl TapUnchanged for Frame {
-    fn tap_unchanged(mut self) -> Self {
-        self.mark_unchanged();
-        self
     }
 }

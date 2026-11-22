@@ -7,6 +7,8 @@
 //! previous engine afterward. Prefer AT-SPI `InsertText` when available; this
 //! is the recoverable fallback when keysyms must be used.
 
+use std::sync::OnceLock;
+
 use agentlink_core::process::hidden;
 
 /// Holds the previous IME engine and restores it on drop.
@@ -21,15 +23,30 @@ enum Backend {
     Fcitx5,
 }
 
+static DETECTED_BACKEND: OnceLock<Option<Backend>> = OnceLock::new();
+static CACHED_IBUS_LATIN: OnceLock<Option<String>> = OnceLock::new();
+
+fn detect_backend() -> Option<Backend> {
+    *DETECTED_BACKEND.get_or_init(|| {
+        if current_ibus().is_some() {
+            Some(Backend::IBus)
+        } else if current_fcitx5().is_some() {
+            Some(Backend::Fcitx5)
+        } else {
+            None
+        }
+    })
+}
+
 impl ImeGuard {
     /// Switch to a Latin/passthrough engine when a composing IME is active.
     /// Returns `None` when no supported IME is running or the session is
     /// already on a passthrough engine (nothing to restore).
     pub fn engage() -> Option<Self> {
-        if let Some(guard) = engage_ibus() {
-            return Some(guard);
+        match detect_backend()? {
+            Backend::IBus => engage_ibus(),
+            Backend::Fcitx5 => engage_fcitx5(),
         }
-        engage_fcitx5()
     }
 }
 
@@ -47,7 +64,10 @@ fn engage_ibus() -> Option<ImeGuard> {
     if previous.is_empty() || is_passthrough_engine(&previous) {
         return None;
     }
-    let latin = ibus_latin_candidate().unwrap_or_else(|| "xkb:us::eng".into());
+    let latin = CACHED_IBUS_LATIN
+        .get_or_init(ibus_latin_candidate)
+        .clone()
+        .unwrap_or_else(|| "xkb:us::eng".into());
     set_ibus(&latin).ok()?;
     Some(ImeGuard {
         backend: Backend::IBus,

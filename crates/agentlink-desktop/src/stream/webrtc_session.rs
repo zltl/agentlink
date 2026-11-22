@@ -16,8 +16,8 @@ use agentlink_core::{
 use bytes::Bytes;
 use rtc::media::Sample;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
-    RtpCodecKind,
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RtpCodecKind,
 };
 use serde_json::{json, Value};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
@@ -66,6 +66,9 @@ struct LiveSession {
     peer_id: String,
     /// Set while this session still holds a control-indicator ref.
     control_held: Arc<AtomicBool>,
+    /// Keys and mouse buttons currently held by this viewer so teardown can
+    /// synthesize releases if the viewer disconnects mid-chord or mid-drag.
+    held_inputs: Arc<Mutex<HeldInputState>>,
     /// ICE ufrag from the current remote offer. Compared to trickle
     /// `usernameFragment` when present; never logged.
     remote_ufrag: Mutex<Option<String>>,
@@ -82,6 +85,7 @@ struct Built {
     stop: Arc<AtomicBool>,
     control: PumpControl,
     channels: Arc<Mutex<ChannelSet>>,
+    held_inputs: Arc<Mutex<HeldInputState>>,
     started: Instant,
     allow_control: bool,
 }
@@ -199,25 +203,82 @@ struct ChannelSet {
     clipboard: Arc<Mutex<crate::clipboard::ClipboardWatchState>>,
 }
 
+const AIMD_IDR_COOLDOWN: Duration = Duration::from_secs(1);
+const MONITOR_CACHE_TTL: Duration = Duration::from_secs(2);
+const INJECT_ERROR_COOLDOWN: Duration = Duration::from_secs(1);
+
 /// AIMD bitrate adaptation state shared with the input data-channel handler.
 #[derive(Clone)]
 struct AimdState {
+    /// Minimum bitrate floor derived from the offer bitrate so low-bitrate
+    /// mobile offers (< 800 kbps) are never clamped upward on packet loss.
+    min_bitrate: u32,
+    max_bitrate: u32,
     /// Instant of the last feedback sample with loss > 2%.
     last_loss_at: Arc<Mutex<Option<Instant>>>,
+    /// Instant of the last AIMD-triggered IDR request (throttled to >= 1s).
+    last_idr_at: Arc<Mutex<Option<Instant>>>,
     /// Instant when the current "no loss" streak began.
     quiet_since: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AimdState {
-    fn new() -> Self {
+    fn new(offer_bitrate: u32) -> Self {
+        let min_bitrate = (offer_bitrate / 2).clamp(100_000, 800_000);
+        let max_bitrate = offer_bitrate.clamp(8_000_000, 12_000_000);
         Self {
+            min_bitrate,
+            max_bitrate,
             last_loss_at: Arc::new(Mutex::new(None)),
+            last_idr_at: Arc::new(Mutex::new(None)),
             quiet_since: Arc::new(Mutex::new(None)),
         }
     }
 }
 
-/// Depth-2 encode→RTP outbox. Full = drop oldest (never block the capture thread).
+fn apply_aimd_feedback(
+    aimd: &AimdState,
+    current: u32,
+    loss: f64,
+    now: Instant,
+) -> (u32, bool) {
+    let mut next = current;
+    let mut request_idr = false;
+    if loss > 0.02 {
+        next = (current as f32 * 0.8) as u32;
+        if let Ok(mut slot) = aimd.last_loss_at.lock() {
+            *slot = Some(now);
+        }
+        if let Ok(mut slot) = aimd.quiet_since.lock() {
+            *slot = None;
+        }
+        if let Ok(mut last_idr) = aimd.last_idr_at.lock() {
+            let can_idr = last_idr
+                .map(|t| now.saturating_duration_since(t) >= AIMD_IDR_COOLDOWN)
+                .unwrap_or(true);
+            if can_idr {
+                *last_idr = Some(now);
+                request_idr = true;
+            }
+        }
+    } else {
+        let quiet_for = {
+            let mut quiet = aimd.quiet_since.lock().unwrap_or_else(|e| e.into_inner());
+            let since = quiet.get_or_insert(now);
+            now.saturating_duration_since(*since)
+        };
+        if quiet_for >= Duration::from_secs(2) {
+            next = (current as f32 * 1.1) as u32;
+            if let Ok(mut slot) = aimd.quiet_since.lock() {
+                *slot = Some(now);
+            }
+        }
+    }
+    (next.clamp(aimd.min_bitrate, aimd.max_bitrate), request_idr)
+}
+
+/// Depth-2 encode→RTP outbox that preserves unsent IDRs and intact P-frame
+/// chains under backpressure.
 struct FrameOutbox {
     slots: Mutex<VecDeque<(super::encode::EncodedAccessUnit, Instant)>>,
     notify: Condvar,
@@ -235,14 +296,30 @@ impl FrameOutbox {
         })
     }
 
-    fn push(&self, unit: super::encode::EncodedAccessUnit) {
+    /// Returns `true` when a non-IDR frame had to be dropped due to backpressure
+    /// so the caller should re-arm a keyframe for the next encoded picture.
+    fn push(&self, unit: super::encode::EncodedAccessUnit) -> bool {
         let mut q = self.slots.lock().unwrap_or_else(|err| err.into_inner());
-        while q.len() >= self.cap {
-            q.pop_front();
+        let mut needs_keyframe = false;
+        if unit.keyframe {
+            // A fresh IDR supersedes every older queued frame cleanly.
+            let stale = q.len() as u64;
+            if stale > 0 {
+                q.clear();
+                self.dropped.fetch_add(stale, Ordering::Relaxed);
+            }
+            q.push_back((unit, Instant::now()));
+        } else if q.len() >= self.cap {
+            // Never evict an unsent IDR or break an already-queued reference
+            // chain for a newer delta; drop the incoming delta and request an
+            // IDR so the next frame starts a clean reference chain.
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            needs_keyframe = true;
+        } else {
+            q.push_back((unit, Instant::now()));
         }
-        q.push_back((unit, Instant::now()));
         self.notify.notify_one();
+        needs_keyframe
     }
 
     fn pop_timeout(
@@ -270,6 +347,127 @@ impl FrameOutbox {
     }
 }
 
+/// Tracks keys and mouse buttons currently held down by one remote control
+/// session so disconnect/close/revocation never leaves stuck host inputs.
+#[derive(Default)]
+struct HeldInputState {
+    keys: Vec<String>,
+    buttons: Vec<MouseButton>,
+    last_pos: (i32, i32),
+}
+
+impl HeldInputState {
+    fn record(&mut self, action: &InputAction) {
+        match action {
+            InputAction::KeyEdge { keys, down: true } => {
+                for key in keys {
+                    if !key.is_empty()
+                        && !self.keys.iter().any(|k| k.eq_ignore_ascii_case(key))
+                    {
+                        self.keys.push(key.clone());
+                    }
+                }
+            }
+            InputAction::KeyEdge { keys, down: false } => {
+                for key in keys {
+                    self.keys.retain(|k| !k.eq_ignore_ascii_case(key));
+                }
+            }
+            InputAction::Button {
+                x,
+                y,
+                button,
+                down: true,
+            } => {
+                self.last_pos = (*x, *y);
+                if !self.buttons.contains(button) {
+                    self.buttons.push(*button);
+                }
+            }
+            InputAction::Button {
+                x,
+                y,
+                button,
+                down: false,
+            } => {
+                self.last_pos = (*x, *y);
+                self.buttons.retain(|b| b != button);
+            }
+            InputAction::Move { x, y } | InputAction::Click { x, y, .. } => {
+                self.last_pos = (*x, *y);
+            }
+            _ => {}
+        }
+    }
+
+    fn drain_release_actions(&mut self) -> Vec<InputAction> {
+        let (x, y) = self.last_pos;
+        let mut out = Vec::with_capacity(self.buttons.len() + self.keys.len());
+        for button in self.buttons.drain(..) {
+            out.push(InputAction::Button {
+                x,
+                y,
+                button,
+                down: false,
+            });
+        }
+        while let Some(key) = self.keys.pop() {
+            out.push(InputAction::KeyEdge {
+                keys: vec![key],
+                down: false,
+            });
+        }
+        out
+    }
+}
+
+fn release_held_inputs(desktop: &Arc<Desktop>, held: &Arc<Mutex<HeldInputState>>) {
+    let actions = {
+        let mut guard = held.lock().unwrap_or_else(|e| e.into_inner());
+        guard.drain_release_actions()
+    };
+    if actions.is_empty() {
+        return;
+    }
+    let desktop = desktop.clone();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || {
+            for action in actions {
+                let _ = desktop.hid.inject(&action);
+            }
+        });
+    } else {
+        for action in actions {
+            let _ = desktop.hid.inject(&action);
+        }
+    }
+}
+
+#[derive(Default)]
+struct MonitorCache {
+    cached: Mutex<Option<(Instant, Vec<crate::capture::MonitorInfo>)>>,
+}
+
+impl MonitorCache {
+    fn get_or_refresh(&self, desktop: &Desktop) -> Vec<crate::capture::MonitorInfo> {
+        let now = Instant::now();
+        {
+            let guard = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((at, monitors)) = guard.as_ref() {
+                if now.saturating_duration_since(*at) < MONITOR_CACHE_TTL {
+                    return monitors.clone();
+                }
+            }
+        }
+        let monitors = desktop.capture.list_monitors().unwrap_or_default();
+        if !monitors.is_empty() {
+            let mut guard = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some((now, monitors.clone()));
+        }
+        monitors
+    }
+}
+
 #[derive(Clone)]
 struct Handler {
     candidates: Arc<Mutex<Vec<Value>>>,
@@ -285,6 +483,9 @@ struct Handler {
     /// From the node-injected `_allow_control` flag. A view-only grant stays
     /// false even when the node ceiling allows remote control.
     allow_control: bool,
+    /// Explicit monitor index selected by the offer, if any; used as the
+    /// default monitor for fractional pointer coordinates that omit `monitor`.
+    default_monitor: Option<u32>,
     grant_jti: String,
     grant_exp_unix: Option<i64>,
     /// Set once ICE and DTLS are both up, which is when the SRTP contexts exist.
@@ -294,6 +495,8 @@ struct Handler {
     wait_idr: Arc<AtomicBool>,
     aimd: AimdState,
     clipboard: Arc<Mutex<crate::clipboard::ClipboardWatchState>>,
+    held_inputs: Arc<Mutex<HeldInputState>>,
+    monitor_cache: Arc<MonitorCache>,
 }
 
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -445,6 +648,7 @@ impl SessionManager {
             viewer: "viewer".into(),
             peer_id: peer.to_string(),
             control_held: Arc::new(AtomicBool::new(false)),
+            held_inputs: Arc::new(Mutex::new(HeldInputState::default())),
             remote_ufrag: Mutex::new(None),
             grant_jti: jti.to_string(),
             grant_exp_unix: exp,
@@ -506,25 +710,15 @@ impl SessionManager {
             .and_then(Value::as_str)
             .unwrap_or(peer)
             .to_string();
-        let session_hint = format!("pending-{peer}");
-        // Account ticket already granted control — do not wait on a human
-        // allow/deny file (ConsentMode::Prompt). Notify still fires.
-        let mut consent = super::consent::read_consent_mode(&self.shared.consent)?;
-        if consent == super::consent::ConsentMode::Prompt
-            && session_allows_control(payload, &policy)
-        {
-            consent = super::consent::ConsentMode::Notify;
-        }
-        super::consent::approve(
-            consent,
-            &self
-                .shared
-                .audit_path
-                .read()
-                .unwrap_or_else(|e| e.into_inner()),
-            &viewer,
-            &session_hint,
-        )?;
+        let session_hint = super::consent::offer_consent_id(peer);
+        let consent = super::consent::read_consent_mode(&self.shared.consent)?;
+        let audit_path = self
+            .shared
+            .audit_path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        super::consent::approve_async(consent, &audit_path, &viewer, &session_hint).await?;
         let built = build_answer(self.desktop.clone(), self.shared.clone(), peer, payload)
             .await
             .map_err(|err| err.to_string())?;
@@ -569,15 +763,18 @@ impl SessionManager {
             control_held.store(true, Ordering::SeqCst);
             control_indicator::note_control_session(true);
         }
-        // When the peer fails/closes, drop the indicator even if the viewer
-        // never sends webrtc_signal close (common after ICE failure).
+        // When the peer fails/closes, drop the indicator and release any held
+        // inputs even if the viewer never sends webrtc_signal close.
         {
             let stop = built.stop.clone();
             let held = control_held.clone();
+            let desktop = self.desktop.clone();
+            let held_inputs = built.held_inputs.clone();
             tokio::spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
+                release_held_inputs(&desktop, &held_inputs);
                 if held.swap(false, Ordering::SeqCst) {
                     control_indicator::note_control_session(false);
                 }
@@ -587,13 +784,17 @@ impl SessionManager {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             sessions.retain(|session| {
                 let alive = !session.stop.load(Ordering::Relaxed);
-                if !alive && session.control_held.swap(false, Ordering::SeqCst) {
-                    control_indicator::note_control_session(false);
+                if !alive {
+                    release_held_inputs(&self.desktop, &session.held_inputs);
+                    if session.control_held.swap(false, Ordering::SeqCst) {
+                        control_indicator::note_control_session(false);
+                    }
                 }
                 alive
             });
             if sessions.len() >= MAX_LIVE_STREAMS {
                 built.stop.store(true, Ordering::Relaxed);
+                release_held_inputs(&self.desktop, &built.held_inputs);
                 if control_held.swap(false, Ordering::SeqCst) {
                     control_indicator::note_control_session(false);
                 }
@@ -608,6 +809,7 @@ impl SessionManager {
                     viewer,
                     peer_id: peer.to_string(),
                     control_held,
+                    held_inputs: built.held_inputs,
                     remote_ufrag: Mutex::new(sdp_ice_ufrag(
                         payload.get("sdp").and_then(Value::as_str).unwrap_or(""),
                     )),
@@ -645,6 +847,7 @@ impl SessionManager {
         sessions.retain(|session| {
             let alive = !session.stop.load(Ordering::Relaxed);
             if !alive {
+                release_held_inputs(&self.desktop, &session.held_inputs);
                 if session.control_held.swap(false, Ordering::SeqCst) {
                     control_indicator::note_control_session(false);
                 }
@@ -902,6 +1105,7 @@ impl SessionManager {
         };
         if let Some(session) = session {
             session.stop.store(true, Ordering::Relaxed);
+            release_held_inputs(&self.desktop, &session.held_inputs);
             if session.control_held.swap(false, Ordering::SeqCst) {
                 control_indicator::note_control_session(false);
             }
@@ -1022,19 +1226,23 @@ async fn build_answer(
         .and_then(Value::as_u64)
         .unwrap_or(2_000_000)
         .clamp(100_000, 12_000_000) as u32;
-    let monitor = payload.get("monitor").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let default_monitor = payload
+        .get("monitor")
+        .and_then(Value::as_u64)
+        .map(|m| m as u32);
+    let monitor = default_monitor.unwrap_or(0);
     let scale_specified = payload.get("scale").is_some();
     let mut scale = payload
         .get("scale")
         .and_then(Value::as_f64)
         .unwrap_or(1.0)
         .clamp(0.05, 1.0) as f32;
-    // Always keep encode width ≤ ENCODE_WIDTH_CAP on wide panels so the pixel
-    // path stays realtime (even if the client asked for a larger scale).
+    // Cap default scale on wide (>1920px) panels when the viewer omitted `scale`,
+    // while honoring any explicit scale requested by the client.
     let mut native_w = 0u32;
     let mut native_h = 0u32;
     if let Ok(monitors) = desktop.capture.list_monitors() {
-        let chosen = if payload.get("monitor").is_some() {
+        let chosen = if default_monitor.is_some() {
             monitors
                 .iter()
                 .find(|m| m.index == monitor)
@@ -1046,25 +1254,14 @@ async fn build_answer(
             native_w = m.width;
             native_h = m.height;
         }
-        if let Some(capped) = default_scale_for_width(native_w, false) {
-            if scale > capped + f32::EPSILON {
-                tracing::info!(
-                    native_width = native_w,
-                    requested_scale = scale,
-                    scale = capped,
-                    cap = ENCODE_WIDTH_CAP,
-                    "clamping scale so encode width ≤ cap"
-                );
-                scale = capped;
-            } else if !scale_specified {
-                scale = capped;
-                tracing::info!(
-                    native_width = native_w,
-                    scale,
-                    cap = ENCODE_WIDTH_CAP,
-                    "capture wider than encode cap and scale unset; defaulting scale = cap/width"
-                );
-            }
+        if let Some(capped) = default_scale_for_width(native_w, scale_specified) {
+            scale = capped;
+            tracing::info!(
+                native_width = native_w,
+                scale,
+                cap = ENCODE_WIDTH_CAP,
+                "capture wider than encode cap and scale unset; defaulting scale = cap/width"
+            );
         }
     }
     let audio = payload
@@ -1181,6 +1378,7 @@ async fn build_answer(
         .policy
         .read()
         .map_err(|_| msg("node policy is unavailable"))?;
+    let held_inputs = Arc::new(Mutex::new(HeldInputState::default()));
     let handler = Arc::new(Handler {
         candidates: Arc::new(Mutex::new(Vec::new())),
         gather_done: Arc::new(AtomicBool::new(false)),
@@ -1193,48 +1391,76 @@ async fn build_answer(
         peer: peer_id.to_string(),
         session_id: session_id.clone(),
         allow_control: session_allows_control(payload, &policy_now),
+        default_monitor,
         grant_jti: payload_grant_jti(payload),
         grant_exp_unix: payload_grant_exp(payload),
         media_ready: Arc::new(AtomicBool::new(false)),
         wait_idr: Arc::new(AtomicBool::new(true)),
-        aimd: AimdState::new(),
+        aimd: AimdState::new(bitrate),
         clipboard: clipboard.clone(),
+        held_inputs: held_inputs.clone(),
+        monitor_cache: Arc::new(MonitorCache::default()),
     });
-    let mut media = MediaEngine::default();
-    media
-        .register_codec(video_codec(&info.codec), RtpCodecKind::Video)
-        .map_err(|err| msg(err.to_string()))?;
     let audio_capture = if audio { AudioCapture::start() } else { None };
-    if audio_capture.is_some() {
-        media
-            .register_codec(pcmu_codec(), RtpCodecKind::Audio)
-            .map_err(|err| msg(err.to_string()))?;
-    }
-    let registry = register_default_interceptors(Registry::new(), &mut media)
-        .map_err(|err| msg(err.to_string()))?;
-    let ice = ice_servers(payload);
+    let ice = resolve_ice_servers(payload).await;
     let policy = ice_transport_policy(payload);
     let gather_for = gather_budget(payload, policy);
     let want = wanted_typ(payload).map(str::to_string);
-    let setting_engine = SettingEngineBuilder::new()
-        .with_host_acceptance_min_wait(Some(HOST_ACCEPTANCE_MIN_WAIT))
-        .build();
-    let pc = PeerConnectionBuilder::new()
-        .with_configuration(
-            RTCConfigurationBuilder::new()
-                .with_ice_servers(ice)
-                .with_ice_transport_policy(policy)
-                .build(),
-        )
-        .with_setting_engine(setting_engine)
-        .with_media_engine(media)
-        .with_interceptor_registry(registry)
-        .with_handler(handler.clone() as Arc<dyn PeerConnectionEventHandler>)
-        .with_runtime(runtime)
-        .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
-        .build()
-        .await
-        .map_err(|err| msg(err.to_string()))?;
+    let mut pc_opt = None;
+    let mut bind_err = None;
+    for udp_addrs in [
+        vec!["[::]:0".to_string(), "0.0.0.0:0".to_string()],
+        vec!["0.0.0.0:0".to_string()],
+    ] {
+        let mut media = MediaEngine::default();
+        media
+            .register_codec(video_codec(&info.codec), RtpCodecKind::Video)
+            .map_err(|err| msg(err.to_string()))?;
+        if audio_capture.is_some() {
+            media
+                .register_codec(pcmu_codec(), RtpCodecKind::Audio)
+                .map_err(|err| msg(err.to_string()))?;
+        }
+        let registry = register_default_interceptors(Registry::new(), &mut media)
+            .map_err(|err| msg(err.to_string()))?;
+        let setting_engine = SettingEngineBuilder::new()
+            .with_host_acceptance_min_wait(Some(HOST_ACCEPTANCE_MIN_WAIT))
+            .build();
+        match PeerConnectionBuilder::new()
+            .with_configuration(
+                RTCConfigurationBuilder::new()
+                    .with_ice_servers(ice.clone())
+                    .with_ice_transport_policy(policy)
+                    .build(),
+            )
+            .with_setting_engine(setting_engine)
+            .with_media_engine(media)
+            .with_interceptor_registry(registry)
+            .with_handler(handler.clone() as Arc<dyn PeerConnectionEventHandler>)
+            .with_runtime(runtime.clone())
+            .with_udp_addrs(udp_addrs.clone())
+            .build()
+            .await
+        {
+            Ok(built) => {
+                pc_opt = Some(built);
+                break;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    ?udp_addrs,
+                    error = %err,
+                    "peer connection UDP bind failed; trying fallback address set"
+                );
+                bind_err = Some(err);
+            }
+        }
+    }
+    let pc = pc_opt.ok_or_else(|| {
+        msg(bind_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "failed to build peer connection".into()))
+    })?;
 
     let ssrc = rand_ssrc();
     let track = Arc::new(
@@ -1378,8 +1604,8 @@ async fn build_answer(
         .clone();
 
     let stop_thread = stop.clone();
-    // Depth 1: new frame overwrites old under backpressure (drop-old).
-    let outbox = FrameOutbox::new(1);
+    // Depth 2: preserve unsent IDRs and intact P-frame chains under backpressure.
+    let outbox = FrameOutbox::new(2);
     let outbox_prod = outbox.clone();
     let control_prod = control.clone();
     std::thread::Builder::new()
@@ -1388,7 +1614,10 @@ async fn build_answer(
             while !stop_thread.load(Ordering::Relaxed) {
                 match pump.next(Duration::from_secs(2)) {
                     Ok(Some(unit)) => {
-                        outbox_prod.push(unit);
+                        let needs_keyframe = outbox_prod.push(unit);
+                        if needs_keyframe {
+                            control_prod.keyframe.store(true, Ordering::Release);
+                        }
                         let dropped = outbox_prod.dropped.swap(0, Ordering::Relaxed);
                         if dropped > 0 {
                             control_prod
@@ -1562,6 +1791,7 @@ async fn build_answer(
         stop,
         control,
         channels,
+        held_inputs,
         started: Instant::now(),
         allow_control: handler.allow_control,
     })
@@ -1656,6 +1886,18 @@ fn spawn_capturable(
 
 fn spawn_clipboard(channels: Arc<Mutex<ChannelSet>>, stop: Arc<AtomicBool>) {
     tokio::spawn(async move {
+        // Seed clipboard baseline on session start so pre-existing clipboard
+        // contents (passwords, OTPs) are never pushed automatically on connect.
+        let initial_clip = {
+            let set = channels.lock().unwrap_or_else(|err| err.into_inner());
+            set.clipboard.clone()
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut state = initial_clip.lock().unwrap_or_else(|err| err.into_inner());
+            state.seed_from_os();
+        })
+        .await;
+
         while !stop.load(Ordering::Relaxed) {
             tokio::time::sleep(crate::clipboard::CLIPBOARD_POLL_INTERVAL).await;
             if stop.load(Ordering::Relaxed) {
@@ -1668,8 +1910,9 @@ fn spawn_clipboard(channels: Arc<Mutex<ChannelSet>>, stop: Arc<AtomicBool>) {
             let Some(input) = input else {
                 continue;
             };
+            let poll_state = clip_state.clone();
             let outgoing = tokio::task::spawn_blocking(move || {
-                let mut state = clip_state.lock().unwrap_or_else(|err| err.into_inner());
+                let mut state = poll_state.lock().unwrap_or_else(|err| err.into_inner());
                 state.poll_outgoing()
             })
             .await
@@ -1679,14 +1922,18 @@ fn spawn_clipboard(channels: Arc<Mutex<ChannelSet>>, stop: Arc<AtomicBool>) {
                 continue;
             };
             let body = crate::clipboard::set_payload(&clip).to_string();
-            let _ = input.send_text(&body).await;
+            if input.send_text(&body).await.is_err() {
+                if let Ok(mut state) = clip_state.lock() {
+                    state.send_failed();
+                }
+            }
         }
     });
 }
 
-/// Encode-width target for panels wider than 1920 (Retina). 1280 keeps the
-/// BGRA capture→scale path near realtime; ≤1920 native is left alone.
-const ENCODE_WIDTH_CAP: f32 = 1280.0;
+/// Encode-width target for panels wider than 1920 (Retina/4K) when the viewer
+/// omits `scale`. Explicit `scale` values are honored; <=1920 native is left alone.
+const ENCODE_WIDTH_CAP: f32 = 1920.0;
 
 /// Capture-side max width for the live stream. `0` disables downsample (full
 /// ScreenCast + ffmpeg `-vf scale`). Default is `min(encode_w, env/1600)`.
@@ -1737,9 +1984,9 @@ fn admit_sample(srtp_ready: bool, waiting_for_idr: bool, keyframe: bool) -> Samp
 
 /// `true` when this access unit must not be written.
 ///
-/// A hold before SRTP re-arms `keyframe`. The pump clears that flag as soon
-/// as it emits the access unit, and a quiet desktop will not emit another
-/// one. The sample stays unwritten until Connected, which is the #33 gate.
+/// Any hold — whether before SRTP is ready or while waiting for an IDR after
+/// Connected/write-error — re-arms `keyframe` so a quiet desktop does not stay
+/// stuck waiting for an IDR forever.
 fn hold_sample(
     srtp_ready: bool,
     waiting_for_idr: bool,
@@ -1749,9 +1996,7 @@ fn hold_sample(
     if admit_sample(srtp_ready, waiting_for_idr, unit_keyframe) != SampleAdmit::Hold {
         return false;
     }
-    if !srtp_ready {
-        keyframe.store(true, Ordering::Release);
-    }
+    keyframe.store(true, Ordering::Release);
     true
 }
 
@@ -1801,7 +2046,20 @@ fn video_codec(codec: &Codec) -> RTCRtpCodecParameters {
             clock_rate: 90000,
             channels: 0,
             sdp_fmtp_line: fmtp.into(),
-            rtcp_feedback: Vec::new(),
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "nack".into(),
+                    parameter: String::new(),
+                },
+                RTCPFeedback {
+                    typ: "nack".into(),
+                    parameter: "pli".into(),
+                },
+                RTCPFeedback {
+                    typ: "ccm".into(),
+                    parameter: "fir".into(),
+                },
+            ],
         },
         payload_type: pt,
     }
@@ -1820,7 +2078,7 @@ fn pcmu_codec() -> RTCRtpCodecParameters {
     }
 }
 
-fn ice_servers(payload: &Value) -> Vec<RTCIceServer> {
+fn parse_offered_ice_servers(payload: &Value) -> Vec<RTCIceServer> {
     let mut servers = Vec::new();
     if let Some(list) = payload.get("ice_servers").and_then(Value::as_array) {
         for entry in list {
@@ -1853,10 +2111,35 @@ fn ice_servers(payload: &Value) -> Vec<RTCIceServer> {
             });
         }
     }
+    servers
+}
+
+#[cfg(test)]
+fn ice_servers(payload: &Value) -> Vec<RTCIceServer> {
+    let mut servers = parse_offered_ice_servers(payload);
     // An explicit ice_path means the viewer chose this attempt's servers,
     // including an empty list for host-only. Do not add default STUN on top.
     if servers.is_empty() && payload.get("ice_path").is_none() {
         let urls = agentlink_core::stun_urls_from_env();
+        if !urls.is_empty() {
+            servers.push(RTCIceServer {
+                urls,
+                username: String::new(),
+                credential: String::new(),
+            });
+        }
+    }
+    servers
+}
+
+async fn resolve_ice_servers(payload: &Value) -> Vec<RTCIceServer> {
+    let mut servers = parse_offered_ice_servers(payload);
+    // An explicit ice_path means the viewer chose this attempt's servers,
+    // including an empty list for host-only. Do not add default STUN on top.
+    if servers.is_empty() && payload.get("ice_path").is_none() {
+        let urls = tokio::task::spawn_blocking(agentlink_core::stun_urls_ready_for_ice)
+            .await
+            .unwrap_or_else(|_| agentlink_core::stun_urls_from_env());
         if !urls.is_empty() {
             servers.push(RTCIceServer {
                 urls,
@@ -2117,6 +2400,14 @@ impl PeerConnectionEventHandler for Handler {
         self.media_ready.store(ready, Ordering::Release);
         if matches!(
             state,
+            RTCPeerConnectionState::Disconnected
+                | RTCPeerConnectionState::Failed
+                | RTCPeerConnectionState::Closed
+        ) {
+            release_held_inputs(&self.desktop, &self.held_inputs);
+        }
+        if matches!(
+            state,
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
         ) {
             self.stop.store(true, Ordering::Relaxed);
@@ -2158,11 +2449,15 @@ impl PeerConnectionEventHandler for Handler {
         let peer = self.peer.clone();
         let session_id = self.session_id.clone();
         let allow_control = self.allow_control;
+        let default_monitor = self.default_monitor;
         let grant_jti = self.grant_jti.clone();
         let grant_exp_unix = self.grant_exp_unix;
         let aimd = self.aimd.clone();
         let stop = self.stop.clone();
         let clipboard = self.clipboard.clone();
+        let held_inputs = self.held_inputs.clone();
+        let monitor_cache = self.monitor_cache.clone();
+        let last_inject_err = Arc::new(Mutex::new(None::<Instant>));
         let input = label == "input" || label.is_empty();
         tokio::spawn(async move {
             loop {
@@ -2185,11 +2480,15 @@ impl PeerConnectionEventHandler for Handler {
                             &peer,
                             &session_id,
                             allow_control,
+                            default_monitor,
                             &grant_jti,
                             grant_exp_unix,
                             &aimd,
                             &stop,
                             &clipboard,
+                            &held_inputs,
+                            &monitor_cache,
+                            &last_inject_err,
                         )
                         .await;
                     }
@@ -2197,13 +2496,17 @@ impl PeerConnectionEventHandler for Handler {
                     _ => {}
                 }
             }
+            if input {
+                release_held_inputs(&desktop, &held_inputs);
+            }
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_input(
     text: &str,
-    desktop: &Desktop,
+    desktop: &Arc<Desktop>,
     policy: &RwLock<NodePolicy>,
     control: &PumpControl,
     channel: &Arc<dyn DataChannel>,
@@ -2211,18 +2514,23 @@ async fn handle_input(
     peer: &str,
     session_id: &str,
     allow_control: bool,
+    default_monitor: Option<u32>,
     grant_jti: &str,
     grant_exp_unix: Option<i64>,
     aimd: &AimdState,
     stop: &AtomicBool,
-    clipboard: &std::sync::Arc<std::sync::Mutex<crate::clipboard::ClipboardWatchState>>,
+    clipboard: &Arc<Mutex<crate::clipboard::ClipboardWatchState>>,
+    held_inputs: &Arc<Mutex<HeldInputState>>,
+    monitor_cache: &Arc<MonitorCache>,
+    last_inject_err: &Arc<Mutex<Option<Instant>>>,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
     };
     if let Some(err) = grant_still_active(shared, grant_jti, grant_exp_unix, peer) {
-        // Same teardown as a revoked/expired signaling call: stop the media
-        // pump, do not leave the datachannel reject as a no-op.
+        // Same teardown as a revoked/expired signaling call: release any held
+        // inputs and stop the media pump.
+        release_held_inputs(desktop, held_inputs);
         stop.store(true, Ordering::Relaxed);
         let body = json!({"type": "error", "error": err}).to_string();
         let _ = channel.send_text(&body).await;
@@ -2231,35 +2539,12 @@ async fn handle_input(
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "feedback" {
         if let Some(loss) = value.get("loss").and_then(Value::as_f64) {
-            // Simple AIMD: loss > 2% → −20% + keyframe; 2s quiet → +10%.
-            // Floor 800 kbps / ceiling 8 Mbps.
             let current = control.bitrate.load(Ordering::Relaxed);
-            let mut next = current;
-            if loss > 0.02 {
-                next = (current as f32 * 0.8) as u32;
+            let (next, request_idr) = apply_aimd_feedback(aimd, current, loss, Instant::now());
+            control.bitrate.store(next, Ordering::Relaxed);
+            if request_idr {
                 control.keyframe.store(true, Ordering::Release);
-                if let Ok(mut slot) = aimd.last_loss_at.lock() {
-                    *slot = Some(Instant::now());
-                }
-                if let Ok(mut slot) = aimd.quiet_since.lock() {
-                    *slot = None;
-                }
-            } else {
-                let quiet_for = {
-                    let mut quiet = aimd.quiet_since.lock().unwrap_or_else(|e| e.into_inner());
-                    let since = quiet.get_or_insert_with(Instant::now);
-                    since.elapsed()
-                };
-                if quiet_for >= Duration::from_secs(2) {
-                    next = (current as f32 * 1.1) as u32;
-                    if let Ok(mut slot) = aimd.quiet_since.lock() {
-                        *slot = Some(Instant::now());
-                    }
-                }
             }
-            control
-                .bitrate
-                .store(next.clamp(800_000, 8_000_000), Ordering::Relaxed);
         }
         return;
     }
@@ -2271,11 +2556,11 @@ async fn handle_input(
         .read()
         .map(|policy| allow_control && input_allowed(&policy, kind))
         .unwrap_or(false);
-    let (detail, mut args) = input_audit(kind, &value);
-    if let Some(obj) = args.as_object_mut() {
-        obj.insert("session".into(), json!(session_id));
-    }
     if !allowed {
+        let (detail, mut args) = input_audit(kind, &value);
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("session".into(), json!(session_id));
+        }
         audit_event(
             shared,
             kind,
@@ -2291,18 +2576,24 @@ async fn handle_input(
             .await;
         return;
     }
-    audit_event(
-        shared,
-        kind,
-        &detail,
-        true,
-        peer,
-        args,
-        None,
-        Duration::ZERO,
-    );
+    if should_audit_input(kind, &value) {
+        let (detail, mut args) = input_audit(kind, &value);
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("session".into(), json!(session_id));
+        }
+        audit_event(
+            shared,
+            kind,
+            &detail,
+            true,
+            peer,
+            args,
+            None,
+            Duration::ZERO,
+        );
+    }
     let action = match kind {
-        "mouse" => mouse_action(desktop, &value),
+        "mouse" => mouse_action(desktop, monitor_cache, default_monitor, &value),
         "key" => value.get("keys").map(|keys| {
             key_input_action(
                 string_list(keys),
@@ -2353,15 +2644,38 @@ async fn handle_input(
         _ => None,
     };
     if let Some(action) = action {
+        if let Ok(mut held) = held_inputs.lock() {
+            held.record(&action);
+        }
         let desktop = desktop.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let result = desktop.hid.inject(&action);
-            if result.is_ok() {
-                control_indicator::note_inject_input();
+        // WebRTC control sessions already hold a control_indicator refcount for
+        // the session's lifetime; do NOT call note_inject_input() here so the
+        // banner disappears immediately when the session closes.
+        let result = tokio::task::spawn_blocking(move || desktop.hid.inject(&action)).await;
+        if let Ok(Err(err)) = result {
+            let err_text = err.to_string();
+            tracing::warn!(session = %session_id, error = %err_text, "remote input inject failed");
+            let should_send = {
+                let now = Instant::now();
+                let mut slot = last_inject_err.lock().unwrap_or_else(|e| e.into_inner());
+                let due = slot
+                    .map(|t| now.saturating_duration_since(t) >= INJECT_ERROR_COOLDOWN)
+                    .unwrap_or(true);
+                if due {
+                    *slot = Some(now);
+                }
+                due
+            };
+            if should_send {
+                let body = json!({
+                    "type": "error",
+                    "code": "inject_failed",
+                    "error": err_text,
+                })
+                .to_string();
+                let _ = channel.send_text(&body).await;
             }
-            result
-        })
-        .await;
+        }
     }
 }
 
@@ -2443,7 +2757,22 @@ fn grant_still_active(
     }
 }
 
-/// Character count and a 12-character preview. The full string stays out of the log.
+/// High-frequency `mouse move` events (60Hz+) are skipped from the audit log
+/// when allowed so the audit file is not flooded with megabytes of noise.
+pub(crate) fn should_audit_input(kind: &str, value: &Value) -> bool {
+    if kind == "mouse" {
+        let action = value
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("move");
+        return action != "move";
+    }
+    true
+}
+
+/// Sanitized input audit entry: logs only action metadata (kind, length/count),
+/// never plaintext typed/clipboard characters or key names that could leak
+/// passwords, OTPs, or secrets.
 pub(crate) fn input_audit(kind: &str, value: &Value) -> (String, Value) {
     match kind {
         "type" | "clipboard" => {
@@ -2452,27 +2781,22 @@ pub(crate) fn input_audit(kind: &str, value: &Value) -> (String, Value) {
                 return (format!("{kind} get"), json!({"kind": kind, "op": "get"}));
             };
             let count = text.chars().count();
-            let mut preview: String = text.chars().take(12).collect();
-            preview = preview.replace(['\n', '\r'], " ");
-            let detail = if count > preview.chars().count() {
-                format!("{kind} {count} chars \"{preview}…\"")
-            } else {
-                format!("{kind} {count} chars \"{preview}\"")
-            };
-            (detail, json!({"kind": kind, "chars": count}))
+            (
+                format!("{kind} {count} chars"),
+                json!({"kind": kind, "chars": count}),
+            )
         }
         "key" => {
-            let keys = key_text(value.get("keys"));
-            if keys.chars().count() > 12 {
-                let count = keys.chars().count();
-                let preview: String = keys.chars().take(12).collect();
-                (
-                    format!("key {count} chars \"{preview}…\""),
-                    json!({"kind": "key", "chars": count}),
-                )
-            } else {
-                (format!("key {keys}"), json!({"kind": "key", "keys": keys}))
-            }
+            let count = value.get("keys").map(string_list).map(|v| v.len()).unwrap_or(0);
+            let edge = match value.get("down").and_then(Value::as_bool) {
+                Some(true) => "down",
+                Some(false) => "up",
+                None => "tap",
+            };
+            (
+                format!("key {edge} count={count}"),
+                json!({"kind": "key", "edge": edge, "count": count}),
+            )
         }
         "mouse" => {
             let action = value
@@ -2488,25 +2812,34 @@ pub(crate) fn input_audit(kind: &str, value: &Value) -> (String, Value) {
     }
 }
 
-fn key_text(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join("+"),
-        Some(Value::String(text)) => text.clone(),
-        _ => String::new(),
-    }
-}
-
-fn mouse_action(desktop: &Desktop, value: &Value) -> Option<InputAction> {
+fn mouse_action(
+    desktop: &Desktop,
+    monitor_cache: &MonitorCache,
+    default_monitor: Option<u32>,
+    value: &Value,
+) -> Option<InputAction> {
     let action = value
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or("move");
+    let effective = if value.get("monitor").is_none() {
+        if let Some(mon) = default_monitor {
+            let mut cloned = value.clone();
+            if let Some(obj) = cloned.as_object_mut() {
+                obj.insert("monitor".into(), json!(mon));
+            }
+            Some(cloned)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let payload = effective.as_ref().unwrap_or(value);
+    let monitors = monitor_cache.get_or_refresh(desktop);
     // Same fraction/absolute + optional monitor mapping as inject_input.
-    let resolved = crate::handlers::resolve_input_coords(desktop, action, value).ok()?;
+    let resolved =
+        crate::handlers::resolve_input_coords_with_monitors(&monitors, action, payload).ok()?;
     let x = resolved.get("x").and_then(Value::as_i64).unwrap_or(0) as i32;
     let y = resolved.get("y").and_then(Value::as_i64).unwrap_or(0) as i32;
     let button = MouseButton::parse(
@@ -2538,8 +2871,8 @@ fn mouse_action(desktop: &Desktop, value: &Value) -> Option<InputAction> {
         "scroll" => InputAction::Scroll {
             x: Some(x),
             y: Some(y),
-            dx: value.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32,
-            dy: value.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32,
+            dx: crate::handlers::parse_scroll_delta(value.get("dx")),
+            dy: crate::handlers::parse_scroll_delta(value.get("dy")),
         },
         _ => InputAction::Move { x, y },
     })
@@ -2561,10 +2894,12 @@ fn string_list(value: &Value) -> Vec<String> {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect(),
-        Value::String(text) => text
-            .split('+')
-            .map(|part| part.trim().to_string())
-            .collect(),
+        Value::String(text) => crate::keys::parse_combo(text).unwrap_or_else(|_| {
+            text.split('+')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect()
+        }),
         _ => Vec::new(),
     }
 }
@@ -2587,7 +2922,7 @@ mod tests {
     fn default_scale_caps_wide_panels_only_when_unset() {
         assert_eq!(
             super::default_scale_for_width(2736, false),
-            Some(1280.0 / 2736.0)
+            Some(1920.0 / 2736.0)
         );
         assert_eq!(super::default_scale_for_width(1920, false), None);
         assert_eq!(super::default_scale_for_width(2736, true), None);
@@ -2892,17 +3227,32 @@ mod tests {
     }
 
     #[test]
-    fn input_audit_keeps_a_short_preview() {
+    fn input_audit_omits_plaintext_previews_and_key_names() {
         let (detail, args) = super::input_audit("type", &json!({"text": "secret-password-value"}));
-        assert!(!detail.contains("secret-password-value"));
+        assert!(!detail.contains("secret"));
+        assert!(!detail.contains("password"));
         assert!(detail.contains("chars"));
         assert!(args.get("text").is_none());
         assert_eq!(args["chars"], 21);
+
         let (clip, clip_args) =
             super::input_audit("clipboard", &json!({"text": "clipboard-secret-value"}));
-        assert!(!clip.contains("clipboard-secret-value"));
+        assert!(!clip.contains("clipboard-se"));
+        assert!(clip.contains("22 chars"));
         assert!(clip_args.get("text").is_none());
         assert!(!format!("{clip_args}").contains("sdp"));
+
+        let (key_detail, key_args) =
+            super::input_audit("key", &json!({"keys": ["p", "a", "s"], "down": true}));
+        assert!(!key_detail.contains("p+a+s"));
+        assert!(key_args.get("keys").is_none());
+        assert_eq!(key_args["count"], 3);
+        assert_eq!(key_args["edge"], "down");
+
+        assert!(!super::should_audit_input("mouse", &json!({"action": "move"})));
+        assert!(!super::should_audit_input("mouse", &json!({})));
+        assert!(super::should_audit_input("mouse", &json!({"action": "click"})));
+        assert!(super::should_audit_input("key", &json!({"keys": "a"})));
     }
 
     #[test]
@@ -3015,6 +3365,7 @@ mod tests {
             viewer: "viewer".into(),
             peer_id: peer.to_string(),
             control_held: Arc::new(AtomicBool::new(false)),
+            held_inputs: Arc::new(Mutex::new(super::HeldInputState::default())),
             remote_ufrag: Mutex::new(None),
             grant_jti: jti.to_string(),
             grant_exp_unix: exp,
@@ -3307,5 +3658,163 @@ mod tests {
             err.contains("too many") || err.contains("stream"),
             "expected stream cap error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn consent_prompt_is_not_downgraded_for_control_offers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager();
+        *mgr.shared.audit_path.write().unwrap() = dir.path().join("audit.jsonl");
+        *mgr.shared.consent.write().unwrap() = crate::stream::consent::ConsentMode::Prompt;
+
+        let consent_dir = dir.path().join("stream-consent");
+        let watcher = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Ok(entries) = std::fs::read_dir(&consent_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.extension().and_then(|e| e.to_str()) == Some("request") {
+                            let decision = p.with_extension("deny");
+                            std::fs::write(&decision, "denied by test\n").unwrap();
+                            return Some(p.file_name().unwrap().to_string_lossy().to_string());
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            None
+        });
+
+        // `_allow_control: true` must STILL enforce ConsentMode::Prompt and NOT downgrade to Notify.
+        let err = mgr
+            .offer(
+                "alice",
+                &json!({"sdp": "v=0\r\n", "viewer": "alice", "_allow_control": true}),
+            )
+            .await
+            .expect_err("ConsentMode::Prompt must wait for human decision even with _allow_control");
+        assert!(err.contains("denied"), "expected consent denial, got: {err}");
+        let req_name = watcher.await.unwrap().expect("request file must have been created");
+        assert!(
+            req_name.starts_with("pending-alice-") && req_name.len() > "pending-alice-.request".len(),
+            "expected per-offer UUID filename, got: {req_name}"
+        );
+    }
+
+    #[test]
+    fn frame_outbox_preserves_unsent_idr_and_rearms_keyframe_on_delta_drop() {
+        use crate::stream::encode::{Codec, EncodedAccessUnit};
+        use std::time::Duration;
+
+        let make = |keyframe: bool, tag: u8| EncodedAccessUnit {
+            codec: Codec::H264,
+            bytes: vec![0, 0, 0, 1, tag],
+            keyframe,
+            width: 64,
+            height: 64,
+            captured_unix_ms: tag as i64,
+        };
+
+        let outbox = super::FrameOutbox::new(2);
+        assert!(!outbox.push(make(true, 1)));
+        assert!(!outbox.push(make(false, 2)));
+        // Queue is full [IDR(1), P(2)]; pushing P(3) must NOT evict IDR(1)
+        // and must signal needs_keyframe=true.
+        assert!(outbox.push(make(false, 3)));
+        assert_eq!(outbox.dropped.load(Ordering::Relaxed), 1);
+
+        let (first, _) = outbox.pop_timeout(Duration::from_millis(10)).unwrap();
+        assert!(first.keyframe && first.bytes[4] == 1, "unsent IDR must be preserved");
+        let (second, _) = outbox.pop_timeout(Duration::from_millis(10)).unwrap();
+        assert!(!second.keyframe && second.bytes[4] == 2);
+
+        // Fresh IDR cleanly supersedes stale frames.
+        assert!(!outbox.push(make(false, 4)));
+        assert!(!outbox.push(make(false, 5)));
+        assert!(!outbox.push(make(true, 6)));
+        let (latest, _) = outbox.pop_timeout(Duration::from_millis(10)).unwrap();
+        assert!(latest.keyframe && latest.bytes[4] == 6);
+    }
+
+    #[test]
+    fn hold_sample_rearms_keyframe_when_srtp_ready_and_waiting_for_idr() {
+        let keyframe = AtomicBool::new(false);
+        assert!(super::hold_sample(true, true, false, &keyframe));
+        assert!(
+            keyframe.load(Ordering::Acquire),
+            "holding a delta while waiting for an IDR must re-arm keyframe"
+        );
+    }
+
+    #[test]
+    fn aimd_respects_low_offer_bitrate_and_throttles_idr_requests() {
+        use std::time::{Duration, Instant};
+
+        let aimd = super::AimdState::new(400_000);
+        let t0 = Instant::now();
+        // 5% loss on a 400 kbps mobile offer must drop to 320 kbps, NOT clamp up to 800 kbps.
+        let (b1, idr1) = super::apply_aimd_feedback(&aimd, 400_000, 0.05, t0);
+        assert_eq!(b1, 320_000);
+        assert!(idr1, "first loss event triggers IDR");
+
+        // Second loss packet 200ms later drops bitrate further but throttles IDR.
+        let (b2, idr2) =
+            super::apply_aimd_feedback(&aimd, b1, 0.05, t0 + Duration::from_millis(200));
+        assert_eq!(b2, 256_000);
+        assert!(!idr2, "burst loss within 1s must not spam IDRs");
+
+        // Repeated loss hits the offer-derived floor (200_000), never above offer.
+        let (b3, idr3) =
+            super::apply_aimd_feedback(&aimd, b2, 0.05, t0 + Duration::from_secs(2));
+        assert_eq!(b3, 204_800);
+        assert!(idr3, "after 1s cooldown, IDR is allowed again");
+        let (b4, _) =
+            super::apply_aimd_feedback(&aimd, b3, 0.05, t0 + Duration::from_secs(3));
+        assert_eq!(b4, 200_000);
+    }
+
+    #[test]
+    fn video_codec_advertises_nack_pli_and_fir_rtcp_feedback() {
+        let params = super::video_codec(&crate::stream::encode::Codec::H264);
+        let fbs = &params.rtp_codec.rtcp_feedback;
+        assert!(fbs.iter().any(|f| f.typ == "nack" && f.parameter.is_empty()));
+        assert!(fbs.iter().any(|f| f.typ == "nack" && f.parameter == "pli"));
+        assert!(fbs.iter().any(|f| f.typ == "ccm" && f.parameter == "fir"));
+    }
+
+    #[test]
+    fn held_input_state_releases_buttons_and_keys_on_disconnect() {
+        let mut held = super::HeldInputState::default();
+        held.record(&InputAction::KeyEdge {
+            keys: vec!["ctrl".into(), "shift".into()],
+            down: true,
+        });
+        held.record(&InputAction::Button {
+            x: 120,
+            y: 240,
+            button: crate::input::MouseButton::Left,
+            down: true,
+        });
+        held.record(&InputAction::Move { x: 300, y: 400 });
+        let releases = held.drain_release_actions();
+        assert_eq!(releases.len(), 3);
+        assert!(matches!(
+            &releases[0],
+            InputAction::Button {
+                x: 300,
+                y: 400,
+                button: crate::input::MouseButton::Left,
+                down: false
+            }
+        ));
+        assert!(matches!(
+            &releases[1],
+            InputAction::KeyEdge { keys, down: false } if keys == &vec!["shift".to_string()]
+        ));
+        assert!(matches!(
+            &releases[2],
+            InputAction::KeyEdge { keys, down: false } if keys == &vec!["ctrl".to_string()]
+        ));
+        assert!(held.drain_release_actions().is_empty());
     }
 }

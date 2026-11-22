@@ -133,8 +133,10 @@ fn mock_desktop_delivers_an_idr_and_a_mouse() {
 
     let input_deadline = Instant::now() + Duration::from_secs(5);
     let mut sent = false;
+    // Discrete clicks are audited (60Hz `move` events are intentionally omitted from audit).
     while Instant::now() < input_deadline {
-        if viewer.send_control(r#"{"type":"mouse","action":"move","x":12,"y":8}"#) {
+        if viewer.send_control(r#"{"type":"mouse","action":"click","button":"left","x":12,"y":8}"#)
+        {
             sent = true;
             break;
         }

@@ -15,9 +15,39 @@ pub struct KeyInfo {
     /// Windows virtual-key code. Read by the Windows backend and unit tests.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub vk: u16,
-    /// macOS virtual keycode. Read by the macOS backend.
+    /// macOS virtual keycode (`None` when macOS has no `CGKeyCode` for this key,
+    /// never `0x00` which is `kVK_ANSI_A`).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub mac: u16,
+    pub mac: Option<u16>,
+}
+
+/// True when `name` is a shifted US ANSI punctuation symbol whose physical key
+/// is shared with an unshifted symbol.
+#[allow(dead_code)]
+pub fn key_requires_shift(name: &str) -> bool {
+    matches!(
+        name,
+        ":" | "\""
+            | "{"
+            | "}"
+            | "|"
+            | "<"
+            | ">"
+            | "?"
+            | "~"
+            | "!"
+            | "@"
+            | "#"
+            | "$"
+            | "%"
+            | "^"
+            | "&"
+            | "*"
+            | "("
+            | ")"
+            | "_"
+            | "+"
+    )
 }
 
 /// Normalize `Ctrl`, `cmd`, `Return`, and single letters to a canonical name.
@@ -46,7 +76,10 @@ pub fn canonical(raw: &str) -> Result<String> {
         "backspace" | "bksp" => "backspace",
         "del" | "delete" => "delete",
         "space" | "spacebar" => "space",
-        "plus" => "equal",
+        "plus" => "+",
+        "capslock" | "caps-lock" | "caps" => "capslock",
+        "numlock" | "num-lock" => "numlock",
+        "scrolllock" | "scroll-lock" | "scrlk" => "scrolllock",
         "printscreen" | "print-screen" | "print" | "sysrq" => "prtsc",
         "contextmenu" | "app" | "application" | "menu-key" => "apps",
         "volumeup" | "volume-up" => "volup",
@@ -121,11 +154,43 @@ pub fn canonical(raw: &str) -> Result<String> {
 }
 
 pub fn parse_combo(spec: &str) -> Result<Vec<String>> {
-    let parts: Vec<_> = spec
-        .split('+')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
+    let mut rest = spec.trim();
+    if rest.is_empty() {
+        return Err(msg("key combo is empty"));
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after) = rest.strip_prefix('+') {
+            parts.push("+");
+            let trimmed = after.trim_start();
+            rest = trimmed.strip_prefix('+').unwrap_or(trimmed);
+            continue;
+        }
+        if let Some(pos) = rest.find('+') {
+            let token = rest[..pos].trim_end();
+            let after = &rest[pos + 1..];
+            if token.eq_ignore_ascii_case("kp") {
+                parts.push("kp+");
+                let trimmed = after.trim_start();
+                rest = trimmed.strip_prefix('+').unwrap_or(trimmed);
+            } else {
+                if !token.is_empty() {
+                    parts.push(token);
+                }
+                rest = after;
+            }
+        } else {
+            let token = rest.trim_end();
+            if !token.is_empty() {
+                parts.push(token);
+            }
+            break;
+        }
+    }
     if parts.is_empty() {
         return Err(msg("key combo is empty"));
     }
@@ -182,7 +247,7 @@ pub fn key_info(name: &str) -> Option<KeyInfo> {
             name: "char",
             keysym: ch as u32,
             vk: ch.to_ascii_uppercase() as u16,
-            mac: mac_letter(ch)?,
+            mac: mac_letter(ch),
         });
     }
     if ch.is_ascii_digit() {
@@ -190,7 +255,7 @@ pub fn key_info(name: &str) -> Option<KeyInfo> {
             name: "digit",
             keysym: ch as u32,
             vk: ch as u16,
-            mac: mac_digit(ch)?,
+            mac: mac_digit(ch),
         });
     }
     if let Some(info) = punctuation_char(ch) {
@@ -271,325 +336,325 @@ const NAMED: &[KeyInfo] = &[
         name: "ctrl",
         keysym: 0xffe3,
         vk: 0x11,
-        mac: 0x3b,
+        mac: Some(0x3b),
     },
     KeyInfo {
         name: "lctrl",
         keysym: 0xffe3,
         vk: 0xa2,
-        mac: 0x3b,
+        mac: Some(0x3b),
     },
     KeyInfo {
         name: "rctrl",
         keysym: 0xffe4,
         vk: 0xa3,
-        mac: 0x3e,
+        mac: Some(0x3e),
     },
     KeyInfo {
         name: "alt",
         keysym: 0xffe9,
         vk: 0x12,
-        mac: 0x3a,
+        mac: Some(0x3a),
     },
     KeyInfo {
         name: "lalt",
         keysym: 0xffe9,
         vk: 0xa4,
-        mac: 0x3a,
+        mac: Some(0x3a),
     },
     KeyInfo {
         name: "ralt",
         keysym: 0xffea,
         vk: 0xa5,
-        mac: 0x3d,
+        mac: Some(0x3d),
     },
     KeyInfo {
         name: "shift",
         keysym: 0xffe1,
         vk: 0x10,
-        mac: 0x38,
+        mac: Some(0x38),
     },
     KeyInfo {
         name: "lshift",
         keysym: 0xffe1,
         vk: 0xa0,
-        mac: 0x38,
+        mac: Some(0x38),
     },
     KeyInfo {
         name: "rshift",
         keysym: 0xffe2,
         vk: 0xa1,
-        mac: 0x3c,
+        mac: Some(0x3c),
     },
     KeyInfo {
         name: "meta",
         keysym: 0xffeb,
         vk: 0x5b,
-        mac: 0x37,
+        mac: Some(0x37),
     },
     KeyInfo {
         name: "lgui",
         keysym: 0xffeb,
         vk: 0x5b,
-        mac: 0x37,
+        mac: Some(0x37),
     },
     KeyInfo {
         name: "rgui",
         keysym: 0xffec,
         vk: 0x5c,
-        mac: 0x36,
+        mac: Some(0x36),
     },
     KeyInfo {
         name: "enter",
         keysym: 0xff0d,
         vk: 0x0d,
-        mac: 0x24,
+        mac: Some(0x24),
     },
     KeyInfo {
         name: "tab",
         keysym: 0xff09,
         vk: 0x09,
-        mac: 0x30,
+        mac: Some(0x30),
     },
     KeyInfo {
         name: "escape",
         keysym: 0xff1b,
         vk: 0x1b,
-        mac: 0x35,
+        mac: Some(0x35),
     },
     KeyInfo {
         name: "space",
         keysym: 0x0020,
         vk: 0x20,
-        mac: 0x31,
+        mac: Some(0x31),
     },
     KeyInfo {
         name: "backspace",
         keysym: 0xff08,
         vk: 0x08,
-        mac: 0x33,
+        mac: Some(0x33),
     },
     KeyInfo {
         name: "delete",
         keysym: 0xffff,
         vk: 0x2e,
-        mac: 0x75,
+        mac: Some(0x75),
     },
     KeyInfo {
         name: "insert",
         keysym: 0xff63,
         vk: 0x2d,
-        mac: 0x72,
+        mac: Some(0x72),
     },
     KeyInfo {
         name: "prtsc",
         keysym: 0xff61,
         vk: 0x2c,
-        mac: 0x69,
+        mac: Some(0x69),
     },
     KeyInfo {
         name: "pause",
         keysym: 0xff13,
         vk: 0x13,
-        mac: 0x71,
+        mac: Some(0x71),
     },
     KeyInfo {
         name: "apps",
         keysym: 0xff67,
         vk: 0x5d,
-        mac: 0x6e,
+        mac: Some(0x6e),
     },
     KeyInfo {
         name: "left",
         keysym: 0xff51,
         vk: 0x25,
-        mac: 0x7b,
+        mac: Some(0x7b),
     },
     KeyInfo {
         name: "up",
         keysym: 0xff52,
         vk: 0x26,
-        mac: 0x7e,
+        mac: Some(0x7e),
     },
     KeyInfo {
         name: "right",
         keysym: 0xff53,
         vk: 0x27,
-        mac: 0x7c,
+        mac: Some(0x7c),
     },
     KeyInfo {
         name: "down",
         keysym: 0xff54,
         vk: 0x28,
-        mac: 0x7d,
+        mac: Some(0x7d),
     },
     KeyInfo {
         name: "home",
         keysym: 0xff50,
         vk: 0x24,
-        mac: 0x73,
+        mac: Some(0x73),
     },
     KeyInfo {
         name: "end",
         keysym: 0xff57,
         vk: 0x23,
-        mac: 0x77,
+        mac: Some(0x77),
     },
     KeyInfo {
         name: "pageup",
         keysym: 0xff55,
         vk: 0x21,
-        mac: 0x74,
+        mac: Some(0x74),
     },
     KeyInfo {
         name: "pagedown",
         keysym: 0xff56,
         vk: 0x22,
-        mac: 0x79,
+        mac: Some(0x79),
     },
     KeyInfo {
         name: "f1",
         keysym: 0xffbe,
         vk: 0x70,
-        mac: 0x7a,
+        mac: Some(0x7a),
     },
     KeyInfo {
         name: "f2",
         keysym: 0xffbf,
         vk: 0x71,
-        mac: 0x78,
+        mac: Some(0x78),
     },
     KeyInfo {
         name: "f3",
         keysym: 0xffc0,
         vk: 0x72,
-        mac: 0x63,
+        mac: Some(0x63),
     },
     KeyInfo {
         name: "f4",
         keysym: 0xffc1,
         vk: 0x73,
-        mac: 0x76,
+        mac: Some(0x76),
     },
     KeyInfo {
         name: "f5",
         keysym: 0xffc2,
         vk: 0x74,
-        mac: 0x60,
+        mac: Some(0x60),
     },
     KeyInfo {
         name: "f6",
         keysym: 0xffc3,
         vk: 0x75,
-        mac: 0x61,
+        mac: Some(0x61),
     },
     KeyInfo {
         name: "f7",
         keysym: 0xffc4,
         vk: 0x76,
-        mac: 0x62,
+        mac: Some(0x62),
     },
     KeyInfo {
         name: "f8",
         keysym: 0xffc5,
         vk: 0x77,
-        mac: 0x64,
+        mac: Some(0x64),
     },
     KeyInfo {
         name: "f9",
         keysym: 0xffc6,
         vk: 0x78,
-        mac: 0x65,
+        mac: Some(0x65),
     },
     KeyInfo {
         name: "f10",
         keysym: 0xffc7,
         vk: 0x79,
-        mac: 0x6d,
+        mac: Some(0x6d),
     },
     KeyInfo {
         name: "f11",
         keysym: 0xffc8,
         vk: 0x7a,
-        mac: 0x67,
+        mac: Some(0x67),
     },
     KeyInfo {
         name: "f12",
         keysym: 0xffc9,
         vk: 0x7b,
-        mac: 0x6f,
+        mac: Some(0x6f),
     },
     KeyInfo {
         name: "f13",
         keysym: 0xffca,
         vk: 0x7c,
-        mac: 0x69,
+        mac: Some(0x69),
     },
     KeyInfo {
         name: "f14",
         keysym: 0xffcb,
         vk: 0x7d,
-        mac: 0x6b,
+        mac: Some(0x6b),
     },
     KeyInfo {
         name: "f15",
         keysym: 0xffcc,
         vk: 0x7e,
-        mac: 0x71,
+        mac: Some(0x71),
     },
     KeyInfo {
         name: "f16",
         keysym: 0xffcd,
         vk: 0x7f,
-        mac: 0x6a,
+        mac: Some(0x6a),
     },
     KeyInfo {
         name: "f17",
         keysym: 0xffce,
         vk: 0x80,
-        mac: 0x40,
+        mac: Some(0x40),
     },
     KeyInfo {
         name: "f18",
         keysym: 0xffcf,
         vk: 0x81,
-        mac: 0x4f,
+        mac: Some(0x4f),
     },
     KeyInfo {
         name: "f19",
         keysym: 0xffd0,
         vk: 0x82,
-        mac: 0x50,
+        mac: Some(0x50),
     },
     KeyInfo {
         name: "f20",
         keysym: 0xffd1,
         vk: 0x83,
-        mac: 0x5a,
+        mac: Some(0x5a),
     },
     KeyInfo {
         name: "f21",
         keysym: 0xffd2,
         vk: 0x84,
-        mac: 0,
+        mac: None,
     },
     KeyInfo {
         name: "f22",
         keysym: 0xffd3,
         vk: 0x85,
-        mac: 0,
+        mac: None,
     },
     KeyInfo {
         name: "f23",
         keysym: 0xffd4,
         vk: 0x86,
-        mac: 0,
+        mac: None,
     },
     KeyInfo {
         name: "f24",
         keysym: 0xffd5,
         vk: 0x87,
-        mac: 0,
+        mac: None,
     },
     // Unshifted punctuation (US ANSI). Shift variants share the physical VK;
     // X11 keysyms use the produced character so temporary mapping can type them.
@@ -597,351 +662,370 @@ const NAMED: &[KeyInfo] = &[
         name: ",",
         keysym: 0x002c,
         vk: 0xbc,
-        mac: 0x2b,
+        mac: Some(0x2b),
     },
     KeyInfo {
         name: ".",
         keysym: 0x002e,
         vk: 0xbe,
-        mac: 0x2f,
+        mac: Some(0x2f),
     },
     KeyInfo {
         name: "/",
         keysym: 0x002f,
         vk: 0xbf,
-        mac: 0x2c,
+        mac: Some(0x2c),
     },
     KeyInfo {
         name: ";",
         keysym: 0x003b,
         vk: 0xba,
-        mac: 0x29,
+        mac: Some(0x29),
     },
     KeyInfo {
         name: "'",
         keysym: 0x0027,
         vk: 0xde,
-        mac: 0x27,
+        mac: Some(0x27),
     },
     KeyInfo {
         name: "[",
         keysym: 0x005b,
         vk: 0xdb,
-        mac: 0x21,
+        mac: Some(0x21),
     },
     KeyInfo {
         name: "]",
         keysym: 0x005d,
         vk: 0xdd,
-        mac: 0x1e,
+        mac: Some(0x1e),
     },
     KeyInfo {
         name: "\\",
         keysym: 0x005c,
         vk: 0xdc,
-        mac: 0x2a,
+        mac: Some(0x2a),
     },
     KeyInfo {
         name: "-",
         keysym: 0x002d,
         vk: 0xbd,
-        mac: 0x1b,
+        mac: Some(0x1b),
     },
     KeyInfo {
         name: "=",
         keysym: 0x003d,
         vk: 0xbb,
-        mac: 0x18,
+        mac: Some(0x18),
     },
     KeyInfo {
         name: "`",
         keysym: 0x0060,
         vk: 0xc0,
-        mac: 0x32,
+        mac: Some(0x32),
     },
     KeyInfo {
         name: ":",
         keysym: 0x003a,
         vk: 0xba,
-        mac: 0x29,
+        mac: Some(0x29),
     },
     KeyInfo {
         name: "\"",
         keysym: 0x0022,
         vk: 0xde,
-        mac: 0x27,
+        mac: Some(0x27),
     },
     KeyInfo {
         name: "{",
         keysym: 0x007b,
         vk: 0xdb,
-        mac: 0x21,
+        mac: Some(0x21),
     },
     KeyInfo {
         name: "}",
         keysym: 0x007d,
         vk: 0xdd,
-        mac: 0x1e,
+        mac: Some(0x1e),
     },
     KeyInfo {
         name: "|",
         keysym: 0x007c,
         vk: 0xdc,
-        mac: 0x2a,
+        mac: Some(0x2a),
     },
     KeyInfo {
         name: "<",
         keysym: 0x003c,
         vk: 0xbc,
-        mac: 0x2b,
+        mac: Some(0x2b),
     },
     KeyInfo {
         name: ">",
         keysym: 0x003e,
         vk: 0xbe,
-        mac: 0x2f,
+        mac: Some(0x2f),
     },
     KeyInfo {
         name: "?",
         keysym: 0x003f,
         vk: 0xbf,
-        mac: 0x2c,
+        mac: Some(0x2c),
     },
     KeyInfo {
         name: "~",
         keysym: 0x007e,
         vk: 0xc0,
-        mac: 0x32,
+        mac: Some(0x32),
     },
     KeyInfo {
         name: "!",
         keysym: 0x0021,
         vk: 0x31,
-        mac: 0x12,
+        mac: Some(0x12),
     },
     KeyInfo {
         name: "@",
         keysym: 0x0040,
         vk: 0x32,
-        mac: 0x13,
+        mac: Some(0x13),
     },
     KeyInfo {
         name: "#",
         keysym: 0x0023,
         vk: 0x33,
-        mac: 0x14,
+        mac: Some(0x14),
     },
     KeyInfo {
         name: "$",
         keysym: 0x0024,
         vk: 0x34,
-        mac: 0x15,
+        mac: Some(0x15),
     },
     KeyInfo {
         name: "%",
         keysym: 0x0025,
         vk: 0x35,
-        mac: 0x17,
+        mac: Some(0x17),
     },
     KeyInfo {
         name: "^",
         keysym: 0x005e,
         vk: 0x36,
-        mac: 0x16,
+        mac: Some(0x16),
     },
     KeyInfo {
         name: "&",
         keysym: 0x0026,
         vk: 0x37,
-        mac: 0x1a,
+        mac: Some(0x1a),
     },
     KeyInfo {
         name: "*",
         keysym: 0x002a,
         vk: 0x38,
-        mac: 0x1c,
+        mac: Some(0x1c),
     },
     KeyInfo {
         name: "(",
         keysym: 0x0028,
         vk: 0x39,
-        mac: 0x19,
+        mac: Some(0x19),
     },
     KeyInfo {
         name: ")",
         keysym: 0x0029,
         vk: 0x30,
-        mac: 0x1d,
+        mac: Some(0x1d),
     },
     KeyInfo {
         name: "_",
         keysym: 0x005f,
         vk: 0xbd,
-        mac: 0x1b,
+        mac: Some(0x1b),
     },
     KeyInfo {
         name: "+",
         keysym: 0x002b,
         vk: 0xbb,
-        mac: 0x18,
+        mac: Some(0x18),
     },
     // Numpad.
     KeyInfo {
         name: "kp0",
         keysym: 0xffb0,
         vk: 0x60,
-        mac: 0x52,
+        mac: Some(0x52),
     },
     KeyInfo {
         name: "kp1",
         keysym: 0xffb1,
         vk: 0x61,
-        mac: 0x53,
+        mac: Some(0x53),
     },
     KeyInfo {
         name: "kp2",
         keysym: 0xffb2,
         vk: 0x62,
-        mac: 0x54,
+        mac: Some(0x54),
     },
     KeyInfo {
         name: "kp3",
         keysym: 0xffb3,
         vk: 0x63,
-        mac: 0x55,
+        mac: Some(0x55),
     },
     KeyInfo {
         name: "kp4",
         keysym: 0xffb4,
         vk: 0x64,
-        mac: 0x56,
+        mac: Some(0x56),
     },
     KeyInfo {
         name: "kp5",
         keysym: 0xffb5,
         vk: 0x65,
-        mac: 0x57,
+        mac: Some(0x57),
     },
     KeyInfo {
         name: "kp6",
         keysym: 0xffb6,
         vk: 0x66,
-        mac: 0x58,
+        mac: Some(0x58),
     },
     KeyInfo {
         name: "kp7",
         keysym: 0xffb7,
         vk: 0x67,
-        mac: 0x59,
+        mac: Some(0x59),
     },
     KeyInfo {
         name: "kp8",
         keysym: 0xffb8,
         vk: 0x68,
-        mac: 0x5b,
+        mac: Some(0x5b),
     },
     KeyInfo {
         name: "kp9",
         keysym: 0xffb9,
         vk: 0x69,
-        mac: 0x5c,
+        mac: Some(0x5c),
     },
     KeyInfo {
         name: "kp-",
         keysym: 0xffad,
         vk: 0x6d,
-        mac: 0x4e,
+        mac: Some(0x4e),
     },
     KeyInfo {
         name: "kp+",
         keysym: 0xffab,
         vk: 0x6b,
-        mac: 0x45,
+        mac: Some(0x45),
     },
     KeyInfo {
         name: "kp*",
         keysym: 0xffaa,
         vk: 0x6a,
-        mac: 0x43,
+        mac: Some(0x43),
     },
     KeyInfo {
         name: "kp/",
         keysym: 0xffaf,
         vk: 0x6f,
-        mac: 0x4b,
+        mac: Some(0x4b),
     },
     KeyInfo {
         name: "kp.",
         keysym: 0xffae,
         vk: 0x6e,
-        mac: 0x41,
+        mac: Some(0x41),
     },
     KeyInfo {
         name: "kpenter",
         keysym: 0xff8d,
         vk: 0x0d,
-        mac: 0x4c,
+        mac: Some(0x4c),
     },
     // Media / browser.
     KeyInfo {
         name: "volup",
         keysym: XF86_AUDIO_RAISE,
         vk: 0xaf,
-        mac: 0x48,
+        mac: Some(0x48),
     },
     KeyInfo {
         name: "voldown",
         keysym: XF86_AUDIO_LOWER,
         vk: 0xae,
-        mac: 0x49,
+        mac: Some(0x49),
     },
     KeyInfo {
         name: "volmute",
         keysym: XF86_AUDIO_MUTE,
         vk: 0xad,
-        mac: 0x4a,
+        mac: Some(0x4a),
     },
     KeyInfo {
         name: "playpause",
         keysym: XF86_AUDIO_PLAY,
         vk: 0xb3,
-        mac: 0x00,
+        mac: None,
     },
     KeyInfo {
         name: "nexttrack",
         keysym: XF86_AUDIO_NEXT,
         vk: 0xb0,
-        mac: 0x00,
+        mac: None,
     },
     KeyInfo {
         name: "prevtrack",
         keysym: XF86_AUDIO_PREV,
         vk: 0xb1,
-        mac: 0x00,
+        mac: None,
     },
     KeyInfo {
         name: "stop",
         keysym: XF86_AUDIO_STOP,
         vk: 0xb2,
-        mac: 0x00,
+        mac: None,
     },
     KeyInfo {
         name: "mediaselect",
         keysym: XF86_AUDIO_MEDIA,
         vk: 0xb5,
-        mac: 0x00,
+        mac: None,
     },
     KeyInfo {
         name: "browser-back",
         keysym: XF86_BACK,
         vk: 0xa6,
-        mac: 0x00,
+        mac: None,
     },
     KeyInfo {
         name: "browser-forward",
         keysym: XF86_FORWARD,
         vk: 0xa7,
-        mac: 0x00,
+        mac: None,
+    },
+    // Lock keys.
+    KeyInfo {
+        name: "capslock",
+        keysym: 0xffe5,
+        vk: 0x14,
+        mac: Some(0x39),
+    },
+    KeyInfo {
+        name: "numlock",
+        keysym: 0xff7f,
+        vk: 0x90,
+        mac: Some(0x47),
+    },
+    KeyInfo {
+        name: "scrolllock",
+        keysym: 0xff14,
+        vk: 0x91,
+        mac: None,
     },
 ];
 
@@ -1083,6 +1167,51 @@ mod tests {
             assert!(
                 !is_windows_extended_vk(vk),
                 "{main_block} (vk={vk:#x}) must not carry KEYEVENTF_EXTENDEDKEY"
+            );
+        }
+    }
+
+    #[test]
+    fn plus_and_ctrl_plus_plus_and_lock_keys_parse() {
+        assert_eq!(canonical("plus").unwrap(), "+");
+        assert_eq!(parse_combo("ctrl++").unwrap(), vec!["ctrl", "+"]);
+        assert_eq!(parse_combo("ctrl+shift++").unwrap(), vec!["ctrl", "shift", "+"]);
+        assert_eq!(parse_combo("+").unwrap(), vec!["+"]);
+        assert_eq!(parse_combo("ctrl+plus").unwrap(), vec!["ctrl", "+"]);
+        assert_eq!(parse_combo("kp+").unwrap(), vec!["kp+"]);
+        assert_eq!(parse_combo("ctrl+kp+").unwrap(), vec!["ctrl", "kp+"]);
+
+        assert_eq!(canonical("capslock").unwrap(), "capslock");
+        assert_eq!(canonical("caps_lock").unwrap(), "capslock");
+        assert_eq!(canonical("numlock").unwrap(), "numlock");
+        assert_eq!(canonical("scrolllock").unwrap(), "scrolllock");
+        assert_eq!(key_info("capslock").unwrap().vk, 0x14);
+        assert_eq!(key_info("numlock").unwrap().vk, 0x90);
+        assert_eq!(key_info("scrolllock").unwrap().vk, 0x91);
+        assert!(is_windows_extended_vk(key_info("numlock").unwrap().vk));
+    }
+
+    #[test]
+    fn unmapped_mac_keys_are_none_not_k_vk_ansi_a() {
+        assert_eq!(key_info("a").unwrap().mac, Some(0x00));
+        for key in [
+            "f21",
+            "f22",
+            "f23",
+            "f24",
+            "playpause",
+            "nexttrack",
+            "prevtrack",
+            "stop",
+            "mediaselect",
+            "browser-back",
+            "browser-forward",
+            "scrolllock",
+        ] {
+            assert_eq!(
+                key_info(key).unwrap().mac,
+                None,
+                "{key} must not map to 0x00 (kVK_ANSI_A)"
             );
         }
     }

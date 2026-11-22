@@ -107,15 +107,42 @@ pub fn vaapi_probe_failure_reason() -> Option<String> {
     }
 }
 
+fn vaapi_probe_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn ensure_vaapi_probed() {
-    let mut guard = vaapi_cache().lock().unwrap_or_else(|err| err.into_inner());
-    if !matches!(&*guard, VaapiCache::Untested) {
-        return;
+    {
+        let guard = vaapi_cache().lock().unwrap_or_else(|err| err.into_inner());
+        if !matches!(&*guard, VaapiCache::Untested) {
+            return;
+        }
     }
-    *guard = run_vaapi_probe();
+    // Never hold `vaapi_cache()` across blocking subprocess I/O so readers
+    // inspecting the cache cannot deadlock if a VAAPI driver stalls.
+    let _probe_guard = vaapi_probe_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    {
+        let guard = vaapi_cache().lock().unwrap_or_else(|err| err.into_inner());
+        if !matches!(&*guard, VaapiCache::Untested) {
+            return;
+        }
+    }
+    let result = run_vaapi_probe();
+    let mut guard = vaapi_cache().lock().unwrap_or_else(|err| err.into_inner());
+    *guard = result;
 }
 
 fn run_vaapi_probe() -> VaapiCache {
+    // Check render node FIRST so Windows/macOS/headless Linux skip spawning
+    // `ffmpeg -encoders` entirely.
+    let Some(render) = find_render_node() else {
+        return VaapiCache::Failed {
+            reason: "no openable /dev/dri/renderD* node".into(),
+        };
+    };
     let Some(binary) = which("ffmpeg") else {
         return VaapiCache::Failed {
             reason: "ffmpeg binary not found on PATH".into(),
@@ -126,11 +153,6 @@ fn run_vaapi_probe() -> VaapiCache {
             reason: "ffmpeg does not advertise h264_vaapi".into(),
         };
     }
-    let Some(render) = find_render_node() else {
-        return VaapiCache::Failed {
-            reason: "no openable /dev/dri/renderD* node".into(),
-        };
-    };
 
     let deadline = Instant::now() + Duration::from_millis(900);
 
@@ -236,25 +258,53 @@ fn probe_one_frame(
         String::from_utf8_lossy(&buf).into_owned()
     });
 
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut got = false;
-    while Instant::now() < deadline {
-        match stdout.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                out.extend_from_slice(&buf[..n]);
-                if !out.is_empty() {
-                    got = true;
+    let (stdout_tx, stdout_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stdout_tx.send(Ok(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    let _ = stdout_tx.send(Err(err));
                     break;
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => {
+        }
+    });
+
+    let mut out = Vec::new();
+    let mut got = false;
+    let mut timed_out = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        match stdout_rx.recv_timeout(remaining) {
+            Ok(Ok(chunk)) if !chunk.is_empty() => {
+                out.extend_from_slice(&chunk);
+                got = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(err)) => {
                 let _ = child.kill();
-                let err_text = stderr_handle.join().unwrap_or_default();
+                let _ = child.wait();
+                let err_text = truncate_stderr(&stderr_handle.join().unwrap_or_default());
                 return Err(format!("read probe stdout: {err}; stderr={err_text}"));
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     let _ = child.kill();
@@ -262,6 +312,14 @@ fn probe_one_frame(
     let err_text = truncate_stderr(&stderr_handle.join().unwrap_or_default());
     if got && !out.is_empty() {
         Ok(())
+    } else if timed_out {
+        if err_text.is_empty() {
+            Err("probe watchdog deadline exceeded".into())
+        } else {
+            Err(format!(
+                "probe watchdog deadline exceeded; stderr={err_text}"
+            ))
+        }
     } else if err_text.is_empty() {
         Err("probe produced no packet".into())
     } else {
@@ -271,12 +329,21 @@ fn probe_one_frame(
 
 const STDERR_KEEP: usize = 4096;
 
+/// Advance `idx` forward to the next UTF-8 character boundary (never panics).
+fn ceil_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 fn truncate_stderr(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.len() <= STDERR_KEEP {
         return trimmed.to_string();
     }
-    let start = trimmed.len() - STDERR_KEEP;
+    let start = ceil_char_boundary(trimmed, trimmed.len() - STDERR_KEEP);
     format!("…{}", &trimmed[start..])
 }
 
@@ -297,8 +364,7 @@ impl StderrTail {
         };
         guard.push_str(chunk);
         if guard.len() > STDERR_KEEP * 2 {
-            let keep = STDERR_KEEP;
-            let drain = guard.len() - keep;
+            let drain = ceil_char_boundary(&guard, guard.len() - STDERR_KEEP);
             guard.drain(..drain);
         }
     }
@@ -309,18 +375,27 @@ impl StderrTail {
     }
 }
 
+const BITRATE_RESPAWN_COOLDOWN: Duration = Duration::from_secs(3);
+
 pub struct FfmpegEncoder {
     child: Child,
     stdin: ChildStdin,
     chunks: Receiver<Vec<u8>>,
     stderr: std::sync::Arc<StderrTail>,
     request: EncoderRequest,
+    spawned_bitrate: u32,
     name: String,
     hardware: bool,
     vaapi: Option<(VaapiMode, String)>,
     frames: u64,
     /// Last time a force-keyframe respawned the child (VAAPI throttling).
     last_idr_at: Instant,
+    /// Last time a bitrate change respawned the child.
+    last_bitrate_respawn: Instant,
+    /// Leftover bytes read past an Annex-B AU boundary for the next frame.
+    pending_out: Vec<u8>,
+    /// Reusable tightly-packed BGRA stdin frame buffer (avoids 1080+ syscalls/frame).
+    write_buf: Vec<u8>,
 }
 
 impl FfmpegEncoder {
@@ -476,13 +551,19 @@ impl FfmpegEncoder {
         cmd.arg("-c:v").arg(name);
         match name {
             "libx264" => {
-                cmd.args(["-preset", "ultrafast", "-tune", "zerolatency"])
+                // Force yuv420p + baseline so raw bgra stdin never produces
+                // High 4:4:4 Predictive (undecodable by OpenH264 / browsers).
+                // `aud=1` inserts explicit Annex-B Access Unit Delimiters.
+                cmd.args(["-pix_fmt", "yuv420p", "-profile:v", "baseline"])
+                    .args(["-preset", "ultrafast", "-tune", "zerolatency"])
                     .args(["-bf", "0", "-g", "60"])
                     .arg("-x264-params")
-                    .arg("bframes=0:sync-lookahead=0:rc-lookahead=0");
+                    .arg("bframes=0:sync-lookahead=0:rc-lookahead=0:repeat-headers=1:annexb=1:aud=1");
             }
             "libvpx-vp9" => {
                 cmd.args([
+                    "-pix_fmt",
+                    "yuv420p",
                     "-deadline",
                     "realtime",
                     "-cpu-used",
@@ -570,6 +651,8 @@ impl FfmpegEncoder {
                 }
             })
             .map_err(|err| msg(format!("ffmpeg reader: {err}")))?;
+        let now = Instant::now();
+        let initial_bitrate = request.bitrate.max(100_000);
         Ok(Self {
             child,
             stdin,
@@ -579,13 +662,18 @@ impl FfmpegEncoder {
                 width,
                 height,
                 fps,
+                bitrate: initial_bitrate,
                 ..*request
             },
+            spawned_bitrate: initial_bitrate,
             name: name.to_string(),
             hardware,
             vaapi,
             frames: 0,
-            last_idr_at: Instant::now(),
+            last_idr_at: now,
+            last_bitrate_respawn: now,
+            pending_out: Vec::new(),
+            write_buf: Vec::with_capacity(src_w as usize * src_h as usize * 4),
         })
     }
 
@@ -640,17 +728,21 @@ impl VideoEncoder for FfmpegEncoder {
         }
         let src_w = self.request.src_width.max(2);
         let src_h = self.request.src_height.max(2);
-        write_bgra(&mut self.stdin, frame, src_w, src_h)?;
+        write_bgra(&mut self.stdin, &mut self.write_buf, frame, src_w, src_h)?;
         self.stdin.flush().map_err(|err| msg(err.to_string()))?;
         // Intel h264_vaapi holds one frame before emitting. A black priming
         // frame used to make the first IDR a blank picture, which made the
         // viewer spam keyframe requests and restart ffmpeg every ~1.5s.
         // Double-writing the first real frame liberates a content IDR instead.
         if self.vaapi.is_some() && self.frames == 0 {
-            write_bgra(&mut self.stdin, frame, src_w, src_h)?;
+            write_bgra(&mut self.stdin, &mut self.write_buf, frame, src_w, src_h)?;
             self.stdin.flush().map_err(|err| msg(err.to_string()))?;
         }
-        let bytes = match read_access_unit(&self.chunks) {
+        let bytes = match read_access_unit(
+            &self.chunks,
+            &mut self.pending_out,
+            self.request.codec,
+        ) {
             Ok(bytes) => bytes,
             Err(err) => {
                 let text = err.to_string();
@@ -675,18 +767,16 @@ impl VideoEncoder for FfmpegEncoder {
     }
 
     fn set_bitrate(&mut self, bitrate: u32) {
-        let previous = self.request.bitrate.max(1);
-        self.request.bitrate = bitrate.max(100_000);
-        // CQP sessions remap qp only on respawn; bitrate mode respawns on big swings.
-        let ratio = self.request.bitrate as f32 / previous as f32;
-        let should_respawn = if matches!(self.vaapi.as_ref().map(|(m, _)| *m), Some(VaapiMode::LowPowerCqp))
-        {
-            vaapi_bitrate_to_qp(previous) != vaapi_bitrate_to_qp(self.request.bitrate)
-                && self.frames > 0
-        } else {
-            !(0.8..=1.25).contains(&ratio) && self.frames > 0
-        };
-        if should_respawn {
+        let next_bitrate = bitrate.max(100_000);
+        self.request.bitrate = next_bitrate;
+        let vaapi_mode = self.vaapi.as_ref().map(|(m, _)| *m);
+        if should_respawn_for_bitrate(
+            self.spawned_bitrate,
+            next_bitrate,
+            vaapi_mode,
+            self.frames,
+            self.last_bitrate_respawn.elapsed(),
+        ) {
             let request = self.request;
             let name = self.name.clone();
             let hardware = self.hardware;
@@ -698,46 +788,214 @@ impl VideoEncoder for FfmpegEncoder {
     }
 }
 
-fn write_bgra(stdin: &mut ChildStdin, frame: &Frame, width: u32, height: u32) -> Result<()> {
-    let src_stride = frame.stride as usize;
-    let row = width as usize * 4;
-    let src = frame.pixels();
-    for y in 0..height as usize {
-        if y < frame.height as usize {
-            let start = y * src_stride;
-            let available = src.len().saturating_sub(start);
-            let copy = row.min(frame.width as usize * 4).min(available);
-            stdin
-                .write_all(&src[start..start + copy])
-                .map_err(|err| msg(err.to_string()))?;
-            if copy < row {
-                stdin
-                    .write_all(&vec![0u8; row - copy])
-                    .map_err(|err| msg(err.to_string()))?;
-            }
-        } else {
-            stdin
-                .write_all(&vec![0u8; row])
-                .map_err(|err| msg(err.to_string()))?;
-        }
+/// Pure policy deciding whether an ffmpeg child must be respawned for a
+/// bitrate change. Ignores minor idle QP jitter and enforces a cooldown so
+/// AIMD/heartbeat updates cannot churn ffmpeg processes.
+fn should_respawn_for_bitrate(
+    spawned_bitrate: u32,
+    new_bitrate: u32,
+    vaapi_mode: Option<VaapiMode>,
+    frames: u64,
+    since_last_respawn: Duration,
+) -> bool {
+    if frames == 0 || since_last_respawn < BITRATE_RESPAWN_COOLDOWN {
+        return false;
     }
-    Ok(())
+    let previous = spawned_bitrate.max(1);
+    if matches!(vaapi_mode, Some(VaapiMode::LowPowerCqp)) {
+        let old_qp = vaapi_bitrate_to_qp(previous) as i32;
+        let new_qp = vaapi_bitrate_to_qp(new_bitrate) as i32;
+        (old_qp - new_qp).abs() >= 3
+    } else {
+        let ratio = new_bitrate as f32 / previous as f32;
+        !(0.65..=1.5).contains(&ratio)
+    }
 }
 
-fn read_access_unit(chunks: &Receiver<Vec<u8>>) -> Result<Vec<u8>> {
-    let mut out = chunks
-        .recv_timeout(Duration::from_millis(800))
-        .map_err(|_| msg("ffmpeg produced no packet"))?;
-    let idle = Duration::from_millis(20);
-    loop {
-        match chunks.recv_timeout(idle) {
-            Ok(more) => out.extend_from_slice(&more),
-            Err(_) => break,
+fn write_bgra(
+    stdin: &mut ChildStdin,
+    buf: &mut Vec<u8>,
+    frame: &Frame,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    let src_stride = frame.stride as usize;
+    let row = width as usize * 4;
+    let total = row * height as usize;
+    let src = frame.pixels();
+    // Fast path: tightly packed frame matches stdin dimensions exactly.
+    if frame.width == width
+        && frame.height == height
+        && src_stride == row
+        && src.len() >= total
+    {
+        return stdin
+            .write_all(&src[..total])
+            .map_err(|err| msg(err.to_string()));
+    }
+    buf.resize(total, 0);
+    buf.fill(0);
+    let rows = (height as usize).min(frame.height as usize);
+    let copy_cols = row.min(frame.width as usize * 4);
+    for y in 0..rows {
+        let src_start = y * src_stride;
+        let available = src.len().saturating_sub(src_start);
+        let copy = copy_cols.min(available);
+        let dst_start = y * row;
+        if copy > 0 {
+            buf[dst_start..dst_start + copy].copy_from_slice(&src[src_start..src_start + copy]);
         }
-        if out.len() > 8 * 1024 * 1024 {
+    }
+    stdin.write_all(buf).map_err(|err| msg(err.to_string()))
+}
+
+/// Find the byte offset of the next Annex-B start code (`00 00 01` or
+/// `00 00 00 01`) at or after `from`, returning `(start_code_pos, nal_header_pos)`.
+fn find_start_code(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i + 3 <= bytes.len() {
+        if bytes[i] == 0 && bytes[i + 1] == 0 {
+            if bytes[i + 2] == 1 {
+                return Some((i, i + 3));
+            }
+            if i + 3 < bytes.len() && bytes[i + 2] == 0 && bytes[i + 3] == 1 {
+                return Some((i, i + 4));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_vcl_nal(codec: Codec, nal_header: u8) -> bool {
+    match codec {
+        Codec::H264 => matches!(nal_header & 0x1f, 1..=5),
+        Codec::H265 => matches!((nal_header >> 1) & 0x3f, 0..=21),
+        _ => true,
+    }
+}
+
+fn is_au_delimiter_after_vcl(codec: Codec, nal: &[u8]) -> bool {
+    let Some(&hdr) = nal.first() else {
+        return false;
+    };
+    match codec {
+        Codec::H264 => {
+            let ty = hdr & 0x1f;
+            // AUD (9), SPS (7), PPS (8), SEI (6), or a new primary slice whose
+            // first_mb_in_slice == 0 (Exp-Golomb 0 starts with MSB 1).
+            matches!(ty, 6 | 7 | 8 | 9)
+                || (matches!(ty, 1..=5) && nal.get(1).is_some_and(|b| (b & 0x80) != 0))
+        }
+        Codec::H265 => {
+            let ty = (hdr >> 1) & 0x3f;
+            // VPS (32), SPS (33), PPS (34), AUD (35), prefix SEI (39), or a new
+            // slice with first_slice_segment_in_pic_flag == 1 (MSB of byte 2).
+            matches!(ty, 32..=35 | 39)
+                || (matches!(ty, 0..=21) && nal.get(2).is_some_and(|b| (b & 0x80) != 0))
+        }
+        _ => false,
+    }
+}
+
+fn annexb_has_vcl(bytes: &[u8], codec: Codec) -> bool {
+    let mut cursor = 0;
+    while let Some((_, hdr_pos)) = find_start_code(bytes, cursor) {
+        if let Some(&hdr) = bytes.get(hdr_pos) {
+            if is_vcl_nal(codec, hdr) {
+                return true;
+            }
+        }
+        cursor = hdr_pos;
+    }
+    false
+}
+
+/// If `buf` contains at least one complete Access Unit followed by the start
+/// of the next Access Unit (AUD, SPS/PPS, or next frame's first slice), split
+/// off and return the first AU immediately, leaving the remainder in `buf`.
+fn split_complete_annexb_au(buf: &mut Vec<u8>, codec: Codec) -> Option<Vec<u8>> {
+    let mut saw_vcl = false;
+    let mut cursor = 0;
+    while let Some((sc_pos, hdr_pos)) = find_start_code(buf, cursor) {
+        if hdr_pos >= buf.len() {
+            break;
+        }
+        let slice = &buf[hdr_pos..];
+        if saw_vcl && is_au_delimiter_after_vcl(codec, slice) {
+            let tail = buf.split_off(sc_pos);
+            let au = std::mem::replace(buf, tail);
+            return Some(au);
+        }
+        if is_vcl_nal(codec, slice[0]) {
+            saw_vcl = true;
+        }
+        cursor = hdr_pos;
+    }
+    None
+}
+
+fn read_access_unit(
+    chunks: &Receiver<Vec<u8>>,
+    pending: &mut Vec<u8>,
+    codec: Codec,
+) -> Result<Vec<u8>> {
+    let annexb = matches!(codec, Codec::H264 | Codec::H265);
+    if annexb {
+        if let Some(au) = split_complete_annexb_au(pending, codec) {
+            return Ok(au);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(800);
+    while pending.is_empty() || (annexb && !annexb_has_vcl(pending, codec)) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(msg("ffmpeg produced no packet"));
+        }
+        let chunk = chunks
+            .recv_timeout(remaining)
+            .map_err(|_| msg("ffmpeg produced no packet"))?;
+        pending.extend_from_slice(&chunk);
+        if annexb {
+            if let Some(au) = split_complete_annexb_au(pending, codec) {
+                return Ok(au);
+            }
+        }
+        if pending.len() > 8 * 1024 * 1024 {
             break;
         }
     }
+    // Drain any chunks already buffered in the channel, then wait only a brief
+    // 2ms tail window (not 20ms) for trailing bytes of a multi-chunk AU.
+    while let Ok(more) = chunks.try_recv() {
+        pending.extend_from_slice(&more);
+        if annexb {
+            if let Some(au) = split_complete_annexb_au(pending, codec) {
+                return Ok(au);
+            }
+        }
+        if pending.len() > 8 * 1024 * 1024 {
+            break;
+        }
+    }
+    let tail_wait = Duration::from_millis(2);
+    loop {
+        match chunks.recv_timeout(tail_wait) {
+            Ok(more) => {
+                pending.extend_from_slice(&more);
+                if annexb {
+                    if let Some(au) = split_complete_annexb_au(pending, codec) {
+                        return Ok(au);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+        if pending.len() > 8 * 1024 * 1024 {
+            break;
+        }
+    }
+    let mut out = std::mem::take(pending);
     if matches!(out.get(0..4), Some(b"DKIF")) {
         out = strip_ivf(&out);
     }
@@ -946,5 +1204,76 @@ mod tests {
         let fail = vaapi_probe_failure_reason();
         assert!(second.elapsed().as_millis() < 50, "cached probe must be fast");
         assert!(again.is_some() || fail.is_some());
+    }
+
+    #[test]
+    fn truncate_stderr_and_tail_are_utf8_safe() {
+        // Multi-byte CJK chars (3 bytes each) repeated past STDERR_KEEP*2 so
+        // raw byte slicing would land mid-character and panic.
+        let chunk = "编码错误".repeat(800);
+        let truncated = truncate_stderr(&chunk);
+        assert!(truncated.len() <= STDERR_KEEP + 4);
+        let tail = StderrTail::new();
+        tail.push(&chunk);
+        tail.push(&chunk);
+        let snap = tail.snapshot();
+        assert!(!snap.is_empty());
+        assert!(snap.len() <= STDERR_KEEP + 4);
+    }
+
+    #[test]
+    fn annexb_au_extractor_splits_back_to_back_access_units() {
+        let au1 = [
+            0, 0, 0, 1, 0x09, 0x10, // AUD
+            0, 0, 0, 1, 0x67, 0x42, // SPS
+            0, 0, 0, 1, 0x68, 0xce, // PPS
+            0, 0, 0, 1, 0x65, 0x88, 0x01, // IDR (first_mb=0)
+        ];
+        let au2 = [
+            0, 0, 0, 1, 0x09, 0x30, // AUD
+            0, 0, 0, 1, 0x41, 0x9a, 0x02, // P-slice
+        ];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&au1);
+        buf.extend_from_slice(&au2);
+        let extracted = split_complete_annexb_au(&mut buf, Codec::H264).expect("first AU");
+        assert_eq!(extracted, au1);
+        assert_eq!(buf, au2);
+        assert!(split_complete_annexb_au(&mut buf, Codec::H264).is_none());
+    }
+
+    #[test]
+    fn bitrate_respawn_policy_ignores_minor_qp_and_cooldown() {
+        // Never respawn inside cooldown or on first frame.
+        assert!(!should_respawn_for_bitrate(
+            2_000_000,
+            500_000,
+            None,
+            0,
+            Duration::from_secs(10)
+        ));
+        assert!(!should_respawn_for_bitrate(
+            2_000_000,
+            500_000,
+            None,
+            10,
+            Duration::from_secs(1)
+        ));
+        // Minor VAAPI QP shift (< 3) must not respawn ffmpeg.
+        assert!(!should_respawn_for_bitrate(
+            2_000_000,
+            1_500_000,
+            Some(VaapiMode::LowPowerCqp),
+            10,
+            Duration::from_secs(10)
+        ));
+        // Large VAAPI QP shift (>= 3) past cooldown does respawn.
+        assert!(should_respawn_for_bitrate(
+            4_000_000,
+            500_000,
+            Some(VaapiMode::LowPowerCqp),
+            10,
+            Duration::from_secs(10)
+        ));
     }
 }
