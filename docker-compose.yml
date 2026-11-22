@@ -7,6 +7,21 @@ services:
       - "7443:7443"
     volumes:
       - relay-data:/var/lib/agentlink
+    # environment:
+    #   # Canonical public origin for /install.sh, /install.ps1, and /api/tokens:
+    #   AGENTLINK_PUBLIC_URL: "https://relay.example.com"
+    #   # Optional PostgreSQL DSN (omit for default SQLite in /var/lib/agentlink):
+    #   AGENTLINK_DATABASE_URL: "postgres://agentlink:password@postgres:5432/agentlink"
+    #   # Optional coturn REST credentials for native desktop/Android WebRTC viewers:
+    #   AGENTLINK_STUN_URLS: "stun:turn.example.com:3478"
+    #   AGENTLINK_TURN_URLS: "turns:turn.example.com:443?transport=tcp"
+    #   AGENTLINK_TURN_SECRET: "replace-with-coturn-static-auth-secret"
+    healthcheck:
+      test: ["CMD", "curl", "-fsSk", "--max-time", "4", "https://127.0.0.1:7443/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
 
 volumes:
   relay-data:

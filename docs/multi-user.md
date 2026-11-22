@@ -4,28 +4,28 @@ The relay keeps local accounts. A node is owned by the user who enrolled it. Tha
 
 Sealed agent sessions and owner-signed grants (relay untrusted for authz) are covered in [e2e-auth.md](e2e-auth.md).
 
-Passwords are stored as argon2id hashes. A login that fails five times locks the account for 15 minutes. The relay still runs one password check when the username does not exist, so a missing account does not return faster than a wrong password. Every login, failure, logout, share, and enrollment-token change is appended to the audit log with the user and device id. The audit log stays a hash-chained JSONL file. It is not stored in the database.
+Passwords are stored as argon2id hashes. A login that fails five times locks the account for 15 minutes. The relay still runs one password check when the username does not exist, so a missing account does not return faster than a wrong password. TOTP step numbers are persisted in the database (`last_totp_step`) to prevent code replay across restarts. Every login, failure, logout, share, and enrollment-token change is appended to the relay's hash-chained `audit.jsonl` (mode `0600`, size-rotated) with the user and device id. Node-authored audit batches are isolated in `node-audit.jsonl` so a compromised node cannot corrupt the relay's auth chain or spoof another user's records.
 
 ## Create the first admin
 
 On the relay host:
 
 ```bash
-agentlink relay user add admin --admin --password-stdin
+agentlink relay --data-dir /var/lib/agentlink user add admin --admin --password-stdin
 ```
 
-If the user table is empty when `agentlink relay` starts, it also creates `admin`, prints the password once, and writes it to `bootstrap.password` (mode 0600) in the data directory. Changing that password deletes the file. If the file is still there after the change, delete it. Do not pass `--print-admin-token` in a systemd unit.
+If the user table is empty when `agentlink relay` starts, it also creates `admin`, prints a one-time bootstrap password once, and writes it to `bootstrap.password` (mode `0600`) in the data directory. Rotate that password immediately; changing it deletes `bootstrap.password`. If the file is still there after the change, delete it. Do not pass `--print-admin-token` in a systemd unit.
 
 ```bash
-agentlink relay user list
-agentlink relay user passwd admin --password-stdin
-agentlink relay user disable alice
-agentlink relay user enable alice
-agentlink relay user set-role alice admin
-agentlink relay user rm alice
+agentlink relay --data-dir /var/lib/agentlink user list
+agentlink relay --data-dir /var/lib/agentlink user passwd admin --password-stdin
+agentlink relay --data-dir /var/lib/agentlink user disable alice
+agentlink relay --data-dir /var/lib/agentlink user enable alice
+agentlink relay --data-dir /var/lib/agentlink user set-role alice admin
+agentlink relay --data-dir /var/lib/agentlink user rm alice
 ```
 
-These commands open the database directly. They do not listen on the relay port. `agentlink user ...` is the same set of operations over a logged-in admin session. Signup from the network stays off unless the relay is started with `--allow-signup`.
+These commands open the database directly. They do not listen on the relay port. `agentlink user ...` is the same set of operations over a logged-in admin session. Self-service password changes (`UserPasswd`) and `TotpDisable` require an operator session with current password + TOTP re-authentication (when TOTP is enabled); registered agent keys (`agentlink client create`) are blocked from changing user passwords or altering node policies. Signup from the network stays off unless the relay is started with `--allow-signup`.
 
 ## Log in
 
@@ -33,7 +33,7 @@ These commands open the database directly. They do not listen on the relay port.
 agentlink login --user alice --relay wss://relay.example.com --fingerprint sha256:...
 ```
 
-The command prompts for the password. `--password-stdin` reads it from stdin. `--totp` sends an authenticator code when the account has one. The client keeps an ed25519 device key in the config directory. The relay binds that key to the user and returns an access token plus a refresh token. The access token expires after 15 minutes, with a few minutes of clock-skew slack so a fast relay clock does not drop the open socket. The refresh token expires after 30 days of inactivity plus two days of clock-skew slack, and every refresh slides that window forward. Refresh rotates the token. If that response never reaches the client, the same refresh token can be presented again until the replacement access token is used. After that, the old refresh token is rejected. The refresh token is stored in `config.json` with mode 0600. Later commands send the access token and sign a challenge with the device key. When the access token is close to expiry, the CLI and MCP server refresh it. A network failure leaves the saved refresh token in place.
+The command prompts for the password (supporting terminal paste and non-TTY stdin). `--password-stdin` reads it from stdin. `--totp` sends an authenticator code when the account has one. The client keeps an ed25519 device key in the config directory. The relay binds that key to the user and returns an access token plus a refresh token. The access token expires after 15 minutes, with a few minutes of clock-skew slack so a fast relay clock does not drop the open socket. The refresh token expires after 30 days of inactivity plus two days of clock-skew slack, and every refresh slides that window forward. Refresh rotates the token. If that response never reaches the client, the same refresh token can be presented again until the replacement access token is used. Replaying an already-acknowledged or revoked refresh token revokes the entire device session family. The refresh token is stored in `config.json` with mode `0600`. Later commands send the access token and sign a challenge with the device key. When the access token is close to expiry, the CLI, controller, and MCP server refresh it automatically (`agentlink status` shows `refreshable` rather than forcing a re-login). A network failure leaves the saved refresh token in place.
 
 ```bash
 agentlink logout
@@ -41,7 +41,7 @@ agentlink devices
 agentlink devices --revoke <device-id>
 ```
 
-Revoking a device deletes its access tokens. The next request on an open socket is rejected.
+Revoking a device deletes its access tokens and prevents re-use of its refresh tokens. The next request on an open socket is rejected.
 
 ```bash
 agentlink user totp enable
@@ -51,16 +51,18 @@ agentlink user totp disable
 
 ## Nodes and shares
 
-A node enrolled while the operator is logged in is owned by that user. `agentlink pair` mints an enrollment token for the logged-in user. Another user does not see the node. The owner, an admin, and anyone the owner has shared the node with get **full** access: shell, files, and desktop. There is no read-only / exec / desktop preset to pick, and no signed grant to paste.
+A node enrolled while the operator is logged in is owned by that user. `agentlink pair` mints a one-time enrollment token and an `agentlink-invite:v1:...` string for the logged-in user. Another user does not see the node unless it is shared with them.
+
+**Relay ownership, admin role, and shares control discovery and routing only — they do not authorize operations on the node.** Every controller (owner, admin, sharee, or registered agent key) must present a time-bounded ed25519 `SignedGrant` verified locally by the node against its `owner-keys.json` and `revoked-grants.json`, bound to that controller's E2E device key and intersected with the node's `--max-access` ceiling. See [e2e-auth.md](e2e-auth.md).
 
 ```bash
 agentlink share <node> --with bob
 agentlink unshare <node> --with bob
 ```
 
-A sharee cannot share the node further. `--access` is accepted and ignored. An agent identity registered with `agentlink client` belongs to the caller.
+A sharee sees the node in `agentlink ls` and can dial an E2E session through the relay once the node operator issues a `SignedGrant` for the sharee's controller key (`agentlink grant issue <node> --grantee <bob-pubkey-hex> --policy ...` or `grant offer` / `grant paste`). A sharee cannot share the node further. An agent identity registered with `agentlink client create` belongs to the caller, connects without an operator token (`agentlink --identity bot.identity.json ...`), and likewise requires a node-local `SignedGrant` for its public key.
 
-The Android app (`app.agentlink`) signs in with the same username, password, and optional TOTP. The server field starts empty; enter the relay URL. There is no built-in host. A session already saved on the phone keeps its server. After that login the phone can list machines. Opening one for control still needs a grant for the phone's device key, issued on the node. The phone can import that grant. The Ed25519 device key is generated in software. The 32-byte seed is sealed with an Android Keystore AES-256-GCM key and stored outside backups. Keystore implementations often reject Ed25519 (`NoSuchAlgorithmException` for provider `AndroidKeyStore`), including on API 33 and later, so sign-in does not ask the Keystore to generate that algorithm. A phone that already has an Ed25519 key in the Keystore keeps signing with it. The refresh token stays in EncryptedSharedPreferences, and the write is flushed before the app opens a socket with the new access token. A process killed before that write retries the previous refresh token. The phone refreshes the 15-minute access token when it opens and while it is in the foreground, including after the app was idle, and it does not clear that saved sign-in when the relay is unreachable or when the handset clock is a couple of days ahead of the stored deadline. A rejected refresh token, or one that has been unused past the inactivity window, is what asks for the password again. Log out and the device list use that session. After login the phone lists the user's own nodes and nodes shared with them.
+The Android app (`app.agentlink`) signs in with the same username, password, and optional TOTP. The relay URL field is visible on first sign-in (starting empty — there is no built-in host). A session already saved on the phone keeps its server. After login the phone lists the user's own nodes and nodes shared with them; controlling a machine still requires a `SignedGrant` for the phone's device key (viewable and importable in Settings / Machine Hub). The Ed25519 device key is generated in software and sealed with Android Keystore AES-256-GCM outside backups; session/pairing secrets are stored using Android Keystore AES-GCM (with automatic recovery to login if a keyset is corrupted). The phone refreshes the 15-minute access token in place without tearing down active Terminal or Desktop sessions, manages TOFU node pins via Rust `node-pins.json` (with in-app pin reset and grant/device management), and automatically fetches short-lived TURN/ICE credentials from `POST /api/ice` via Bearer auth.
 
 Act as node enrolls the phone under that user. It signs `agentlink-enroll-v1` with the phone's node key, and the relay inserts the node under that user. No pairing token is consumed. The Add-machine QR (`agentlink://enroll?...`) is a separate path: it opens the node setup screen and does use the enrollment token.
 
@@ -70,21 +72,26 @@ Act as node enrolls the phone under that user. It signs `agentlink-enroll-v1` wi
 
 The machine list shows name, online or offline, OS and architecture, and last seen. Refresh asks `/api/nodes` again. It does not reload the page. Each user sees the machines they own and the ones shared with them. An admin sees every machine. Seeing a machine is not permission to control it.
 
-Cards do not open a terminal, files, or a desktop. Those actions need a sealed client and a grant stored on the node.
+Cards do not open a terminal, files, or a desktop. Those actions need a sealed client and a valid `SignedGrant` trusted by the node.
 
 Add machine asks for a name, a lifetime, and a use count. The page then shows one install command. Linux and macOS is the default. Windows is the same token in a PowerShell one-liner. The token is not put in the page URL. Enrollment does not grant remote control. After the node connects it reports whether it has a graphical session for sealed desktop clients.
 
 ```bash
-curl -fsSL https://relay.example.com/install.sh | sh -s -- --token '<T>' --name 'laptop' --access 'full' --max-access 'full'
+curl -fsSL --proto '=https' --tlsv1.2 https://relay.example.com/install.sh | \
+  env AGENTLINK_TOKEN='<T>' sh -s -- --name 'laptop' --access 'exec' --max-access 'exec'
 ```
 
-That command downloads the binary, checks the checksum and the pinned minisign signature, installs the service, starts it, and enrolls with the token. `--access` and `--max-access` are accepted and do not authorize remote control. The dashboard fills in the host that served the page and pins that host's leaf certificate. There is no compiled-in relay that skips the pin. Set `AGENTLINK_CHECKSUM_ONLY=1` only when you intentionally skip the signature.
+That command enforces HTTPS, pre-checks `minisign` before downloading, verifies `SHA256SUMS` + `SHA256SUMS.minisig` with the pinned project key, installs the binary (pass `--desktop` on Linux for the glibc GUI build or `--headless` for the static musl build), installs and starts the service, and enrolls with the one-time token (`AGENTLINK_ENROLL=1` in the relay-served script maps `AGENTLINK_TOKEN` to the enrollment token). `--access` and `--max-access` default to `exec` (pass `full` when desktop capture/control is desired) and never bypass node-local `SignedGrant` verification. Set `AGENTLINK_PUBLIC_URL` on the relay behind reverse proxies so generated install URLs do not rely on the `Host` header.
 
 ```powershell
-& ([scriptblock]::Create((irm https://relay.example.com/install.ps1))) -Token '<T>' -Name 'laptop' -Access 'exec' -MaxAccess 'exec'
+$env:AGENTLINK_TOKEN='<T>'; & ([scriptblock]::Create((irm https://relay.example.com/install.ps1))) -Name 'laptop' -Access 'exec' -MaxAccess 'exec'
 ```
 
-The Android QR is `agentlink://enroll?relay=...&fingerprint=...&token=...&name=...&access=...`. A blank relay in that link stays blank. An empty fingerprint selects public-root trust only together with a relay URL you set. The relay serves `install.sh` and `install.ps1` with the relay URL and enroll mode already filled in. In that mode `--token` is the enrollment token. `--dry-run` prints the plan and exits before any download. Binaries are served from `<data-dir>/dist` when present, and otherwise the relay redirects to the signed GitHub release asset. The phone app itself is `/download/agentlink.apk` on that same host.
+On Windows, `install.ps1` stops any running tray/service gracefully before replacing `%LOCALAPPDATA%\agentlink\agentlink.exe` (and `agentlink-gui.exe` when present), validates zip entries against zip-slip, and appends `%LOCALAPPDATA%\agentlink` to User `PATH` (`-NoPath` / `AGENTLINK_NO_PATH=1` to opt out).
+
+You can also pass a one-time invite directly to either installer (`--invite` / `AGENTLINK_INVITE` or `-Invite` / `AGENTLINK_INVITE`) without manually copying `--relay` or `--fingerprint`.
+
+The Android QR is `agentlink://enroll?relay=...&fingerprint=...&token=...&name=...&access=...`. A blank relay in that link stays blank. An empty fingerprint selects public-root trust only together with a relay URL you set. The relay serves `install.sh` and `install.ps1` with the relay URL and enroll mode already filled in. `--dry-run` prints a redacted plan and exits before any download. Binaries are streamed asynchronously from `<data-dir>/dist` when present, and otherwise the relay redirects to the signed GitHub release asset. The phone app itself is `/download/agentlink.apk` on that same host.
 
 `https://<relay>/view` explains that browser control is not available. It does not open a desktop.
 
@@ -98,4 +105,4 @@ Tokens are single-use or N-use, expire, and can be revoked. They are scoped to t
 
 ## Audit
 
-A user can query audit records for their own user id, their nodes, and their agents. An admin can query everything. Per-user audit policy is stored with `SetUserAudit` and is separate from the per-node policy. The hash chain is unchanged: records that predate the user field still verify, because the new fields are omitted when they are empty.
+A user can query audit records for their own relay auth events and for nodes they own or have visibility into. An admin can query everything. Node-submitted `AuditBatch` records have `node_id` overwritten from the authenticated WebSocket identity, are stored in `node-audit.jsonl` separately from the relay's `audit.jsonl` auth chain, and are filtered strictly by visible `node_id` so one tenant's compromised node cannot inject spoofed records into another user's audit view. Per-user audit policy is stored with `SetUserAudit` and is separate from the per-node policy.

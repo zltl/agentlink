@@ -8,11 +8,23 @@ The same repository API is compiled into the binary for both engines. Migrations
 agentlink relay --bind 0.0.0.0:7443 --data-dir /var/lib/agentlink
 ```
 
-The first start generates `cert.pem` and `key.pem`. It does not mint or write `admin.token` unless legacy admin is explicitly enabled (see [Legacy admin token](#legacy-admin-token)). When the user table is empty, the first start also prints a one-time password for the `admin` account and writes `bootstrap.password` (mode 0600). Change it with `agentlink relay user passwd admin`. That change deletes `bootstrap.password`. If the file is still there, delete it. Do not leave the bootstrap password on disk.
+The first start generates `cert.pem` and `key.pem`. It does not mint or write `admin.token` unless legacy admin is explicitly enabled (see [Legacy admin token](#legacy-admin-token)). When the user table is empty, the first start also prints a one-time password for the `admin` account and writes `bootstrap.password` (mode `0600`). Change it immediately:
+
+```bash
+agentlink relay --data-dir /var/lib/agentlink user passwd admin
+```
+
+That change deletes `bootstrap.password`. If the file is still there after the change, delete it. Do not leave the bootstrap password on disk.
+
+## Health check and Docker image
+
+The relay serves `GET /healthz` and `HEAD /healthz` over its HTTPS listener, returning `200 OK` with `{"status":"ok"}` (and security headers) for container orchestrators, reverse proxies, and uptime monitors.
+
+The provided `Dockerfile` builds a headless relay binary with `cargo build --locked --release -p agentlink-cli --no-default-features` (omitting the default GUI `controller` feature so the runtime image has no `eframe`, OpenH264, or `libstdc++6` dependency), runs as a non-root `agentlink` user, and includes a `HEALTHCHECK` against `https://127.0.0.1:7443/healthz`. `docker-compose.yml` mirrors that health check and documents optional `AGENTLINK_PUBLIC_URL`, `AGENTLINK_DATABASE_URL`, and TURN environment variables.
 
 ## Relay data directory and SQLite
 
-`<data-dir>` is created mode 0700 (`util::ensure_dir`). New secret files (`write_secret`, `admin.token`, `bootstrap.password`, `node.json`) are 0600. After the default SQLite backend opens `<data-dir>/relay.db` in WAL mode, the relay also restricts `relay.db`, `relay.db-wal`, and `relay.db-shm` to owner-only access (0600, or a private ACL on Windows). There is no API that imports a client-supplied SQLite file: `AGENTLINK_DATABASE_URL` / `--database-url` must be a `postgres://` (or `postgresql://`) URL, otherwise the process refuses to start. The only file import is `store.json` already in the operator data directory, which is renamed to `store.json.bak` after a one-time read. Operators should not point the data directory at a folder writable by untrusted accounts.
+`<data-dir>` is created mode `0700` (`util::ensure_dir`). New secret files (`write_private_bytes`, `admin.token`, `bootstrap.password`, `node.json`) are created atomically with `0600` permissions (no world-readable TOCTOU window). Relay logs (`audit.jsonl`, `node-audit.jsonl`, `connect.jsonl`) are also kept `0600` with bounded size rotation (16 MiB, keeping 3 archives). After the default SQLite backend opens `<data-dir>/relay.db` in WAL mode, the relay restricts `relay.db`, `relay.db-wal`, and `relay.db-shm` to owner-only access (`0600`, or a private ACL on Windows). There is no API that imports a client-supplied SQLite file: `AGENTLINK_DATABASE_URL` / `--database-url` must be a `postgres://` (or `postgresql://`) URL, otherwise the process refuses to start. The only file import is `store.json` already in the operator data directory, which is renamed to `store.json.bak` after a one-time read. Operators should not point the data directory at a folder writable by untrusted accounts.
 
 The default build links crates.io `libsqlite3-sys =0.39.1` (`bundled` SQLite `3.54.1`, which includes the upstream fix for `RUSTSEC-2026-0459`). Because crates.io `sqlx` (`0.8.6` / `0.9.0`) has not yet published a release allowing `libsqlite3-sys 0.39.x`, the workspace pins the official `launchbadge/sqlx` merge commit of PR #4502 (`10462fa4414c6c7f1ed1d39bb31678e3b726878c`) in `Cargo.toml` and `Cargo.lock`. That full-SHA pin keeps `cargo build --locked` reproducible, but offline or distribution builds must either run `cargo vendor` ahead of time or wait for the next crates.io `sqlx` release before publishing crates to crates.io.
 
@@ -32,7 +44,7 @@ sudo install -m 600 -o agentlink -g agentlink deploy/db.env.example /etc/agentli
 sudoedit /etc/agentlink/db.env
 ```
 
-`deploy/install-relay.sh --database-url postgres://...` writes that file with mode 0600. The unit loads it with `EnvironmentFile=-/etc/agentlink/db.env`. The leading dash means a missing file is ignored and the relay stays on SQLite. The unit starts after `network-online.target` and `postgresql.service`.
+`deploy/install-relay.sh --database-url postgres://...` writes that file with mode `0600`. The unit loads it with `EnvironmentFile=-/etc/agentlink/db.env`. The leading dash means a missing file is ignored and the relay stays on SQLite. The unit starts after `network-online.target` and `postgresql.service`.
 
 ```bash
 sudo systemctl daemon-reload
@@ -46,15 +58,15 @@ The fingerprint is also in `/var/lib/agentlink/fingerprint.txt`. Clients pin a s
 
 A later start that still has both `cert.pem` and `key.pem` keeps that fingerprint. A new pair is generated only when either file is missing: the first start, a wiped data directory, or a start whose `--data-dir` is not the directory that holds the existing files. Omitting `--data-dir` stores the certificate under the per-user data directory, not `/var/lib/agentlink`. The fingerprint is the SHA-256 of the leaf, so a new pair is a new pin. A node whose relay host is `127.0.0.1`, `::1`, or `localhost` adopts that leaf and rewrites `node.json`. Any other host keeps the stored pin and logs `got sha256:…` plus the value to copy from `fingerprint.txt`. SPKI pins and public-root checks are not replaced. Operator clients keep the pin on every host, including loopback.
 
-Create another operator account if you do not want to keep the bootstrap password:
+Create another operator account if you do not want to keep only `admin`:
 
 ```bash
-sudo -u agentlink agentlink relay user add alice --password-stdin --data-dir /var/lib/agentlink
+sudo -u agentlink agentlink relay --data-dir /var/lib/agentlink user add alice --password-stdin
 ```
 
 ## What is stored
 
-SQLite or PostgreSQL holds users, devices, refresh tokens, access tokens, web sessions, nodes and their owners, shares, agent identities and grants, enrollment tokens, the approval queue, and audit policy text. Access tokens and web sessions are rows, so a restart does not log people out. The legacy admin token remains one file, `admin.token`, and one row in `relay_secrets`.
+SQLite or PostgreSQL holds users, devices, refresh tokens, access tokens, web sessions, TOTP replay state (`last_totp_step`), nodes and their owners, shares, agent identities and grants, enrollment tokens, the approval queue, and audit policy text. Access tokens and web sessions are rows, so a restart does not log people out. The legacy admin token (when enabled) remains one file, `admin.token`, and one row in `relay_secrets`.
 
 Enrollment tokens, refresh tokens, access tokens, and web session cookies are stored as SHA-256 hashes. The plaintext is returned once to the client.
 
@@ -62,7 +74,7 @@ Enrollment tokens, refresh tokens, access tokens, and web session cookies are st
 
 `wss://host` and `wss://host:443` dial port 443. An explicit port is always kept, so `wss://host:7443` dials 7443. A bare host with no scheme (`host` or `host:9000`) is the only form that defaults to 7443 when the port is omitted.
 
-That parsing is shared by the CLI, the node, the MCP server, QUIC rendezvous, and `agentlink view`. `agentlink view` turns `wss://relay.example` into `https://relay.example/view/#...` and `wss://relay.example:7443` into `https://relay.example:7443/view/#...`. `agentlink guide` uses the same origin rules for `https://relay.example/operate/#...`; see [operate-guide.md](operate-guide.md).
+That parsing is shared by the CLI, the node, the MCP server, the desktop controller, and `agentlink guide`. `agentlink guide` turns `wss://relay.example` into `https://relay.example/operate/#...` and `wss://relay.example:7443` into `https://relay.example:7443/operate/#...`; see [operate-guide.md](operate-guide.md). (Browser desktop viewing at `/view` is disabled; `agentlink view` does not open a browser controller.)
 
 The install scripts pass the URL through. Do not append `:7443` to a `wss://` URL that is served on 443.
 
@@ -73,7 +85,7 @@ A relay that generated its own certificate is pinned:
 ```bash
 agentlink login \
   --relay wss://relay.example:7443 \
-  --token "$AGENTLINK_TOKEN" \
+  --user admin \
   --fingerprint "$AGENTLINK_FINGERPRINT"
 ```
 
@@ -84,13 +96,13 @@ Let's Encrypt rotates the leaf about every 60–90 days. For a name that has a p
 ```bash
 agentlink login \
   --relay wss://relay.example.com \
-  --token "$AGENTLINK_TOKEN" \
+  --user admin \
   --trust webpki
 
 agentlink node \
   --relay wss://relay.example.com \
   --trust webpki \
-  --pairing-token "$TOKEN" \
+  --pairing-token "$PAIRING_TOKEN" \
   --name laptop
 ```
 
@@ -103,7 +115,7 @@ A pin and a root mode together both have to succeed:
 ```bash
 agentlink login \
   --relay wss://relay.example.com \
-  --token "$AGENTLINK_TOKEN" \
+  --user admin \
   --fingerprint "spki:sha256:<hex>" \
   --trust webpki
 ```
@@ -114,7 +126,7 @@ agentlink login \
 agentlink node --invite 'agentlink-invite:v1:...'
 ```
 
-The relay still stores only the random pairing token. The trust mode is not part of that token.
+Or pass it straight to the installer (`install.sh --invite ...` / `install.ps1 -Invite ...`). The relay still stores only the random pairing token. The trust mode is not part of that token.
 
 ### Pins that survive renewal
 
@@ -166,22 +178,25 @@ server {
 }
 ```
 
-Start the relay so it trusts that proxy and records the client address:
+Start the relay so it trusts that proxy, pins its canonical public origin, and records the client address:
 
 ```bash
+AGENTLINK_PUBLIC_URL=https://relay.example.com \
 agentlink relay \
   --bind 127.0.0.1:7443 \
   --data-dir /var/lib/agentlink \
   --trust-proxy 127.0.0.1/32
 ```
 
+Set `AGENTLINK_PUBLIC_URL` (for example `https://relay.example.com`) so `/install.sh`, `/install.ps1`, and `/api/tokens` always emit the canonical origin rather than trusting request `Host` headers. When `AGENTLINK_PUBLIC_URL` is unset, the relay strictly validates the `Host` header and rejects malformed or duplicate `Host` headers with `400 Bad Request`.
+
 `--trust-proxy` may be repeated. A bare IP means that single host. Forwarded headers are used only when the TCP peer is inside one of those CIDRs. `X-Forwarded-For` is walked from the right, skipping addresses that are themselves trusted proxies. `X-Real-IP` is used when `X-Forwarded-For` is absent. Any other client that sends those headers is logged by its TCP address.
 
-Successful node and client handshakes append one JSON line to `connect.jsonl` in the data directory (`peer` is the audit address, `tcp_peer` is the socket). The lines are also in the process log.
+Successful node and client handshakes append one JSON line to `connect.jsonl` (mode `0600`, rotated) in the data directory (`peer` is the audit address, `tcp_peer` is the socket). The lines are also in the process log.
 
 ## Dashboard host
 
-The management UI is served by the relay at `GET /`. The example below terminates TLS for `relay.example.com` and proxies `/` to `127.0.0.1:7443`. No extra nginx `location` is required for the dashboard, login, machine list, enrollment, `install.sh`, `install.ps1`, or `/dl/` when the relay itself serves them. Leave `/shell/` on ttyd and `/download/` on the APK if those already exist. Node and client WebSockets use the same host you put in `--relay`.
+The management UI is served by the relay at `GET /`. The example below terminates TLS for `relay.example.com` and proxies `/` to `127.0.0.1:7443`. No extra nginx `location` is required for the dashboard, login, machine list, enrollment, `/healthz`, `/audit`, `install.sh`, `install.ps1`, or `/dl/` when the relay itself serves them. Leave `/shell/` on ttyd and `/download/` on the APK if those already exist. Node and client WebSockets use the same host you put in `--relay`.
 
 `proxy_buffering off` and a long `proxy_read_timeout` (the relay vhost already sets these) let the dashboard's live machine list through. A short `GET /api/nodes` still refreshes the list if buffering is left on.
 
@@ -226,18 +241,13 @@ server {
 }
 ```
 
-An install command minted by the dashboard downloads the script from that same host and enrolls the machine at `wss://` that host, pinning the leaf certificate. There is no second public hostname and no compiled-in relay.
+An install command minted by the dashboard downloads the script from `AGENTLINK_PUBLIC_URL` (or the validated host) and enrolls the machine at `wss://` that host, pinning the leaf certificate. There is no second public hostname and no compiled-in relay. `GET /dl/*` streams local `<data-dir>/dist` files asynchronously with bounded concurrency (`503` on saturation) and path-traversal rejection.
 
-## QUIC and UDP
+## File transfer transport (relay-path; direct QUIC P2P planned)
 
-File copies try a direct QUIC path. Each side punches a UDP packet at the relay host and port taken from the relay URL, so the relay can learn the external address. The relay binds that UDP socket to the same address as its TCP listener.
+File copies (`agentlink cp`, `cat`, `write`, and MCP file tools) currently transfer bulk bytes as **end-to-end encrypted WebSocket binary frames over the relay** (with E2E frame AAD v2 authenticating the full 40-byte frame header). Direct QUIC P2P file transfer is **disabled / planned** until E2E-sealed direct P2P lands — nodes do not bind a dormant UDP QUIC listener, and no UDP port forwarding is needed on the relay for file transfers today.
 
-nginx does not forward that UDP. Behind the proxy above, clients punch `relay.example.com:443`, while the relay's UDP socket is on `127.0.0.1:7443`. Punch packets never arrive unless you also publish UDP:
-
-- forward public UDP 443 to the relay's UDP port, or
-- give clients a relay URL whose port is a UDP port that really reaches the relay (`wss://relay.example.com:7443` dials TCP 7443 as well, so that only works when TCP and UDP are both open on 7443).
-
-When the punch or the QUIC handshake fails, the copy continues on the relay WebSocket. The transfer's transport is `quic` or `relay`. The open UDP socket is only for learning a reflexive address. It does not carry file bytes or desktop media in the clear. WebRTC picture bytes for **sealed clients** are DTLS-SRTP between the client and the node, using host candidates, the STUN list in the next section, and, off the LAN, a TURN server you run yourself. The relay does not carry those picture bytes and does not need UDP for them.
+WebRTC picture and audio bytes for **sealed native clients** (`agentlink controller` and Android) travel peer-to-peer over DTLS-SRTP using dual-stack IPv6/IPv4 host candidates, the STUN list in the next section, and, off the LAN, a TURN server you run yourself. The relay does not carry desktop video bytes and does not need UDP for them.
 
 ## STUN and TURN (sealed clients)
 
@@ -245,7 +255,12 @@ Browser control (`/v1/web`, view tickets, `/view` desktop) is **retired**. The d
 
 `GET /view/config.json` is unauthenticated. It advertises ICE server **URLs only** (no TURN username or credential). The node uses the same STUN list when an offer arrives without `ice_servers`.
 
-Short-lived credentials come from `POST /api/ice`. With tickets gone, a logged-in dashboard cookie plus CSRF can still mint REST credentials for tooling; sealed clients should prefer their own device auth paths. The response is the ICE document plus a coturn REST credential: `username` is `<expiry unix>:<user id>`, `credential` is base64(HMAC-SHA1(secret, username)). TTL is clamped to 5–15 minutes. The default is 10 minutes.
+Short-lived coturn REST credentials come from `POST /api/ice`. That endpoint accepts either:
+
+- **`Authorization: Bearer <access_token>`** (validated against an active, non-revoked user/device session; no CSRF header required), or
+- a logged-in dashboard session cookie plus `X-CSRF-Token`.
+
+Access is gated to callers who own or have share visibility into at least one node (callers with zero nodes receive `403`). The response returns `ice_servers` (STUN + TURN entries with `username` `<expiry unix>:<user id>` and `credential` `base64(HMAC-SHA1(secret, username))`) plus `ttl_secs` (clamped to 5–15 minutes, default 10 minutes). Both `agentlink controller` and the Android client **automatically fetch ICE/TURN credentials from `POST /api/ice`** on connect and refresh them automatically on `ice_restart`, while still honoring explicit client-side `AGENTLINK_TURN_URLS` / `AGENTLINK_TURN_USER` / `AGENTLINK_TURN_PASS` and `AGENTLINK_STUN_URLS` overrides.
 
 | Variable | When it is unset |
 | --- | --- |
@@ -253,10 +268,10 @@ Short-lived credentials come from `POST /api/ice`. With tickets gone, a logged-i
 | `AGENTLINK_TURN_URLS` | No TURN server. Comma-separated `turn:` or `turns:` URLs. Prefer `turns:host:443?transport=tcp`. |
 | `AGENTLINK_TURN_SECRET` | No TURN credential is minted. Coturn `static-auth-secret` must be this value, with `use-auth-secret`. |
 | `AGENTLINK_TURN_TTL_SECS` | 600. Values outside 5–15 minutes are clamped. |
-| `AGENTLINK_TURN_USERNAME` | Ignored. Not copied into any ICE document. |
-| `AGENTLINK_TURN_PASSWORD` | Ignored. Not copied into any ICE document. |
+| `AGENTLINK_TURN_USERNAME` | Ignored on the relay. Not copied into any ICE document. |
+| `AGENTLINK_TURN_PASSWORD` | Ignored on the relay. Not copied into any ICE document. |
 
-Any static TURN password that was published in `/view/config.json` before this change is compromised. Rotate it on the coturn host when you deploy this relay, switch coturn to `use-auth-secret`, and set `AGENTLINK_TURN_SECRET` to a new secret. Do not reuse the old password as that secret.
+Any static TURN password that was published in `/view/config.json` in older deployments is compromised. Rotate it on the coturn host, switch coturn to `use-auth-secret`, and set `AGENTLINK_TURN_SECRET` to a new secret. Do not reuse the old password as that secret.
 
 STUN only helps the two sides learn a reflexive address. A viewer across a symmetric NAT still needs a TURN server you run (coturn is the usual one). agentlink does not embed TURN, and the relay does not terminate it. Put the variables in a systemd drop-in so a restart keeps them. `EnvironmentFile=-/etc/agentlink/db.env` is also loaded, if you would rather keep them next to the database URL.
 
@@ -289,7 +304,7 @@ Leaving `AGENTLINK_STUN_URLS` unset is enough for the public STUN defaults. An e
 
 Live video for sealed clients is DTLS-SRTP between the client and the node. It is not the agentlink end-to-end payload cipher. A literal address in `198.18.0.0/15` is not contacted; that range is not a reachable STUN or TURN server.
 
-`POST /api/view-ticket` and `/api/view-ticket/revoke` return **410 Gone**. `GET /v1/web` upgrades are refused. `agentlink view` does not open a browser controller. Use a sealed CLI/phone client after a node-local grant.
+`POST /api/view-ticket` and `/api/view-ticket/revoke` return **410 Gone**. `GET /v1/web` upgrades are refused. `agentlink view` does not open a browser controller. Use a sealed CLI, `agentlink controller`, or Android client after a node-local grant.
 
 ## Legacy admin token
 
@@ -299,15 +314,15 @@ Live video for sealed clients is DTLS-SRTP between the client and the node. It i
 
 Authorization that does not trust the relay (owner-signed grants inside the sealed body) is described in [e2e-auth.md](e2e-auth.md).
 
-End-to-end sessions are bound to the node id. A relay whose certificate is only checked by a public CA can still claim that a familiar name belongs to a different key. The CLI, MCP server, and phone pin the id after the first successful connect (`node-pins.json` in the config directory). The dashboard stores the same mapping in `localStorage` under `agentlink.nodePins` and warns when it changes. Commands to a mismatched name fail until the file is edited on purpose. This does not pin the relay. Set `AGENTLINK_RELAY_PIN=spki:sha256:<hex>` (or `sha256:<leaf hex>`, or pass `--fingerprint`) for a known relay. Do not treat a key published next to the binary as that pin. CA-only trust prints a warning.
+End-to-end sessions are bound to the node id. A relay whose certificate is only checked by a public CA can still claim that a familiar name belongs to a different key. The CLI, MCP server, desktop controller, and Android client pin the id after the first successful connect (`node-pins.json` in the config directory). Commands to a mismatched name fail closed until you intentionally clear the old pin with `agentlink pin rm <name-or-id>` (inspect pins with `agentlink pin list`, or manage pins in Android Settings). The dashboard also warns in-browser when a name changes keys. This does not pin the relay itself: set `AGENTLINK_RELAY_PIN=spki:sha256:<hex>` (or `sha256:<leaf hex>`, or pass `--fingerprint`) for a known relay. Do not treat a key published next to the binary as that pin. CA-only trust (`system` or `webpki` without a pin) prints a warning.
 
 ## Command globs
 
-A node with no `limits.json` denies disk format, `dd` onto disk devices, shutdown, reboot, and shred, and allows every other command. A node with no `confirm.toml` holds `rm -rf`, those same destructive lines, and a recursive delete of `/` until `agentlink approve`. Allow stays empty. Both files are glob matches on the command line or the human summary. They are not an operating-system sandbox. An allowed shell can still do anything that user can do. Bubblewrap, seccomp, or a platform sandbox would be a separate program.
+A node with no `limits.json` denies destructive disk/power commands across Unix and Windows (`mkfs`, `dd` onto disk devices, `shutdown`, `reboot`, `shred`, `format`, `diskpart`, `Stop-Computer`, `cipher /w`, etc.) and allows every other command. A node with no `confirm.toml` holds destructive commands (`rm -rf`, `rd /s`, `rmdir /s`, `Remove-Item -Recurse -Force`, disk/power commands, recursive root deletion) until `agentlink approve allow`. `confirm.toml` rules also evaluate file edits (`replace`, `edit-lines`, `apply-patch`, `rename`) and file transfer writes (`Push`, `PushStream`, `PushDir`) with normalized path containment. Glob matching uses polynomial DP where `*` matches across `/` and `\`, preventing `/bin/rm -rf /` bypasses. Both files are operational guardrails, not an operating-system sandbox. An allowed shell can still do anything that user can do. Bubblewrap, seccomp, or a platform sandbox would be a separate program.
 
 ## What the relay can read
 
-Invoke payloads, file bytes, and the JPEG screenshot are sealed to the node. `forward.central` uploads the node's audit chain, and approval summaries are stored so a person can approve them. Both are readable on the relay by design. Leave `forward.central` off when the relay must not store those records. The node still writes its local chain.
+Invoke payloads, `Cancel`, `Session` cursor updates, file transfer frames, and JPEG screenshots are sealed to the node. `forward.central` uploads the node's audit chain into the relay's isolated `node-audit.jsonl` (mode `0600`, rotated, server-pinned to the node's authenticated WS identity), and approval summaries are stored so a person can approve them. Both are readable on the relay by design. Leave `forward.central` off when the relay must not store those records. The node still writes its local chain. The read-only `/audit` and `/audit/records` HTTP endpoints enforce full security headers (`CSP`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`) and scope non-admin views strictly to visible nodes.
 
 ## Slim-bin drop-ins (`agentlink-relay` / `agentlink-node-daemon`)
 
@@ -334,7 +349,7 @@ sudo systemctl restart agentlink-relay agentlink-node
 - `/usr/local/bin/agentlink-relay` → `exec /usr/local/bin/agentlink relay "$@"`
 - `/usr/local/bin/agentlink-node-daemon` → a pass-through copy of the CLI (node units already pass the `node` subcommand; wrapping with an extra `node` yields `node node` and fails)
 
-`agentlink update` also refreshes `agentlink-node-daemon` next to the CLI it replaces (same release bytes, mode 0755), so the next deferred node restart picks up the tip; the `agentlink-relay` wrapper is left alone. Hosts that still hand-install a build must rerun `deploy/install-slim-wrappers.sh` or copy the tip onto `agentlink-node-daemon`.
+`agentlink update` also refreshes `agentlink-node-daemon` next to the CLI it replaces (same release bytes, mode `0755`), so the next deferred node restart picks up the tip; the `agentlink-relay` wrapper is left alone. Hosts that still hand-install a build must rerun `deploy/install-slim-wrappers.sh` or copy the tip onto `agentlink-node-daemon`.
 
 Stock `deploy/agentlink-relay.service` already uses `ExecStart=/usr/local/bin/agentlink relay …` and does not need the wrapper. Prefer that unit on new installs.
 
@@ -342,66 +357,64 @@ Do not leave `bootstrap.password` on disk after the admin password is set. Tip u
 
 ## Sync box when GitHub is slow
 
-`deploy/sync-box-bundle.sh` moves the current branch tip from the box to box without going through GitHub: it creates a `git bundle`, copies it with `agentlink cp` to `/tmp/agentlink-bundle/`, then `agentlink exec` fetches it into `refs/remotes/bundle/<branch>` and fast-forwards box's checkout. Use it when `git pull` on box hangs. It does not push to GitHub and does not create a tag. The box keeps its single checkout; `--node` and `--checkout` are required. There is no built-in node name or home directory.
+`deploy/sync-box-bundle.sh` moves the current branch tip to a build box without going through GitHub: it creates a `git bundle`, copies it with `agentlink cp` to `/tmp/agentlink-bundle/`, then `agentlink exec` fetches it into `refs/remotes/bundle/<branch>` and fast-forwards the remote checkout. Use it when `git pull` on the box hangs. It does not push to GitHub and does not create a tag. Both `--node` and `--checkout` (or `TARGET_NODE` / `TARGET_CHECKOUT`) are required; there is no built-in node name or home directory.
 
 ```sh
-deploy/sync-box-bundle.sh --dry-run   # create the bundle, print cp/exec commands
-deploy/sync-box-bundle.sh             # copy and fast-forward box
-TARGET_BASE=<sha-on-box> deploy/sync-box-bundle.sh   # incremental bundle
+deploy/sync-box-bundle.sh --node box --checkout /var/lib/agentlink/src --dry-run
+deploy/sync-box-bundle.sh --node box --checkout /var/lib/agentlink/src
+TARGET_BASE=<sha-on-box> deploy/sync-box-bundle.sh --node box --checkout /var/lib/agentlink/src
 ```
 
 The working tree may be dirty; the bundle always records HEAD. Add `--require-clean` to refuse that. A merge that is not fast-forward fails instead of creating a merge commit. The bundle stays in `/tmp/agentlink-bundle/` on box and is overwritten on the next run.
 
 ## Build a release on box
 
-`deploy/box-release-build.sh` chains the sync with a release build: it calls `deploy/sync-box-bundle.sh` (same `--repo`/`--node`/`--checkout`/`--dry-run` flags, `TARGET_BASE` passed through) and then runs `cargo build -p agentlink-cli --release` on box with `AGENTLINK_RELEASE_VERSION` exported. The version comes from an exact tag on HEAD, else the nearest `git describe --tags` with the `-<n>-g<sha>` suffix and leading `v` stripped (so `0.1.137-2-gaffb434` becomes `0.1.137`); pass `--version` to override it. The build runs through `agentlink exec --timeout-secs 600` and prints `./target/release/agentlink --version` plus the binary size. This is an ops helper only: it does not tag, push, or publish `/dl`.
+`deploy/box-release-build.sh` chains the sync with a release build: it calls `deploy/sync-box-bundle.sh` (requiring `--node` and `--checkout`, with `--repo`/`--dry-run` and `TARGET_BASE` passed through) and then runs `cargo build -p agentlink-cli --release` on the box with `AGENTLINK_RELEASE_VERSION` exported. The version comes from an exact tag on HEAD, else the nearest `git describe --tags` with the `-<n>-g<sha>` suffix and leading `v` stripped (so `0.1.137-2-gaffb434` becomes `0.1.137`); pass `--version` to override it. The build runs through `agentlink exec --timeout-secs 600` and prints `./target/release/agentlink --version` plus the binary size. This is an ops helper only: it does not tag, push, or publish `/dl`.
 
 ```sh
-deploy/box-release-build.sh              # sync the tip, then release-build on box
-deploy/box-release-build.sh --skip-sync  # build the checkout already on box
-deploy/box-release-build.sh --dry-run    # bundle locally, print sync + exec commands
-deploy/box-release-build.sh --version 0.1.136
+deploy/box-release-build.sh --node box --checkout /var/lib/agentlink/src
+deploy/box-release-build.sh --node box --checkout /var/lib/agentlink/src --skip-sync
+deploy/box-release-build.sh --node box --checkout /var/lib/agentlink/src --dry-run
+deploy/box-release-build.sh --node box --checkout /var/lib/agentlink/src --version 0.1.136
 ```
 
 It fails if `agentlink` is not on PATH, the node is offline, the sync fails, or the build fails. `cargo` must be at `~/.cargo/bin` on the node.
 
 ## Release archives (arm / mac / linux / windows)
 
-This repository does not run GitHub Actions. Do not add `.github/workflows`. Build the archives you need on the machines you already have. The names `install.sh` looks for are:
+This repository does not run GitHub Actions. Do not add `.github/workflows`. Build the archives you need on the machines you already have. The archive targets recognized by `install.sh`, `install.ps1`, and `agentlink update` are:
 
-- `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
-- `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`
-- `x86_64-apple-darwin`, `aarch64-apple-darwin`, `universal-apple-darwin`
+- Linux headless (static musl): `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (`install.sh` default / `--headless`)
+- Linux desktop (glibc with `controller` GUI): `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (`install.sh --desktop`)
+- Windows (dual-binary zip containing `agentlink.exe` + `agentlink-gui.exe`): `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`
+- macOS: `universal-apple-darwin` (preferred) with automatic fallback to `x86_64-apple-darwin` or `aarch64-apple-darwin`
 
-Validate the name list locally:
+Validate the release matrix and local build hygiene with:
 
 ```sh
 sh scripts/check-release-matrix.sh
+sh scripts/verify.sh
 ```
 
 ## Install signatures
 
-`install.sh` and `install.ps1` check `SHA256SUMS` and require `SHA256SUMS.minisig`. The verifier is the public key pinned in the script, the same material as `deploy/minisign.pub`. The scripts refuse to download `minisign.pub` from the release host, and they stop if `minisign` is missing or the signature file is missing or wrong. `AGENTLINK_CHECKSUM_ONLY=1` is the explicit skip. `agentlink update` verifies that signature in-process (no external `minisign` binary required) with the key embedded from `deploy/minisign.pub`. It does not fetch a replacement key from the mirror. Releases produce `SHA256SUMS.minisig` and `minisign.pub` only when the CI secret `AGENTLINK_SIGNING_KEY` is set. The copy attached to a release is not a trust root.
+`install.sh` and `install.ps1` enforce `https://` downloads (`curl --proto '=https' --tlsv1.2` / redirect-checked URI validation; explicit `--allow-insecure-http` / `-AllowInsecureHttp` override required for non-loopback HTTP), pre-check `minisign` before downloading any archive, verify `SHA256SUMS.minisig` against the pinned project key (`deploy/minisign.pub`) before downloading the binary archive, and then verify the archive's SHA-256 checksum. On Windows, `install.ps1` extracts zips via .NET `System.IO.Compression.ZipFile` with per-entry zip-slip validation instead of `Expand-Archive`.
+
+The scripts refuse to fetch `minisign.pub` from the release host. If `minisign` is missing, they exit immediately before downloading with package-manager install commands or recommend upgrading existing installs via `agentlink update --yes` (which verifies signatures in-process with the embedded key and does not need `minisign`). `AGENTLINK_CHECKSUM_ONLY=1` remains a break-glass override.
 
 ### `AGENTLINK_SIGNING_KEY` (release signing)
 
 The signing key is a **32-byte ed25519 seed encoded as 64 hex characters**, not an encrypted minisign secret-key file. Public keys and `.minisig` files use the ordinary minisign text format (`minisign -V` can verify them).
 
-Generate a seed and public key (private file stays outside git):
+Generate a seed and public key (`scripts/generate-signing-key.sh` sets `umask 077` before creating files; keep the private seed outside git):
 
 ```sh
 sh scripts/generate-signing-key.sh
 # default: ~/.config/agentlink/signing.key (mode 600)
-#          ~/.config/agentlink/minisign.pub
+#          ~/.config/agentlink/minisign.pub (mode 644)
 ```
 
-On a relay host you may prefer `OUT_DIR=/etc/agentlink` (root-owned, mode 700). **Never commit `signing.key`.** `.gitignore` already excludes it.
-
-Wire CI:
-
-1. GitHub → Settings → Secrets → Actions → `AGENTLINK_SIGNING_KEY` = contents of `signing.key` (hex only, no quotes).
-2. Optional: `AGENTLINK_SIGNING_KEY_ID` = 16 hex chars if you need a stable key id (otherwise derived from the seed).
-3. Tag Release workflow runs `agentlink internal sign-checksums SHA256SUMS --pubkey-out minisign.pub` when the secret is set.
+On a relay host you may prefer `OUT_DIR=/etc/agentlink` (root-owned, mode `0700`). **Never commit `signing.key`.** `.gitignore` already excludes it.
 
 Local / mirror signing (manual cuts):
 
@@ -413,7 +426,7 @@ agentlink internal sign-checksums SHA256SUMS --pubkey-out minisign.pub
 
 ### Published public key
 
-The project pin lives at [`deploy/minisign.pub`](../deploy/minisign.pub). Prefer pinning that file (or its base64 line) out of band; treat a `minisign.pub` asset on a GitHub Release as a convenience copy, not the trust root.
+The project pin lives at [`deploy/minisign.pub`](../deploy/minisign.pub). Prefer pinning that file (or its base64 line) out of band; treat a `minisign.pub` asset on a release host as a convenience copy, not the trust root.
 
 Clients:
 
@@ -428,9 +441,7 @@ agentlink update --pubkey /path/to/deploy/minisign.pub --check
 AGENTLINK_UPDATE_PUBKEY=/path/to/deploy/minisign.pub sh install.sh
 ```
 
-`agentlink update` also looks for `minisign.pub` beside the running binary, in `$XDG_DATA_HOME/agentlink` (or `~/.local/share/agentlink`), and in `/usr/local/share/agentlink`, `/etc/agentlink`, and `/usr/share/agentlink`. If none exist, it falls back to the project pin embedded from `deploy/minisign.pub` at build time, so stock builds verify signed releases out of the box. Explicit `--pubkey`, `AGENTLINK_UPDATE_PUBKEY`, and saved config still win.
-
-Without a usable public key, `agentlink update` still verifies SHA256 and prints that the signature was not checked. `--checksum-only` is a break-glass switch that skips signature enforcement even when a key is configured.
+`agentlink update` prioritizes the build-time embedded project pin (`deploy/minisign.pub`) over ambient disk files unless `--pubkey`, `AGENTLINK_UPDATE_PUBKEY`, or an explicit saved `update.json` key overrides it, preventing an unprivileged file drop next to the binary or in `$XDG_DATA_HOME` from silently swapping the verification key. `--checksum-only` is a break-glass switch that skips signature enforcement.
 
 ## Relay URL
 
@@ -440,21 +451,21 @@ A `config.json` that already stores `relay` keeps that URL and its pin or trust.
 
 `agentlink relay` still binds `0.0.0.0:7443` on the machine where you run it.
 
-The Android login field starts empty. A session already stored on the phone keeps the server it saved. A new sign-in has to enter the relay URL. An empty fingerprint means public-root trust only after that URL is set; it does not select a host. Username login on the phone follows `agentlink login --user`.
+The Android login field starts empty (visible on fresh sign-in). A session already stored on the phone keeps the server it saved. A new sign-in has to enter the relay URL. An empty fingerprint means public-root trust only after that URL is set; it does not select a host. Username login on the phone follows `agentlink login --user`.
 
 ## Restart and reconnect
 
-The relay is restarted on upgrade. Peers treat that as a short network blip. On Unix, `agentlink update` replaces the binary and then a detached helper restarts the node units after the updater process exits, so an update run from a live node or `agentlink exec` session does not leave the service stranded inactive. The helper prefers `sudo -n systemd-run --scope` when passwordless sudo is available, then plain `systemd-run --scope` (falling back to `setsid`, then a plain `sh -c`) so it escapes the node's service cgroup and survives the restart that tears that cgroup down.
+The relay is restarted on upgrade. Peers treat that as a short network blip. On Unix, `agentlink update` replaces the binary via an atomic temp file + single `rename` and then a detached helper restarts the node units after the updater process exits, so an update run from a live node or `agentlink exec` session does not leave the service stranded inactive. The helper prefers `sudo -n systemd-run --scope` when passwordless sudo is available, then plain `systemd-run --scope` (falling back to `setsid`, then a plain `sh -c`) so it escapes the node's service cgroup and survives the restart that tears that cgroup down. On Windows, `agentlink update` stops the running tray/service gracefully before swapping `agentlink.exe` (and `agentlink-gui.exe` when present) using `cmd /D /C`, relaunches the tray/service, and cleans up temporary `.new`/`.cmd` files.
 
-Durable state is the SQLite or PostgreSQL database (users, devices, sessions, nodes, shares, enrollment tokens, agent grants, the approval queue, and audit policy text), plus the TLS certificate and the legacy admin token. The audit JSONL file stays beside the database. Routing tables are memory only. They are rebuilt when nodes dial back.
+Durable state is the SQLite or PostgreSQL database (users, devices, sessions, nodes, shares, enrollment tokens, agent grants, the approval queue, and audit policy text), plus the TLS certificate and (if enabled) the legacy admin token. The audit JSONL files (`audit.jsonl`, `node-audit.jsonl`) stay beside the database. Routing tables are memory only. They are rebuilt when nodes dial back.
 
 On SIGTERM the relay sends a `going_away` frame, waits briefly, and closes sockets. `deploy/agentlink-relay.service` uses that signal. The listener uses `SO_REUSEPORT`, so the new process can bind the port before the old one has exited. `deploy/agentlink-relay.socket` is an optional systemd socket unit: when it is enabled, the process takes the inherited listening fd instead of binding. When the relay unit is active and its `ExecStart` uses the binary that was just replaced, `agentlink update` defers `systemctl restart agentlink-relay` to the same post-exit helper. When `AGENTLINK_SERVICE` is set (the updater runs under a node), the relay is never bounced automatically: restart it manually if the shared binary also serves the relay.
 
 System-scope units (including the relay) are bounced from that helper with `sudo -n systemctl restart ...`, so the user running `agentlink update` needs passwordless sudo for `systemctl`; without it the helper logs a tip to `agentlink.update.log` and the units keep running the old binary.
 
-Nodes and clients reconnect on their own. The first retry is about 200ms, then exponential up to 10s, with jitter. No new pairing is required. Each client keeps a session id, per-request sequence numbers, and a replay buffer. After the socket returns, in-flight invokes are resent. The node dedupes them by request id, keeps PTY sessions and background processes, and replays output the client has not applied. Watches keep running. Copies retry through the resume journal. End-to-end keys are reused; a reset on the node starts a new handshake without a user prompt. An MCP call waits through a blip of about 60 seconds instead of returning an error.
+Nodes and clients reconnect on their own. The first retry is about 200ms, then exponential up to 10s, with jitter. No new pairing is required. Each client keeps a session id, per-request sequence numbers, and a replay buffer. After the socket returns, in-flight invokes are resent and `Envelope::Session` cursor updates are sent E2E-sealed. The node dedupes them by request id (verified against `(owner_peer, grant_jti, grant_exp_unix)`), keeps PTY sessions and background processes, and replays sealed output the client has not applied. Watches keep running. Copies retry through the resume journal. End-to-end keys are reused; a reset on the node starts a new handshake without a user prompt. An MCP call waits through a blip of about 60 seconds instead of returning an error.
 
-A WebRTC session that is already connected keeps its media during the restart, because picture bytes do not go through the relay. The viewer page reconnects only the signaling websocket. If ICE drops, the page restarts ICE once on the same peer connection. If that still fails, it polls JPEG screenshots and shows the error on the picture.
+A WebRTC session that is already connected keeps its media during the restart, because picture bytes do not go through the relay. Native viewers reconnect only the signaling websocket; if ICE drops, they perform `ice_restart` with refreshed TURN credentials from `POST /api/ice`, and fall back to sealed JPEG screenshots if ICE cannot recover.
 
 `relay_restart_mid_exec_pty_transfer_mcp_and_watch` (in the `agentlink` binary tests) kills the relay during a long exec, a PTY, a 100 MiB copy, an MCP `run_command`, and a watch, then asserts each one completes with no client-visible error.
 
