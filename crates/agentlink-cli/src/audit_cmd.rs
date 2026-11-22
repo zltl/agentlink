@@ -2,7 +2,8 @@
 //!
 //! Query can read the node directory, the relay's forwarded chain, or an
 //! S3-compatible bucket. Config and sink edits update `audit.toml` and append
-//! an audit record for the change.
+//! an audit record for the change (unless `--push <node>` targets a remote node,
+//! in which case local `audit.toml` is left untouched).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,12 +35,12 @@ pub enum AuditAction {
         /// Operation or category, for example `exec` or `file_write`.
         #[arg(long)]
         op: Option<String>,
-        /// Inclusive start, unix seconds.
-        #[arg(long)]
-        since: Option<i64>,
-        /// Inclusive end, unix seconds.
-        #[arg(long)]
-        until: Option<i64>,
+        /// Inclusive start: unix seconds, relative duration (e.g. `-24h`, `30m`), or ISO-8601 UTC (`2026-11-22T10:00:00Z`).
+        #[arg(long, allow_hyphen_values = true)]
+        since: Option<String>,
+        /// Inclusive end: unix seconds, relative duration (e.g. `-1h`), or ISO-8601 UTC.
+        #[arg(long, allow_hyphen_values = true)]
+        until: Option<String>,
         /// Case-insensitive substring over the JSON record.
         #[arg(long)]
         text: Option<String>,
@@ -94,7 +95,7 @@ pub enum ConfigAction {
         value: String,
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Push the resulting policy to a live node through the relay.
+        /// Push the resulting policy to a live node through the relay without overwriting local `audit.toml`.
         #[arg(long)]
         push: Option<String>,
     },
@@ -103,6 +104,7 @@ pub enum ConfigAction {
         name: String,
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Push the preset to a live node through the relay without overwriting local `audit.toml`.
         #[arg(long)]
         push: Option<String>,
     },
@@ -165,6 +167,133 @@ pub enum SinkAction {
     },
 }
 
+/// Parse `--since` / `--until`: unix epoch seconds, relative span (`-24h`, `30m`, `7d`),
+/// or ISO-8601 UTC / offset timestamp (`2026-11-22`, `2026-11-22T10:00:00Z`, `2026-11-22T10:00:00+08:00`).
+pub(crate) fn parse_audit_time(raw: &str, now_unix: i64) -> Result<i64> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(anyhow!("timestamp cannot be empty"));
+    }
+    // Plain unix timestamp (positive integer or 0)
+    if let Ok(ts) = text.parse::<i64>() {
+        if ts >= 0 {
+            return Ok(ts);
+        }
+        // Negative plain integer like `-60` means 60s ago.
+        return Ok(now_unix.saturating_add(ts));
+    }
+    // Relative duration (`-24h`, `24h`, `-30m`, `1h30m`, `7d`)
+    let rel_body = text.strip_prefix('-').unwrap_or(text);
+    if !rel_body.is_empty()
+        && rel_body.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && rel_body
+            .chars()
+            .last()
+            .is_some_and(|c| matches!(c.to_ascii_lowercase(), 's' | 'm' | 'h' | 'd' | 'w'))
+    {
+        if let Ok(secs) = parse_relative_duration(rel_body) {
+            return Ok(now_unix.saturating_sub(secs));
+        }
+    }
+    // ISO-8601 date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DDTHH:MM:SS[Z|+HH:MM|-HH:MM]`)
+    parse_iso8601_unix(text).ok_or_else(|| {
+        anyhow!(
+            "invalid timestamp `{raw}`; expected unix seconds, relative span (e.g. `-24h`, `30m`), or ISO-8601 (e.g. `2026-11-22T10:00:00Z`)"
+        )
+    })
+}
+
+fn parse_relative_duration(text: &str) -> Result<i64> {
+    let mut total = 0i64;
+    let mut digits = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        if digits.is_empty() {
+            return Err(anyhow!("missing number before `{ch}`"));
+        }
+        let n: i64 = digits.parse()?;
+        let mult = match ch.to_ascii_lowercase() {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            'w' => 604_800,
+            _ => return Err(anyhow!("unknown unit `{ch}`")),
+        };
+        total = total.saturating_add(n.saturating_mul(mult));
+        digits.clear();
+    }
+    if !digits.is_empty() || total <= 0 {
+        return Err(anyhow!("invalid relative duration"));
+    }
+    Ok(total)
+}
+
+fn parse_iso8601_unix(text: &str) -> Option<i64> {
+    let (date_part, rest) = if let Some((d, t)) = text.split_once('T').or_else(|| text.split_once(' ')) {
+        (d, Some(t))
+    } else {
+        (text, None)
+    };
+    let mut dparts = date_part.split('-');
+    let year: i64 = dparts.next()?.parse().ok()?;
+    let month: u32 = dparts.next()?.parse().ok()?;
+    let day: u32 = dparts.next()?.parse().ok()?;
+    if dparts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (hour, min, sec, tz_offset_secs) = match rest {
+        None => (0u32, 0u32, 0u32, 0i64),
+        Some(t) => {
+            let (hms, offset) = if let Some(stripped) = t.strip_suffix('Z').or_else(|| t.strip_suffix('z')) {
+                (stripped, 0i64)
+            } else if let Some(pos) = t.rfind(['+', '-']) {
+                let (left, tz) = t.split_at(pos);
+                let sign = if tz.starts_with('-') { -1i64 } else { 1i64 };
+                let tz_body = &tz[1..];
+                let (th, tm) = tz_body.split_once(':')?;
+                let th: i64 = th.parse().ok()?;
+                let tm: i64 = tm.parse().ok()?;
+                (left, sign * (th * 3600 + tm * 60))
+            } else {
+                (t, 0i64)
+            };
+            let hms = hms.split('.').next().unwrap_or(hms);
+            let mut tparts = hms.split(':');
+            let hour: u32 = tparts.next()?.parse().ok()?;
+            let min: u32 = tparts.next()?.parse().ok()?;
+            let sec: u32 = tparts.next().unwrap_or("0").parse().ok()?;
+            if tparts.next().is_some() || hour > 23 || min > 59 || sec > 60 {
+                return None;
+            }
+            (hour, min, sec.min(59), offset)
+        }
+    };
+    let days = days_from_civil(year, month, day)?;
+    Some(
+        days * 86_400
+            + i64::from(hour) * 3600
+            + i64::from(min) * 60
+            + i64::from(sec)
+            - tz_offset_secs,
+    )
+}
+
+/// Howard Hinnant's civil-from-days inverse: days since 1970-01-01.
+fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
+    let m = i64::from(m);
+    let d = i64::from(d);
+    let y = y - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 pub async fn run(action: &AuditAction, json_out: bool, client: Option<&Client>) -> Result<i32> {
     match action {
         AuditAction::Query {
@@ -187,12 +316,21 @@ pub async fn run(action: &AuditAction, json_out: bool, client: Option<&Client>) 
             credential_file,
             profile,
         } => {
+            let now = agentlink_core::util::unix_now();
+            let since_unix = since
+                .as_deref()
+                .map(|raw| parse_audit_time(raw, now))
+                .transpose()?;
+            let until_unix = until
+                .as_deref()
+                .map(|raw| parse_audit_time(raw, now))
+                .transpose()?;
             let filter = AuditFilter {
                 node: node.clone(),
                 agent: agent.clone(),
                 op: op.clone(),
-                since_unix: *since,
-                until_unix: *until,
+                since_unix,
+                until_unix,
                 text: text.clone(),
                 limit: if *follow { 10_000 } else { 200 },
                 user: None,
@@ -250,12 +388,13 @@ pub async fn run(action: &AuditAction, json_out: bool, client: Option<&Client>) 
                 policy
                     .set_key(key, value)
                     .map_err(|err| anyhow!(err.to_string()))?;
-                save_policy(
+                save_or_push_policy(
                     &dir,
                     &policy,
                     &format!("set {key}={value}"),
                     client,
                     push.as_deref(),
+                    json_out,
                 )
                 .await?;
                 Ok(0)
@@ -267,12 +406,13 @@ pub async fn run(action: &AuditAction, json_out: bool, client: Option<&Client>) 
             } => {
                 let dir = node_dir(data_dir.as_deref())?;
                 let policy = AuditPolicy::preset(name).map_err(|err| anyhow!(err.to_string()))?;
-                save_policy(
+                save_or_push_policy(
                     &dir,
                     &policy,
                     &format!("preset {name}"),
                     client,
                     push.as_deref(),
+                    json_out,
                 )
                 .await?;
                 Ok(0)
@@ -331,12 +471,13 @@ pub async fn run(action: &AuditAction, json_out: bool, client: Option<&Client>) 
                 policy.sinks.retain(|sink| sink.name != *name);
                 policy.sinks.push(spec);
                 policy.validate().map_err(|err| anyhow!(err.to_string()))?;
-                save_policy(
+                save_or_push_policy(
                     &dir,
                     &policy,
                     &format!("sink add {name}"),
                     client,
                     push.as_deref(),
+                    json_out,
                 )
                 .await?;
                 Ok(0)
@@ -372,12 +513,13 @@ pub async fn run(action: &AuditAction, json_out: bool, client: Option<&Client>) 
                     return Err(anyhow!("no sink named {name}"));
                 }
                 policy.validate().map_err(|err| anyhow!(err.to_string()))?;
-                save_policy(
+                save_or_push_policy(
                     &dir,
                     &policy,
                     &format!("sink rm {name}"),
                     client,
                     push.as_deref(),
+                    json_out,
                 )
                 .await?;
                 Ok(0)
@@ -402,25 +544,39 @@ fn load_policy_file(dir: &Path) -> Result<AuditPolicy> {
     AuditPolicy::preset("standard").map_err(|err| anyhow!(err.to_string()))
 }
 
-async fn save_policy(
+/// Push to a remote node WITHOUT overwriting local `audit.toml` when `--push` is set;
+/// otherwise update local `audit.toml` and record a local audit change entry.
+async fn save_or_push_policy(
     dir: &Path,
     policy: &AuditPolicy,
     detail: &str,
     client: Option<&Client>,
     push: Option<&str>,
+    json_out: bool,
 ) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
     let text = policy.to_toml().map_err(|err| anyhow!(err.to_string()))?;
-    std::fs::write(dir.join("audit.toml"), &text)?;
-    record_local_change(dir, detail);
     if let Some(node) = push {
         let client = client.ok_or_else(|| anyhow!("--push needs a relay login"))?;
         client
             .set_audit_policy(node, None, &text)
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
+        if json_out {
+            println!("{}", json!({"ok": true, "pushed": node, "detail": detail}));
+        } else {
+            println!("pushed audit policy ({detail}) to {node}");
+        }
+        return Ok(());
     }
-    eprintln!("updated {}", dir.join("audit.toml").display());
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("audit.toml");
+    std::fs::write(&path, &text)?;
+    record_local_change(dir, detail);
+    if json_out {
+        println!("{}", json!({"ok": true, "path": path, "detail": detail}));
+    } else {
+        println!("updated {}", path.display());
+    }
     Ok(())
 }
 
@@ -504,6 +660,15 @@ fn s3_from_flags_or_file(
         .ok_or_else(|| anyhow!("pass --endpoint and --bucket, or configure an s3 sink"))
 }
 
+fn short_id_if_hex64(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        trimmed.chars().take(12).collect()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn emit_records(json_out: bool, records: &[AuditRecord], verified: bool) {
     if json_out {
         let body = json!({
@@ -522,7 +687,11 @@ fn emit_records(json_out: bool, records: &[AuditRecord], verified: bool) {
     for record in records {
         println!(
             "{} {} {} {} {}",
-            record.ts, record.op, record.client_id, record.result, record.node_id
+            record.ts,
+            record.op,
+            short_id_if_hex64(&record.client_id),
+            record.result,
+            short_id_if_hex64(&record.node_id)
         );
     }
 }
@@ -533,4 +702,45 @@ fn split_csv(text: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_unix_relative_and_iso8601_timestamps() {
+        let now = 1_763_800_000;
+        assert_eq!(parse_audit_time("1763700000", now).unwrap(), 1_763_700_000);
+        assert_eq!(parse_audit_time("-24h", now).unwrap(), now - 86_400);
+        assert_eq!(parse_audit_time("30m", now).unwrap(), now - 1800);
+        assert_eq!(parse_audit_time("-1h30m", now).unwrap(), now - 5400);
+        assert_eq!(parse_audit_time("1970-01-01T00:00:00Z", now).unwrap(), 0);
+        assert_eq!(parse_audit_time("1970-01-02", now).unwrap(), 86_400);
+        assert_eq!(
+            parse_audit_time("1970-01-01T08:00:00+08:00", now).unwrap(),
+            0
+        );
+        assert!(parse_audit_time("not-a-time", now).is_err());
+    }
+
+    #[tokio::test]
+    async fn push_without_client_does_not_clobber_local_audit_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("audit.toml");
+        std::fs::write(&toml_path, "# sentinel\n").unwrap();
+        let policy = AuditPolicy::preset("paranoid").unwrap();
+        let err = save_or_push_policy(
+            dir.path(),
+            &policy,
+            "preset paranoid",
+            None,
+            Some("remote-box"),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--push needs a relay login"));
+        assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), "# sentinel\n");
+    }
 }

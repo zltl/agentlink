@@ -1,6 +1,6 @@
 //! Username sessions: local relay accounts and remote user, share, and token commands.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use agentlink_core::{parse_access, Client};
@@ -30,21 +30,27 @@ pub enum RelayUserCmd {
         #[arg(long)]
         admin: bool,
     },
+    /// List accounts in this relay's database.
     List,
+    /// Set or rotate the password for an account.
     Passwd {
         username: String,
         #[arg(long)]
         password_stdin: bool,
     },
+    /// Disable an account so it cannot sign in.
     Disable {
         username: String,
     },
+    /// Re-enable a disabled account.
     Enable {
         username: String,
     },
+    /// Permanently remove an account.
     Rm {
         username: String,
     },
+    /// Change an account's role (`admin` or `user`).
     SetRole {
         username: String,
         role: String,
@@ -53,6 +59,7 @@ pub enum RelayUserCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum UserAction {
+    /// Create a user account on the relay.
     Add {
         username: String,
         #[arg(long)]
@@ -60,21 +67,27 @@ pub enum UserAction {
         #[arg(long)]
         admin: bool,
     },
+    /// List user accounts on the relay.
     List,
+    /// Change an account's password on the relay.
     Passwd {
         username: String,
         #[arg(long)]
         password_stdin: bool,
     },
+    /// Disable a user account on the relay.
     Disable {
         username: String,
     },
+    /// Re-enable a disabled user account on the relay.
     Enable {
         username: String,
     },
+    /// Permanently remove a user account on the relay.
     Rm {
         username: String,
     },
+    /// Change a user account's role (`admin` or `user`).
     SetRole {
         username: String,
         role: String,
@@ -88,13 +101,17 @@ pub enum UserAction {
 
 #[derive(Subcommand, Debug)]
 pub enum TotpAction {
+    /// Generate a new TOTP secret and provisioning URL.
     Enable,
+    /// Verify a TOTP code to finish enabling authenticator login.
     Confirm { code: String },
+    /// Disable TOTP authenticator codes for this account.
     Disable,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum TokenAction {
+    /// Create a new enrollment token for pairing machines.
     Create {
         #[arg(long)]
         name: String,
@@ -106,7 +123,9 @@ pub enum TokenAction {
         #[arg(long, default_value_t = 1)]
         uses: u32,
     },
+    /// List enrollment tokens.
     List,
+    /// Revoke an enrollment token by id.
     Revoke {
         id: String,
     },
@@ -116,40 +135,78 @@ pub fn read_password(password_stdin: bool, label: &str) -> Result<String> {
     if password_stdin {
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
-        return Ok(line.trim().to_string());
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
     }
     prompt_secret(label)
 }
 
+struct SecretTerminalGuard {
+    bracketed_paste: bool,
+}
+
+impl SecretTerminalGuard {
+    fn enter() -> Result<Self> {
+        use crossterm::event::EnableBracketedPaste;
+        use crossterm::execute;
+        use crossterm::terminal::enable_raw_mode;
+        enable_raw_mode().map_err(|err| anyhow!(err))?;
+        let bracketed_paste = execute!(std::io::stderr(), EnableBracketedPaste).is_ok();
+        Ok(Self { bracketed_paste })
+    }
+}
+
+impl Drop for SecretTerminalGuard {
+    fn drop(&mut self) {
+        use crossterm::event::DisableBracketedPaste;
+        use crossterm::execute;
+        use crossterm::terminal::disable_raw_mode;
+        if self.bracketed_paste {
+            let _ = execute!(std::io::stderr(), DisableBracketedPaste);
+        }
+        let _ = disable_raw_mode();
+    }
+}
+
 pub fn prompt_secret(label: &str) -> Result<String> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    if !std::io::stdin().is_terminal() {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+    }
     eprint!("{label}");
     std::io::stderr().flush().ok();
-    enable_raw_mode().map_err(|err| anyhow!(err))?;
+    let _guard = SecretTerminalGuard::enter()?;
     let mut password = String::new();
     let result = loop {
         let event = match event::read() {
             Ok(event) => event,
             Err(err) => break Err(anyhow!(err)),
         };
-        let Event::Key(key) = event else { continue };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        match key.code {
-            KeyCode::Enter => break Ok(password),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                break Err(anyhow!("cancelled"));
+        match event {
+            Event::Paste(text) => {
+                password.push_str(text.trim_end_matches(['\r', '\n']));
             }
-            KeyCode::Char(ch) => password.push(ch),
-            KeyCode::Backspace => {
-                password.pop();
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter => break Ok(password),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break Err(anyhow!("cancelled"));
+                    }
+                    KeyCode::Char(ch) => password.push(ch),
+                    KeyCode::Backspace => {
+                        password.pop();
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
     };
-    disable_raw_mode().ok();
+    drop(_guard);
     eprintln!();
     result
 }
@@ -184,8 +241,8 @@ pub async fn relay_user(
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(
                 json_mode,
-                json!({"username": user.username, "role": user.role}),
-                || eprintln!("added {} ({})", user.username, user.role),
+                json!({"ok": true, "username": user.username, "role": user.role}),
+                || println!("added {} ({})", user.username, user.role),
             );
         }
         RelayUserCmd::List => {
@@ -206,7 +263,7 @@ pub async fn relay_user(
                 .collect::<Vec<_>>();
             emit(json_mode, json!({"users": value}), || {
                 for user in &users {
-                    eprintln!("{} {} disabled={}", user.username, user.role, user.disabled);
+                    println!("{} {} disabled={}", user.username, user.role, user.disabled);
                 }
             });
         }
@@ -219,7 +276,7 @@ pub async fn relay_user(
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true, "username": username}), || {
-                eprintln!("password updated for {username}");
+                println!("password updated for {username}");
             });
         }
         RelayUserCmd::Disable { username } => {
@@ -227,7 +284,7 @@ pub async fn relay_user(
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true}), || {
-                eprintln!("disabled {username}")
+                println!("disabled {username}")
             });
         }
         RelayUserCmd::Enable { username } => {
@@ -235,7 +292,7 @@ pub async fn relay_user(
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true}), || {
-                eprintln!("enabled {username}")
+                println!("enabled {username}")
             });
         }
         RelayUserCmd::Rm { username } => {
@@ -243,7 +300,7 @@ pub async fn relay_user(
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true}), || {
-                eprintln!("removed {username}")
+                println!("removed {username}")
             });
         }
         RelayUserCmd::SetRole { username, role } => {
@@ -251,7 +308,7 @@ pub async fn relay_user(
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true, "role": role}), || {
-                eprintln!("{username} is now {role}");
+                println!("{username} is now {role}");
             });
         }
     }
@@ -273,7 +330,7 @@ pub async fn share_cmd(
     emit(
         json_mode,
         json!({"ok": true, "node": node, "with": with, "access": access}),
-        || eprintln!("shared {node} with {with} ({access})"),
+        || println!("shared {node} with {with} ({access})"),
     );
     Ok(0)
 }
@@ -287,7 +344,7 @@ pub async fn unshare_cmd(client: &Client, node: &str, with: &str, json_mode: boo
         json_mode,
         json!({"ok": true, "node": node, "with": with}),
         || {
-            eprintln!("removed {with} from {node}");
+            println!("removed {with} from {node}");
         },
     );
     Ok(0)
@@ -335,7 +392,7 @@ pub async fn token_cmd(client: &Client, action: &TokenAction, json_mode: bool) -
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"tokens": tokens}), || {
                 for token in &tokens {
-                    eprintln!(
+                    println!(
                         "{} {} {} {} remaining={}",
                         token.id, token.name, token.state, token.owner, token.uses_remaining
                     );
@@ -348,7 +405,7 @@ pub async fn token_cmd(client: &Client, action: &TokenAction, json_mode: bool) -
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true, "id": id}), || {
-                eprintln!("revoked {id}")
+                println!("revoked {id}")
             });
         }
     }
@@ -367,7 +424,7 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                 .user_add(username, &password, *admin)
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
-            emit(json_mode, created, || eprintln!("added {username}"));
+            emit(json_mode, created, || println!("added {username}"));
         }
         UserAction::List => {
             let users = client
@@ -376,7 +433,7 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"users": users}), || {
                 for user in &users {
-                    eprintln!("{} {} disabled={}", user.username, user.role, user.disabled);
+                    println!("{} {} disabled={}", user.username, user.role, user.disabled);
                 }
             });
         }
@@ -390,7 +447,7 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true}), || {
-                eprintln!("password updated")
+                println!("password updated")
             });
         }
         UserAction::Disable { username } => {
@@ -399,7 +456,7 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true}), || {
-                eprintln!("disabled {username}")
+                println!("disabled {username}")
             });
         }
         UserAction::Enable { username } => {
@@ -408,7 +465,7 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true}), || {
-                eprintln!("enabled {username}")
+                println!("enabled {username}")
             });
         }
         UserAction::Rm { username } => {
@@ -417,7 +474,7 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             emit(json_mode, json!({"ok": true}), || {
-                eprintln!("removed {username}")
+                println!("removed {username}")
             });
         }
         UserAction::SetRole { username, role } => {
@@ -425,8 +482,8 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                 .user_set_role(username, role)
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
-            emit(json_mode, json!({"ok": true}), || {
-                eprintln!("{username} is now {role}")
+            emit(json_mode, json!({"ok": true, "role": role}), || {
+                println!("{username} is now {role}")
             });
         }
         UserAction::Totp { action } => match action {
@@ -436,8 +493,8 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                     .await
                     .map_err(|err| anyhow!(err.to_string()))?;
                 emit(json_mode, json!({"secret": secret, "url": url}), || {
-                    eprintln!("secret: {secret}");
-                    eprintln!("url: {url}");
+                    println!("secret: {secret}");
+                    println!("url: {url}");
                     eprintln!("confirm with: agentlink user totp confirm CODE");
                 });
             }
@@ -447,7 +504,7 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                     .await
                     .map_err(|err| anyhow!(err.to_string()))?;
                 emit(json_mode, json!({"ok": true}), || {
-                    eprintln!("authenticator enabled")
+                    println!("authenticator enabled")
                 });
             }
             TotpAction::Disable => {
@@ -456,7 +513,7 @@ pub async fn user_cmd(client: &Client, action: &UserAction, json_mode: bool) -> 
                     .await
                     .map_err(|err| anyhow!(err.to_string()))?;
                 emit(json_mode, json!({"ok": true}), || {
-                    eprintln!("authenticator disabled")
+                    println!("authenticator disabled")
                 });
             }
         },

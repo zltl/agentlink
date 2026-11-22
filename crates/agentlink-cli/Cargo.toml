@@ -7,9 +7,29 @@ rust-version.workspace = true
 publish.workspace = true
 description = "agentlink CLI, node, relay, and MCP server"
 
+[lib]
+name = "agentlink_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agentlink"
 path = "src/main.rs"
+
+[[bin]]
+name = "agentlink-gui"
+path = "src/bin/agentlink_gui.rs"
+
+[features]
+default = ["controller"]
+controller = [
+    "dep:agentlink-view",
+    "dep:eframe",
+    "dep:image",
+    "dep:openh264",
+    "dep:alacritty_terminal",
+    "dep:unicode-width",
+    "dep:ksni",
+]
 
 [dependencies]
 agentlink-core.workspace = true
@@ -44,20 +64,21 @@ sysinfo.workspace = true
 tempfile.workspace = true
 
 # The controller window is glibc Linux, macOS, and Windows. Musl release
-# archives stay headless so the static link does not pull a GUI toolkit.
+# archives and `--no-default-features` builds stay headless so they do not
+# pull GUI toolkits, OpenH264, or libstdc++.
 [target.'cfg(not(target_env = "musl"))'.dependencies]
-agentlink-view.workspace = true
-eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-openh264 = "0.8"
+agentlink-view = { workspace = true, optional = true }
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+openh264 = { version = "0.8", optional = true }
 # Alacritty's VT/grid core (Apache-2.0). Used for the desktop Controller
 # terminal; we feed the remote agentlink PTY and do not spawn a local tty.
-alacritty_terminal = "0.25.1"
+alacritty_terminal = { version = "0.25.1", optional = true }
 # Same width table alacritty uses for speculative local-echo cell advance.
-unicode-width = "0.2"
+unicode-width = { version = "0.2", optional = true }
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
-ksni = "0.3.7"
+ksni = { version = "0.3.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

@@ -99,19 +99,20 @@ pub fn load(args: NodeArgs) -> Result<NodeConfig> {
             .map(PathBuf::from)
     });
     // First-run (no saved node.json, or a pre-max_policy file with the key
-    // absent) keeps the historical default of `full` so a fresh node can be
-    // configured. A present but unreadable `max_policy` is fail-closed: do
-    // not start as `full`. Fix or remove the key, then restart.
+    // absent) defaults to `exec` (matching `NodePolicy::exec()` least-privilege
+    // enrollment; opt into desktop/full with `--max-access full`). A present
+    // but unreadable `max_policy` is fail-closed: fix or remove the key, then
+    // restart.
     let max_policy = if let Some(access) = args.max_access {
         parse_access(&access)?
     } else if let Some(policy) = saved.as_ref().and_then(|v| v.get("max_policy")) {
         serde_json::from_value(policy.clone()).map_err(|err| {
             anyhow!(
-                "node.json max_policy is invalid ({err}); refusing to start.                  Repair or delete that key and restart. A missing key (first run                  or a pre-max_policy config) still defaults to full."
+                "node.json max_policy is invalid ({err}); refusing to start. Repair or delete that key and restart."
             )
         })?
     } else {
-        agentlink_core::NodePolicy::full()
+        agentlink_core::NodePolicy::exec()
     };
     let pairing_token = first_string(
         args.pairing_token,

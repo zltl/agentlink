@@ -4,10 +4,11 @@
 //! service runs in session 0 and cannot see the interactive desktop.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +25,8 @@ use crate::node_cfg::{self, NodeArgs};
 use crate::service::NODE_NAME;
 
 static DATA_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+const MAX_SERVICE_LOG_BYTES: u64 = 5 * 1024 * 1024;
+const SCM_DELETE_WAIT: Duration = Duration::from_secs(10);
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -88,18 +91,87 @@ fn run_service() -> Result<()> {
     result.map(|_| ()).map_err(|err| anyhow!(err))
 }
 
+struct RotatingLogInner {
+    path: PathBuf,
+    file: Option<File>,
+    written: u64,
+}
+
+impl RotatingLogInner {
+    fn open(path: PathBuf) -> Self {
+        let written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut inner = Self {
+            path,
+            file: None,
+            written,
+        };
+        inner.maybe_rotate();
+        inner.reopen();
+        inner
+    }
+
+    fn reopen(&mut self) {
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .ok();
+        self.written = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+    }
+
+    fn maybe_rotate(&mut self) {
+        if self.written < MAX_SERVICE_LOG_BYTES {
+            return;
+        }
+        self.file = None;
+        let backup = self.path.with_extension("log.1");
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::rename(&self.path, &backup);
+        self.written = 0;
+        self.reopen();
+    }
+}
+
+#[derive(Clone)]
+struct RotatingLogWriter {
+    inner: Arc<Mutex<RotatingLogInner>>,
+}
+
+impl Write for RotatingLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.maybe_rotate();
+        if guard.file.is_none() {
+            guard.reopen();
+        }
+        if let Some(file) = guard.file.as_mut() {
+            let n = file.write(buf)?;
+            guard.written = guard.written.saturating_add(n as u64);
+            Ok(n)
+        } else {
+            Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(file) = guard.file.as_mut() {
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
 fn init_log(data_dir: &Path) {
     let _ = std::fs::create_dir_all(data_dir);
-    let Ok(file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data_dir.join("service.log"))
-    else {
-        return;
+    let writer = RotatingLogWriter {
+        inner: Arc::new(Mutex::new(RotatingLogInner::open(
+            data_dir.join("service.log"),
+        ))),
     };
     let _ = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_writer(move || file.try_clone().expect("service log"))
+        .with_writer(move || writer.clone())
         .try_init();
 }
 
@@ -119,9 +191,17 @@ fn status_of(state: ServiceState, accept: ServiceControlAccept, code: u32) -> Se
     }
 }
 
+fn wait_for_service_deletion() {
+    let deadline = Instant::now() + SCM_DELETE_WAIT;
+    while service_exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 pub fn install_service(binary: &Path, data_dir: &Path) -> Result<()> {
     let _ = stop_service();
     let _ = uninstall_service();
+    wait_for_service_deletion();
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -144,10 +224,22 @@ pub fn install_service(binary: &Path, data_dir: &Path) -> Result<()> {
         account_name: None,
         account_password: None,
     };
-    let _service = manager
-        .create_service(&info, ServiceAccess::START)
-        .map_err(|err| anyhow!("create Windows service: {err}"))?;
-    Ok(())
+    let deadline = Instant::now() + SCM_DELETE_WAIT;
+    loop {
+        match manager.create_service(&info, ServiceAccess::START) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                let text = err.to_string();
+                let marked_for_delete =
+                    text.contains("1072") || text.to_ascii_lowercase().contains("marked for deletion");
+                if marked_for_delete && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                return Err(anyhow!("create Windows service: {err}"));
+            }
+        }
+    }
 }
 
 pub fn start_service() -> Result<()> {
@@ -172,6 +264,15 @@ pub fn stop_service() -> Result<()> {
     service
         .stop()
         .map_err(|err| anyhow!("stop Windows service: {err}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(status) = service.query_status() {
+            if status.current_state == ServiceState::Stopped {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     Ok(())
 }
 
