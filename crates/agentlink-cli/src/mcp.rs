@@ -22,15 +22,41 @@ use base64::Engine;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 
-pub async fn serve(settings: ClientSettings, identity_path: PathBuf) -> Result<()> {
+#[derive(Clone, Debug)]
+pub struct McpConfig {
+    pub config_dir: PathBuf,
+    pub identity_path: PathBuf,
+    pub explicit_identity: bool,
+    pub relay: Option<String>,
+    pub token: Option<String>,
+    pub fingerprint: Option<String>,
+    pub trust: Option<String>,
+    pub preset_settings: Option<ClientSettings>,
+}
+
+impl McpConfig {
+    pub fn from_settings(settings: ClientSettings, identity_path: PathBuf) -> Self {
+        let config_dir = identity_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            config_dir,
+            identity_path,
+            explicit_identity: false,
+            relay: None,
+            token: None,
+            fingerprint: None,
+            trust: None,
+            preset_settings: Some(settings),
+        }
+    }
+}
+
+pub async fn serve(config: McpConfig) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
-    let mut state = Mcp {
-        settings,
-        identity_path,
-        client: None,
-        terminals: HashMap::new(),
-    };
+    let mut state = new_state_from_config(config);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -50,19 +76,25 @@ pub async fn serve(settings: ClientSettings, identity_path: PathBuf) -> Result<(
 }
 
 pub(crate) struct Mcp {
-    pub(crate) settings: ClientSettings,
-    pub(crate) identity_path: PathBuf,
+    pub(crate) config: McpConfig,
+    resolved_settings: Option<ClientSettings>,
     client: Option<Client>,
     terminals: HashMap<String, PtySession>,
 }
 
-pub(crate) fn new_state(settings: ClientSettings, identity_path: PathBuf) -> Mcp {
+pub(crate) fn new_state_from_config(config: McpConfig) -> Mcp {
+    let resolved_settings = config.preset_settings.clone();
     Mcp {
-        settings,
-        identity_path,
+        config,
+        resolved_settings,
         client: None,
         terminals: HashMap::new(),
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn new_state(settings: ClientSettings, identity_path: PathBuf) -> Mcp {
+    new_state_from_config(McpConfig::from_settings(settings, identity_path))
 }
 
 pub(crate) async fn handle(state: &mut Mcp, message: Value) -> Option<Value> {
@@ -119,18 +151,160 @@ pub(crate) async fn handle(state: &mut Mcp, message: Value) -> Option<Value> {
     }
 }
 
+fn mcp_grant_status_str(status: agentlink_core::grant::GrantStatus) -> &'static str {
+    match status {
+        agentlink_core::grant::GrantStatus::Active => "active",
+        agentlink_core::grant::GrantStatus::Expired => "expired",
+        agentlink_core::grant::GrantStatus::NotYetValid => "not_yet_valid",
+        agentlink_core::grant::GrantStatus::GranteeMismatch => "wrong_grantee",
+        agentlink_core::grant::GrantStatus::NodeMismatch => "wrong_node",
+    }
+}
+
+fn resolve_node_alias(state: &Mcp, raw: &str) -> String {
+    let cfg = agentlink_core::config::load_file(&state.config.config_dir).unwrap_or_default();
+    cfg.aliases
+        .get(raw)
+        .cloned()
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn required_node(state: &Mcp, args: &Value, key: &str) -> std::result::Result<String, String> {
+    let raw = required_str(args, key)?;
+    Ok(resolve_node_alias(state, &raw))
+}
+
+fn get_status_tool(state: &Mcp) -> String {
+    let now = agentlink_core::util::unix_now();
+    let cfg = agentlink_core::config::load_file(&state.config.config_dir).unwrap_or_default();
+    let local_identity = Identity::load(&state.config.identity_path).ok();
+    let local_public_id = local_identity
+        .as_ref()
+        .map(|id| id.public_hex().to_string());
+
+    let relay = state
+        .config
+        .relay
+        .clone()
+        .or_else(|| state.config.preset_settings.as_ref().map(|s| s.relay.clone()))
+        .or_else(|| cfg.relay.clone());
+
+    let has_refresh = cfg
+        .refresh_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    let has_token = cfg.token.as_deref().is_some_and(|t| !t.trim().is_empty())
+        || state
+            .config
+            .token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+        || state
+            .config
+            .preset_settings
+            .as_ref()
+            .is_some_and(|s| !s.token.trim().is_empty());
+
+    let session_state = match (has_token, has_refresh, cfg.access_expires_unix) {
+        (true, _, Some(exp)) if exp > now => "active",
+        (_, true, _) => "refreshable",
+        (true, false, Some(_)) => "expired",
+        (true, false, None) => "token",
+        (false, false, _) if state.config.explicit_identity => "identity_only",
+        (false, false, _) => "none",
+    };
+
+    let authenticated = session_state != "none"
+        && session_state != "expired"
+        && relay.as_deref().is_some_and(|r| !r.trim().is_empty());
+    let default_node = std::env::var("AGENTLINK_NODE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg.default_node.clone());
+
+    let stored = agentlink_core::grant::list_stored_grants(&state.config.config_dir)
+        .unwrap_or_default();
+    let grants: Vec<Value> = stored
+        .iter()
+        .map(|item| {
+            let status = agentlink_core::grant::grant_status(
+                &item.grant,
+                Some(&item.grant.node_id),
+                local_public_id.as_deref(),
+                now,
+            );
+            let node_name =
+                agentlink_core::node_pin::name_for_id(&state.config.config_dir, &item.grant.node_id)
+                    .ok()
+                    .flatten();
+            json!({
+                "node_id": item.grant.node_id,
+                "node_name": node_name,
+                "jti": item.grant.jti,
+                "grant_status": mcp_grant_status_str(status),
+                "grant_expires_in_secs": item.grant.exp_unix - now,
+                "exp_unix": item.grant.exp_unix,
+                "access": item.grant.policy.capability_summary(),
+            })
+        })
+        .collect();
+
+    pretty(&json!({
+        "config_dir": state.config.config_dir.display().to_string(),
+        "identity_path": state.config.identity_path.display().to_string(),
+        "identity_exists": local_public_id.is_some(),
+        "public_id": local_public_id,
+        "relay": relay,
+        "session_state": session_state,
+        "authenticated": authenticated,
+        "default_node": default_node,
+        "aliases": cfg.aliases,
+        "grants": grants,
+    }))
+}
+
 async fn call_tool(
     state: &mut Mcp,
     name: &str,
     args: &Value,
 ) -> std::result::Result<String, String> {
     match name {
+        "get_status" => Ok(get_status_tool(state)),
         "list_machines" => {
             let nodes = retry(state, |client| Box::pin(client.list_nodes())).await?;
-            Ok(pretty(&json!({"machines": nodes})))
+            let now = agentlink_core::util::unix_now();
+            let local_public_id = Identity::load(&state.config.identity_path)
+                .ok()
+                .map(|id| id.public_hex().to_string());
+            let mut enriched = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                let mut val = serde_json::to_value(&node).unwrap_or_else(|_| json!({}));
+                let (grant_status_str, expires_in) = match agentlink_core::grant::load_grant(
+                    &state.config.config_dir,
+                    &node.id,
+                ) {
+                    Ok(Some(grant)) => {
+                        let status = agentlink_core::grant::grant_status(
+                            &grant,
+                            Some(&node.id),
+                            local_public_id.as_deref(),
+                            now,
+                        );
+                        (mcp_grant_status_str(status), Some(grant.exp_unix - now))
+                    }
+                    _ => ("missing", None),
+                };
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("grant_status".into(), json!(grant_status_str));
+                    obj.insert("grant_expires_in_secs".into(), json!(expires_in));
+                }
+                enriched.push(val);
+            }
+            Ok(pretty(&json!({"machines": enriched})))
         }
         "list_dir" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let path = args
                 .get("path")
                 .and_then(Value::as_str)
@@ -151,7 +325,7 @@ async fn call_tool(
             Ok(pretty(&json!(entries)))
         }
         "stat_path" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let path = required_str(args, "path")?;
             let node_label = node.clone();
             let path_label = path.clone();
@@ -166,13 +340,13 @@ async fn call_tool(
         }
         "read_file" => read_file_tool(state, args).await,
         "write_file" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let path = required_str(args, "path")?;
             let bytes = decode_content(args)?;
             let n = bytes.len();
             let path_out = path.clone();
             let node_out = node.clone();
-            retry(state, move |client| {
+            run_once(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
                 let bytes = bytes.clone();
@@ -189,12 +363,12 @@ async fn call_tool(
             Ok(pretty(&json!({"path": path_out, "bytes": n})))
         }
         "mkdir" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let path = required_str(args, "path")?;
             let parents = args.get("parents").and_then(Value::as_bool).unwrap_or(true);
             let path_out = path.clone();
             let node_out = node.to_string();
-            match retry(state, move |client| {
+            match run_once(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
                 Box::pin(async move { client.mkdir(&node, &path, parents).await })
@@ -213,7 +387,7 @@ async fn call_tool(
             }
         }
         "remove_path" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let path = required_str(args, "path")?;
             let recursive = args
                 .get("recursive")
@@ -221,7 +395,7 @@ async fn call_tool(
                 .unwrap_or(false);
             let path_out = path.clone();
             let node_out = node.clone();
-            match retry(state, move |client| {
+            match run_once(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
                 Box::pin(async move { client.remove(&node, &path, recursive).await })
@@ -242,13 +416,13 @@ async fn call_tool(
             }
         }
         "move_path" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let from = required_str(args, "from")?;
             let to = required_str(args, "to")?;
             let node_fallback = node.clone();
             let from_fallback = from.clone();
             let to_fallback = to.clone();
-            let body = match retry(state, move |client| {
+            let body = match run_once(state, move |client| {
                 let node = node.clone();
                 let from = from.clone();
                 let to = to.clone();
@@ -285,7 +459,7 @@ async fn call_tool(
         }
         "run_command" => run_command(state, args).await,
         "search_content" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let pattern = required_str(args, "pattern")?;
             let path = args
                 .get("path")
@@ -356,7 +530,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "search_files" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let pattern = required_str(args, "pattern")?;
             let path = args
                 .get("path")
@@ -409,7 +583,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "replace_text" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let path = required_str(args, "path")?;
             // Don't use `required_str` here: a present-but-empty `old` must
             // reach the empty-anchor tip instead of reading as missing.
@@ -428,7 +602,7 @@ async fn call_tool(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let path_out = path.clone();
-            let value = retry(state, move |client| {
+            let value = run_once(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
                 let old = old.clone();
@@ -440,7 +614,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "edit_lines" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let path = required_str(args, "path")?;
             let start = number(args, "start_line") as u32;
             let end = number(args, "end_line") as u32;
@@ -452,7 +626,7 @@ async fn call_tool(
             if start == 0 || end == 0 {
                 return Err("line numbers are 1-based".into());
             }
-            let value = retry(state, move |client| {
+            let value = run_once(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
                 let content = content.clone();
@@ -462,14 +636,14 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "apply_patch" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let root = args
                 .get("root")
                 .and_then(Value::as_str)
                 .unwrap_or(".")
                 .to_string();
             let patch = required_str(args, "patch")?;
-            let value = retry(state, move |client| {
+            let value = run_once(state, move |client| {
                 let node = node.clone();
                 let root = root.clone();
                 let patch = patch.clone();
@@ -479,13 +653,13 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "watch_start" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let path = required_str(args, "path")?;
             let recursive = args
                 .get("recursive")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let value = retry(state, move |client| {
+            let value = run_once(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
                 Box::pin(async move { client.watch_start(&node, &path, recursive).await })
@@ -494,7 +668,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "watch_poll" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let watch_id = required_str(args, "watch_id")?;
             let cursor = number(args, "cursor");
             let timeout_ms = {
@@ -519,9 +693,9 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "watch_stop" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let watch_id = required_str(args, "watch_id")?;
-            let value = retry(state, move |client| {
+            let value = run_once(state, move |client| {
                 let node = node.clone();
                 let watch_id = watch_id.clone();
                 Box::pin(async move { client.watch_stop(&node, &watch_id).await })
@@ -530,7 +704,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "process_start" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let cwd = args.get("cwd").and_then(Value::as_str).map(str::to_string);
             let env = parse_env_arg(args)?;
             let stdin = parse_stdin_arg(args)?;
@@ -538,7 +712,7 @@ async fn call_tool(
             let node_label = node.clone();
             let program_label = program.clone();
             let cwd_label = cwd.clone();
-            let value = retry(state, move |client| {
+            let value = run_once(state, move |client| {
                 let node = node.clone();
                 let program = program.clone();
                 let argv = argv.clone();
@@ -563,7 +737,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "process_list" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let value = retry(state, move |client| {
                 let node = node.clone();
                 Box::pin(async move { client.bg_list(&node).await })
@@ -572,7 +746,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "process_output" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let id = required_str(args, "id")?;
             let stdout_cursor = number(args, "stdout_cursor");
             let stderr_cursor = number(args, "stderr_cursor");
@@ -590,7 +764,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "process_status" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let id = required_str(args, "id")?;
             let value = retry(state, move |client| {
                 let node = node.clone();
@@ -601,9 +775,9 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "process_kill" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let id = required_str(args, "id")?;
-            let value = retry(state, move |client| {
+            let value = run_once(state, move |client| {
                 let node = node.clone();
                 let id = id.clone();
                 Box::pin(async move { client.bg_kill(&node, &id).await })
@@ -612,7 +786,7 @@ async fn call_tool(
             Ok(pretty(&value))
         }
         "system_info" => {
-            let node = required_str(args, "node")?;
+            let node = required_node(state, args, "node")?;
             let value = retry(state, move |client| {
                 let node = node.clone();
                 Box::pin(async move { client.sysinfo(&node).await })
@@ -626,14 +800,14 @@ async fn call_tool(
         "terminal_resize" => terminal_resize(state, args).await,
         "terminal_close" => terminal_close(state, args).await,
         "copy_path" => copy_path_tool(state, args).await,
-        "click" => desktop_tool(state, args, click_payload(args)?).await,
+        "click" => desktop_tool(state, args, click_payload(args)?, false).await,
         "type" => {
             let text = required_str(args, "text")?;
-            desktop_tool(state, args, json!({"action": "type", "text": text})).await
+            desktop_tool(state, args, json!({"action": "type", "text": text}), false).await
         }
         "key" => {
             let keys = required_str(args, "keys")?;
-            desktop_tool(state, args, json!({"action": "key", "keys": keys})).await
+            desktop_tool(state, args, json!({"action": "key", "keys": keys}), false).await
         }
         "scroll" => {
             let has_x = args.get("x").is_some_and(|value| value.is_number());
@@ -650,7 +824,7 @@ async fn call_tool(
                 payload["x"] = args.get("x").cloned().unwrap();
                 payload["y"] = args.get("y").cloned().unwrap();
             }
-            desktop_tool(state, args, payload).await
+            desktop_tool(state, args, payload, false).await
         }
         "get_ui_tree" => {
             desktop_tool(
@@ -661,6 +835,7 @@ async fn call_tool(
                     "max_depth": args.get("max_depth").and_then(Value::as_u64).unwrap_or(6),
                     "max_nodes": args.get("max_nodes").and_then(Value::as_u64).unwrap_or(400),
                 }),
+                true,
             )
             .await
         }
@@ -671,21 +846,76 @@ async fn call_tool(
             if let Some(value) = args.get("value").and_then(Value::as_str) {
                 payload["value"] = json!(value);
             }
-            desktop_tool(state, args, payload).await
+            desktop_tool(state, args, payload, false).await
         }
         other => Err(format!("unknown tool {other}")),
     }
 }
 
+const READ_FILE_DEFAULT_MAX_BYTES: u64 = 64 * 1024;
+const READ_FILE_MAX_BYTES_CAP: u64 = 1024 * 1024;
+
+fn slice_utf8_lines(
+    text: &str,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+) -> std::result::Result<(String, u64, u64, usize, bool), String> {
+    if let Some(0) = start_line {
+        return Err("start_line is 1-based".into());
+    }
+    if let Some(0) = end_line {
+        return Err("end_line is 1-based".into());
+    }
+    let start = start_line.unwrap_or(1);
+    if let Some(end) = end_line {
+        if end < start {
+            return Err("end_line must be >= start_line".into());
+        }
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let total = lines.len();
+    let start_idx = (start as usize).saturating_sub(1);
+    let end_idx = end_line
+        .map(|e| (e as usize).min(total))
+        .unwrap_or(total);
+    let sliced = if start_idx >= total || start_idx >= end_idx {
+        String::new()
+    } else {
+        lines[start_idx..end_idx].concat()
+    };
+    let effective_end = end_line.unwrap_or(total as u64).min(total as u64);
+    let clipped = end_idx < total;
+    Ok((sliced, start, effective_end, total, clipped))
+}
+
 async fn read_file_tool(state: &mut Mcp, args: &Value) -> std::result::Result<String, String> {
-    let node = required_str(args, "node")?;
+    let node = required_node(state, args, "node")?;
     let path = required_str(args, "path")?;
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let start_line = args.get("start_line").and_then(Value::as_u64);
+    let end_line = args.get("end_line").and_then(Value::as_u64);
+    if let Some(0) = start_line {
+        return Err("start_line is 1-based".into());
+    }
+    if let Some(0) = end_line {
+        return Err("end_line is 1-based".into());
+    }
+    if let (Some(s), Some(e)) = (start_line, end_line) {
+        if e < s {
+            return Err("end_line must be >= start_line".into());
+        }
+    }
+    let line_mode = start_line.is_some() || end_line.is_some();
+    let default_bytes = if line_mode {
+        READ_FILE_MAX_BYTES_CAP
+    } else {
+        READ_FILE_DEFAULT_MAX_BYTES
+    };
     let max_bytes = args
         .get("max_bytes")
         .and_then(Value::as_u64)
-        .unwrap_or(1024 * 1024)
-        .min(u32::MAX as u64) as u32;
+        .unwrap_or(default_bytes)
+        .min(READ_FILE_MAX_BYTES_CAP) as u32;
     let node_label = node.clone();
     let path_label = path.clone();
     let (data, file_size, end) = {
@@ -719,12 +949,30 @@ async fn read_file_tool(state: &mut Mcp, args: &Value) -> std::result::Result<St
         })?
     };
     let truncated = end < file_size;
+    if line_mode {
+        let text = std::str::from_utf8(&data)
+            .map_err(|_| "start_line/end_line requires a UTF-8 text file".to_string())?;
+        let (sliced, eff_start, eff_end, total_lines, clipped) =
+            slice_utf8_lines(text, start_line, end_line)?;
+        return Ok(pretty(&json!({
+            "path": path,
+            "offset": offset,
+            "encoding": "utf-8",
+            "content": sliced,
+            "bytes": sliced.len(),
+            "size": file_size,
+            "start_line": eff_start,
+            "end_line": eff_end,
+            "total_lines": total_lines,
+            "truncated": truncated || clipped,
+        })));
+    }
     Ok(encode_bytes(&path, offset, &data, truncated, file_size))
 }
 
 async fn copy_path_tool(state: &mut Mcp, args: &Value) -> std::result::Result<String, String> {
     let direction = required_str(args, "direction")?;
-    let node = required_str(args, "node")?;
+    let node = required_node(state, args, "node")?;
     let path = required_str(args, "path")?;
     let compress = match args
         .get("compress")
@@ -757,14 +1005,21 @@ async fn copy_path_tool(state: &mut Mcp, args: &Value) -> std::result::Result<St
         "upload" => {
             let local = required_str(args, "local")?;
             let local_path = std::path::PathBuf::from(&local);
-            retry(state, move |client| {
+            let file_name = crate::file_name_hint(&local_path)
+                .map(str::to_string)
+                .map_err(|e| e.to_string())?;
+            run_once(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
+                let file_name = file_name.clone();
                 let local_path = local_path.clone();
                 let opts = opts.clone();
                 Box::pin(async move {
+                    let resolved = crate::resolve_remote_cp_dest(client, &node, &path, &file_name)
+                        .await
+                        .map_err(|e| Error::Message(e.to_string()))?;
                     client
-                        .copy_upload(&node, &path, &local_path, &opts, None)
+                        .copy_upload(&node, &resolved, &local_path, &opts, None)
                         .await
                 })
             })
@@ -777,7 +1032,13 @@ async fn copy_path_tool(state: &mut Mcp, args: &Value) -> std::result::Result<St
         }
         "download" => {
             let local = required_str(args, "local")?;
-            let local_path = std::path::PathBuf::from(&local);
+            let local_path = crate::resolve_local_cp_dest(std::path::Path::new(&local), &path)
+                .map_err(|e| e.to_string())?;
+            if let Some(parent) = local_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+            }
             retry(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
@@ -795,21 +1056,29 @@ async fn copy_path_tool(state: &mut Mcp, args: &Value) -> std::result::Result<St
             })?
         }
         "peer" => {
-            let dst_node = required_str(args, "dst_node")?;
+            let dst_node = required_node(state, args, "dst_node")?;
             let dst_path = required_str(args, "dst_path")?;
             let src_node = node.clone();
             let src_path = path.clone();
             let dst_label = dst_node.clone();
             let dst_path_label = dst_path.clone();
-            retry(state, move |client| {
+            let file_name = crate::file_name_hint_str(&src_path)
+                .map(str::to_string)
+                .map_err(|e| e.to_string())?;
+            run_once(state, move |client| {
                 let node = node.clone();
                 let path = path.clone();
                 let dst_node = dst_node.clone();
                 let dst_path = dst_path.clone();
+                let file_name = file_name.clone();
                 let opts = opts.clone();
                 Box::pin(async move {
+                    let resolved =
+                        crate::resolve_remote_cp_dest(client, &dst_node, &dst_path, &file_name)
+                            .await
+                            .map_err(|e| Error::Message(e.to_string()))?;
                     client
-                        .copy_node_to_node(&node, &path, &dst_node, &dst_path, &opts, direct, None)
+                        .copy_node_to_node(&node, &path, &dst_node, &resolved, &opts, direct, None)
                         .await
                 })
             })
@@ -841,7 +1110,7 @@ async fn copy_path_tool(state: &mut Mcp, args: &Value) -> std::result::Result<St
 }
 
 async fn run_command(state: &mut Mcp, args: &Value) -> std::result::Result<String, String> {
-    let node = required_str(args, "node")?;
+    let node = required_node(state, args, "node")?;
     let cwd = args.get("cwd").and_then(Value::as_str).map(str::to_string);
     let cwd_label = cwd.clone();
     let env = parse_env_arg(args)?;
@@ -885,7 +1154,7 @@ async fn run_command(state: &mut Mcp, args: &Value) -> std::result::Result<Strin
         req.stdin = stdin;
         req
     };
-    let output = retry(state, move |client| {
+    let output = run_once(state, move |client| {
         let node = node.clone();
         let req = req.clone();
         Box::pin(async move { client.exec_collect(&node, req, Some(1024 * 1024)).await })
@@ -904,14 +1173,15 @@ async fn desktop_tool(
     state: &mut Mcp,
     args: &Value,
     payload: Value,
+    idempotent: bool,
 ) -> std::result::Result<String, String> {
-    let node = required_str(args, "node")?;
-    let value = extension_call(state, node, PHASE2_INJECT_INPUT, payload).await?;
+    let node = required_node(state, args, "node")?;
+    let value = extension_call(state, node, PHASE2_INJECT_INPUT, payload, idempotent).await?;
     Ok(pretty(&value))
 }
 
 async fn screenshot_tool(state: &mut Mcp, args: &Value) -> std::result::Result<Value, String> {
-    let node = required_str(args, "node")?;
+    let node = required_node(state, args, "node")?;
     let mut payload = json!({
         "target": args.get("target").and_then(Value::as_str).unwrap_or("screen"),
         "format": args.get("format").and_then(Value::as_str).unwrap_or("jpeg"),
@@ -923,7 +1193,7 @@ async fn screenshot_tool(state: &mut Mcp, args: &Value) -> std::result::Result<V
             payload[key] = value.clone();
         }
     }
-    let mut value = extension_call(state, node, PHASE2_SCREENSHOT, payload).await?;
+    let mut value = extension_call(state, node, PHASE2_SCREENSHOT, payload, true).await?;
     let Some(data) = value["data_b64"].as_str().map(str::to_string) else {
         return Ok(tool_ok(&pretty(&value)));
     };
@@ -945,23 +1215,43 @@ async fn extension_call(
     node: String,
     name: &'static str,
     payload: Value,
+    idempotent: bool,
 ) -> std::result::Result<Value, String> {
-    retry(state, move |client| {
-        let node = node.clone();
-        let payload = payload.clone();
-        Box::pin(async move {
-            client
-                .call_op(
-                    &node,
-                    Op::Extension {
-                        name: name.to_string(),
-                        payload,
-                    },
-                )
-                .await
+    if idempotent {
+        retry(state, move |client| {
+            let node = node.clone();
+            let payload = payload.clone();
+            Box::pin(async move {
+                client
+                    .call_op(
+                        &node,
+                        Op::Extension {
+                            name: name.to_string(),
+                            payload,
+                        },
+                    )
+                    .await
+            })
         })
-    })
-    .await
+        .await
+    } else {
+        run_once(state, move |client| {
+            let node = node.clone();
+            let payload = payload.clone();
+            Box::pin(async move {
+                client
+                    .call_op(
+                        &node,
+                        Op::Extension {
+                            name: name.to_string(),
+                            payload,
+                        },
+                    )
+                    .await
+            })
+        })
+        .await
+    }
 }
 
 fn click_payload(args: &Value) -> std::result::Result<Value, String> {
@@ -1001,6 +1291,30 @@ fn coord_arg(args: &Value, key: &str) -> std::result::Result<Value, String> {
     }
 }
 
+/// Execute a non-idempotent RPC once. Reconnects beforehand if the cached
+/// client is already dead, and drops the dead client if the transport closes
+/// mid-call, but NEVER automatically re-executes the operation.
+async fn run_once<T, F>(state: &mut Mcp, mut op: F) -> std::result::Result<T, String>
+where
+    F: for<'a> FnMut(
+        &'a Client,
+    ) -> Pin<Box<dyn Future<Output = agentlink_core::Result<T>> + Send + 'a>>,
+{
+    let result = {
+        let client = ensure_client(state).await?;
+        op(client).await
+    };
+    match result {
+        Ok(value) => Ok(value),
+        Err(Error::Message(msg)) if msg.contains("connection closed") => {
+            state.terminals.clear();
+            state.client = None;
+            Err(msg)
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 async fn retry<T, F>(state: &mut Mcp, mut op: F) -> std::result::Result<T, String>
 where
     F: for<'a> FnMut(
@@ -1026,38 +1340,83 @@ where
     Err(last)
 }
 
+fn friendly_settings_error(err: impl std::fmt::Display) -> String {
+    let msg = err.to_string();
+    if msg.contains("admin token missing") {
+        "Not signed in. Run 'agentlink login --relay <url> --user <user>' (or pass --identity)"
+            .to_string()
+    } else {
+        msg
+    }
+}
+
 async fn ensure_client(state: &mut Mcp) -> std::result::Result<&Client, String> {
     let alive = state.client.as_ref().map(Client::is_alive).unwrap_or(false);
     if !alive {
         state.terminals.clear();
-        let identity = Identity::load_or_create(&state.identity_path).map_err(|e| e.to_string())?;
-        if let Some(dir) = state.identity_path.parent() {
-            if let Ok(Some(fresh)) = agentlink_core::client::maintain_session(dir, &identity).await
+        let mut settings = if let Some(preset) = state.config.preset_settings.clone() {
+            preset
+        } else {
+            agentlink_core::config::load_settings_for_identity(
+                &state.config.config_dir,
+                state.config.relay.clone(),
+                state.config.token.clone(),
+                state.config.fingerprint.clone(),
+                state.config.trust.clone(),
+                state.config.explicit_identity,
+            )
+            .map_err(friendly_settings_error)?
+        };
+        let identity =
+            Identity::load_or_create(&state.config.identity_path).map_err(|e| e.to_string())?;
+        let tokenless_identity = state.config.explicit_identity
+            && state.config.token.is_none()
+            && settings.token.is_empty();
+        if !tokenless_identity {
+            let saved_session_expired = agentlink_core::config::load_file(&state.config.config_dir)
+                .ok()
+                .is_some_and(|f| {
+                    f.refresh_token
+                        .as_deref()
+                        .is_some_and(|t| !t.trim().is_empty())
+                        && f.access_expires_unix
+                            .is_some_and(|exp| exp <= agentlink_core::util::unix_now())
+                });
+            match agentlink_core::client::maintain_session(&state.config.config_dir, &identity)
+                .await
             {
-                state.settings.token = fresh.token;
-                if !fresh.relay.is_empty() {
-                    state.settings.relay = fresh.relay;
+                Ok(Some(fresh)) => {
+                    settings.token = fresh.token;
+                    if !fresh.relay.is_empty() {
+                        settings.relay = fresh.relay;
+                    }
+                    if !fresh.fingerprint.is_empty() {
+                        settings.fingerprint = fresh.fingerprint;
+                    }
                 }
-                if !fresh.fingerprint.is_empty() {
-                    state.settings.fingerprint = fresh.fingerprint;
+                Ok(None) => {}
+                Err(err) if saved_session_expired => {
+                    return Err(format!("session refresh failed: {err}"));
                 }
+                Err(_) => {}
             }
         }
-        let use_token = !state.settings.token.is_empty();
-        let client = Client::connect_identity(&state.settings, identity, use_token)
+        let use_token = !settings.token.is_empty();
+        let client = Client::connect_identity(&settings, identity, use_token)
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(dir) = state.identity_path.parent() {
-            client.remember_node_pins(dir);
-            client.remember_grants(dir);
-            client.remember_session(dir);
+        client.remember_node_pins(&state.config.config_dir);
+        client.remember_grants(&state.config.config_dir);
+        if !tokenless_identity {
+            client.remember_session(&state.config.config_dir);
         }
         if let Some(warning) = agentlink_core::config::ca_only_warning(
-            &state.settings.fingerprint,
-            state.settings.trust.as_deref(),
+            &settings.fingerprint,
+            settings.trust.as_deref(),
         ) {
             eprintln!("{warning}");
         }
+        state.resolved_settings = Some(settings);
         state.client = Some(client);
     }
     state
@@ -1067,7 +1426,7 @@ async fn ensure_client(state: &mut Mcp) -> std::result::Result<&Client, String> 
 }
 
 async fn terminal_open(state: &mut Mcp, args: &Value) -> std::result::Result<String, String> {
-    let node = required_str(args, "node")?;
+    let node = required_node(state, args, "node")?;
     let command = args
         .get("command")
         .and_then(Value::as_str)
@@ -1083,7 +1442,7 @@ async fn terminal_open(state: &mut Mcp, args: &Value) -> std::result::Result<Str
         .and_then(Value::as_u64)
         .unwrap_or(80)
         .clamp(1, 512) as u16;
-    let session = retry(state, move |client| {
+    let session = run_once(state, move |client| {
         let node = node.clone();
         let command = command.clone();
         let cwd = cwd.clone();
@@ -1428,8 +1787,13 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
 fn tool_specs() -> Vec<Value> {
     vec![
         tool(
+            "get_status",
+            "Inspect local controller identity, relay/session status, aliases, and stored grant states without connecting to the relay.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        tool(
             "list_machines",
-            "List paired machines and whether each is online.",
+            "List paired machines, whether each is online, and each node's local grant_status (active/expired/missing/wrong_grantee) and grant_expires_in_secs.",
             json!({"type": "object", "properties": {}}),
         ),
         tool(
@@ -1453,14 +1817,16 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "read_file",
-            "Read a byte range. Text is returned as UTF-8 when possible, otherwise base64. Only offset..offset+max_bytes is transferred (default 1 MiB).",
+            "Read a byte range or 1-based inclusive line range. Text is returned as UTF-8 when possible, otherwise base64. Defaults to 64 KiB (up to 1 MiB).",
             json!({
                 "type": "object",
                 "properties": {
                     "node": {"type": "string"},
                     "path": {"type": "string"},
                     "offset": {"type": "integer"},
-                    "max_bytes": {"type": "integer", "description": "Defaults to 1 MiB"}
+                    "max_bytes": {"type": "integer", "description": "Defaults to 64 KiB (max 1 MiB)"},
+                    "start_line": {"type": "integer", "minimum": 1, "description": "Optional 1-based inclusive start line (UTF-8 text files)"},
+                    "end_line": {"type": "integer", "minimum": 1, "description": "Optional 1-based inclusive end line (UTF-8 text files)"}
                 },
                 "required": ["node", "path"]
             }),
@@ -1523,14 +1889,22 @@ fn tool_specs() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "direction": {"type": "string", "description": "upload (local to node), download (node to local), or peer (node to node)"},
+                    "direction": {
+                        "type": "string",
+                        "enum": ["upload", "download", "peer"],
+                        "description": "upload (local to node), download (node to local), or peer (node to node)"
+                    },
                     "node": {"type": "string", "description": "Node name or id. For peer, the source node."},
                     "path": {"type": "string", "description": "Remote path. For peer, the source path."},
                     "local": {"type": "string", "description": "Local path for upload or download."},
                     "dst_node": {"type": "string", "description": "Destination node for peer copies."},
                     "dst_path": {"type": "string", "description": "Destination path for peer copies."},
                     "chunk_size": {"type": "integer", "description": "Chunk size in bytes. Default 1 MiB."},
-                    "compress": {"type": "string", "description": "auto, on, or off"},
+                    "compress": {
+                        "type": "string",
+                        "enum": ["auto", "on", "off"],
+                        "description": "auto, on, or off"
+                    },
                     "direct": {"type": "boolean", "description": "Try a direct QUIC path. Default true."}
                 },
                 "required": ["direction", "node", "path"]
@@ -1543,14 +1917,22 @@ fn tool_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "node": {"type": "string"},
-                    "target": {"type": "string", "description": "screen, monitor, region, window, or monitors"},
+                    "target": {
+                        "type": "string",
+                        "enum": ["screen", "monitor", "region", "window", "monitors"],
+                        "description": "screen, monitor, region, window, or monitors"
+                    },
                     "monitor": {"type": "integer"},
                     "window_id": {"type": "string"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                     "width": {"type": "integer"},
                     "height": {"type": "integer"},
-                    "format": {"type": "string", "description": "jpeg, png, or webp. Default jpeg."},
+                    "format": {
+                        "type": "string",
+                        "enum": ["jpeg", "png", "webp"],
+                        "description": "jpeg, png, or webp. Default jpeg."
+                    },
                     "quality": {"type": "integer"},
                     "scale": {"type": "number", "description": "0.05 to 1"}
                 },
@@ -1566,7 +1948,11 @@ fn tool_specs() -> Vec<Value> {
                     "node": {"type": "string"},
                     "x": {"type": "number"},
                     "y": {"type": "number"},
-                    "button": {"type": "string"},
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "middle"],
+                        "description": "Mouse button (default left)"
+                    },
                     "count": {"type": "integer"},
                     "to_x": {"type": "number"},
                     "to_y": {"type": "number"},
@@ -1621,7 +2007,11 @@ fn tool_specs() -> Vec<Value> {
                 "properties": {
                     "node": {"type": "string"},
                     "id": {"type": "string"},
-                    "op": {"type": "string", "description": "click, focus, or set_value"},
+                    "op": {
+                        "type": "string",
+                        "enum": ["click", "focus", "set_value"],
+                        "description": "click, focus, or set_value"
+                    },
                     "value": {"type": "string"}
                 },
                 "required": ["node", "id"]
@@ -1697,15 +2087,17 @@ fn tool_specs() -> Vec<Value> {
             "replace_text",
             "Replace an exact string in an existing file (does not create it). Fails unless the \
              match is unique or replace_all is true.",
-            obj_schema(
-                &[
-                    ("node", "Node name or id"),
-                    ("path", "File path"),
-                    ("old", "Exact text to replace"),
-                    ("new", "Replacement text"),
-                ],
-                &["node", "path", "old"],
-            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name or id"},
+                    "path": {"type": "string", "description": "File path"},
+                    "old": {"type": "string", "description": "Exact text to replace"},
+                    "new": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring a unique match"}
+                },
+                "required": ["node", "path", "old"]
+            }),
         ),
         tool(
             "edit_lines",
@@ -1937,7 +2329,7 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Opt
         let Some(line) = read_bounded_line(reader, MAX_MCP_MESSAGE_BYTES).await? else {
             return Ok(None);
         };
-        let trimmed = line.trim();
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -1971,7 +2363,8 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Opt
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).await?;
             let text = String::from_utf8(buf).map_err(|e| anyhow::anyhow!(e))?;
-            return Ok(Some(serde_json::from_str(&text)?));
+            let text = text.trim_start_matches('\u{feff}');
+            return Ok(Some(serde_json::from_str(text)?));
         }
         match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => return Ok(Some(value)),
@@ -7107,17 +7500,15 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_and_tools_do_not_need_a_relay() {
-        let mut state = Mcp {
-            settings: ClientSettings {
+        let mut state = new_state(
+            ClientSettings {
                 relay: "wss://127.0.0.1:1".into(),
                 token: "t".into(),
                 fingerprint: "sha256:00".into(),
                 trust: None,
             },
-            identity_path: std::env::temp_dir().join("agentlink-mcp-test.identity.json"),
-            client: None,
-            terminals: HashMap::new(),
-        };
+            std::env::temp_dir().join("agentlink-mcp-test.identity.json"),
+        );
         let init = handle(
             &mut state,
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}),
@@ -7137,6 +7528,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
+        assert!(names.contains(&"get_status"));
         assert!(names.contains(&"list_machines"));
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -7160,6 +7552,126 @@ mod tests {
         )
         .await;
         assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_mcp_answers_initialize_tools_and_get_status_then_returns_tool_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentlink-mcp-unauth-{}",
+            agentlink_core::util::random_hex(8)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = new_state_from_config(McpConfig {
+            config_dir: dir.clone(),
+            identity_path: dir.join("identity.json"),
+            explicit_identity: false,
+            relay: None,
+            token: None,
+            fingerprint: None,
+            trust: None,
+            preset_settings: None,
+        });
+        let init = handle(
+            &mut state,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(init["result"]["serverInfo"]["name"], "agentlink");
+
+        let status = handle(
+            &mut state,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_status","arguments":{}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["result"]["isError"], json!(false));
+        let status_body: Value =
+            serde_json::from_str(status["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(status_body["authenticated"], json!(false));
+        assert_eq!(status_body["identity_exists"], json!(false));
+
+        let list = handle(
+            &mut state,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_machines","arguments":{}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(list["result"]["isError"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_message_strips_utf8_bom() {
+        let ndjson = "\u{feff}{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+        let mut reader = BufReader::new(ndjson.as_bytes());
+        let msg = read_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg["method"], "ping");
+
+        let body = "\u{feff}{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}";
+        let framed = format!("\u{feff}Content-Length: {}\r\n\r\n{body}", body.len());
+        let mut reader = BufReader::new(framed.as_bytes());
+        let msg = read_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg["method"], "tools/list");
+    }
+
+    #[test]
+    fn tool_specs_include_replace_all_enums_and_line_ranges() {
+        let specs = tool_specs();
+        let find = |name: &str| {
+            specs
+                .iter()
+                .find(|t| t["name"] == name)
+                .expect("tool present")
+        };
+        let replace = find("replace_text");
+        assert_eq!(
+            replace["inputSchema"]["properties"]["replace_all"]["type"],
+            "boolean"
+        );
+        let read = find("read_file");
+        assert_eq!(
+            read["inputSchema"]["properties"]["start_line"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            read["inputSchema"]["properties"]["end_line"]["type"],
+            "integer"
+        );
+        let copy = find("copy_path");
+        assert_eq!(
+            copy["inputSchema"]["properties"]["direction"]["enum"],
+            json!(["upload", "download", "peer"])
+        );
+        assert_eq!(
+            copy["inputSchema"]["properties"]["compress"]["enum"],
+            json!(["auto", "on", "off"])
+        );
+        let shot = find("screenshot");
+        assert_eq!(
+            shot["inputSchema"]["properties"]["format"]["enum"],
+            json!(["jpeg", "png", "webp"])
+        );
+        let click = find("click");
+        assert_eq!(
+            click["inputSchema"]["properties"]["button"]["enum"],
+            json!(["left", "right", "middle"])
+        );
+        let act = find("act_on_element");
+        assert_eq!(
+            act["inputSchema"]["properties"]["op"]["enum"],
+            json!(["click", "focus", "set_value"])
+        );
+    }
+
+    #[test]
+    fn slice_utf8_lines_handles_ranges_and_bounds() {
+        let text = "one\ntwo\nthree\nfour";
+        let (out, s, e, total, clipped) = slice_utf8_lines(text, Some(2), Some(3)).unwrap();
+        assert_eq!(out, "two\nthree\n");
+        assert_eq!((s, e, total, clipped), (2, 3, 4, true));
+        assert!(slice_utf8_lines(text, Some(0), None).is_err());
+        assert!(slice_utf8_lines(text, Some(4), Some(2)).is_err());
     }
 
     #[tokio::test]

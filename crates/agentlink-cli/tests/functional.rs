@@ -772,7 +772,7 @@ fn mcp_http(world: &World) {
                 "--http",
                 "127.0.0.1:0",
                 "--mcp-token",
-                "http-secret",
+                "http-secret-token-012345",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -793,7 +793,7 @@ fn mcp_http(world: &World) {
         addr,
         "POST",
         "/mcp",
-        Some("http-secret"),
+        Some("http-secret-token-012345"),
         Some("https://evil.example"),
         init.as_bytes(),
     );
@@ -802,7 +802,7 @@ fn mcp_http(world: &World) {
         addr,
         "POST",
         "/nope",
-        Some("http-secret"),
+        Some("http-secret-token-012345"),
         None,
         init.as_bytes(),
     );
@@ -811,7 +811,7 @@ fn mcp_http(world: &World) {
         addr,
         "POST",
         "/mcp",
-        Some("http-secret"),
+        Some("http-secret-token-012345"),
         None,
         init.as_bytes(),
     );
@@ -824,14 +824,21 @@ fn mcp_http(world: &World) {
         addr,
         "POST",
         "/mcp",
-        Some("http-secret"),
+        Some("http-secret-token-012345"),
         Some(&session),
         call.as_bytes(),
         None,
     );
     assert!(listed.contains("200"), "{listed}");
     assert!(listed.contains(&world.name), "{listed}");
-    let stream = http(addr, "GET", "/mcp", Some("http-secret"), None, b"");
+    let stream = http(
+        addr,
+        "GET",
+        "/mcp",
+        Some("http-secret-token-012345"),
+        None,
+        b"",
+    );
     assert!(stream.contains("text/event-stream"), "{stream}");
     assert!(
         stream.contains("keepalive") || stream.contains("Mcp-Session-Id"),
@@ -841,7 +848,7 @@ fn mcp_http(world: &World) {
         addr,
         "DELETE",
         "/mcp",
-        Some("http-secret"),
+        Some("http-secret-token-012345"),
         Some(&session),
         b"",
         None,
@@ -1117,19 +1124,36 @@ fn pwd_line() -> &'static str {
 }
 
 fn path_mentioned(printed: &str, path: &Path) -> bool {
+    let unescaped;
+    let haystack = if let Ok(val) = serde_json::from_str::<Value>(printed.trim()) {
+        if let Some(s) = val.get("stdout").and_then(Value::as_str) {
+            unescaped = s.to_string();
+            unescaped.as_str()
+        } else {
+            printed
+        }
+    } else {
+        printed
+    };
     let raw = path.to_string_lossy().to_string();
-    if printed.contains(&raw) {
+    if haystack.contains(&raw) || printed.contains(&raw) {
         return true;
     }
     if let Ok(canon) = path.canonicalize() {
-        if printed.contains(&canon.to_string_lossy().to_string()) {
+        let canon_str = canon.to_string_lossy().to_string();
+        let stripped = canon_str.strip_prefix(r"\\?\").unwrap_or(&canon_str);
+        if haystack.contains(&canon_str)
+            || haystack.contains(stripped)
+            || printed.contains(&canon_str)
+            || printed.contains(stripped)
+        {
             return true;
         }
     }
     #[cfg(unix)]
     {
         let alias = swap_var_prefix(path);
-        if printed.contains(&alias.to_string_lossy().to_string()) {
+        if haystack.contains(&alias.to_string_lossy().to_string()) {
             return true;
         }
     }

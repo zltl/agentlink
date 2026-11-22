@@ -83,7 +83,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.json");
         let err = show(&path, true).unwrap_err().to_string();
-        assert!(err.contains("不存在") || err.contains("identity"), "{err}");
+        assert!(
+            err.contains("missing") || err.contains("not found") || err.contains("identity"),
+            "{err}"
+        );
         assert!(!path.exists());
     }
 
@@ -107,9 +110,9 @@ mod tests {
         let err = create_or_ensure(&path, false, "create")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("未重新生成"), "{err}");
+        assert!(err.contains("(not regenerated)"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
         let err = show(&path, false).unwrap_err().to_string();
-        assert!(err.contains("未重新生成"), "{err}");
+        assert!(err.contains("(not regenerated)"), "{err}");
     }
 }

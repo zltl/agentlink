@@ -49,14 +49,30 @@ pub enum Action {
     Start(ControlArgs),
     /// Stop the service.
     Stop(ControlArgs),
+    /// Restart the service.
+    Restart(ControlArgs),
     /// Print whether the service is running.
     Status(ControlArgs),
+    /// Show recent service logs.
+    Logs(LogsArgs),
     /// Windows Service Control Manager entry. Not used on other systems.
     #[command(hide = true)]
     Run {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+}
+
+#[derive(Args, Debug)]
+pub struct LogsArgs {
+    #[arg(long, value_enum, default_value = "user")]
+    pub scope: Scope,
+    /// Number of trailing lines to show.
+    #[arg(short = 'n', long, default_value_t = 50)]
+    pub lines: usize,
+    /// Stream new log lines as they are written.
+    #[arg(short = 'f', long)]
+    pub follow: bool,
 }
 
 #[derive(Args, Debug)]
@@ -74,10 +90,10 @@ pub struct InstallArgs {
     /// Invite from `agentlink pair`. Flags and `--pairing-token` override it.
     #[arg(long)]
     pub invite: Option<String>,
-    /// Relay enrollment preset for the owner (`full` by default).
-    #[arg(long, default_value = "full")]
+    /// Relay enrollment preset for the owner (`exec` by default; pass `full` for desktop/screen).
+    #[arg(long, default_value = "exec")]
     pub access: String,
-    /// Local node ceiling intersected with every signed grant (`full` when omitted).
+    /// Local node ceiling intersected with every signed grant (`exec` when omitted; pass `full` for desktop/screen).
     #[arg(long)]
     pub max_access: Option<String>,
     #[arg(long)]
@@ -188,18 +204,26 @@ pub async fn dispatch(env: &Env, action: &Action) -> Result<i32> {
         Action::Start(args) => {
             start(args.scope)?;
             emit(env.json, json!({"ok": true, "running": true}), || {
-                eprintln!("started {}", NODE_NAME);
+                println!("started {}", NODE_NAME);
             });
             Ok(0)
         }
         Action::Stop(args) => {
             stop(args.scope)?;
             emit(env.json, json!({"ok": true, "running": false}), || {
-                eprintln!("stopped {}", NODE_NAME);
+                println!("stopped {}", NODE_NAME);
+            });
+            Ok(0)
+        }
+        Action::Restart(args) => {
+            restart(args.scope)?;
+            emit(env.json, json!({"ok": true, "running": true, "restarted": true}), || {
+                println!("restarted {}", NODE_NAME);
             });
             Ok(0)
         }
         Action::Status(args) => status(env, args.scope),
+        Action::Logs(args) => logs(env, args),
         Action::Run { .. } => {
             bail!("`service run` is started by the Windows Service Control Manager");
         }
@@ -303,7 +327,7 @@ async fn install(env: &Env, args: &InstallArgs) -> Result<i32> {
     };
     let max_policy = match &args.max_access {
         Some(access) => parse_access(access)?,
-        None => NodePolicy::full(),
+        None => NodePolicy::exec(),
     };
     let node = NodeConfig {
         relay_url: relay.clone(),
@@ -419,6 +443,13 @@ fn preview_node(node: &NodeConfig) -> serde_json::Value {
 
 async fn mint_pairing(env: &Env, name: &str, access: &str, ttl_minutes: u64) -> Result<String> {
     let dir = config_dir(env)?;
+    let identity = agentlink_core::Identity::load_or_create(&dir.join("identity.json"))
+        .map_err(|err| anyhow!(err.to_string()))?;
+    if env.token.is_none() {
+        let _ = agentlink_core::client::maintain_session(&dir, &identity)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+    }
     let settings = agentlink_core::load_settings(
         &dir,
         env.relay.clone(),
@@ -427,8 +458,6 @@ async fn mint_pairing(env: &Env, name: &str, access: &str, ttl_minutes: u64) -> 
         env.trust.clone(),
     )
     .map_err(|err| anyhow!(err))?;
-    let identity = agentlink_core::Identity::load_or_create(&dir.join("identity.json"))
-        .map_err(|err| anyhow!(err.to_string()))?;
     let client = agentlink_core::Client::connect_identity(&settings, identity, true)
         .await
         .map_err(|err| anyhow!(err))?;
@@ -481,13 +510,118 @@ fn status(env: &Env, scope: Scope) -> Result<i32> {
         env.json,
         json!({"running": active, "scope": scope_name(scope), "output": output}),
         || {
-            println!("{}", if active { "running" } else { "stopped" });
+            println!("status: {}", if active { "running" } else { "stopped" });
             if !output.trim().is_empty() {
-                println!("{output}");
+                print!("{}", output.trim_end());
+                println!();
             }
         },
     );
     Ok(if active { 0 } else { 1 })
+}
+
+fn restart(scope: Scope) -> Result<()> {
+    match std::env::consts::OS {
+        "linux" => systemctl(scope, &["restart", &format!("{NODE_NAME}.service")]),
+        "macos" => {
+            let target = launchd_target(scope, LAUNCHD_NODE)?;
+            run_ok("launchctl", &["kickstart", "-k", &target])
+        }
+        "windows" => {
+            let _ = stop(scope);
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            start(scope)
+        }
+        other => bail!("cannot restart a service on {other}"),
+    }
+}
+
+fn logs(env: &Env, args: &LogsArgs) -> Result<i32> {
+    match std::env::consts::OS {
+        "linux" => {
+            let mut cmd = process::hidden("journalctl");
+            if args.scope == Scope::User {
+                cmd.arg("--user");
+            }
+            cmd.args(["-u", &format!("{NODE_NAME}.service"), "-n"])
+                .arg(args.lines.to_string())
+                .arg("--no-pager");
+            if args.follow {
+                cmd.arg("-f");
+                let status = cmd.status().context("journalctl")?;
+                return Ok(status.code().unwrap_or(1));
+            }
+            let output = cmd.output().context("journalctl")?;
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            emit(
+                env.json,
+                json!({"scope": scope_name(args.scope), "lines": text.lines().collect::<Vec<_>>()}),
+                || print!("{text}"),
+            );
+            Ok(if output.status.success() { 0 } else { 1 })
+        }
+        "macos" | "windows" => {
+            let path = service_log_path(args.scope)?;
+            if !path.is_file() {
+                bail!("log file does not exist yet: {}", path.display());
+            }
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let all: Vec<&str> = content.lines().collect();
+            let start = all.len().saturating_sub(args.lines);
+            let tail = &all[start..];
+            if env.json && !args.follow {
+                println!(
+                    "{}",
+                    json!({"scope": scope_name(args.scope), "path": path, "lines": tail})
+                );
+                return Ok(0);
+            }
+            for line in tail {
+                println!("{line}");
+            }
+            if args.follow {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file = fs::File::open(&path)?;
+                let mut pos = file.seek(SeekFrom::End(0))?;
+                let mut buf = Vec::new();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(pos);
+                    if len < pos {
+                        file = fs::File::open(&path)?;
+                        pos = 0;
+                    }
+                    if len > pos {
+                        buf.clear();
+                        file.seek(SeekFrom::Start(pos))?;
+                        let n = file.read_to_end(&mut buf)?;
+                        pos += n as u64;
+                        print!("{}", String::from_utf8_lossy(&buf));
+                    }
+                }
+            }
+            Ok(0)
+        }
+        other => bail!("service logs are not implemented for {other}"),
+    }
+}
+
+fn service_log_path(scope: Scope) -> Result<PathBuf> {
+    match std::env::consts::OS {
+        "macos" => launchd_log_path(scope, "agentlink-node.log"),
+        "windows" => {
+            if scope == Scope::User {
+                let dir = crate::tray::installed_data_dir()
+                    .map(Ok)
+                    .unwrap_or_else(|| default_data_dir(Scope::User))?;
+                Ok(dir.join("tray.log"))
+            } else {
+                Ok(default_data_dir(Scope::System)?.join("service.log"))
+            }
+        }
+        other => bail!("no local log path for {other}"),
+    }
 }
 
 /// Soften raw systemctl dbus errors into an actionable hint.
@@ -611,6 +745,7 @@ pub fn installed_services() -> Vec<InstalledService> {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn stop_installed(service: &InstalledService) -> Result<()> {
     let _ = service.kind;
     stop(service.scope)
@@ -796,7 +931,10 @@ fn render_systemd_node(spec: &NodeSpec) -> Result<String> {
     );
     let work = systemd_quote(&spec.work_dir)?;
     let user = match &spec.run_as {
-        Some(user) if spec.scope == Scope::System => format!("User={user}\n"),
+        Some(user) if spec.scope == Scope::System => {
+            validate_run_as(user)?;
+            format!("User={user}\n")
+        }
         _ => String::new(),
     };
     let (after, part_of, pass_env, wanted, note) = if spec.scope == Scope::User && !spec.headless {
@@ -979,8 +1117,16 @@ fn render_windows_task(spec: &NodeSpec, job: TaskJob) -> Result<String> {
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>"
     };
+    let restart_block = match job {
+        TaskJob::Node => "\
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>\n",
+        TaskJob::Update => "",
+    };
     Ok(format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>{}</Description>
@@ -1000,11 +1146,7 @@ fn render_windows_task(spec: &NodeSpec, job: TaskJob) -> Result<String> {
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <RestartOnFailure>
-      <Interval>PT1M</Interval>
-      <Count>999</Count>
-    </RestartOnFailure>
-  </Settings>
+{restart_block}  </Settings>
   <Actions Context="Author">
     <Exec>
       <Command>{}</Command>
@@ -1530,7 +1672,8 @@ fn start_windows_user() -> Result<()> {
     if windows_task_exists(NODE_NAME) && !crate::tray::autostart_enabled() {
         return run_ok("schtasks", &["/Run", "/TN", NODE_NAME]);
     }
-    crate::tray::spawn_tray(&current_binary()?, &data_dir)
+    let binary = crate::preferred_gui_binary(&current_binary()?);
+    crate::tray::spawn_tray(&binary, &data_dir)
 }
 
 fn stop_windows_user() -> Result<()> {
@@ -1552,7 +1695,7 @@ fn windows_user_status_text() -> Result<String> {
     let config = crate::tray::resolve_config_dir(None).unwrap_or_else(|_| PathBuf::from("."));
     let view = crate::tray::load_view(&dir, &config);
     let mut text = format!(
-        "connection: {}\nrelay: {}\nnode: {}\npairing: {}\naccount: {}\nautostart: {}\nrunning: {}\n",
+        "connection: {}\nrelay: {}\nnode: {}\npairing: {}\naccount: {}\nautostart: {}\n",
         view.connection,
         view.relay,
         view.node_name,
@@ -1563,7 +1706,6 @@ fn windows_user_status_text() -> Result<String> {
         } else {
             "off"
         },
-        if view.running { "yes" } else { "no" },
     );
     if !view.detail.is_empty() {
         text.push_str("detail: ");
@@ -1622,6 +1764,19 @@ fn strip_verbatim(path: &Path) -> PathBuf {
     }
 }
 
+pub(crate) fn validate_run_as(user: &str) -> Result<&str> {
+    if user.is_empty()
+        || user.len() > 64
+        || user.starts_with('-')
+        || !user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        bail!("invalid --run-as username `{user}` (allowed: ^[a-zA-Z0-9._-]+$, must not start with `-`)");
+    }
+    Ok(user)
+}
+
 fn resolve_run_as(
     scope: Scope,
     requested: Option<String>,
@@ -1631,16 +1786,19 @@ fn resolve_run_as(
         return Ok(None);
     }
     if let Some(user) = requested.filter(|s| !s.trim().is_empty()) {
+        validate_run_as(&user)?;
         return Ok(Some(user));
     }
     if let Ok(user) = std::env::var("SUDO_USER") {
         if !user.is_empty() && user != "root" {
+            validate_run_as(&user)?;
             return Ok(Some(user));
         }
     }
     if !euid_is_root() {
         if let Ok(user) = std::env::var("USER") {
             if !user.is_empty() && user != "root" {
+                validate_run_as(&user)?;
                 return Ok(Some(user));
             }
         }
@@ -1679,14 +1837,14 @@ fn euid_is_root() -> bool {
 }
 
 fn chown_tree(path: &Path, user: &str) -> Result<()> {
+    validate_run_as(user)?;
     #[cfg(unix)]
     {
         if !euid_is_root() {
             return Ok(());
         }
         let status = process::hidden("chown")
-            .arg("-R")
-            .arg(user)
+            .args(["-R", "-h", "--", user])
             .arg(path)
             .status()
             .context("chown")?;
@@ -1718,8 +1876,13 @@ fn admin_token_available(env: &Env) -> bool {
     config_dir(env)
         .ok()
         .and_then(|dir| agentlink_core::config::load_file(&dir).ok())
-        .and_then(|file| file.token)
-        .is_some_and(|token| !token.trim().is_empty())
+        .is_some_and(|file| {
+            file.token.as_deref().is_some_and(|t| !t.trim().is_empty())
+                || file
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+        })
 }
 
 fn config_dir(env: &Env) -> Result<PathBuf> {
@@ -1909,12 +2072,27 @@ mod tests {
         assert!(bin.contains("service run"));
         assert!(bin.contains("--data-dir"));
         let update = render_windows_task(&spec(Scope::User, true), TaskJob::Update).unwrap();
+        assert!(update.contains("encoding=\"UTF-8\""), "{update}");
+        assert!(!update.contains("UTF-16"), "{update}");
+        assert!(!update.contains("RestartOnFailure"), "{update}");
         assert!(update.contains("update --yes"));
         assert!(update.contains("ScheduleByDay"));
         let legacy = render_windows_task(&user, TaskJob::Node).unwrap();
+        assert!(legacy.contains("encoding=\"UTF-8\""), "{legacy}");
+        assert!(legacy.contains("RestartOnFailure"), "{legacy}");
         assert!(legacy.contains("InteractiveToken"));
         assert!(legacy.contains("node --data-dir"));
         assert!(!legacy.contains("pairing"));
+    }
+
+    #[test]
+    fn run_as_rejects_injection_and_accepts_safe_usernames() {
+        for good in ["ada", "agentlink", "svc_node", "app.user-1"] {
+            assert_eq!(validate_run_as(good).unwrap(), good);
+        }
+        for bad in ["", "-root", "ada\nExecStart=/bin/sh", "ada:wheel", "a b", "ada/x"] {
+            assert!(validate_run_as(bad).is_err(), "{bad} should fail");
+        }
     }
 }
 

@@ -90,84 +90,113 @@ struct Asset {
     url: Option<String>,
 }
 
-#[derive(Debug, Default, serde::Serialize, Deserialize)]
+const DEFAULT_REPO: &str = "zltl/agentlink";
+
+#[derive(Debug, Default, serde::Serialize, Deserialize, PartialEq, Eq)]
 struct UpdateConfig {
     #[serde(default)]
     pubkey: Option<String>,
     #[serde(default)]
     auto: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_base: Option<String>,
 }
 
 pub async fn run(json_mode: bool, config_dir: Option<PathBuf>, args: &UpdateArgs) -> Result<i32> {
-    check_repo(&args.repo)?;
     let dir = match config_dir {
         Some(dir) => dir,
         None => agentlink_core::config::default_config_dir()?,
     };
+    let saved_cfg = load_update_config(&dir);
+    let effective_repo = if args.repo != DEFAULT_REPO {
+        args.repo.clone()
+    } else {
+        saved_cfg
+            .repo
+            .clone()
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| args.repo.clone())
+    };
+    check_repo(&effective_repo)?;
+    let effective_base = normalize_download_base(args.download_base.as_deref())
+        .or_else(|| normalize_download_base(saved_cfg.download_base.as_deref()));
+
     if args.disable_auto {
         service::remove_auto_timer(args.scope)?;
-        let mut saved = load_update_config(&dir);
+        let mut saved = saved_cfg;
         saved.auto = false;
         save_update_config(&dir, &saved)?;
         emit(json_mode, json!({"ok": true, "auto": false}), || {
-            eprintln!("removed the daily update task");
+            println!("removed the daily update task");
         });
         return Ok(0);
     }
     if args.auto {
         let binary = std::env::current_exe().context("locate the running binary")?;
         service::install_auto_timer(&binary, args.scope)?;
-        let mut saved = load_update_config(&dir);
+        let mut saved = saved_cfg;
         saved.auto = true;
         if let Some(key) = &args.pubkey {
             saved.pubkey = Some(key.clone());
         }
+        if args.repo != DEFAULT_REPO {
+            saved.repo = Some(args.repo.clone());
+        }
+        if let Some(base) = normalize_download_base(args.download_base.as_deref()) {
+            saved.download_base = Some(base);
+        }
         save_update_config(&dir, &saved)?;
         emit(
             json_mode,
-            json!({"ok": true, "auto": true, "scope": format!("{:?}", args.scope)}),
-            || eprintln!("installed a daily `agentlink update --yes` task"),
+            json!({
+                "ok": true,
+                "auto": true,
+                "scope": format!("{:?}", args.scope),
+                "repo": saved.repo,
+                "download_base": saved.download_base,
+            }),
+            || println!("installed a daily `agentlink update --yes` task"),
         );
         return Ok(0);
     }
 
-    if let Some(base) = normalize_download_base(args.download_base.as_deref()) {
+    if let Some(base) = effective_base {
         return run_from_mirror(json_mode, &dir, args, &base).await;
     }
 
     let authorization = github_authorization(args);
     let auth = authorization.as_deref();
-    let release = match fetch_release(&args.repo, args.version.as_deref(), auth).await {
-        Ok(release) => release,
-        Err(err) => return Err(err),
-    };
+    let release = fetch_release(&effective_repo, args.version.as_deref(), auth).await?;
     let latest = release.tag_name.trim().trim_start_matches('v');
     let explicit = args.version.is_some();
     let current = version::semver();
     let newer = compare_versions(latest, current) == Ordering::Greater;
-    // `--check` still downloads and verifies checksum/signature even when the
-    // running binary already matches latest, so AGENTLINK_UPDATE_PUBKEY users
-    // can confirm the release pin without forcing a reinstall.
     if !newer && !explicit && !args.check {
         emit(
             json_mode,
             json!({"ok": true, "current": current, "latest": latest, "update": false}),
-            || eprintln!("{}", already_latest_line(&current)),
+            || println!("{}", already_latest_line(&current)),
         );
         return Ok(0);
     }
     let names = archive_names(latest, std::env::consts::OS, std::env::consts::ARCH);
     let asset = choose_asset(&release, &names)?;
-    let bytes = download_asset(asset, auth).await?;
-    let sums = download_named(&args.repo, &release, SUMS_NAME, auth).await?;
-    verify_checksum(&asset.name, &bytes, &sums)?;
+    // Fetch only lightweight metadata (SHA256SUMS + signature) first so `--check`
+    // verifies the release without downloading a 20-40 MB binary archive.
+    let sums = download_named(&effective_repo, &release, SUMS_NAME, auth).await?;
+    let sums_text = std::str::from_utf8(&sums).context("SHA256SUMS is not utf-8")?;
+    if checksum_for(sums_text, &asset.name).is_none() {
+        bail!("SHA256SUMS does not list {}", asset.name);
+    }
     let pubkey = if args.checksum_only {
         None
     } else {
         resolve_pubkey(args, &dir)?
     };
     let signature_verified =
-        verify_signature(&args.repo, &release, &sums, pubkey.as_ref(), auth).await?;
+        verify_signature(&effective_repo, &release, &sums, pubkey.as_ref(), auth).await?;
     if args.check {
         let daemon = node_daemon_sibling(current_exe_dir().as_deref());
         let report = CheckReport {
@@ -183,17 +212,19 @@ pub async fn run(json_mode: bool, config_dir: Option<PathBuf>, args: &UpdateArgs
         let value = report.json();
         emit(json_mode, value, || {
             for line in report.human_lines() {
-                eprintln!("{line}");
+                println!("{line}");
             }
         });
         return Ok(0);
     }
     if !confirm(args.yes, latest)? {
-        eprintln!("not updated");
+        println!("not updated");
         return Ok(0);
     }
-    let binary = extract_binary(&asset.name, &bytes)?;
-    let report = apply_binary(&binary)?;
+    let bytes = download_asset(asset, auth).await?;
+    verify_checksum(&asset.name, &bytes, &sums)?;
+    let extracted = extract_binaries(&asset.name, &bytes)?;
+    let report = apply_binaries(&extracted)?;
     let mut value = json!({
         "ok": true,
         "current": current,
@@ -205,10 +236,10 @@ pub async fn run(json_mode: bool, config_dir: Option<PathBuf>, args: &UpdateArgs
     });
     add_apply_fields(&mut value, &report);
     emit(json_mode, value, || {
-        eprintln!("updated to {latest}");
-        eprintln!("checksum: ok");
+        println!("updated to {latest}");
+        println!("checksum: ok");
         if signature_verified {
-            eprintln!("signature: ok");
+            println!("signature: ok");
         } else {
             eprintln!("{}", missing_signature_tip());
         }
@@ -267,7 +298,7 @@ async fn run_from_mirror(
         emit(
             json_mode,
             json!({"ok": true, "current": current, "latest": latest, "update": false, "mirror": base}),
-            || eprintln!("{}", already_latest_line(&current)),
+            || println!("{}", already_latest_line(&current)),
         );
         return Ok(0);
     }
@@ -282,11 +313,6 @@ async fn run_from_mirror(
                 names.join(", ")
             )
         })?;
-    let bytes = download_mirror(&format!("{base}/{asset_name}"))
-        .await
-        .with_context(|| format!("download {asset_name} from {base}"))
-        .map_err(decorate_mirror_download_anyhow)?;
-    verify_checksum(&asset_name, &bytes, &sums)?;
     let pubkey = if args.checksum_only {
         None
     } else {
@@ -318,17 +344,22 @@ async fn run_from_mirror(
         let value = report.json();
         emit(json_mode, value, || {
             for line in report.human_lines() {
-                eprintln!("{line}");
+                println!("{line}");
             }
         });
         return Ok(0);
     }
     if !confirm(args.yes, &latest)? {
-        eprintln!("not updated");
+        println!("not updated");
         return Ok(0);
     }
-    let binary = extract_binary(&asset_name, &bytes)?;
-    let report = apply_binary(&binary)?;
+    let bytes = download_mirror(&format!("{base}/{asset_name}"))
+        .await
+        .with_context(|| format!("download {asset_name} from {base}"))
+        .map_err(decorate_mirror_download_anyhow)?;
+    verify_checksum(&asset_name, &bytes, &sums)?;
+    let extracted = extract_binaries(&asset_name, &bytes)?;
+    let report = apply_binaries(&extracted)?;
     let mut value = json!({
         "ok": true,
         "current": current,
@@ -341,10 +372,10 @@ async fn run_from_mirror(
     });
     add_apply_fields(&mut value, &report);
     emit(json_mode, value, || {
-        eprintln!("updated to {latest} via {base}");
-        eprintln!("checksum: ok");
+        println!("updated to {latest} via {base}");
+        println!("checksum: ok");
         if signature_verified {
-            eprintln!("signature: ok");
+            println!("signature: ok");
         } else {
             eprintln!("{}", missing_signature_tip());
         }
@@ -765,9 +796,27 @@ fn archive_name(version: &str, target: &str) -> String {
 }
 
 fn candidate_targets(os: &str, arch: &str) -> Vec<&'static str> {
+    let prefer_glibc =
+        cfg!(all(target_os = "linux", not(target_env = "musl"), feature = "controller"));
+    candidate_targets_for_flavor(os, arch, prefer_glibc)
+}
+
+fn candidate_targets_for_flavor(os: &str, arch: &str, prefer_glibc: bool) -> Vec<&'static str> {
     match (os, arch) {
-        ("linux", "x86_64") => vec!["x86_64-unknown-linux-musl"],
-        ("linux", "aarch64") => vec!["aarch64-unknown-linux-musl"],
+        ("linux", "x86_64") => {
+            if prefer_glibc {
+                vec!["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+            } else {
+                vec!["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
+            }
+        }
+        ("linux", "aarch64") => {
+            if prefer_glibc {
+                vec!["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"]
+            } else {
+                vec!["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"]
+            }
+        }
         ("windows", "x86_64") => vec!["x86_64-pc-windows-msvc"],
         ("windows", "aarch64") => vec!["aarch64-pc-windows-msvc"],
         ("macos", "x86_64") => vec!["universal-apple-darwin", "x86_64-apple-darwin"],
@@ -793,10 +842,15 @@ fn resolve_pubkey(args: &UpdateArgs, config_dir: &Path) -> Result<Option<signatu
     if let Some(value) = saved.pubkey.filter(|value| !value.trim().is_empty()) {
         return Ok(Some(signature::load_public_key(&value)?));
     }
+    // Always prioritize the build-time embedded project pin over ambient
+    // disk `minisign.pub` files so stray or untrusted files next to the binary
+    // cannot silently override release signature verification (`SEC-15`).
+    if let Ok(key) = embedded_project_pubkey() {
+        return Ok(Some(key));
+    }
     if let Some(key) = discover_pubkey(config_dir, current_exe_dir().as_deref()) {
         return Ok(Some(key));
     }
-    // Stock builds verify official releases without any local config.
     Ok(Some(embedded_project_pubkey()?))
 }
 
@@ -997,11 +1051,24 @@ fn save_update_config(dir: &Path, config: &UpdateConfig) -> Result<()> {
     Ok(())
 }
 
+pub struct ExtractedBinaries {
+    pub cli: Vec<u8>,
+    pub gui: Option<Vec<u8>>,
+}
+
+#[allow(dead_code)]
 pub fn extract_binary(archive_name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    Ok(extract_binaries(archive_name, bytes)?.cli)
+}
+
+pub fn extract_binaries(archive_name: &str, bytes: &[u8]) -> Result<ExtractedBinaries> {
     if archive_name.ends_with(".zip") {
         extract_zip(bytes)
     } else if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
-        extract_tar_gz(bytes)
+        Ok(ExtractedBinaries {
+            cli: extract_tar_gz(bytes)?,
+            gui: None,
+        })
     } else {
         bail!("unknown release archive {archive_name}");
     }
@@ -1009,8 +1076,10 @@ pub fn extract_binary(archive_name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
 
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 
-fn extract_zip(bytes: &[u8]) -> Result<Vec<u8>> {
+fn extract_zip(bytes: &[u8]) -> Result<ExtractedBinaries> {
     let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes)).context("open zip")?;
+    let mut cli: Option<Vec<u8>> = None;
+    let mut gui: Option<Vec<u8>> = None;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
         if !file.is_file() {
@@ -1020,7 +1089,9 @@ fn extract_zip(bytes: &[u8]) -> Result<Vec<u8>> {
         let Ok(name) = file.name() else {
             continue;
         };
-        if !is_binary_name(name.as_ref()) {
+        let is_cli = is_binary_name(name.as_ref());
+        let is_gui = is_gui_binary_name(name.as_ref());
+        if !is_cli && !is_gui {
             continue;
         }
         if file.size() > MAX_ARCHIVE_ENTRY_BYTES {
@@ -1032,9 +1103,14 @@ fn extract_zip(bytes: &[u8]) -> Result<Vec<u8>> {
         if (buf.len() as u64) > MAX_ARCHIVE_ENTRY_BYTES {
             bail!("archive entry is too large");
         }
-        return Ok(buf);
+        if is_cli && cli.is_none() {
+            cli = Some(buf);
+        } else if is_gui && gui.is_none() {
+            gui = Some(buf);
+        }
     }
-    bail!("zip does not contain agentlink");
+    let cli = cli.ok_or_else(|| anyhow!("zip does not contain agentlink"))?;
+    Ok(ExtractedBinaries { cli, gui })
 }
 
 fn extract_tar_gz(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -1074,6 +1150,15 @@ fn is_binary_name(name: &str) -> bool {
     )
 }
 
+fn is_gui_binary_name(name: &str) -> bool {
+    let name = name.replace('\\', "/");
+    if name.split('/').any(|part| part == "..") {
+        return false;
+    }
+    matches!(name.rsplit('/').next(), Some("agentlink-gui.exe"))
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 const RELAY_NAME: &str = "agentlink-relay";
 
 /// Pass-through copy of the CLI used by slim-bin node drop-ins
@@ -1115,7 +1200,8 @@ fn service_label(service: &service::InstalledService) -> String {
     }
 }
 
-fn apply_binary(bytes: &[u8]) -> Result<ApplyReport> {
+fn apply_binaries(extracted: &ExtractedBinaries) -> Result<ApplyReport> {
+    let bytes = extracted.cli.as_slice();
     let current = std::env::current_exe().context("locate the running binary")?;
     let current = fs::canonicalize(&current).unwrap_or(current);
     let installed = service::installed_services();
@@ -1126,10 +1212,11 @@ fn apply_binary(bytes: &[u8]) -> Result<ApplyReport> {
         .collect();
     #[cfg(windows)]
     {
-        stage_windows_replace(&current, bytes, &active)
+        stage_windows_replace(&current, bytes, extracted.gui.as_deref(), &active)
     }
     #[cfg(not(windows))]
     {
+        let _ = &extracted.gui;
         // Snapshot the services and relay before replacing the file. Stopping
         // a node unit from inside `agentlink update` would kill this process
         // (it often runs under `agentlink exec`/the node), so every bounce is
@@ -1144,9 +1231,8 @@ fn apply_binary(bytes: &[u8]) -> Result<ApplyReport> {
 
         replace_unix(&current, bytes).with_context(|| {
             format!(
-                "could not replace {}; the running service was not touched and the old binary was left at {}.old",
+                "could not replace {}; the running service was not touched",
                 current.display(),
-                current.display()
             )
         })?;
 
@@ -1620,7 +1706,7 @@ fn spawn_deferred_helper(pid: u32, jobs: &[DeferredJob], log: &Path) -> Result<(
 
 #[cfg(unix)]
 fn replace_unix(current: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
     let parent = current
         .parent()
         .ok_or_else(|| anyhow!("binary path has no directory"))?;
@@ -1628,11 +1714,24 @@ fn replace_unix(current: &Path, bytes: &[u8]) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("binary name is not utf-8"))?;
-    let new_path = parent.join(format!("{name}.new"));
-    let old_path = parent.join(format!("{name}.old"));
-    fs::write(&new_path, bytes).with_context(|| format!("write {}", new_path.display()))?;
-    fs::set_permissions(&new_path, fs::Permissions::from_mode(0o755))?;
-    swap_binary(current, &new_path, &old_path)
+    let nonce = agentlink_core::util::random_hex(8);
+    let tmp_path = parent.join(format!(".{name}.new.{}.{nonce}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&tmp_path)
+        .with_context(|| format!("create {}", tmp_path.display()))?;
+    if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("write {}", tmp_path.display()));
+    }
+    drop(file);
+    if let Err(err) = fs::rename(&tmp_path, current) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("install {}", current.display()));
+    }
+    Ok(())
 }
 
 /// Refresh the slim-bin `agentlink-node-daemon` next to the CLI so the next
@@ -1677,15 +1776,53 @@ fn escape_cmd_assignment_path(path: &Path) -> Result<String> {
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 fn format_windows_update_cmd(
     target: &Path,
     source: &Path,
     stop: &str,
     restart: &str,
 ) -> Result<String> {
+    format_windows_update_cmd_with_gui(target, source, None, None, stop, restart)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn format_windows_update_cmd_with_gui(
+    target: &Path,
+    source: &Path,
+    gui_target: Option<&Path>,
+    gui_source: Option<&Path>,
+    stop: &str,
+    restart: &str,
+) -> Result<String> {
     let escaped_target = escape_cmd_assignment_path(target)?;
     let escaped_source = escape_cmd_assignment_path(source)?;
-    // Stop installed services inside the detached helper — never in the
+    let mut gui_vars = String::new();
+    let mut gui_move_block = String::new();
+    let mut gui_cleanup = String::new();
+    if let (Some(gt), Some(gs)) = (gui_target, gui_source) {
+        let escaped_gt = escape_cmd_assignment_path(gt)?;
+        let escaped_gs = escape_cmd_assignment_path(gs)?;
+        gui_vars = format!(
+            "set \"GUI_TARGET={escaped_gt}\"\r\n\
+             set \"GUI_SOURCE={escaped_gs}\"\r\n"
+        );
+        gui_move_block = "\
+for /L %%i in (1,1,30) do (\r\n\
+  move /Y \"%GUI_SOURCE%\" \"%GUI_TARGET%\" >nul 2>&1 && goto :gui_moved\r\n\
+  timeout /t 1 /nobreak >nul\r\n\
+)\r\n\
+>> \"%TARGET%.update.log\" echo agentlink update could not replace GUI executable\r\n\
+del /F /Q \"%GUI_SOURCE%\" >nul 2>&1\r\n\
+:gui_moved\r\n"
+            .to_string();
+        gui_cleanup = "del /F /Q \"%GUI_SOURCE%\" >nul 2>&1\r\n".to_string();
+    } else if let Some(parent) = target.parent() {
+        let sibling_gui = parent.join("agentlink-gui.exe");
+        let escaped_gt = escape_cmd_assignment_path(&sibling_gui)?;
+        gui_vars = format!("set \"GUI_TARGET={escaped_gt}\"\r\n");
+    }
+    // Stop installed services/tray inside the detached helper — never in the
     // updater process itself — so a remote `exec`-triggered update cannot
     // kill itself before staging the new binary and spawning this script.
     let stop_block = if stop.trim().is_empty() {
@@ -1697,16 +1834,21 @@ fn format_windows_update_cmd(
         "@echo off\r\n\
 set \"TARGET={escaped_target}\"\r\n\
 set \"SOURCE={escaped_source}\"\r\n\
+{gui_vars}\
 {stop_block}\
 for /L %%i in (1,1,30) do (\r\n\
   move /Y \"%SOURCE%\" \"%TARGET%\" >nul 2>&1 && goto :moved\r\n\
   timeout /t 1 /nobreak >nul\r\n\
 )\r\n\
 >> \"%TARGET%.update.log\" echo agentlink update could not replace target executable\r\n\
+del /F /Q \"%SOURCE%\" >nul 2>&1\r\n\
+{gui_cleanup}\
+del /F /Q \"%~f0\" >nul 2>&1\r\n\
 exit /b 1\r\n\
 :moved\r\n\
+{gui_move_block}\
 {restart}\r\n\
-del \"%~f0\"\r\n"
+del /F /Q \"%~f0\" >nul 2>&1\r\n"
     ))
 }
 
@@ -1714,21 +1856,36 @@ del \"%~f0\"\r\n"
 fn stage_windows_replace(
     current: &Path,
     bytes: &[u8],
+    gui_bytes: Option<&[u8]>,
     active: &[service::InstalledService],
 ) -> Result<ApplyReport> {
     let new_path = current.with_extension("exe.new");
     fs::write(&new_path, bytes).with_context(|| format!("write {}", new_path.display()))?;
+    let (gui_target, gui_source) = if let (Some(gui), Some(parent)) = (gui_bytes, current.parent())
+    {
+        let gt = parent.join("agentlink-gui.exe");
+        let gs = parent.join("agentlink-gui.exe.new");
+        fs::write(&gs, gui).with_context(|| format!("write {}", gs.display()))?;
+        (Some(gt), Some(gs))
+    } else {
+        (None, None)
+    };
     let script = current.with_extension("update.cmd");
     let stop = windows_stop_mode(active);
     let restart = windows_restart_mode(active);
-    let body = format_windows_update_cmd(current, &new_path, &stop, &restart)?;
+    let body = format_windows_update_cmd_with_gui(
+        current,
+        &new_path,
+        gui_target.as_deref(),
+        gui_source.as_deref(),
+        &stop,
+        &restart,
+    )?;
     fs::write(&script, body)?;
-    // CREATE_NO_WINDOW only (via process::detached). DETACHED_PROCESS would
-    // make Windows ignore CREATE_NO_WINDOW and flash cmd.exe. Dropping the
-    // Child does not kill it; the script stops services, waits until this
-    // process exits (file lock), replaces the binary, then restarts.
+    // CREATE_NO_WINDOW only (via process::detached) and `/D` so AutoRun
+    // registry commands cannot hijack the updater shell (`SEC-15`).
     agentlink_core::process::detached("cmd")
-        .arg("/C")
+        .args(["/D", "/C"])
         .arg(&script)
         .spawn()
         .context("start the Windows update helper")?;
@@ -1752,8 +1909,9 @@ fn windows_stop_mode_for_kinds(kinds: &[service::ServiceKind]) -> String {
                 lines.push("schtasks /End /TN agentlink-node".to_string());
             }
             service::ServiceKind::WindowsRun => {
-                // Tray/Run entries have no service stop; the move loop waits
-                // for the updater process to release the executable lock.
+                // Signal the running user-scope tray to exit gracefully so it
+                // releases the executable lock before `move /Y` (`UX-03`).
+                lines.push("\"%TARGET%\" service stop --scope user >nul 2>&1".to_string());
             }
             service::ServiceKind::WindowsService => {
                 lines.push("sc.exe stop agentlink-node".to_string());
@@ -1773,7 +1931,10 @@ fn windows_restart_mode_for_kinds(kinds: &[service::ServiceKind]) -> String {
                 lines.push("schtasks /Run /TN agentlink-node".to_string());
             }
             service::ServiceKind::WindowsRun => {
-                lines.push("start \"\" \"%TARGET%\" tray --background".to_string());
+                lines.push(
+                    "if exist \"%GUI_TARGET%\" (start \"\" \"%GUI_TARGET%\" tray --background) else (start \"\" \"%TARGET%\" tray --background)"
+                        .to_string(),
+                );
             }
             service::ServiceKind::WindowsService => {
                 lines.push("sc.exe start agentlink-node".to_string());
@@ -2559,7 +2720,7 @@ mod tests {
     fn deferred_helper_pid_assignment_is_what_makes_wait_work() {
         // Pre-fix bug: `$pid` was never assigned, so `kill -0 ""` failed
         // immediately and the helper bounced services in ~0ms.
-        let empty = std::process::Command::new("sh")
+        let empty = std::process::Command::new("sh") // no-window-reviewed: unix-only test
             .args([
                 "-c",
                 r#"pid=; n=0; while kill -0 "$pid" 2>/dev/null; do n=$((n+1)); [ "$n" -ge 5 ] && break; sleep 1; done; echo n=$n"#,
@@ -2574,7 +2735,7 @@ mod tests {
 
         // With pid assigned to a live child, the loop observes it. `wait`
         // reaps the zombie so kill -0 stops succeeding after exit.
-        let live = std::process::Command::new("sh")
+        let live = std::process::Command::new("sh") // no-window-reviewed: unix-only test
             .args([
                 "-c",
                 r#"
@@ -2697,14 +2858,16 @@ echo n=$n
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
-    fn replace_unix_keeps_the_previous_binary() {
+    fn replace_unix_atomically_replaces_binary() {
         let dir = tempfile::tempdir().unwrap();
         let current = dir.path().join("agentlink");
         fs::write(&current, b"old").unwrap();
         replace_unix(&current, b"new").unwrap();
         assert_eq!(fs::read(&current).unwrap(), b"new");
-        assert_eq!(fs::read(dir.path().join("agentlink.old")).unwrap(), b"old");
+        // No leftover predictable `.new` or `.old` temp files.
+        assert!(!dir.path().join("agentlink.new").exists());
     }
 
     #[cfg(unix)]
@@ -2817,9 +2980,17 @@ echo n=$n
         let target = Path::new(r"C:\Program Files (x86)\A&B%1\agentlink.exe");
         let source = Path::new(r"C:\Program Files (x86)\A&B%1\agentlink.exe.new");
         let stop = windows_stop_mode_for_kinds(&[service::ServiceKind::WindowsService]);
+        let stop_tray = windows_stop_mode_for_kinds(&[service::ServiceKind::WindowsRun]);
         let restart = windows_restart_mode_for_kinds(&[service::ServiceKind::WindowsRun]);
         assert_eq!(stop, "sc.exe stop agentlink-node");
-        assert_eq!(restart, "start \"\" \"%TARGET%\" tray --background");
+        assert!(
+            stop_tray.contains("service stop --scope user"),
+            "tray stop must gracefully exit user tray: {stop_tray}"
+        );
+        assert!(
+            restart.contains("%GUI_TARGET%") && restart.contains("tray --background"),
+            "{restart}"
+        );
         let script = format_windows_update_cmd(target, source, &stop, &restart).unwrap();
         assert!(
             script.contains("set \"TARGET=C:\\Program Files (x86)\\A&B%%1\\agentlink.exe\"\r\n"),
@@ -2830,8 +3001,12 @@ echo n=$n
         let move_at = script.find("move /Y").expect(&script);
         assert!(stop_at < move_at, "stop must precede move: {script}");
         assert!(
-            script.contains("start \"\" \"%TARGET%\" tray --background\r\n"),
+            script.contains("tray --background"),
             "{script}"
+        );
+        assert!(
+            script.contains("del /F /Q \"%SOURCE%\""),
+            "failure path must clean up .new file: {script}"
         );
         assert!(
             !script.contains("replace %TARGET%"),
@@ -2840,5 +3015,55 @@ echo n=$n
         assert!(
             format_windows_update_cmd(Path::new("bad\"quote.exe"), source, "", "rem").is_err()
         );
+    }
+
+    #[test]
+    fn embedded_pubkey_wins_over_ambient_disk_minisign_pub() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_pk = signature::public_from_signing(&ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        fs::write(dir.path().join("minisign.pub"), other_pk.to_minisign()).unwrap();
+        let args = UpdateArgs {
+            check: true,
+            yes: false,
+            auto: false,
+            disable_auto: false,
+            version: None,
+            repo: DEFAULT_REPO.into(),
+            github_token: None,
+            download_base: None,
+            pubkey: None,
+            checksum_only: false,
+            scope: Scope::User,
+        };
+        let resolved = resolve_pubkey(&args, dir.path()).unwrap().unwrap();
+        assert_eq!(
+            resolved.to_minisign(),
+            embedded_project_pubkey().unwrap().to_minisign()
+        );
+    }
+
+    #[test]
+    fn linux_targets_preserve_glibc_vs_musl_flavor() {
+        assert_eq!(
+            candidate_targets_for_flavor("linux", "x86_64", true),
+            vec!["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+        );
+        assert_eq!(
+            candidate_targets_for_flavor("linux", "x86_64", false),
+            vec!["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
+        );
+    }
+
+    #[test]
+    fn update_config_persists_repo_and_download_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = UpdateConfig {
+            pubkey: None,
+            auto: true,
+            repo: Some("org/fork".into()),
+            download_base: Some("https://mirror.example.com/dl".into()),
+        };
+        save_update_config(dir.path(), &cfg).unwrap();
+        assert_eq!(load_update_config(dir.path()), cfg);
     }
 }

@@ -402,7 +402,7 @@ async fn mcp_latency(
                 "--http",
                 "127.0.0.1:0",
                 "--mcp-token",
-                "bench-mcp",
+                "bench-mcp-token-012345",
             ])
             .env("AGENTLINK_CONFIG_DIR", &log_dir)
             .stdin(Stdio::null())
@@ -420,7 +420,7 @@ async fn mcp_latency(
     let mut out = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
-        let body = mcp_post(addr, "bench-mcp")?;
+        let body = mcp_post(addr, "bench-mcp-token-012345")?;
         if !body.contains("bench") {
             return Err(anyhow!("mcp list_machines missed the node: {body}"));
         }
