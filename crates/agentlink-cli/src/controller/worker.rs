@@ -5823,19 +5823,19 @@ mod pty_fairness_tests {
     fn shared_cursor_defaults_visible_and_rgba_pool_recycles_desk_11() {
         let shared = Shared::new();
         assert!(
-            shared.cursor().visible,
+            shared.cursor.lock().unwrap().visible,
             "DeskCursor must default to visible=true so cursor is not hidden until first cursor message"
         );
 
-        let mut hidden = DeskCursor::default();
+        let mut hidden = super::DeskCursor::default();
         hidden.visible = false;
-        hidden.x = 42;
+        hidden.hotspot_x = 42;
         shared.set_cursor(hidden);
-        assert!(!shared.cursor().visible);
+        assert!(!shared.cursor.lock().unwrap().visible);
 
         shared.reset_cursor();
         assert!(
-            shared.cursor().visible,
+            shared.cursor.lock().unwrap().visible,
             "reset_cursor on node switch must restore visible=true"
         );
 

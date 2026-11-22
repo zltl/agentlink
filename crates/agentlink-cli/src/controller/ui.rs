@@ -949,10 +949,17 @@ impl ControllerApp {
                     {
                         self.release_remote_input();
                         self.send(Cmd::LiveStop);
+                        self.send(Cmd::PtyClose);
+                        let parked_gens: Vec<u64> =
+                            self.term_parked.drain().map(|(_, p)| p.gen).collect();
+                        for gen in parked_gens {
+                            self.send(Cmd::PtyCloseGen { gen });
+                        }
+                        self.term_alive = false;
+                        self.term_open = None;
                         self.user = None;
                         self.nodes.clear();
                         self.nodes_loaded = false;
-                        self.term_parked.clear();
                         self.screen = Screen::Login;
                         self.error = message;
                     } else if matches!(self.screen, Screen::Restoring) {
@@ -8898,8 +8905,9 @@ mod geometry_tests {
         let _ = harn.ctx.run(raw.take(), |ctx| harn.app.ui_frame(ctx));
         let keys = drain_key_inputs(&mut harn.cmd_rx);
         assert!(
-            keys.iter().any(|(k, down)| k == "ctrl+d" && *down == Some(true)),
-            "Ctrl+D on Windows/Linux must send 'ctrl+d' without 'meta': {keys:?}"
+            keys.iter().any(|(k, down)| k == "ctrl" && *down == Some(true))
+                && keys.iter().any(|(k, down)| k == "d" && *down == Some(true)),
+            "Ctrl+D on Windows/Linux must press 'ctrl' and 'd' without 'meta': {keys:?}"
         );
         assert!(
             keys.iter().all(|(k, _)| !k.contains("meta") && !k.contains("super") && !k.contains("win")),
@@ -8959,7 +8967,13 @@ mod geometry_tests {
     #[test]
     fn nodes_loaded_and_parked_terminal_switch_preserve_session_desk_09_10() {
         let mut harn = Harness::new(1280.0, 800.0);
-        assert!(harn.app.nodes_loaded);
+        let template = harn
+            .app
+            .nodes
+            .iter()
+            .find(|n| n.id == "workstation")
+            .cloned()
+            .expect("workstation fixture");
         harn.app.nodes_loaded = false;
         harn.app.shared.push(UiEvent::Nodes(Vec::new()));
         harn.pass();
@@ -8968,29 +8982,19 @@ mod geometry_tests {
             "Empty UiEvent::Nodes must flip nodes_loaded=true so spinner stops"
         );
 
-        let node_a = NodeInfo {
-            id: "node-a".into(),
-            name: "Alpha".into(),
-            online: true,
-            access: "full".into(),
-            role: "owner".into(),
-            capabilities: vec!["shell".into()],
-            last_seen: 0,
-        };
-        let node_b = NodeInfo {
-            id: "node-b".into(),
-            name: "Beta".into(),
-            online: true,
-            access: "full".into(),
-            role: "owner".into(),
-            capabilities: vec!["shell".into()],
-            last_seen: 0,
-        };
+        let mut node_a = template.clone();
+        node_a.id = "node-a".into();
+        node_a.name = "Alpha".into();
+        node_a.online = true;
+        let mut node_b = template;
+        node_b.id = "node-b".into();
+        node_b.name = "Beta".into();
+        node_b.online = true;
         harn.app.nodes = vec![node_a.clone(), node_b.clone()];
         harn.app.prefs.allow_osc52 = true;
         harn.app.open_terminal(&node_a);
         let gen_a = harn.app.term_gen;
-        assert!(harn.app.terminal.allow_osc52());
+        assert!(harn.app.terminal.allows_osc52());
         harn.app.shared.push(UiEvent::Pty {
             gen: gen_a,
             bytes: b"alpha$ ".to_vec(),
@@ -9006,7 +9010,7 @@ mod geometry_tests {
         while let Ok(cmd) = harn.cmd_rx.try_recv() {
             assert!(
                 !matches!(cmd, Cmd::PtyClose | Cmd::PtyCloseGen { .. }),
-                "switching nodes must park node A instead of closing its PTY: {cmd:?}"
+                "switching nodes must park node A instead of closing its PTY"
             );
         }
 
@@ -9014,7 +9018,7 @@ mod geometry_tests {
         harn.app.open_terminal(&node_a);
         assert_eq!(harn.app.term_gen, gen_a);
         assert!(harn.app.term_alive);
-        assert!(harn.app.terminal.allow_osc52());
+        assert!(harn.app.terminal.allows_osc52());
         while let Ok(cmd) = harn.cmd_rx.try_recv() {
             assert!(
                 !matches!(cmd, Cmd::PtyOpen { .. }),
@@ -9029,7 +9033,7 @@ mod geometry_tests {
         harn.app.shared.push(UiEvent::File(super::model::LoadedFile {
             path: "/tmp/huge.log".into(),
             text: "preview only".into(),
-            size_bytes: 512 * 1024,
+            total_size: Some(512 * 1024),
             read_only: true,
             read_only_reason: Some("File exceeds 256 KiB.".into()),
         }));
@@ -9039,6 +9043,8 @@ mod geometry_tests {
         assert_eq!(ed.saved_text, "preview only");
 
         // Auth expiry error must kick the user back to Screen::Login (`DESK-10`).
+        harn.app.mock = false;
+        harn.app.preview_ui = false;
         harn.app.screen = Screen::Machines;
         harn.app
             .shared
