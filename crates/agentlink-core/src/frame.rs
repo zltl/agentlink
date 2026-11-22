@@ -86,6 +86,11 @@ pub fn decode(bytes: &[u8]) -> Result<DataFrame> {
         return Err(Error::Protocol("binary frame too large".into()));
     }
     let flags = u16::from_le_bytes([bytes[2], bytes[3]]);
+    if flags & !(FLAG_ZSTD | FLAG_E2E | FLAG_HOLE) != 0 {
+        return Err(Error::Protocol(format!(
+            "unknown binary frame flags 0x{flags:04x}"
+        )));
+    }
     let offset = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
     let mut id_bytes = [0u8; 16];
     id_bytes.copy_from_slice(&bytes[12..28]);
@@ -95,15 +100,51 @@ pub fn decode(bytes: &[u8]) -> Result<DataFrame> {
     if bytes.len() != HEADER_LEN + payload_len {
         return Err(Error::Protocol("binary frame length mismatch".into()));
     }
+    let compressed = flags & FLAG_ZSTD != 0;
+    let hole = flags & FLAG_HOLE != 0;
+    if hole {
+        if compressed {
+            return Err(Error::Protocol("hole frame cannot be compressed".into()));
+        }
+        if u64::from(raw_len) > crate::sparse::FILE_MAX_HOLE {
+            return Err(Error::Protocol(format!(
+                "hole frame raw_len {raw_len} exceeds {} byte cap",
+                crate::sparse::FILE_MAX_HOLE
+            )));
+        }
+        if flags & FLAG_E2E == 0 && payload_len != 0 {
+            return Err(Error::Protocol(
+                "hole frame must have empty payload".into(),
+            ));
+        }
+    }
     Ok(DataFrame {
         request_id,
         offset,
         raw_len,
-        compressed: flags & FLAG_ZSTD != 0,
-        hole: flags & FLAG_HOLE != 0,
+        compressed,
+        hole,
         tar: kind == KIND_TAR,
         payload: bytes[HEADER_LEN..].to_vec(),
     })
+}
+
+/// Raw header fields bound into E2E frame AAD v2:
+/// `(version, kind, non_e2e_flags, offset, raw_len, request_id)`.
+pub fn header_fields(bytes: &[u8]) -> Result<(u8, u8, u16, u64, u32, String)> {
+    if bytes.len() < HEADER_LEN {
+        return Err(Error::Protocol("short binary frame".into()));
+    }
+    let version = bytes[0];
+    let kind = bytes[1];
+    let flags = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let non_e2e_flags = flags & !FLAG_E2E;
+    let offset = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+    let mut id_bytes = [0u8; 16];
+    id_bytes.copy_from_slice(&bytes[12..28]);
+    let request_id = Uuid::from_bytes(id_bytes).to_string();
+    let raw_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+    Ok((version, kind, non_e2e_flags, offset, raw_len, request_id))
 }
 
 /// `true` when the frame header carries [`FLAG_E2E`].

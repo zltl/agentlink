@@ -142,7 +142,9 @@ proptest! {
         std::fs::create_dir(&root).unwrap();
         let rel = parts.join("/");
         let resolved = resolve_lexical(Some(&root), &rel).unwrap();
-        let root_c = std::fs::canonicalize(&root).unwrap();
+        let root_c = agentlink_core::paths::strip_verbatim_prefix(
+            &std::fs::canonicalize(&root).unwrap(),
+        );
         prop_assert!(resolved.starts_with(&root_c), "{resolved:?} not in {root_c:?}");
     }
 
@@ -269,13 +271,16 @@ fn symlink_and_var_style_root_stay_inside() {
 #[cfg(windows)]
 #[test]
 fn drive_letter_and_verbatim_prefix_cannot_leave_the_jail() {
+    use std::path::Path;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");
     std::fs::create_dir(&root).unwrap();
     for candidate in [r"C:\Windows", r"\\?\C:\Windows", r"D:\outside"] {
         match resolve_path(Some(&root), candidate) {
             Ok(path) => {
-                let root_c = std::fs::canonicalize(&root).unwrap();
+                let root_c = agentlink_core::paths::strip_verbatim_prefix(
+                    &std::fs::canonicalize(&root).unwrap(),
+                );
                 assert!(
                     path.starts_with(&root_c),
                     "{candidate} resolved outside the jail to {}",

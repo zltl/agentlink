@@ -30,9 +30,13 @@ pub fn is_link_entry(meta: &fs::Metadata) -> bool {
 pub fn remove_link_entry(path: &std::path::Path, meta: &fs::Metadata) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        // DeleteFile fails on directory reparse points; RemoveDirectory
-        // removes the link and leaves the target intact.
-        if meta.is_dir() {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        // DeleteFile fails on directory symlinks and junctions (`Metadata::is_dir()`
+        // returns false for `symlink_metadata` of a directory symlink on Windows,
+        // so check `FILE_ATTRIBUTE_DIRECTORY` too); RemoveDirectory removes the
+        // link and leaves the target intact.
+        if meta.is_dir() || (meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0) {
             return fs::remove_dir(path);
         }
     }

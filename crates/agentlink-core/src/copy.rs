@@ -15,6 +15,54 @@ use crate::ws::{self, Outbound};
 
 type Progress = Option<Arc<dyn Fn(u64, u64) + Send + Sync>>;
 
+const PEER_COPY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Debug)]
+enum PeerCopyWait {
+    Done(TransferStats),
+    Failed(Error),
+    HandshakeTimeout,
+}
+
+/// Wait for `src_node` to accept a `PeerCopy` within `handshake_timeout`, then
+/// wait without a whole-transfer cap for the accepted transfer to finish.
+async fn await_peer_copy(link: &mut Link, handshake_timeout: Duration) -> PeerCopyWait {
+    let first = match tokio::time::timeout(handshake_timeout, link.recv()).await {
+        Ok(Ok(wire)) => wire,
+        Ok(Err(err)) => return PeerCopyWait::Failed(err),
+        Err(_) => return PeerCopyWait::HandshakeTimeout,
+    };
+    match first {
+        Wire::Msg(TransferMsg::Done { stats }) => return PeerCopyWait::Done(stats),
+        Wire::Msg(TransferMsg::Failed { message }) => {
+            return PeerCopyWait::Failed(Error::Message(message));
+        }
+        Wire::Msg(TransferMsg::Accept { .. } | TransferMsg::Ack { .. }) => {
+            // Peer accepted / started: wait for completion without the 12s handshake cap.
+        }
+        other => {
+            return PeerCopyWait::Failed(Error::Protocol(format!(
+                "expected peer copy result, got {other:?}"
+            )));
+        }
+    }
+    loop {
+        match link.recv().await {
+            Ok(Wire::Msg(TransferMsg::Done { stats })) => return PeerCopyWait::Done(stats),
+            Ok(Wire::Msg(TransferMsg::Failed { message })) => {
+                return PeerCopyWait::Failed(Error::Message(message));
+            }
+            Ok(Wire::Msg(TransferMsg::Accept { .. } | TransferMsg::Ack { .. })) => continue,
+            Ok(other) => {
+                return PeerCopyWait::Failed(Error::Protocol(format!(
+                    "expected peer copy result, got {other:?}"
+                )));
+            }
+            Err(err) => return PeerCopyWait::Failed(err),
+        }
+    }
+}
+
 /// Map one phase of a two-hop bridge onto a single 0..2*total range.
 fn scale_bridge_progress(progress: Progress, phase: u64) -> Progress {
     let hook = progress?;
@@ -189,20 +237,18 @@ impl Client {
                 .copy_node_bridge(src_node, src_path, dst_node, dst_path, opts, progress)
                 .await;
         }
-        match tokio::time::timeout(
-            Duration::from_secs(12),
-            self.peer_copy_once(&src_id, src_path, &dst_id, dst_path, opts, direct),
-        )
-        .await
+        match self
+            .peer_copy_once(&src_id, src_path, &dst_id, dst_path, opts, direct)
+            .await
         {
-            Ok(Ok(stats)) => Ok(stats),
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "peer copy failed; bridging via local temp");
+            Ok(stats) => Ok(stats),
+            Err(Error::Timeout) => {
+                tracing::warn!("peer copy handshake timed out; cancelled and bridging via local temp");
                 self.copy_node_bridge(src_node, src_path, dst_node, dst_path, opts, progress)
                     .await
             }
-            Err(_) => {
-                tracing::warn!("peer copy timed out; bridging via local temp");
+            Err(err) => {
+                tracing::warn!(error = %err, "peer copy failed; bridging via local temp");
                 self.copy_node_bridge(src_node, src_path, dst_node, dst_path, opts, progress)
                     .await
             }
@@ -231,12 +277,16 @@ impl Client {
             direct,
         })
         .await?;
-        match link.recv().await? {
-            Wire::Msg(TransferMsg::Done { stats }) => Ok(stats),
-            Wire::Msg(TransferMsg::Failed { message }) => Err(Error::Message(message)),
-            other => Err(Error::Protocol(format!(
-                "expected peer copy result, got {other:?}"
-            ))),
+        match await_peer_copy(&mut link, PEER_COPY_HANDSHAKE_TIMEOUT).await {
+            PeerCopyWait::Done(stats) => Ok(stats),
+            PeerCopyWait::Failed(err) => Err(err),
+            PeerCopyWait::HandshakeTimeout => {
+                drop(link);
+                // Explicitly cancel the peer transfer before falling back to
+                // local bridging so src_node cannot race against copy_node_bridge.
+                let _ = self.cancel(src_id, &request_id).await;
+                Err(Error::Timeout)
+            }
         }
     }
 
@@ -250,8 +300,12 @@ impl Client {
         opts: &XferOpts,
         progress: Progress,
     ) -> Result<TransferStats> {
-        let tmp_root = std::env::temp_dir().join(format!("agentlink-bridge-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp_root).map_err(Error::Io)?;
+        let tmp_dir = tempfile::Builder::new()
+            .prefix("agentlink-bridge-")
+            .tempdir()
+            .map_err(Error::Io)?;
+        crate::util::ensure_dir(tmp_dir.path())?;
+        let tmp_root = tmp_dir.path().to_path_buf();
         let is_dir = self
             .stat(src_node, src_path)
             .await
@@ -279,7 +333,7 @@ impl Client {
                 .await
         }
         .await;
-        let _ = std::fs::remove_dir_all(&tmp_root);
+        drop(tmp_dir);
         result
     }
 
@@ -360,6 +414,7 @@ pub(crate) async fn open_relay_link(
     let tx = inner.tx.clone();
     let binary = inner.binary.clone();
     let transfers = inner.transfers.clone();
+    let routes = inner.routes.clone();
     let endpoint = inner.e2e.clone();
     let request_id = request_id.to_string();
     let node_id = node_id.to_string();
@@ -446,6 +501,9 @@ pub(crate) async fn open_relay_link(
         }
         if let Ok(mut set) = transfers.lock() {
             set.remove(&request_id);
+        }
+        if let Ok(mut map) = routes.lock() {
+            map.remove(&request_id);
         }
     });
     Ok(worker)
@@ -561,5 +619,56 @@ mod bridge_progress_tests {
             &Error::Message("grant revoked".into()),
             true
         ));
+    }
+
+    #[tokio::test]
+    async fn ux05_peer_copy_timeout_applies_only_to_initial_handshake_not_whole_transfer() {
+        let (mut client_link, peer_link) = Link::pair(8);
+        let producer = tokio::spawn(async move {
+            // Peer accepts quickly within the 80ms handshake budget.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            peer_link
+                .send_msg(TransferMsg::Accept {
+                    mode: crate::protocol::AcceptMode::Full {
+                        missing: Vec::new(),
+                    },
+                })
+                .await
+                .unwrap();
+            // Actual bulk transfer runs LONGER than the 80ms handshake timeout!
+            tokio::time::sleep(Duration::from_millis(160)).await;
+            peer_link
+                .send_msg(TransferMsg::Done {
+                    stats: TransferStats {
+                        logical_bytes: 1234,
+                        payload_bytes: 1234,
+                        skipped: false,
+                        files: 1,
+                        files_skipped: 0,
+                        compressed: false,
+                        transport: "relay".into(),
+                        delta_copy_bytes: 0,
+                        resumed_bytes: 0,
+                    },
+                })
+                .await
+                .unwrap();
+        });
+
+        match await_peer_copy(&mut client_link, Duration::from_millis(80)).await {
+            PeerCopyWait::Done(stats) => assert_eq!(stats.logical_bytes, 1234),
+            other => panic!("accepted long peer copy must not time out: {other:?}"),
+        }
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ux05_peer_copy_times_out_when_initial_handshake_stalls() {
+        let (mut client_link, _stalled_peer) = Link::pair(8);
+        let outcome = await_peer_copy(&mut client_link, Duration::from_millis(50)).await;
+        assert!(
+            matches!(outcome, PeerCopyWait::HandshakeTimeout),
+            "expected HandshakeTimeout, got {outcome:?}"
+        );
     }
 }

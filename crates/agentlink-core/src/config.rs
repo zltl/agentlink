@@ -7,6 +7,7 @@
 //! `config.json.lock` so two processes cannot each burn a stale refresh
 //! token. Writes use [`util::write_secret`] (unique tmp + rename).
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -62,6 +63,12 @@ pub struct FileConfig {
     pub access_expires_unix: Option<i64>,
     #[serde(default)]
     pub user: Option<String>,
+    /// Local friendly aliases (`alias -> node_id_or_name`) for fleet ergonomics.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
+    /// Optional default target node when a CLI command omits `<node>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_node: Option<String>,
 }
 
 pub fn default_config_dir() -> Result<PathBuf> {
@@ -170,19 +177,24 @@ pub fn save_session_unlocked(
     refresh_token: &str,
     access_expires_unix: i64,
 ) -> Result<()> {
-    let file = FileConfig {
-        relay: Some(settings.relay.clone()),
-        token: Some(settings.token.clone()),
-        fingerprint: Some(settings.fingerprint.clone()).filter(|value| !value.is_empty()),
-        trust: settings
-            .trust
-            .clone()
-            .filter(|value| !value.trim().is_empty()),
-        refresh_token: Some(refresh_token.to_string()),
-        access_expires_unix: Some(access_expires_unix),
-        user: Some(user.to_string()),
-    };
+    let mut file = load_file(dir).unwrap_or_default();
+    file.relay = Some(settings.relay.clone());
+    file.token = Some(settings.token.clone());
+    file.fingerprint = Some(settings.fingerprint.clone()).filter(|value| !value.is_empty());
+    file.trust = settings
+        .trust
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    file.refresh_token = Some(refresh_token.to_string());
+    file.access_expires_unix = Some(access_expires_unix);
+    file.user = Some(user.to_string());
     write_file(dir, &file)
+}
+
+/// Persist an updated [`FileConfig`] (for example after editing aliases or
+/// `default_node`) atomically with private file permissions.
+pub fn save_file(dir: &Path, file: &FileConfig) -> Result<()> {
+    write_file(dir, file)
 }
 
 fn write_file(dir: &std::path::Path, file: &FileConfig) -> Result<()> {
@@ -201,14 +213,35 @@ pub fn load_settings(
     fingerprint: Option<String>,
     trust: Option<String>,
 ) -> Result<ClientSettings> {
+    load_settings_for_identity(config_dir, relay, token, fingerprint, trust, false)
+}
+
+/// Merge explicit overrides with the config file, allowing tokenless
+/// `--identity` authentication when `explicit_identity` is `true`.
+///
+/// When `explicit_identity` is `true`, an operator session token saved in
+/// `config.json` is neither required nor loaded automatically (an explicit
+/// `--token` override is still honored if supplied).
+pub fn load_settings_for_identity(
+    config_dir: &std::path::Path,
+    relay: Option<String>,
+    token: Option<String>,
+    fingerprint: Option<String>,
+    trust: Option<String>,
+    explicit_identity: bool,
+) -> Result<ClientSettings> {
     let file = load_file(config_dir).unwrap_or_default();
     let mut relay = nonempty(relay).or(nonempty(file.relay)).unwrap_or_default();
-    let token = nonempty(token).or(nonempty(file.token)).ok_or_else(|| {
-        Error::Message(
-            "admin token missing (pass --token, set AGENTLINK_TOKEN, or run `agentlink login`)"
-                .into(),
-        )
-    })?;
+    let token = if explicit_identity {
+        nonempty(token).unwrap_or_default()
+    } else {
+        nonempty(token).or(nonempty(file.token)).ok_or_else(|| {
+            Error::Message(
+                "admin token missing (pass --token, set AGENTLINK_TOKEN, or run `agentlink login`)"
+                    .into(),
+            )
+        })?
+    };
     let fingerprint = relay_pin_source(
         nonempty(fingerprint),
         nonempty(std::env::var("AGENTLINK_RELAY_PIN").ok()),
@@ -251,15 +284,23 @@ pub fn relay_pin_source(
         .unwrap_or_default()
 }
 
-/// True when the relay is checked only by a public CA, with no leaf or SPKI pin.
-pub fn ca_only_trust(fingerprint: &str, trust: Option<&str>) -> bool {
-    if !fingerprint.trim().is_empty() {
-        return false;
-    }
+fn is_ca_trust_mode(value: &str) -> bool {
     matches!(
-        trust.map(str::trim),
-        Some("system") | Some("webpki") | Some("system+webpki") | Some("webpki+system")
+        value.trim().to_ascii_lowercase().as_str(),
+        "system" | "webpki" | "system+webpki" | "webpki+system"
     )
+}
+
+/// True when the relay is checked only by a public CA, with no leaf or SPKI pin.
+///
+/// Also handles the legacy case where `"webpki"` / `"system"` is stored in
+/// `fingerprint` rather than `trust`.
+pub fn ca_only_trust(fingerprint: &str, trust: Option<&str>) -> bool {
+    let fp = fingerprint.trim();
+    if !fp.is_empty() {
+        return is_ca_trust_mode(fp);
+    }
+    trust.is_some_and(is_ca_trust_mode)
 }
 
 /// Warning for a CA-only relay. Node-id pins still have to be checked separately.
@@ -401,5 +442,95 @@ mod tests {
         assert_eq!(loaded.access_expires_unix, Some(9_999));
         // Never assert or print token values beyond equality above.
         assert!(session_lock_path(dir.path()).is_file());
+    }
+
+    #[test]
+    fn sec20_ca_only_trust_detects_trust_modes_stored_in_fingerprint() {
+        assert!(ca_only_trust("webpki", None));
+        assert!(ca_only_trust("system", None));
+        assert!(ca_only_trust("SYSTEM+WEBPKI", None));
+        assert!(ca_only_warning("webpki", None).is_some());
+        assert!(ca_only_warning("system", None).is_some());
+        let pin = format!("sha256:{}", "ab".repeat(32));
+        assert!(!ca_only_trust(&pin, Some("webpki")));
+        assert!(ca_only_warning(&pin, Some("webpki")).is_none());
+    }
+
+    #[test]
+    fn ux08_load_settings_for_identity_allows_tokenless_auth_and_skips_saved_operator_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = format!("sha256:{}", "ab".repeat(32));
+        // Empty config dir: normal load_settings fails without token, explicit_identity succeeds.
+        assert!(load_settings(
+            dir.path(),
+            Some("wss://relay.example:7443".into()),
+            None,
+            Some(fp.clone()),
+            None,
+        )
+        .is_err());
+        let id_settings = load_settings_for_identity(
+            dir.path(),
+            Some("wss://relay.example:7443".into()),
+            None,
+            Some(fp.clone()),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(id_settings.token, "");
+        assert_eq!(id_settings.relay, "wss://relay.example:7443");
+
+        // Even when an operator token is saved in config.json, explicit_identity must not load it.
+        save_settings(
+            dir.path(),
+            &ClientSettings {
+                relay: "wss://relay.example:7443".into(),
+                token: "saved-operator-token".into(),
+                fingerprint: fp.clone(),
+                trust: None,
+            },
+        )
+        .unwrap();
+        let id_settings2 =
+            load_settings_for_identity(dir.path(), None, None, None, None, true).unwrap();
+        assert_eq!(id_settings2.token, "");
+        assert_eq!(id_settings2.relay, "wss://relay.example:7443");
+        assert_eq!(id_settings2.fingerprint, fp);
+
+        // Passing an explicit token still wins when provided.
+        let with_tok = load_settings_for_identity(
+            dir.path(),
+            None,
+            Some("explicit-tok".into()),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(with_tok.token, "explicit-tok");
+    }
+
+    #[test]
+    fn ux06_aliases_and_default_node_survive_session_and_settings_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = FileConfig::default();
+        cfg.aliases.insert("prod".into(), "abcdef0123456789".into());
+        cfg.default_node = Some("prod".into());
+        save_file(dir.path(), &cfg).unwrap();
+
+        let settings = ClientSettings {
+            relay: "wss://relay.example:7443".into(),
+            token: "tok".into(),
+            fingerprint: format!("sha256:{}", "cd".repeat(32)),
+            trust: None,
+        };
+        save_session(dir.path(), &settings, "alice", "ref", 12_345).unwrap();
+        let loaded = load_file(dir.path()).unwrap();
+        assert_eq!(
+            loaded.aliases.get("prod").map(String::as_str),
+            Some("abcdef0123456789")
+        );
+        assert_eq!(loaded.default_node.as_deref(), Some("prod"));
     }
 }

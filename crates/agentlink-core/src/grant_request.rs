@@ -165,6 +165,9 @@ pub fn list_requests(data_dir: &Path) -> Result<Vec<AccessRequest>> {
 }
 
 pub fn load_request(data_dir: &Path, request_id: &str) -> Result<Option<AccessRequest>> {
+    if !is_request_id(request_id) {
+        return Err(Error::Message("invalid request id".into()));
+    }
     let path = request_path(data_dir, request_id);
     if !path.exists() {
         return Ok(None);
@@ -241,7 +244,7 @@ pub fn resolve_allow_scope(
         Some(p) if p.is_subset_of(requested) => p,
         Some(_) => {
             return Err(Error::Message(
-                "目标机可以缩小权限，但不能加大（例如把 read-only 改成 desktop/exec）。".into(),
+                "the target node may narrow permissions, but cannot widen them (for example, changing read-only to desktop/exec)".into(),
             ))
         }
         None => requested,
@@ -250,7 +253,7 @@ pub fn resolve_allow_scope(
         Some(t) if t > 0 && t <= requested_ttl => t,
         Some(_) => {
             return Err(Error::Message(
-                "目标机可以缩短有效期，但不能延长请求里的 ttl。请求 ttl 只约束这份待批，并不强迫目标机授权。".into(),
+                "the target node may shorten the grant lifetime, but cannot extend the requested ttl".into(),
             ))
         }
         None => requested_ttl,
@@ -580,11 +583,20 @@ mod tests {
         let err = resolve_allow_scope(NodePolicy::exec(), 600, Some(NodePolicy::desktop()), None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("不能加大"), "{err}");
+        assert!(err.contains("cannot widen"), "{err}");
         let err = resolve_allow_scope(req, 600, None, Some(3600))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("不能延长"), "{err}");
+        assert!(err.contains("cannot extend"), "{err}");
+    }
+
+    #[test]
+    fn sec20_load_request_rejects_path_traversal_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["../node", "..\\node", "a/b", "a\\b", "", "req.json"] {
+            let err = load_request(dir.path(), bad).unwrap_err().to_string();
+            assert!(err.contains("invalid request id"), "bad={bad}: {err}");
+        }
     }
 
     #[test]

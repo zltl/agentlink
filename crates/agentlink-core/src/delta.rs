@@ -9,11 +9,13 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::protocol::{BlockSig, ByteRange, PlanOp, SigTable};
 use crate::sparse;
 
 pub const DELTA_MIN_SIZE: u64 = 128 * 1024;
+/// Maximum file size eligible for block-delta signature/plan computation (256 MiB).
+pub const DELTA_MAX_SIZE: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_BLOCK: usize = 64 * 1024;
 
 const MOD: u32 = 65521;
@@ -148,11 +150,57 @@ pub fn signatures(data: &[u8], block: usize) -> SigTable {
     }
 }
 
+/// Stream block signatures from `path` in `block`-byte chunks without reading
+/// the entire file into memory. Enforces [`DELTA_MAX_SIZE`] (256 MiB).
 pub fn signatures_file(path: &Path, block: usize) -> Result<SigTable> {
+    signatures_file_capped(path, block, DELTA_MAX_SIZE)
+}
+
+pub(crate) fn signatures_file_capped(path: &Path, block: usize, max_size: u64) -> Result<SigTable> {
+    let block = block.max(1);
     let mut file = File::open(path)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-    Ok(signatures(&data, block))
+    let meta_len = file.metadata()?.len();
+    if meta_len > max_size {
+        return Err(Error::Message(format!(
+            "file size {meta_len} exceeds {max_size} byte delta signature cap"
+        )));
+    }
+    let mut sigs = Vec::new();
+    let mut buf = vec![0u8; block];
+    let mut off = 0u64;
+    loop {
+        let mut filled = 0usize;
+        while filled < block {
+            match file.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if filled < block {
+            break;
+        }
+        let next_off = off
+            .checked_add(block as u64)
+            .ok_or_else(|| Error::Message("delta file offset overflow".into()))?;
+        if next_off > max_size {
+            return Err(Error::Message(format!(
+                "file grew past {max_size} byte delta signature cap while hashing"
+            )));
+        }
+        sigs.push(BlockSig {
+            off,
+            len: block as u32,
+            weak: adler32(&buf),
+            strong: strong16(&buf),
+        });
+        off = next_off;
+    }
+    Ok(SigTable {
+        block: block as u32,
+        sigs,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +436,34 @@ mod tests {
         let path = dir.path().join("empty");
         std::fs::write(&path, b"").unwrap();
         assert_eq!(hash_file(&path).unwrap(), hash_bytes(b""));
+    }
+
+    #[test]
+    fn ux12_signatures_file_streams_identically_and_enforces_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.bin");
+        let data: Vec<u8> = (0..150_000usize).map(|i| ((i * 31) % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let streamed = signatures_file(&path, 8_192).unwrap();
+        let in_mem = signatures(&data, 8_192);
+        assert_eq!(streamed.block, in_mem.block);
+        assert_eq!(streamed.sigs.len(), in_mem.sigs.len());
+        for (a, b) in streamed.sigs.iter().zip(in_mem.sigs.iter()) {
+            assert_eq!((a.off, a.len, a.weak, &a.strong), (b.off, b.len, b.weak, &b.strong));
+        }
+
+        // Enforcing cap rejects oversized files without reading them into RAM.
+        let err = signatures_file_capped(&path, 8_192, 65_536)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("delta signature cap"), "{err}");
+
+        // Sparse file > DELTA_MAX_SIZE (256 MiB) is rejected immediately via metadata cap.
+        let huge = dir.path().join("huge.bin");
+        let f = File::create(&huge).unwrap();
+        f.set_len(DELTA_MAX_SIZE + 1).unwrap();
+        drop(f);
+        assert!(signatures_file(&huge, DEFAULT_BLOCK).is_err());
     }
 }
 

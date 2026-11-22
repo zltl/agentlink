@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -261,8 +261,8 @@ impl S3Client {
     }
 
     pub fn put(&self, key: &str, body: &[u8], content_type: &str) -> Result<()> {
-        let body = maybe_encrypt(&self.config, body)?;
         let key = full_key(&self.config, key);
+        let body = maybe_encrypt(&self.config, &key, body)?;
         let (url, host, canonical_uri) = self.location(&key)?;
         let payload_hash = sha256_hex(&body);
         let now = amz_now();
@@ -387,7 +387,7 @@ impl S3Client {
             .bytes()
             .map_err(|e| Error::Message(format!("s3 get: {e}")))?
             .to_vec();
-        maybe_decrypt(&self.config, &bytes)
+        maybe_decrypt(&self.config, &key, &bytes)
     }
 
     pub fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -717,16 +717,39 @@ fn xml_tags(xml: &str, tag: &str) -> Vec<String> {
 
 const CSE_MAGIC: &[u8] = b"AGLKCSE1";
 
-fn maybe_encrypt(config: &S3Config, body: &[u8]) -> Result<Vec<u8>> {
-    let Some(key) = client_key(config)? else {
+fn cse_aad(bucket: &str, full_key: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(bucket.len() + 1 + full_key.len());
+    aad.extend_from_slice(bucket.as_bytes());
+    aad.push(b'/');
+    aad.extend_from_slice(full_key.as_bytes());
+    aad
+}
+
+fn zeroize_key(key: &mut [u8; 32]) {
+    for b in key.iter_mut() {
+        *b = std::hint::black_box(0);
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+fn maybe_encrypt(config: &S3Config, full_key: &str, body: &[u8]) -> Result<Vec<u8>> {
+    let Some(mut key) = client_key(config)? else {
         return Ok(body.to_vec());
     };
     let cipher = Aes256Gcm::new((&key).into());
+    zeroize_key(&mut key);
     let mut nonce_bytes = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
+    let aad = cse_aad(&config.bucket, full_key);
     let ct = cipher
-        .encrypt(nonce, body)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: body,
+                aad: &aad,
+            },
+        )
         .map_err(|_| Error::Message("client-side encryption failed".into()))?;
     let mut out = Vec::with_capacity(CSE_MAGIC.len() + 12 + ct.len());
     out.extend_from_slice(CSE_MAGIC);
@@ -735,17 +758,28 @@ fn maybe_encrypt(config: &S3Config, body: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn maybe_decrypt(config: &S3Config, body: &[u8]) -> Result<Vec<u8>> {
-    let Some(key) = client_key(config)? else {
+fn maybe_decrypt(config: &S3Config, full_key: &str, body: &[u8]) -> Result<Vec<u8>> {
+    let Some(mut key) = client_key(config)? else {
         return Ok(body.to_vec());
     };
     if body.len() < CSE_MAGIC.len() + 12 + 16 || !body.starts_with(CSE_MAGIC) {
-        return Ok(body.to_vec());
+        zeroize_key(&mut key);
+        return Err(Error::Message(
+            "client-side decryption failed: missing or truncated AGLKCSE1 envelope".into(),
+        ));
     }
     let nonce = Nonce::from_slice(&body[CSE_MAGIC.len()..CSE_MAGIC.len() + 12]);
     let cipher = Aes256Gcm::new((&key).into());
+    zeroize_key(&mut key);
+    let aad = cse_aad(&config.bucket, full_key);
     cipher
-        .decrypt(nonce, &body[CSE_MAGIC.len() + 12..])
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &body[CSE_MAGIC.len() + 12..],
+                aad: &aad,
+            },
+        )
         .map_err(|_| Error::Message("client-side decryption failed".into()))
 }
 
@@ -1030,5 +1064,52 @@ mod tests {
         let mut out = head.into_bytes();
         out.extend_from_slice(body);
         out
+    }
+
+    #[test]
+    fn sec17_cse_fails_closed_on_plaintext_and_binds_bucket_and_key_in_aad() {
+        std::env::set_var(
+            "AGENTLINK_TEST_S3_SEC17_KEY",
+            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff",
+        );
+        let config = S3Config {
+            endpoint: "http://127.0.0.1:9".into(),
+            region: "us-east-1".into(),
+            bucket: "audit-bucket".into(),
+            prefix: "pfx".into(),
+            path_style: true,
+            credentials: "env".into(),
+            credential_file: None,
+            profile: None,
+            sse: String::new(),
+            client_key_env: "AGENTLINK_TEST_S3_SEC17_KEY".into(),
+        };
+
+        // 1. Plaintext downgrade (no AGLKCSE1 magic) must fail closed.
+        let err = maybe_decrypt(&config, "pfx/logs/a.jsonl", b"forged plaintext audit").unwrap_err();
+        assert!(err.to_string().contains("AGLKCSE1"), "{err}");
+
+        // 2. Truncated AGLKCSE1 payload must fail closed.
+        let err = maybe_decrypt(&config, "pfx/logs/a.jsonl", b"AGLKCSE1short").unwrap_err();
+        assert!(err.to_string().contains("AGLKCSE1"), "{err}");
+
+        // 3. Ciphertext encrypted under key A succeeds for key A, fails for key B (object swap).
+        let ct = maybe_encrypt(&config, "pfx/logs/a.jsonl", b"secret-audit-line").unwrap();
+        assert_eq!(
+            maybe_decrypt(&config, "pfx/logs/a.jsonl", &ct).unwrap(),
+            b"secret-audit-line"
+        );
+        assert!(
+            maybe_decrypt(&config, "pfx/logs/b.jsonl", &ct).is_err(),
+            "swapping ciphertext to a different S3 key must fail AAD authentication"
+        );
+
+        // 4. Ciphertext moved to a different bucket must also fail AAD authentication.
+        let mut other_bucket = config.clone();
+        other_bucket.bucket = "other-bucket".into();
+        assert!(
+            maybe_decrypt(&other_bucket, "pfx/logs/a.jsonl", &ct).is_err(),
+            "swapping ciphertext to a different bucket must fail AAD authentication"
+        );
     }
 }

@@ -39,9 +39,15 @@ const UNARY_TIMEOUT: Duration = Duration::from_secs(120);
 /// enough to ride out a transient relay TLS handshake flap.
 const INITIAL_CONNECT_GIVE_UP: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RouteBinding {
+    pub(crate) node_id: String,
+    pub(crate) requires_e2e: bool,
+}
+
 struct PendingGuard {
     map: Arc<Mutex<HashMap<String, PendingSender>>>,
-    routes: Arc<Mutex<HashMap<String, String>>>,
+    routes: Arc<Mutex<HashMap<String, RouteBinding>>>,
     id: String,
 }
 
@@ -100,7 +106,7 @@ pub(crate) struct ClientInner {
     pub(crate) direct_id: OnceLock<crate::identity::Identity>,
     pub(crate) quic: Mutex<Option<Arc<crate::p2p::QuicPeer>>>,
     pub(crate) e2e: crate::e2e::Endpoint,
-    pub(crate) routes: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) routes: Arc<Mutex<HashMap<String, RouteBinding>>>,
     pub(crate) gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Stable across relay restarts. Paired with per-request cursors.
     session_id: String,
@@ -128,8 +134,21 @@ pub(crate) struct ClientInner {
 impl ClientInner {
     pub(crate) fn note_route(&self, request_id: &str, node_id: &str) {
         if let Ok(mut map) = self.routes.lock() {
-            map.insert(request_id.to_string(), node_id.to_string());
+            map.insert(
+                request_id.to_string(),
+                RouteBinding {
+                    node_id: node_id.to_string(),
+                    requires_e2e: true,
+                },
+            );
         }
+    }
+
+    pub(crate) fn route_node_id(&self, request_id: &str) -> Option<String> {
+        self.routes
+            .lock()
+            .ok()
+            .and_then(|map| map.get(request_id).map(|b| b.node_id.clone()))
     }
 
     pub(crate) fn forget_pty_stream(&self, request_id: &str) {
@@ -344,7 +363,19 @@ impl PtySession {
             .send(ws::encode(&session_env)?)
             .await
             .map_err(|_| Error::Message("connection closed".into()))?;
-        let out = seal_now(&self.inner, &self.node_id, &self.client_id, &env)?;
+        let out = match seal_now(&self.inner, &self.node_id, &self.client_id, &env) {
+            Ok(out) => out,
+            Err(Error::Protocol(msg))
+                if msg.contains("no e2e session") || msg.contains("counter exhausted") =>
+            {
+                if msg.contains("counter exhausted") {
+                    self.inner.e2e.forget(&self.node_id);
+                }
+                ensure_e2e(&self.inner, &self.node_id, &self.client_id).await?;
+                seal_now(&self.inner, &self.node_id, &self.client_id, &env)?
+            }
+            Err(err) => return Err(err),
+        };
         self.inner
             .tx
             .send(out)
@@ -742,7 +773,19 @@ impl PtyWriter {
                 user: None,
                 device_id: None,
             };
-            let out = seal_now(&self.inner, &self.node_id, &self.client_id, &env)?;
+            let out = match seal_now(&self.inner, &self.node_id, &self.client_id, &env) {
+            Ok(out) => out,
+            Err(Error::Protocol(msg))
+                if msg.contains("no e2e session") || msg.contains("counter exhausted") =>
+            {
+                if msg.contains("counter exhausted") {
+                    self.inner.e2e.forget(&self.node_id);
+                }
+                ensure_e2e(&self.inner, &self.node_id, &self.client_id).await?;
+                seal_now(&self.inner, &self.node_id, &self.client_id, &env)?
+            }
+            Err(err) => return Err(err),
+        };
             self.inner
                 .tx
                 .send(out)
@@ -1987,7 +2030,7 @@ impl Client {
         }
     }
 
-    async fn cancel(&self, node_id: &str, request_id: &str) -> Result<()> {
+    pub(crate) async fn cancel(&self, node_id: &str, request_id: &str) -> Result<()> {
         self.send(&Envelope::Cancel {
             request_id: request_id.to_string(),
             node_id: node_id.to_string(),
@@ -2080,8 +2123,12 @@ impl Client {
             self.inner.note_route(id, &node_id);
         }
         match crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env) {
-            Err(Error::Protocol(msg)) if msg.contains("counter exhausted") => {
-                self.inner.e2e.forget(&node_id);
+            Err(Error::Protocol(msg))
+                if msg.contains("counter exhausted") || msg.contains("no e2e session") =>
+            {
+                if msg.contains("counter exhausted") {
+                    self.inner.e2e.forget(&node_id);
+                }
                 self.ensure_e2e(&node_id).await?;
                 crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env)
             }
@@ -2543,37 +2590,99 @@ pub(crate) async fn ensure_e2e(
     if inner.e2e.has(node_id) {
         return Ok(());
     }
-    let pending_hello = inner.e2e.client_hello(node_id)?;
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let (wait_tx, rx) = pending::channel();
+    let pending_v2 = inner.e2e.client_hello_v2(node_id)?;
+    let req_v2 = uuid::Uuid::new_v4().to_string();
+    let (wait_tx_v2, rx_v2) = pending::channel();
     {
         let mut map = inner
             .pending
             .lock()
             .map_err(|_| Error::Message("client lock poisoned".into()))?;
-        map.insert(request_id.clone(), wait_tx);
+        map.insert(req_v2.clone(), wait_tx_v2);
     }
-    let _drop = PendingGuard::new(inner, request_id.clone());
-    let hello = Envelope::E2eHello {
-        request_id: request_id.clone(),
+    let _drop_v2 = PendingGuard::new(inner, req_v2.clone());
+    let hello_v2 = Envelope::E2eHello {
+        request_id: req_v2.clone(),
         node_id: node_id.to_string(),
-        message_b64: crate::util::b64_encode(crate::e2e::Endpoint::hello_bytes(&pending_hello)),
+        message_b64: crate::util::b64_encode(crate::e2e::Endpoint::hello_bytes(&pending_v2)),
     };
     let _ = client_id;
     inner
         .tx
-        .send(ws::encode(&hello)?)
+        .send(ws::encode(&hello_v2)?)
         .await
         .map_err(|_| Error::Message("connection closed".into()))?;
-    let welcome = timeout(Duration::from_secs(15), rx.recv())
+    match timeout(Duration::from_secs(2), rx_v2.recv()).await {
+        Ok(Some(Envelope::E2eWelcome { message_b64, .. })) => {
+            let bytes = crate::util::b64_decode(&message_b64)?;
+            inner.e2e.complete(pending_v2, &bytes)?;
+            tracing::debug!(%node_id, "e2e handshake complete (frame_aad_v2)");
+            return Ok(());
+        }
+        Ok(Some(Envelope::Result {
+            ok: false, error, ..
+        })) => {
+            return Err(Error::Message(
+                error.unwrap_or_else(|| "e2e handshake failed".into()),
+            ));
+        }
+        Ok(Some(other)) => {
+            return Err(Error::Protocol(format!(
+                "expected e2e welcome, got {}",
+                kind(&other)
+            )));
+        }
+        Ok(None) => return Err(Error::Message("connection closed".into())),
+        Err(_) => {
+            tracing::debug!(
+                %node_id,
+                "no v2 e2e welcome within 2s; falling back to v1 hello for rolling-upgrade interop"
+            );
+        }
+    }
+    let pending_v1 = inner.e2e.client_hello(node_id)?;
+    let req_v1 = uuid::Uuid::new_v4().to_string();
+    let (wait_tx_v1, rx_v1) = pending::channel();
+    {
+        let mut map = inner
+            .pending
+            .lock()
+            .map_err(|_| Error::Message("client lock poisoned".into()))?;
+        map.insert(req_v1.clone(), wait_tx_v1);
+    }
+    let _drop_v1 = PendingGuard::new(inner, req_v1.clone());
+    let hello_v1 = Envelope::E2eHello {
+        request_id: req_v1.clone(),
+        node_id: node_id.to_string(),
+        message_b64: crate::util::b64_encode(crate::e2e::Endpoint::hello_bytes(&pending_v1)),
+    };
+    inner
+        .tx
+        .send(ws::encode(&hello_v1)?)
         .await
-        .map_err(|_| Error::Timeout)?
-        .ok_or_else(|| Error::Message("connection closed".into()))?;
+        .map_err(|_| Error::Message("connection closed".into()))?;
+    let (is_v2, welcome) = match timeout(Duration::from_secs(13), async {
+        tokio::select! {
+            res = rx_v2.recv() => (true, res),
+            res = rx_v1.recv() => (false, res),
+        }
+    })
+    .await
+    .map_err(|_| Error::Timeout)?
+    {
+        (is_v2, Some(env)) => (is_v2, env),
+        (_, None) => return Err(Error::Message("connection closed".into())),
+    };
     match welcome {
         Envelope::E2eWelcome { message_b64, .. } => {
             let bytes = crate::util::b64_decode(&message_b64)?;
-            inner.e2e.complete(pending_hello, &bytes)?;
-            tracing::debug!(%node_id, "e2e handshake complete");
+            if is_v2 {
+                inner.e2e.complete(pending_v2, &bytes)?;
+                tracing::debug!(%node_id, "e2e handshake complete (frame_aad_v2)");
+            } else {
+                inner.e2e.complete(pending_v1, &bytes)?;
+                tracing::debug!(%node_id, "e2e handshake complete (v1 fallback)");
+            }
             Ok(())
         }
         Envelope::Result {
@@ -2597,23 +2706,105 @@ fn seal_now(
     if let Some(id) = env.request_id() {
         inner.note_route(id, node_id);
     }
-    if inner.e2e.has(node_id) {
-        let wrapped = crate::e2e::seal_envelope(&inner.e2e, node_id, node_id, client_id, env)?;
-        return ws::encode(&wrapped);
+    if !inner.e2e.has(node_id) {
+        return Err(Error::Protocol(format!(
+            "no e2e session for {node_id}; refusing plaintext fallback"
+        )));
     }
-    ws::encode(env)
+    let wrapped = crate::e2e::seal_envelope(&inner.e2e, node_id, node_id, client_id, env)?;
+    ws::encode(&wrapped)
 }
 
-fn unwrap_client(endpoint: &crate::e2e::Endpoint, env: Envelope) -> Envelope {
-    let Envelope::E2e { node_id, .. } = &env else {
-        return env;
-    };
-    let peer = node_id.clone();
-    match crate::e2e::open_sealed(endpoint, &peer, env) {
-        Ok(inner) => inner,
-        Err(err) => {
-            tracing::warn!(error = %err, "e2e open failed");
-            Envelope::Ping
+fn unwrap_client(
+    endpoint: &crate::e2e::Endpoint,
+    routes: &Mutex<HashMap<String, RouteBinding>>,
+    env: Envelope,
+) -> Envelope {
+    match env {
+        Envelope::E2e {
+            ref request_id,
+            ref node_id,
+            ..
+        } => {
+            let expected = routes
+                .lock()
+                .ok()
+                .and_then(|map| map.get(request_id).cloned());
+            if let Some(binding) = &expected {
+                if binding.node_id != *node_id {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        expected_node = %binding.node_id,
+                        actual_node = %node_id,
+                        "dropping cross-node e2e response"
+                    );
+                    return Envelope::Ping;
+                }
+            }
+            let peer = expected
+                .as_ref()
+                .map(|b| b.node_id.clone())
+                .unwrap_or_else(|| node_id.clone());
+            let outer_req_id = request_id.clone();
+            match crate::e2e::open_sealed(endpoint, &peer, env) {
+                Ok(inner) => {
+                    if inner.request_id() != Some(outer_req_id.as_str()) {
+                        tracing::warn!(
+                            outer_request_id = %outer_req_id,
+                            inner_request_id = inner.request_id().unwrap_or(""),
+                            "dropping e2e response with mismatched inner request_id"
+                        );
+                        return Envelope::Ping;
+                    }
+                    inner
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "e2e open failed");
+                    Envelope::Ping
+                }
+            }
+        }
+        other => {
+            let requires_e2e = other
+                .request_id()
+                .and_then(|id| {
+                    routes
+                        .lock()
+                        .ok()
+                        .and_then(|map| map.get(id).map(|b| b.requires_e2e))
+                })
+                .unwrap_or(false);
+            if !requires_e2e {
+                return other;
+            }
+            // For E2E-tracked node requests, drop any unsealed plaintext data,
+            // success, chunk, end, or transfer envelope. Allow ONLY strictly
+            // non-data relay transport errors (`Result { ok: false, body: None }`).
+            match other {
+                Envelope::Result {
+                    request_id,
+                    ok: false,
+                    body: None,
+                    error,
+                    seq,
+                    terminal,
+                } => Envelope::Result {
+                    request_id,
+                    ok: false,
+                    body: None,
+                    error,
+                    seq,
+                    terminal,
+                },
+                rejected => {
+                    tracing::warn!(
+                        kind = kind(&rejected),
+                        request_id = rejected.request_id().unwrap_or(""),
+                        "dropping unsealed plaintext response for e2e-tracked request"
+                    );
+                    Envelope::Ping
+                }
+            }
         }
     }
 }
@@ -2685,15 +2876,19 @@ mod tests {
     fn pending_guard_drop_clears_unary_routes() {
         let pending: Arc<Mutex<HashMap<String, PendingSender>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let routes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let routes: Arc<Mutex<HashMap<String, RouteBinding>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let id = "req-unary".to_string();
         {
             let (tx, _rx) = pending::channel();
             pending.lock().unwrap().insert(id.clone(), tx);
-            routes
-                .lock()
-                .unwrap()
-                .insert(id.clone(), "node-a".into());
+            routes.lock().unwrap().insert(
+                id.clone(),
+                RouteBinding {
+                    node_id: "node-a".into(),
+                    requires_e2e: true,
+                },
+            );
             let _guard = PendingGuard {
                 map: pending.clone(),
                 routes: routes.clone(),
@@ -3404,9 +3599,7 @@ async fn run_socket(
                         }
                         Ok(Incoming::Binary(bytes)) => {
                             let id = crate::frame::request_id(&bytes);
-                            let peer = id.as_ref().and_then(|id| {
-                                inner.routes.lock().ok().and_then(|map| map.get(id).cloned())
-                            });
+                            let peer = id.as_ref().and_then(|id| inner.route_node_id(id));
                             match peer {
                                 Some(peer) => {
                                     match crate::e2e::open_bound_frame(&inner.e2e, &peer, &bytes) {
@@ -3469,10 +3662,10 @@ fn session_frames(inner: &ClientInner) -> Vec<Envelope> {
         .unwrap_or_default();
     let mut by_node: HashMap<String, Vec<crate::protocol::SessionCursor>> = HashMap::new();
     for cursor in cursors {
-        let Some(node) = routes.get(&cursor.request_id) else {
+        let Some(binding) = routes.get(&cursor.request_id) else {
             continue;
         };
-        by_node.entry(node.clone()).or_default().push(cursor);
+        by_node.entry(binding.node_id.clone()).or_default().push(cursor);
     }
     if let Ok(inflight) = inner.inflight.lock() {
         for env in inflight.values() {
@@ -3579,7 +3772,10 @@ fn close_orphan_pty_best_effort(
 }
 
 fn take_ready(inner: &Arc<ClientInner>, env: Envelope) -> Vec<Envelope> {
-    let env = unwrap_client(&inner.e2e, env);
+    let env = unwrap_client(&inner.e2e, &inner.routes, env);
+    if matches!(env, Envelope::Ping) {
+        return Vec::new();
+    }
     if let Envelope::Result {
         ok: false,
         error: Some(message),
@@ -3590,12 +3786,7 @@ fn take_ready(inner: &Arc<ClientInner>, env: Envelope) -> Vec<Envelope> {
         if crate::resume::is_transient_message(message) {
             let lower = message.to_ascii_lowercase();
             if lower.contains("e2e session reset") {
-                if let Some(node) = inner
-                    .routes
-                    .lock()
-                    .ok()
-                    .and_then(|routes| routes.get(request_id).cloned())
-                {
+                if let Some(node) = inner.route_node_id(request_id) {
                     inner.e2e.forget(&node);
                 }
             }
@@ -4593,5 +4784,200 @@ mod session_maintain_tests {
             &out2[0],
             Envelope::Result { ok: false, error: Some(msg), .. } if msg.contains("too many concurrent pty sessions")
         ));
+    }
+
+    fn make_test_inner(client_ep: crate::e2e::Endpoint) -> (Arc<ClientInner>, mpsc::Receiver<Outbound>) {
+        let (tx, rx) = mpsc::channel(16);
+        let inner = Arc::new(ClientInner {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            binary: Arc::new(Mutex::new(HashMap::new())),
+            alive: Arc::new(AtomicBool::new(true)),
+            socket_gen: std::sync::atomic::AtomicU64::new(1),
+            shutdown: CancellationToken::new(),
+            relay_addr: None,
+            direct_id: OnceLock::new(),
+            quic: Mutex::new(None),
+            e2e: client_ep,
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            gates: Mutex::new(HashMap::new()),
+            session_id: "sess-sec".into(),
+            inflight: Mutex::new(HashMap::new()),
+            cursors: Mutex::new(crate::resume::Cursors::default()),
+            pty_streams: Mutex::new(HashMap::new()),
+            transfers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            grant_dir: Arc::new(Mutex::new(None)),
+            session_dir: Arc::new(Mutex::new(None)),
+            resend: Notify::new(),
+            fast: AtomicBool::new(false),
+            transport: crate::transport_status::TransportObserver::new(),
+            offline_since: Mutex::new(HashMap::new()),
+            write_hook: Mutex::new(None),
+        });
+        (inner, rx)
+    }
+
+    #[test]
+    fn sec02_unwrap_client_drops_plaintext_and_cross_node_responses_for_e2e_routes() {
+        let client_ep = crate::e2e::Endpoint::new(crate::identity::Identity::generate());
+        let node_a = crate::e2e::Endpoint::new(crate::identity::Identity::generate());
+        let node_b = crate::e2e::Endpoint::new(crate::identity::Identity::generate());
+        for node in [&node_a, &node_b] {
+            let p = client_ep.client_hello_v2(node.peer_id()).unwrap();
+            let (_, w) = node.accept(crate::e2e::Endpoint::hello_bytes(&p)).unwrap();
+            client_ep.complete(p, &w).unwrap();
+        }
+        let (inner, _rx) = make_test_inner(client_ep);
+        let req_id = "req-e2e-1".to_string();
+        inner.note_route(&req_id, node_a.peer_id());
+
+        // 1. Plaintext Result { ok: true } must be dropped!
+        let spoof_ok = Envelope::result_ok(req_id.clone(), serde_json::json!({"stdout": "pwned"}));
+        assert!(matches!(
+            unwrap_client(&inner.e2e, &inner.routes, spoof_ok.clone()),
+            Envelope::Ping
+        ));
+        assert!(take_ready(&inner, spoof_ok).is_empty());
+
+        // 2. Plaintext Chunk must be dropped!
+        let spoof_chunk = Envelope::Chunk {
+            request_id: req_id.clone(),
+            stream: "stdout".into(),
+            data_b64: crate::util::b64_encode(b"injected"),
+            seq: 1,
+        };
+        assert!(matches!(
+            unwrap_client(&inner.e2e, &inner.routes, spoof_chunk),
+            Envelope::Ping
+        ));
+
+        // 3. Plaintext End must be dropped!
+        let spoof_end = Envelope::End {
+            request_id: req_id.clone(),
+            exit_code: Some(0),
+            error: None,
+            seq: 2,
+        };
+        assert!(matches!(
+            unwrap_client(&inner.e2e, &inner.routes, spoof_end),
+            Envelope::Ping
+        ));
+
+        // 4. Plaintext Transfer must be dropped!
+        let spoof_xfer = Envelope::Transfer {
+            request_id: req_id.clone(),
+            node_id: node_a.peer_id().into(),
+            client_id: inner.e2e.peer_id().into(),
+            terminal: false,
+            msg: crate::protocol::TransferMsg::Accept {
+                mode: crate::protocol::AcceptMode::Skip,
+            },
+            authz: None,
+        };
+        assert!(matches!(
+            unwrap_client(&inner.e2e, &inner.routes, spoof_xfer),
+            Envelope::Ping
+        ));
+
+        // 5. Plaintext Result { ok: false, body: Some(...) } must be dropped!
+        let spoof_err_with_body = Envelope::Result {
+            request_id: req_id.clone(),
+            ok: false,
+            body: Some(serde_json::json!({"smuggled": true})),
+            error: Some("err".into()),
+            seq: 0,
+            terminal: true,
+        };
+        assert!(matches!(
+            unwrap_client(&inner.e2e, &inner.routes, spoof_err_with_body),
+            Envelope::Ping
+        ));
+
+        // 6. Strictly non-data relay transport error (ok: false, body: None) IS allowed!
+        let relay_err = Envelope::result_err(req_id.clone(), "node offline: box");
+        assert!(matches!(
+            unwrap_client(&inner.e2e, &inner.routes, relay_err),
+            Envelope::Result { ok: false, body: None, .. }
+        ));
+
+        // 7. Cross-node sealed response from compromised Node B for Node A's request_id must be DROPPED!
+        let fake_inner = Envelope::result_ok(req_id.clone(), serde_json::json!({"from": "node_b"}));
+        let cross_sealed = crate::e2e::seal_envelope(
+            &node_b,
+            inner.e2e.peer_id(),
+            node_b.peer_id(),
+            inner.e2e.peer_id(),
+            &fake_inner,
+        )
+        .unwrap();
+        assert!(matches!(
+            unwrap_client(&inner.e2e, &inner.routes, cross_sealed),
+            Envelope::Ping
+        ));
+
+        // 8. Genuine sealed response from expected Node A opens cleanly!
+        let real_inner = Envelope::result_ok(req_id.clone(), serde_json::json!({"from": "node_a"}));
+        let real_sealed = crate::e2e::seal_envelope(
+            &node_a,
+            inner.e2e.peer_id(),
+            node_a.peer_id(),
+            inner.e2e.peer_id(),
+            &real_inner,
+        )
+        .unwrap();
+        assert!(matches!(
+            unwrap_client(&inner.e2e, &inner.routes, real_sealed),
+            Envelope::Result { ok: true, .. }
+        ));
+    }
+
+    #[test]
+    fn sec06_seal_now_fails_closed_when_e2e_session_missing_or_reset() {
+        let client_ep = crate::e2e::Endpoint::new(crate::identity::Identity::generate());
+        let node_ep = crate::e2e::Endpoint::new(crate::identity::Identity::generate());
+        let (inner, _rx) = make_test_inner(client_ep);
+        let env = Envelope::Invoke {
+            request_id: "pty-secret-1".into(),
+            node_id: node_ep.peer_id().into(),
+            client_id: inner.e2e.peer_id().into(),
+            op: Op::PtyInput {
+                session_id: "sid-1".into(),
+                data_b64: crate::util::b64_encode(b"super-secret-password\n"),
+            },
+            grant: None,
+            authz: None,
+            user: None,
+            device_id: None,
+        };
+
+        // Without an E2E session, seal_now MUST return Err (never plaintext ws::encode)!
+        let err = match seal_now(&inner, node_ep.peer_id(), inner.e2e.peer_id(), &env) {
+            Err(err) => err,
+            Ok(_) => panic!("seal_now must fail closed without an E2E session"),
+        };
+        assert!(err.to_string().contains("no e2e session"), "{err}");
+
+        // Complete handshake, then simulate relay sending plaintext "e2e session reset".
+        let p = inner.e2e.client_hello_v2(node_ep.peer_id()).unwrap();
+        let (_, w) = node_ep.accept(crate::e2e::Endpoint::hello_bytes(&p)).unwrap();
+        inner.e2e.complete(p, &w).unwrap();
+        let sealed_ok = seal_now(&inner, node_ep.peer_id(), inner.e2e.peer_id(), &env)
+            .expect("seal_now succeeds with active E2E session");
+        if let Outbound::Text(text) = sealed_ok {
+            assert!(!text.contains("super-secret-password"));
+            assert!(text.contains("\"type\":\"e2e\""));
+        } else {
+            panic!("expected text frame");
+        }
+
+        // Relay injects "e2e session reset": session is forgotten, and subsequent seal_now
+        // MUST fail closed instead of falling back to plaintext!
+        let reset = Envelope::result_err("pty-secret-1".to_string(), "e2e session reset");
+        let _ = take_ready(&inner, reset);
+        assert!(!inner.e2e.has(node_ep.peer_id()));
+        assert!(
+            seal_now(&inner, node_ep.peer_id(), inner.e2e.peer_id(), &env).is_err(),
+            "seal_now fell back to plaintext after e2e session reset!"
+        );
     }
 }

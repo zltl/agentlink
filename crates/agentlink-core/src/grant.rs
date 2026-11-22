@@ -842,6 +842,131 @@ pub fn delete_grant(config_dir: &Path, node_id: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// High-level local status of a stored [`SignedGrant`] for CLI / UI display (`LIVE-02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantStatus {
+    Active,
+    Expired,
+    NotYetValid,
+    GranteeMismatch,
+    NodeMismatch,
+}
+
+impl GrantStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Expired => "expired",
+            Self::NotYetValid => "not_yet_valid",
+            Self::GranteeMismatch => "grantee_mismatch",
+            Self::NodeMismatch => "node_mismatch",
+        }
+    }
+}
+
+/// True when `grant` is bound to `grantee_id` (case-insensitive, trimmed).
+pub fn grant_matches_grantee(grant: &SignedGrant, grantee_id: &str) -> bool {
+    !grantee_id.trim().is_empty()
+        && grant
+            .grantee_id
+            .trim()
+            .eq_ignore_ascii_case(grantee_id.trim())
+}
+
+/// Classify a stored grant against optional expected node/grantee identities and `now_unix`.
+pub fn grant_status(
+    grant: &SignedGrant,
+    expected_node_id: Option<&str>,
+    expected_grantee_id: Option<&str>,
+    now_unix: i64,
+) -> GrantStatus {
+    if let Some(node) = expected_node_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if !grant.node_id.trim().eq_ignore_ascii_case(node) {
+            return GrantStatus::NodeMismatch;
+        }
+    }
+    if let Some(grantee) = expected_grantee_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if !grant_matches_grantee(grant, grantee) {
+            return GrantStatus::GranteeMismatch;
+        }
+    }
+    if now_unix > grant.exp_unix {
+        return GrantStatus::Expired;
+    }
+    if now_unix < grant.nbf_unix {
+        return GrantStatus::NotYetValid;
+    }
+    GrantStatus::Active
+}
+
+/// Compact human-readable relative duration (e.g. `2d 3h`, `45m`, `12s`).
+pub fn format_relative_duration(secs: i64) -> String {
+    let abs = secs.unsigned_abs();
+    if abs < 60 {
+        return format!("{abs}s");
+    }
+    let mins = abs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 48 {
+        return if rem_mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {rem_mins}m")
+        };
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    if rem_hours == 0 {
+        format!("{days}d")
+    } else {
+        format!("{days}d {rem_hours}h")
+    }
+}
+
+fn short_hex_prefix(hex_id: &str) -> &str {
+    let trimmed = hex_id.trim();
+    let end = trimmed.floor_char_boundary(trimmed.len().min(12));
+    &trimmed[..end]
+}
+
+/// Render a human-friendly status summary for `grant list` / diagnostics (`LIVE-02`),
+/// surfacing expiry and grantee/node mismatches clearly.
+pub fn format_grant_status(
+    grant: &SignedGrant,
+    expected_node_id: Option<&str>,
+    expected_grantee_id: Option<&str>,
+    now_unix: i64,
+) -> String {
+    match grant_status(grant, expected_node_id, expected_grantee_id, now_unix) {
+        GrantStatus::Active => format!(
+            "active (expires in {})",
+            format_relative_duration(grant.exp_unix.saturating_sub(now_unix))
+        ),
+        GrantStatus::Expired => format!(
+            "expired ({} ago)",
+            format_relative_duration(now_unix.saturating_sub(grant.exp_unix))
+        ),
+        GrantStatus::NotYetValid => format!(
+            "not valid yet (in {})",
+            format_relative_duration(grant.nbf_unix.saturating_sub(now_unix))
+        ),
+        GrantStatus::GranteeMismatch => format!(
+            "grantee mismatch (bound to {}.., expected {}..)",
+            short_hex_prefix(&grant.grantee_id),
+            short_hex_prefix(expected_grantee_id.unwrap_or(""))
+        ),
+        GrantStatus::NodeMismatch => format!(
+            "node mismatch (bound to {}.., expected {}..)",
+            short_hex_prefix(&grant.node_id),
+            short_hex_prefix(expected_node_id.unwrap_or(""))
+        ),
+    }
+}
+
 /// Reject a grant that is bound to another node/grantee or outside its window.
 pub fn validate_grant_for(
     grant: &SignedGrant,
@@ -2011,5 +2136,74 @@ mod tests {
 
         // Empty jti cannot be signed in the first place.
         assert!(SignedRevoke::sign(&owner, node.public_hex(), "   ", now, now + 1).is_err());
+    }
+
+    #[test]
+    fn live02_grant_status_and_grantee_mismatch_helpers() {
+        let issuer = Identity::generate();
+        let node = Identity::generate();
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let now = 1_700_000_000;
+        let grant = SignedGrant::sign(
+            &issuer,
+            alice.public_hex(),
+            node.public_hex(),
+            NodePolicy::exec(),
+            now - 60,
+            now + 7500,
+            "jti-status",
+        )
+        .unwrap();
+
+        assert!(grant_matches_grantee(&grant, alice.public_hex()));
+        assert!(!grant_matches_grantee(&grant, bob.public_hex()));
+        assert_eq!(
+            grant_status(&grant, Some(node.public_hex()), Some(alice.public_hex()), now),
+            GrantStatus::Active
+        );
+        let active_str =
+            format_grant_status(&grant, Some(node.public_hex()), Some(alice.public_hex()), now);
+        assert!(active_str.contains("active"), "{active_str}");
+        assert!(active_str.contains("2h 5m"), "{active_str}");
+
+        assert_eq!(
+            grant_status(&grant, Some(node.public_hex()), Some(bob.public_hex()), now),
+            GrantStatus::GranteeMismatch
+        );
+        let mismatch_str =
+            format_grant_status(&grant, Some(node.public_hex()), Some(bob.public_hex()), now);
+        assert!(mismatch_str.contains("grantee mismatch"), "{mismatch_str}");
+
+        assert_eq!(
+            grant_status(&grant, Some(bob.public_hex()), Some(alice.public_hex()), now),
+            GrantStatus::NodeMismatch
+        );
+        assert_eq!(
+            grant_status(
+                &grant,
+                Some(node.public_hex()),
+                Some(alice.public_hex()),
+                now + 8000
+            ),
+            GrantStatus::Expired
+        );
+        let expired_str = format_grant_status(
+            &grant,
+            Some(node.public_hex()),
+            Some(alice.public_hex()),
+            now + 8000,
+        );
+        assert!(expired_str.contains("expired"), "{expired_str}");
+
+        assert_eq!(
+            grant_status(
+                &grant,
+                Some(node.public_hex()),
+                Some(alice.public_hex()),
+                now - 120
+            ),
+            GrantStatus::NotYetValid
+        );
     }
 }

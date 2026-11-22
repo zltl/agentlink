@@ -2039,18 +2039,28 @@ pub fn chain_hash(prev: &str, canonical_json: &str) -> String {
 }
 
 pub fn verify_chain(records: &[AuditRecord]) -> Result<()> {
-    let mut prev = "0".repeat(64);
-    for record in records {
-        if record.hash == "off" {
-            continue;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let genesis = "0".repeat(64);
+    let mut prev: Option<String> = None;
+    for (idx, record) in records.iter().enumerate() {
+        if record.hash == "off" || record.prev_hash == "off" || record.hash.is_empty() {
+            return Err(Error::Message(format!(
+                "audit chain disabled or missing hash at seq {}",
+                record.seq
+            )));
         }
-        if record.prev_hash != prev && record.seq != 1 && prev.chars().all(|c| c == '0') {
-            // A reader that starts mid-chain cannot confirm the link into the
-            // first record it sees. Later records must still connect.
-            prev = record.hash.clone();
-            continue;
-        }
-        if record.prev_hash != prev && record.seq > 1 {
+        if idx == 0 {
+            if record.seq == 1 && record.prev_hash != genesis {
+                return Err(Error::Message(format!(
+                    "audit chain genesis prev_hash mismatch at seq {}",
+                    record.seq
+                )));
+            }
+            // Even when starting mid-chain (`seq != 1`), always verify record 0's
+            // own hash against its `prev_hash` and canonical payload.
+        } else if prev.as_deref() != Some(record.prev_hash.as_str()) {
             return Err(Error::Message(format!(
                 "audit chain broke at seq {}",
                 record.seq
@@ -2063,7 +2073,7 @@ pub fn verify_chain(records: &[AuditRecord]) -> Result<()> {
                 record.seq
             )));
         }
-        prev = record.hash.clone();
+        prev = Some(record.hash.clone());
     }
     Ok(())
 }
@@ -2215,7 +2225,8 @@ fn text_diff(
     let diff = unified(path, &before, &after);
     let diff = redact.text(&diff);
     if diff.len() > cap {
-        Some(format!("{}[diff truncated]", &diff[..cap.min(diff.len())]))
+        let cut = diff.floor_char_boundary(cap.min(diff.len()));
+        Some(format!("{}[diff truncated]", &diff[..cut]))
     } else {
         Some(diff)
     }
@@ -2612,5 +2623,54 @@ mod tests {
         assert_eq!(page[0].op, "ok");
         // Reader buffer never retained the oversized line as a String.
         assert!(MAX_AUDIT_LINE_BYTES < body.len());
+    }
+
+    #[test]
+    fn sec14_verify_chain_checks_midchain_record0_and_rejects_hash_off() {
+        let policy = AuditPolicy::preset("minimal").unwrap();
+        let mut r1 = prepare(&policy, "n", "box", &event("exec", "exec"))
+            .unwrap()
+            .record;
+        assign_chain(&mut r1, 1, &"0".repeat(64), true);
+        let mut r2 = r1.clone();
+        r2.ts = "2026-01-01T00:00:01Z".into();
+        assign_chain(&mut r2, 2, &r1.hash, true);
+        let mut r3 = r2.clone();
+        r3.ts = "2026-01-01T00:00:02Z".into();
+        assign_chain(&mut r3, 3, &r2.hash, true);
+
+        // Valid mid-chain slice starting at seq 2 passes.
+        verify_chain(&[r2.clone(), r3.clone()]).unwrap();
+
+        // Tampering record 0 of a mid-chain slice MUST fail!
+        let mut tampered_r2 = r2.clone();
+        tampered_r2.op = "forged".into();
+        let err = verify_chain(&[tampered_r2, r3.clone()]).unwrap_err();
+        assert!(err.to_string().contains("hash mismatch"), "{err}");
+
+        // Forged `"hash": "off"` record inside a verified chain MUST fail!
+        let mut off_rec = r2.clone();
+        assign_chain(&mut off_rec, 2, &r1.hash, false);
+        assert!(verify_chain(&[off_rec]).is_err());
+
+        // Bad genesis prev_hash at seq 1 MUST fail.
+        let mut bad_genesis = r1.clone();
+        bad_genesis.prev_hash = "1".repeat(64);
+        bad_genesis.hash = chain_hash(&bad_genesis.prev_hash, &canonical(&bad_genesis));
+        assert!(verify_chain(&[bad_genesis]).is_err());
+    }
+
+    #[test]
+    fn sec20_text_diff_truncates_multibyte_utf8_without_panicking() {
+        let policy = AuditPolicy::preset("standard").unwrap();
+        let redact = Redactor::new(&policy.redact);
+        let before = "你好世界\n".repeat(4);
+        let after = "你好宇宙🚀\n".repeat(4);
+        // Pick a cap that lands in the middle of a multi-byte UTF-8 character in the diff.
+        for cap in 1..64 {
+            if let Some(out) = text_diff("doc.txt", before.as_bytes(), after.as_bytes(), cap, &redact) {
+                assert!(out.is_char_boundary(out.len()));
+            }
+        }
     }
 }

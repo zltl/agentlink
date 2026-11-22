@@ -26,8 +26,14 @@
 //! be rewritten, it is omitted and logged; the offer continues with any
 //! remaining STUN URLs (host-only if none remain).
 
-use std::net::{IpAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
 
 /// Public STUN servers used when `AGENTLINK_STUN_URLS` is unset.
 /// These reveal a reflexive address. They do not relay media through symmetric NAT.
@@ -334,7 +340,7 @@ where
 }
 
 /// Policy for [`stun_urls_ready_for_ice`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StunRewriteMode {
     /// Never DoH, never rewrite hostnames to literals. Literal RFC 2544
     /// destinations are still skipped.
@@ -475,18 +481,145 @@ where
     out
 }
 
-/// Default or env STUN URLs, prepared for the WebRTC stack under
-/// [`stun_rewrite_mode_from_env`].
-pub fn stun_urls_ready_for_ice() -> Vec<String> {
-    // reqwest::blocking (used by DoH) creates and drops its own runtime.
-    // Viewer::connect calls this from an async context, so the lookup
-    // must run on a regular thread.
+/// TTL for cached prepared STUN URL results so repeated connects do not repeat
+/// DNS/DoH round-trips or stall callers.
+pub const STUN_CACHE_TTL: Duration = Duration::from_secs(300);
+
+type StunCacheKey = (Vec<String>, StunRewriteMode);
+type StunCacheEntry = (Instant, Vec<String>);
+
+fn stun_cache() -> &'static Mutex<HashMap<StunCacheKey, StunCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<StunCacheKey, StunCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn stun_cache_get(urls: &[String], mode: StunRewriteMode) -> Option<Vec<String>> {
+    let guard = stun_cache().lock().ok()?;
+    let key = (urls.to_vec(), mode);
+    let (at, cached) = guard.get(&key)?;
+    if at.elapsed() <= STUN_CACHE_TTL {
+        Some(cached.clone())
+    } else {
+        None
+    }
+}
+
+fn stun_cache_put(urls: &[String], mode: StunRewriteMode, resolved: &[String]) {
+    if let Ok(mut guard) = stun_cache().lock() {
+        guard.retain(|_, (at, _)| at.elapsed() <= STUN_CACHE_TTL);
+        if guard.len() >= 32 {
+            guard.clear();
+        }
+        guard.insert((urls.to_vec(), mode), (Instant::now(), resolved.to_vec()));
+    }
+}
+
+#[cfg(test)]
+fn clear_stun_cache() {
+    if let Ok(mut guard) = stun_cache().lock() {
+        guard.clear();
+    }
+}
+
+/// Async version of [`prepare_stun_urls`] using `tokio::net::lookup_host` and
+/// async DoH (`A` + `AAAA` with literal bootstrap IPs) so Tokio worker threads
+/// are never blocked by `thread::join()` or `reqwest::blocking`.
+pub async fn prepare_stun_urls_async(urls: &[String], mode: StunRewriteMode) -> Vec<String> {
+    if let Some(cached) = stun_cache_get(urls, mode) {
+        return cached;
+    }
+    let mut out = Vec::new();
+    for url in urls {
+        let Some((scheme, host, suffix)) = split_ice_url_parts(url) else {
+            out.push(url.clone());
+            continue;
+        };
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_benchmarking_ip(ip) {
+                eprintln!(
+                    "agentlink live-webrtc: skipping ICE URL in RFC 2544 198.18.0.0/15 ({url})"
+                );
+                continue;
+            }
+            out.push(url.clone());
+            continue;
+        }
+        let default = is_default_stun_url(url);
+        if mode == StunRewriteMode::Off || !default {
+            out.push(url.clone());
+            continue;
+        }
+        let system = lookup_host_system_async(&host).await;
+        let usable_system: Vec<IpAddr> = system
+            .iter()
+            .copied()
+            .filter(|ip| !is_benchmarking_ip(*ip))
+            .collect();
+        if !usable_system.is_empty() {
+            out.push(url.clone());
+            continue;
+        }
+        if system.iter().any(|ip| is_benchmarking_ip(*ip)) {
+            eprintln!(
+                "agentlink live-webrtc: default STUN host {host} resolved to RFC 2544 198.18.0.0/15 via system DNS; trying DoH (AGENTLINK_STUN_REWRITE=defaults)"
+            );
+        } else {
+            eprintln!(
+                "agentlink live-webrtc: default STUN host {host} had no system DNS address; trying DoH (AGENTLINK_STUN_REWRITE=defaults)"
+            );
+        }
+        let usable_doh: Vec<IpAddr> = doh_lookup_async(&host)
+            .await
+            .into_iter()
+            .filter(|ip| !is_benchmarking_ip(*ip))
+            .collect();
+        if usable_doh.is_empty() {
+            eprintln!(
+                "agentlink live-webrtc: no usable DoH address for default STUN host {host}; omitting rather than leaving a poisoned hostname"
+            );
+            continue;
+        }
+        for ip in usable_doh {
+            let rewritten = format_ice_url(scheme, ip, suffix);
+            eprintln!(
+                "agentlink live-webrtc: ICE URL {url} rewritten to {rewritten} so the peer connection does not re-resolve via poisoned DNS"
+            );
+            out.push(rewritten);
+        }
+    }
+    stun_cache_put(urls, mode, &out);
+    out
+}
+
+/// Async, TTL-cached preparation of STUN URLs from the environment for WebRTC.
+///
+/// Prefer this over [`stun_urls_ready_for_ice`] inside async tasks so Tokio
+/// worker threads are never blocked.
+pub async fn stun_urls_ready_for_ice_async() -> Vec<String> {
     let urls = stun_urls_from_env();
     let mode = stun_rewrite_mode_from_env();
-    match std::thread::Builder::new()
+    prepare_stun_urls_async(&urls, mode).await
+}
+
+/// Default or env STUN URLs, prepared for the WebRTC stack under
+/// [`stun_rewrite_mode_from_env`]. Uses the shared [`STUN_CACHE_TTL`] cache.
+pub fn stun_urls_ready_for_ice() -> Vec<String> {
+    let urls = stun_urls_from_env();
+    let mode = stun_rewrite_mode_from_env();
+    if let Some(cached) = stun_cache_get(&urls, mode) {
+        return cached;
+    }
+    let urls_for_thread = urls.clone();
+    let resolved = match std::thread::Builder::new()
         .name("agentlink-ice-resolve".into())
-        .spawn(move || prepare_stun_urls(&urls, mode, lookup_host_system, doh_lookup_a))
-    {
+        .spawn(move || {
+            prepare_stun_urls(
+                &urls_for_thread,
+                mode,
+                lookup_host_system,
+                doh_lookup_sync,
+            )
+        }) {
         Ok(handle) => handle.join().unwrap_or_else(|_| {
             eprintln!(
                 "agentlink live-webrtc: ICE URL resolve thread panicked; STUN hostnames left unresolved"
@@ -497,7 +630,29 @@ pub fn stun_urls_ready_for_ice() -> Vec<String> {
             eprintln!("agentlink live-webrtc: cannot spawn ICE URL resolve thread: {err}");
             Vec::new()
         }
+    };
+    stun_cache_put(&urls, mode, &resolved);
+    resolved
+}
+
+async fn lookup_host_system_async(host: &str) -> Vec<IpAddr> {
+    let query = if host.contains(':') && !host.contains('.') {
+        format!("[{host}]:0")
+    } else {
+        format!("{host}:0")
+    };
+    let Ok(Ok(iter)) =
+        tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host(query)).await
+    else {
+        return Vec::new();
+    };
+    let mut ips = Vec::new();
+    for addr in iter {
+        if !ips.contains(&addr.ip()) {
+            ips.push(addr.ip());
+        }
     }
+    ips
 }
 
 fn lookup_host_system(host: &str) -> Vec<IpAddr> {
@@ -520,44 +675,76 @@ fn lookup_host_system(host: &str) -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
-fn doh_lookup_a(host: &str) -> Vec<IpAddr> {
-    let endpoints = [
-        format!("https://cloudflare-dns.com/dns-query?name={host}&type=A"),
-        format!("https://dns.google/resolve?name={host}&type=A"),
-    ];
-    for url in endpoints {
-        let client = match reqwest::blocking::Client::builder()
+/// Literal DoH bootstrap resolvers so poisoned system DNS cannot blackhole DoH
+/// itself while TLS SNI and WebPKI certificate validation still verify the
+/// DoH server hostname.
+const DOH_PROVIDERS: &[(&str, &str, &[[u8; 4]])] = &[
+    (
+        "cloudflare-dns.com",
+        "https://cloudflare-dns.com/dns-query",
+        &[[1, 1, 1, 1], [1, 0, 0, 1]],
+    ),
+    (
+        "dns.google",
+        "https://dns.google/resolve",
+        &[[8, 8, 8, 8], [8, 8, 4, 4]],
+    ),
+];
+
+fn parse_doh_answer_ips(text: &str) -> Vec<IpAddr> {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut ips = Vec::new();
+    if let Some(answers) = body.get("Answer").and_then(|value| value.as_array()) {
+        for item in answers {
+            let rtype = item.get("type").and_then(|value| value.as_u64());
+            // Type 1 = A (IPv4), Type 28 = AAAA (IPv6).
+            if rtype != Some(1) && rtype != Some(28) {
+                continue;
+            }
+            if let Some(data) = item.get("data").and_then(|value| value.as_str()) {
+                if let Ok(ip) = data.trim().parse::<IpAddr>() {
+                    if !is_benchmarking_ip(ip) && !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+            }
+        }
+    }
+    ips
+}
+
+async fn doh_lookup_async(host: &str) -> Vec<IpAddr> {
+    for (domain, base_url, bootstrap_v4s) in DOH_PROVIDERS {
+        let addrs: Vec<SocketAddr> = bootstrap_v4s
+            .iter()
+            .map(|octets| SocketAddr::from((Ipv4Addr::from(*octets), 443)))
+            .collect();
+        let Ok(client) = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
+            .resolve_to_addrs(domain, &addrs)
             .build()
-        {
-            Ok(client) => client,
-            Err(_) => continue,
-        };
-        let Ok(resp) = client
-            .get(&url)
-            .header("accept", "application/dns-json")
-            .send()
         else {
             continue;
         };
-        let Ok(text) = resp.text() else {
-            continue;
-        };
-        let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
         let mut ips = Vec::new();
-        if let Some(answers) = body.get("Answer").and_then(|value| value.as_array()) {
-            for item in answers {
-                if item.get("type").and_then(|value| value.as_u64()) != Some(1) {
-                    continue;
-                }
-                if let Some(data) = item.get("data").and_then(|value| value.as_str()) {
-                    if let Ok(ip) = data.trim().parse::<IpAddr>() {
-                        if !is_benchmarking_ip(ip) && !ips.contains(&ip) {
-                            ips.push(ip);
-                        }
-                    }
+        for qtype in ["A", "AAAA"] {
+            let url = format!("{base_url}?name={host}&type={qtype}");
+            let Ok(resp) = client
+                .get(&url)
+                .header("accept", "application/dns-json")
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(text) = resp.text().await else {
+                continue;
+            };
+            for ip in parse_doh_answer_ips(&text) {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
                 }
             }
         }
@@ -566,6 +753,300 @@ fn doh_lookup_a(host: &str) -> Vec<IpAddr> {
         }
     }
     Vec::new()
+}
+
+fn doh_lookup_sync(host: &str) -> Vec<IpAddr> {
+    for (domain, base_url, bootstrap_v4s) in DOH_PROVIDERS {
+        let addrs: Vec<SocketAddr> = bootstrap_v4s
+            .iter()
+            .map(|octets| SocketAddr::from((Ipv4Addr::from(*octets), 443)))
+            .collect();
+        let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .resolve_to_addrs(domain, &addrs)
+            .build()
+        else {
+            continue;
+        };
+        let mut ips = Vec::new();
+        for qtype in ["A", "AAAA"] {
+            let url = format!("{base_url}?name={host}&type={qtype}");
+            let Ok(resp) = client
+                .get(&url)
+                .header("accept", "application/dns-json")
+                .send()
+            else {
+                continue;
+            };
+            let Ok(text) = resp.text() else {
+                continue;
+            };
+            for ip in parse_doh_answer_ips(&text) {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+        }
+        if !ips.is_empty() {
+            return ips;
+        }
+    }
+    Vec::new()
+}
+
+/// One WebRTC ICE server entry (STUN or TURN with optional REST credentials).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IceServerConfig {
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+impl IceServerConfig {
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::json!({ "urls": self.urls });
+        if let Some(u) = self.username.as_deref().filter(|s| !s.is_empty()) {
+            obj["username"] = serde_json::json!(u);
+        }
+        if let Some(c) = self.credential.as_deref().filter(|s| !s.is_empty()) {
+            obj["credential"] = serde_json::json!(c);
+        }
+        obj
+    }
+}
+
+/// ICE server list fetched from relay `POST /api/ice` or env override (`DESK-03`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayIceConfig {
+    pub ice_servers: Vec<IceServerConfig>,
+    pub ttl_secs: u64,
+}
+
+impl RelayIceConfig {
+    pub fn to_json_servers(&self) -> Vec<serde_json::Value> {
+        self.ice_servers.iter().map(IceServerConfig::to_json).collect()
+    }
+}
+
+/// Parse explicit TURN servers from `AGENTLINK_TURN_URLS` plus optional
+/// `AGENTLINK_TURN_USERNAME` (`AGENTLINK_TURN_USER`) and
+/// `AGENTLINK_TURN_PASSWORD` (`AGENTLINK_TURN_PASS` / `AGENTLINK_TURN_CREDENTIAL`).
+pub fn turn_servers_from_env() -> Vec<IceServerConfig> {
+    let raw = match std::env::var("AGENTLINK_TURN_URLS") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Vec::new(),
+    };
+    let username = std::env::var("AGENTLINK_TURN_USERNAME")
+        .or_else(|_| std::env::var("AGENTLINK_TURN_USER"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let credential = std::env::var("AGENTLINK_TURN_PASSWORD")
+        .or_else(|_| std::env::var("AGENTLINK_TURN_PASS"))
+        .or_else(|_| std::env::var("AGENTLINK_TURN_CREDENTIAL"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    turn_servers_from_values(&raw, username, credential)
+}
+
+fn turn_servers_from_values(
+    raw_urls: &str,
+    username: Option<String>,
+    credential: Option<String>,
+) -> Vec<IceServerConfig> {
+    let urls: Vec<String> = raw_urls
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && usable_ice_url(s))
+        .map(str::to_string)
+        .collect();
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    vec![IceServerConfig {
+        urls,
+        username,
+        credential,
+    }]
+}
+
+/// Build the HTTP(S) `/api/ice` endpoint URL from a relay URL (`ws://`, `wss://`,
+/// `http://`, or `https://`).
+pub fn relay_ice_endpoint(relay_url: &str) -> Result<String> {
+    let trimmed = relay_url.trim();
+    let mut parsed = url::Url::parse(trimmed)
+        .map_err(|e| Error::Message(format!("invalid relay url '{trimmed}': {e}")))?;
+    match parsed.scheme() {
+        "wss" => {
+            parsed
+                .set_scheme("https")
+                .map_err(|_| Error::Message("could not convert wss:// relay url to https://".into()))?;
+        }
+        "ws" => {
+            parsed
+                .set_scheme("http")
+                .map_err(|_| Error::Message("could not convert ws:// relay url to http://".into()))?;
+        }
+        "https" | "http" => {}
+        other => {
+            return Err(Error::Message(format!(
+                "unsupported relay url scheme '{other}'"
+            )));
+        }
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.set_path("/api/ice");
+    Ok(parsed.to_string())
+}
+
+fn parse_ice_server_entry(item: &serde_json::Value) -> Option<IceServerConfig> {
+    let urls: Vec<String> = match item.get("urls") {
+        Some(serde_json::Value::String(s)) => vec![s.trim().to_string()],
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .collect(),
+        _ => return None,
+    }
+    .into_iter()
+    .filter(|u| !u.is_empty() && usable_ice_url(u))
+    .collect();
+    if urls.is_empty() {
+        return None;
+    }
+    let username = item
+        .get("username")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let credential = item
+        .get("credential")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some(IceServerConfig {
+        urls,
+        username,
+        credential,
+    })
+}
+
+/// Parse relay `/api/ice` JSON responses (supporting both `{ "ice_servers": [...] }`
+/// and legacy `{ "stun": [...], "turn": [...] }` shapes).
+pub fn parse_relay_ice_response(body: &serde_json::Value) -> RelayIceConfig {
+    let ttl_secs = body
+        .get("ttl_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300);
+    let mut servers = Vec::new();
+    if let Some(arr) = body.get("ice_servers").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(cfg) = parse_ice_server_entry(item) {
+                servers.push(cfg);
+            }
+        }
+    }
+    if servers.is_empty() {
+        if let Some(stun_arr) = body.get("stun").and_then(|v| v.as_array()) {
+            let stun_urls: Vec<String> = stun_arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|u| !u.is_empty() && usable_ice_url(u))
+                .collect();
+            if !stun_urls.is_empty() {
+                servers.push(IceServerConfig {
+                    urls: stun_urls,
+                    username: None,
+                    credential: None,
+                });
+            }
+        }
+        if let Some(turn_arr) = body.get("turn").and_then(|v| v.as_array()) {
+            for item in turn_arr {
+                if let Some(cfg) = parse_ice_server_entry(item) {
+                    servers.push(cfg);
+                }
+            }
+        }
+    }
+    RelayIceConfig {
+        ice_servers: servers,
+        ttl_secs,
+    }
+}
+
+/// Fetch fresh STUN + short-lived TURN ICE servers for WebRTC (`DESK-03`).
+///
+/// Honors explicit `AGENTLINK_TURN_URLS` (plus `AGENTLINK_TURN_USERNAME` /
+/// `AGENTLINK_TURN_PASSWORD`) env override first; otherwise POSTs to the
+/// relay's `/api/ice` endpoint with `Authorization: Bearer <access_token>`
+/// authenticated against the pinned [`crate::tls::RelayTrust`].
+pub async fn fetch_relay_ice_servers(
+    relay_url: &str,
+    trust: &crate::tls::RelayTrust,
+    access_token: &str,
+) -> Result<RelayIceConfig> {
+    let env_turn = turn_servers_from_env();
+    if !env_turn.is_empty() {
+        let mut servers = Vec::new();
+        let stuns = stun_urls_ready_for_ice_async().await;
+        if !stuns.is_empty() {
+            servers.push(IceServerConfig {
+                urls: stuns,
+                username: None,
+                credential: None,
+            });
+        }
+        servers.extend(env_turn);
+        return Ok(RelayIceConfig {
+            ice_servers: servers,
+            ttl_secs: STUN_CACHE_TTL.as_secs(),
+        });
+    }
+
+    let endpoint = relay_ice_endpoint(relay_url)?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none());
+    if endpoint.starts_with("https://") {
+        let tls_cfg = crate::tls::client_config_for(trust)?;
+        builder = builder.use_preconfigured_tls((*tls_cfg).clone());
+    }
+    let client = builder
+        .build()
+        .map_err(|e| Error::Message(format!("build relay ice client: {e}")))?;
+
+    let mut req = client
+        .post(&endpoint)
+        .header("content-type", "application/json")
+        .body("{}");
+    let token = access_token.trim();
+    if !token.is_empty() {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| Error::Message(format!("fetch relay /api/ice: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(Error::Message(format!(
+            "relay /api/ice returned HTTP {}",
+            resp.status()
+        )));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| Error::Message(format!("read relay /api/ice body: {e}")))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::Message(format!("parse relay /api/ice json: {e}")))?;
+    Ok(parse_relay_ice_response(&json))
 }
 
 fn split_ice_url_parts(url: &str) -> Option<(&str, String, &str)> {
@@ -840,5 +1321,157 @@ mod tests {
             stun_rewrite_mode_from_value(Some("mystery")),
             StunRewriteMode::DefaultsOnly
         );
+    }
+
+    #[test]
+    fn strm02_parse_doh_answer_supports_a_and_aaaa_and_skips_rfc2544() {
+        let json = r#"{
+            "Answer": [
+                {"type": 5, "data": "alias.example."},
+                {"type": 1, "data": "198.18.0.1"},
+                {"type": 1, "data": "74.125.250.129"},
+                {"type": 28, "data": "2001:4860:4864:5::81"}
+            ]
+        }"#;
+        let ips = parse_doh_answer_ips(json);
+        assert_eq!(
+            ips,
+            vec![
+                "74.125.250.129".parse::<IpAddr>().unwrap(),
+                "2001:4860:4864:5::81".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(
+            format_ice_url("stun", ips[1], ":19302"),
+            "stun:[2001:4860:4864:5::81]:19302"
+        );
+    }
+
+    #[tokio::test]
+    async fn strm02_prepare_stun_urls_async_caches_and_filters_rfc2544() {
+        clear_stun_cache();
+        let urls = vec![
+            "stun:198.18.0.1:19302".into(),
+            "stun:74.125.250.129:19302".into(),
+            "stun:[2001:4860:4864:5::81]:19302".into(),
+        ];
+        let first = prepare_stun_urls_async(&urls, StunRewriteMode::DefaultsOnly).await;
+        assert_eq!(
+            first,
+            vec![
+                "stun:74.125.250.129:19302".to_string(),
+                "stun:[2001:4860:4864:5::81]:19302".to_string(),
+            ]
+        );
+        // Second call returns cached entry immediately.
+        assert_eq!(
+            stun_cache_get(&urls, StunRewriteMode::DefaultsOnly),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn desk03_parse_relay_ice_response_supports_new_and_legacy_shapes_and_turn_env() {
+        assert_eq!(
+            relay_ice_endpoint("wss://relay.example:7443/ws").unwrap(),
+            "https://relay.example:7443/api/ice"
+        );
+        assert_eq!(
+            relay_ice_endpoint("ws://127.0.0.1:8080/ws").unwrap(),
+            "http://127.0.0.1:8080/api/ice"
+        );
+
+        let new_shape = serde_json::json!({
+            "ttl_secs": 600,
+            "ice_servers": [
+                { "urls": "stun:stun.l.google.com:19302" },
+                {
+                    "urls": ["turn:198.18.0.1:3478", "turn:192.0.2.5:3478", "turns:turn.example:5349"],
+                    "username": "1700000600:alice",
+                    "credential": "hmac-pass"
+                }
+            ]
+        });
+        let parsed = parse_relay_ice_response(&new_shape);
+        assert_eq!(parsed.ttl_secs, 600);
+        assert_eq!(parsed.ice_servers.len(), 2);
+        assert_eq!(
+            parsed.ice_servers[1].urls,
+            vec![
+                "turn:192.0.2.5:3478".to_string(),
+                "turns:turn.example:5349".to_string()
+            ]
+        );
+        assert_eq!(
+            parsed.ice_servers[1].username.as_deref(),
+            Some("1700000600:alice")
+        );
+
+        let legacy_shape = serde_json::json!({
+            "stun": ["stun:stun.cloudflare.com:3478"],
+            "turn": [
+                {
+                    "urls": ["turn:192.0.2.9:3478"],
+                    "username": "u",
+                    "credential": "p"
+                }
+            ]
+        });
+        let legacy = parse_relay_ice_response(&legacy_shape);
+        assert_eq!(legacy.ice_servers.len(), 2);
+        assert_eq!(legacy.ice_servers[0].urls, vec!["stun:stun.cloudflare.com:3478"]);
+        assert_eq!(legacy.ice_servers[1].credential.as_deref(), Some("p"));
+
+        let from_env = turn_servers_from_values(
+            "turn:198.18.0.1:3478, turn:192.0.2.10:3478, turns:turn.example:5349",
+            Some("user".into()),
+            Some("pass".into()),
+        );
+        assert_eq!(from_env.len(), 1);
+        assert_eq!(
+            from_env[0].urls,
+            vec![
+                "turn:192.0.2.10:3478".to_string(),
+                "turns:turn.example:5349".to_string()
+            ]
+        );
+        assert_eq!(from_env[0].username.as_deref(), Some("user"));
+        assert_eq!(from_env[0].credential.as_deref(), Some("pass"));
+    }
+
+    #[tokio::test]
+    async fn desk03_fetch_relay_ice_servers_posts_bearer_token_and_parses_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(req.starts_with("POST /api/ice HTTP/1.1"), "{req}");
+            assert!(
+                req.to_ascii_lowercase()
+                    .contains("authorization: bearer test-ice-token"),
+                "{req}"
+            );
+            let body = r#"{"ttl_secs":420,"ice_servers":[{"urls":["turn:192.0.2.1:3478"],"username":"u1","credential":"c1"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let trust = crate::tls::RelayTrust::parse("", Some("webpki")).unwrap();
+        let cfg = fetch_relay_ice_servers(&format!("ws://{addr}/ws"), &trust, "test-ice-token")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(cfg.ttl_secs, 420);
+        assert_eq!(cfg.ice_servers.len(), 1);
+        assert_eq!(cfg.ice_servers[0].urls, vec!["turn:192.0.2.1:3478"]);
+        assert_eq!(cfg.ice_servers[0].username.as_deref(), Some("u1"));
+        assert_eq!(cfg.ice_servers[0].credential.as_deref(), Some("c1"));
     }
 }

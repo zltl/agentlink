@@ -42,8 +42,16 @@ pub fn baseline_deny() -> Vec<String> {
         "*> /dev/nvme*",
         "shutdown",
         "shutdown *",
+        "*shutdown /s*",
+        "*shutdown /r*",
+        "*shutdown -h*",
+        "*shutdown -r*",
+        "*&& shutdown*",
+        "*; shutdown*",
         "reboot",
         "reboot *",
+        "*&& reboot*",
+        "*; reboot*",
         "poweroff",
         "poweroff *",
         "halt",
@@ -56,6 +64,25 @@ pub fn baseline_deny() -> Vec<String> {
         "shred",
         "shred *",
         "*shred */dev/*",
+        // Windows destructive disk / power / wipe commands.
+        "format",
+        "format *",
+        "format.com",
+        "format.com *",
+        "*\\format *",
+        "*/format *",
+        "*&& format *",
+        "*; format *",
+        "*/c format *",
+        "*format-volume*",
+        "diskpart",
+        "diskpart *",
+        "*diskpart*",
+        "*stop-computer*",
+        "*restart-computer*",
+        "*cipher /w*",
+        "*cipher.exe /w*",
+        "*cipher */w*",
     ]
     .into_iter()
     .map(str::to_string)
@@ -108,56 +135,120 @@ impl CommandPolicy {
     }
 }
 
-/// `*` matches within a path segment, `**` matches across segments, `?` is one
-/// character. Matching is case-insensitive so `RM` and `rm` share a rule.
+/// `*` and `**` match across `/` and `\` so command rules like `*rm -rf*`
+/// match `/bin/rm -rf /` and `cd /tmp && rm -rf /`. `**/` and `**\` match zero
+/// or more directory prefixes (so `**/.ssh/**` matches both `.ssh/id_rsa` and
+/// `/home/a/.ssh/id_rsa` without matching `/home/a/x.ssh/id_rsa`). `?` matches
+/// one byte. Matching is ASCII case-insensitive and runs in polynomial `O(P*T)`
+/// time with no exponential backtracking.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let text = text.to_ascii_lowercase();
-    glob_rec(pattern.as_bytes(), text.as_bytes())
+    glob_dp(pattern.as_bytes(), text.as_bytes())
 }
 
-fn glob_rec(pattern: &[u8], text: &[u8]) -> bool {
-    let mut p = 0;
-    let mut t = 0;
-    while p < pattern.len() {
-        if pattern[p] == b'*' {
-            let double = p + 1 < pattern.len() && pattern[p + 1] == b'*';
-            let rest = if double {
-                let mut next = p + 2;
-                if next < pattern.len() && (pattern[next] == b'/' || pattern[next] == b'\\') {
-                    next += 1;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlobTok {
+    Literal(u8),
+    AnyChar,
+    /// `*` or `**` — zero or more arbitrary bytes (crossing `/` and `\`).
+    AnySeq,
+    /// `**/` or `**\` — zero directory segments (at start or right after a
+    /// path separator) or any non-empty sequence ending in `/` or `\`.
+    AnyDirPrefix,
+}
+
+fn is_path_sep(b: u8) -> bool {
+    b == b'/' || b == b'\\'
+}
+
+fn parse_glob_tokens(pattern: &[u8]) -> Vec<GlobTok> {
+    let mut tokens = Vec::with_capacity(pattern.len());
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            b'*' => {
+                let mut stars = 1;
+                while i + stars < pattern.len() && pattern[i + stars] == b'*' {
+                    stars += 1;
                 }
-                next
-            } else {
-                p + 1
-            };
-            if rest >= pattern.len() {
-                return true;
+                i += stars;
+                if stars >= 2 && i < pattern.len() && is_path_sep(pattern[i]) {
+                    i += 1;
+                    if tokens.last() != Some(&GlobTok::AnyDirPrefix) {
+                        tokens.push(GlobTok::AnyDirPrefix);
+                    }
+                } else if tokens.last() != Some(&GlobTok::AnySeq) {
+                    tokens.push(GlobTok::AnySeq);
+                }
             }
-            while t <= text.len() {
-                if glob_rec(&pattern[rest..], &text[t..]) {
-                    return true;
-                }
-                if t == text.len() {
-                    break;
-                }
-                if !double && (text[t] == b'/' || text[t] == b'\\') {
-                    break;
-                }
-                t += 1;
+            b'?' => {
+                tokens.push(GlobTok::AnyChar);
+                i += 1;
             }
-            return false;
+            b => {
+                tokens.push(GlobTok::Literal(b));
+                i += 1;
+            }
         }
-        if t >= text.len() {
-            return false;
-        }
-        if pattern[p] != b'?' && pattern[p] != text[t] {
-            return false;
-        }
-        p += 1;
-        t += 1;
     }
-    t == text.len()
+    tokens
+}
+
+fn glob_dp(pattern: &[u8], text: &[u8]) -> bool {
+    let tokens = parse_glob_tokens(pattern);
+    let n = text.len();
+    let mut dp = vec![false; n + 1];
+    let mut next = vec![false; n + 1];
+    dp[0] = true;
+
+    for tok in tokens {
+        next.fill(false);
+        match tok {
+            GlobTok::Literal(ch) => {
+                for t in 0..n {
+                    if dp[t] && text[t] == ch {
+                        next[t + 1] = true;
+                    }
+                }
+            }
+            GlobTok::AnyChar => {
+                for t in 0..n {
+                    if dp[t] {
+                        next[t + 1] = true;
+                    }
+                }
+            }
+            GlobTok::AnySeq => {
+                let mut seen = false;
+                for t in 0..=n {
+                    if dp[t] {
+                        seen = true;
+                    }
+                    if seen {
+                        next[t] = true;
+                    }
+                }
+            }
+            GlobTok::AnyDirPrefix => {
+                let mut seen = false;
+                for t in 0..=n {
+                    if dp[t] {
+                        if t == 0 || is_path_sep(text[t - 1]) {
+                            next[t] = true;
+                        }
+                        seen = true;
+                    }
+                    if seen && t > 0 && is_path_sep(text[t - 1]) {
+                        next[t] = true;
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut dp, &mut next);
+    }
+
+    dp[n]
 }
 
 #[cfg(test)]
@@ -184,6 +275,17 @@ mod tests {
         assert!(shell
             .allows("sh", &["-c".into(), "rm -rf /".into()], Some("rm -rf /"))
             .is_err());
+        // SEC-10: `*` crosses `/` and `\` so full paths and chained commands match.
+        assert!(shell
+            .allows("/bin/rm", &["-rf".into(), "/".into()], None)
+            .is_err());
+        assert!(shell
+            .allows(
+                "sh",
+                &["-c".into(), "cd /tmp && rm -rf /".into()],
+                Some("cd /tmp && rm -rf /")
+            )
+            .is_err());
     }
 
     #[test]
@@ -193,10 +295,17 @@ mod tests {
         assert!(policy.allows("echo", &["hi".into()], None).is_ok());
         assert!(policy.allows("rm", &["file.txt".into()], None).is_ok());
         assert!(policy
-            .allows("mkfs.ext4", &["/dev/sda".into()], None)
+            .allows("git", &["log".into(), "--format=%H".into()], None)
+            .is_ok());
+        assert!(policy
+            .allows("/sbin/mkfs.ext4", &["/dev/sda".into()], None)
             .is_err());
         assert!(policy
-            .allows("dd", &["if=/dev/zero".into(), "of=/dev/sda".into()], None)
+            .allows(
+                "sh",
+                &["-c".into(), "cd /tmp && dd if=/dev/zero of=/dev/sda".into()],
+                Some("cd /tmp && dd if=/dev/zero of=/dev/sda")
+            )
             .is_err());
         assert!(policy
             .allows("shutdown", &["-h".into(), "now".into()], None)
@@ -204,16 +313,45 @@ mod tests {
         assert!(policy
             .allows(
                 "sh",
-                &["-c".into(), "echo x > /dev/sda".into()],
-                Some("echo x > /dev/sda")
+                &["-c".into(), "cat /etc/passwd > /dev/sda".into()],
+                Some("cat /etc/passwd > /dev/sda")
             )
+            .is_err());
+        // Windows destructive commands in baseline deny.
+        assert!(policy
+            .allows("format", &["D:".into(), "/fs:NTFS".into()], None)
+            .is_err());
+        assert!(policy
+            .allows("cmd", &["/c".into(), "diskpart".into()], Some("diskpart"))
+            .is_err());
+        assert!(policy
+            .allows(
+                "powershell",
+                &["-Command".into(), "Stop-Computer -Force".into()],
+                Some("Stop-Computer -Force")
+            )
+            .is_err());
+        assert!(policy
+            .allows("shutdown", &["/s".into(), "/t".into(), "0".into()], None)
+            .is_err());
+        assert!(policy
+            .allows("cipher", &["/w:C:\\".into()], None)
             .is_err());
     }
 
     #[test]
-    fn glob_stars() {
+    fn glob_stars_and_no_exponential_backtracking() {
         assert!(glob_match("**/.ssh/**", "/home/a/.ssh/id_rsa"));
+        assert!(glob_match("**/.ssh/**", ".ssh/id_rsa"));
+        assert!(!glob_match("**/.ssh/**", "/home/a/x.ssh/id_rsa"));
         assert!(glob_match("*.pem", "key.pem"));
         assert!(!glob_match("*.pem", "key.pem.old"));
+        assert!(glob_match("*rm -rf*", "/bin/rm -rf /"));
+        assert!(glob_match("*rm -rf*", "cd /tmp && rm -rf /"));
+        assert!(glob_match("*rm -rf*", "C:\\Windows\\rm -rf C:\\"));
+        // Pathological pattern that would hang naive recursive glob_rec.
+        let pat = "*a".repeat(32) + "*b";
+        let text = "a".repeat(120);
+        assert!(!glob_match(&pat, &text));
     }
 }
