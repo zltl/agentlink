@@ -59,6 +59,23 @@ pub fn read_consent_mode(
         .map_err(|_| "stream consent is unavailable".into())
 }
 
+/// Unique per-offer consent identifier so concurrent or retried offers from
+/// the same peer never collide on `.request`/`.allow`/`.deny` files.
+pub fn offer_consent_id(peer: &str) -> String {
+    let safe_peer: String = peer
+        .chars()
+        .take(32)
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let suffix = uuid::Uuid::new_v4();
+    if safe_peer.is_empty() {
+        format!("pending-{suffix}")
+    } else {
+        format!("pending-{safe_peer}-{suffix}")
+    }
+}
+
+#[allow(dead_code)]
 pub fn approve(
     mode: ConsentMode,
     audit_path: &Path,
@@ -73,6 +90,29 @@ pub fn approve(
             Ok(())
         }
         ConsentMode::Prompt => prompt(audit_path, viewer, session_id),
+    }
+}
+
+/// Async consent check for use on the `agentlink-rtc` Tokio runtime.
+///
+/// Unlike [`approve`], `ConsentMode::Prompt` awaits with `tokio::time::sleep`
+/// instead of blocking a Tokio worker thread for 30s with `thread::sleep`.
+pub async fn approve_async(
+    mode: ConsentMode,
+    audit_path: &Path,
+    viewer: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    match mode {
+        ConsentMode::Deny => Err("remote desktop streaming is denied on this node".into()),
+        ConsentMode::Auto => Ok(()),
+        ConsentMode::Notify => {
+            notify(viewer, session_id);
+            Ok(())
+        }
+        ConsentMode::Prompt => {
+            prompt_async_with_timeout(audit_path, viewer, session_id, Duration::from_secs(30)).await
+        }
     }
 }
 
@@ -124,10 +164,36 @@ pub fn macos_notification_script(body: &str) -> String {
     )
 }
 
-/// PowerShell source that shows a notification. The body is read from
-/// [`NOTIFY_BODY_ENV`]; this source must not contain the untrusted text.
+/// PowerShell source that shows a notification using built-in Windows APIs
+/// (WinRT ToastNotificationManager with a System.Windows.Forms.NotifyIcon
+/// fallback — no third-party BurntToast module required).
+///
+/// The untrusted body is read solely from [`NOTIFY_BODY_ENV`] and XML-escaped
+/// before building the toast payload; this source must never embed viewer text.
 pub fn windows_notification_script() -> &'static str {
-    "New-BurntToastNotification -Text 'agentlink', [string]$env:AGENTLINK_NOTIFY_BODY"
+    concat!(
+        "$body = [string]$env:AGENTLINK_NOTIFY_BODY; ",
+        "try { ",
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; ",
+        "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; ",
+        "$esc = [System.Security.SecurityElement]::Escape($body); ",
+        "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; ",
+        "$xml.LoadXml('<toast><visual><binding template=\"ToastText02\"><text id=\"1\">agentlink</text><text id=\"2\">' + $esc + '</text></binding></visual></toast>'); ",
+        "$toast = New-Object Windows.UI.Notifications.ToastNotification $xml; ",
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('agentlink').Show($toast); ",
+        "} catch { ",
+        "try { ",
+        "Add-Type -AssemblyName System.Windows.Forms; ",
+        "$n = New-Object System.Windows.Forms.NotifyIcon; ",
+        "$n.Icon = [System.Drawing.SystemIcons]::Information; ",
+        "$n.BalloonTipTitle = 'agentlink'; ",
+        "$n.BalloonTipText = $body; ",
+        "$n.Visible = $true; ",
+        "$n.ShowBalloonTip(5000); ",
+        "Start-Sleep -Milliseconds 500; ",
+        "$n.Dispose(); ",
+        "} catch {} }"
+    )
 }
 
 /// Build the platform notification plan. `os` is `linux`, `macos`, or `windows`.
@@ -171,10 +237,21 @@ fn notify(viewer: &str, session_id: &str) {
     let plan = notify_plan(current_notify_os(), viewer, session_id);
     let mut cmd = agentlink_core::process::hidden(&plan.program);
     cmd.args(&plan.args);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     for (key, value) in &plan.env {
         cmd.env(key, value);
     }
-    let _ = cmd.spawn();
+    if let Ok(mut child) = cmd.spawn() {
+        // Reap the notification child in the background so Unix systems do not
+        // accumulate zombie processes over long daemon lifetimes.
+        let _ = thread::Builder::new()
+            .name("agentlink-notify-reap".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
     if cfg!(target_os = "windows") {
         tracing::info!("remote desktop session starting");
     }
@@ -185,10 +262,25 @@ fn notify(viewer: &str, session_id: &str) {
     );
 }
 
-fn prompt(audit_path: &Path, viewer: &str, session_id: &str) -> Result<(), String> {
+struct PromptFiles {
+    request: PathBuf,
+    allow: PathBuf,
+    deny: PathBuf,
+}
+
+fn prepare_prompt_files(
+    audit_path: &Path,
+    viewer: &str,
+    session_id: &str,
+) -> Result<PromptFiles, String> {
     let dir = consent_dir(audit_path);
     if let Err(err) = fs::create_dir_all(&dir) {
         return Err(format!("consent directory: {err}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     }
     let safe: String = session_id
         .chars()
@@ -199,32 +291,92 @@ fn prompt(audit_path: &Path, viewer: &str, session_id: &str) -> Result<(), Strin
     let deny = dir.join(format!("{safe}.deny"));
     let _ = fs::remove_file(&allow);
     let _ = fs::remove_file(&deny);
-    let note = format!("viewer={viewer}\nsession={session_id}\n");
+    let note = format!(
+        "viewer={viewer}\nsession={session_id}\nallow={}\ndeny={}\n",
+        allow.display(),
+        deny.display()
+    );
     fs::write(&request, note).map_err(|err| format!("consent request: {err}"))?;
     tracing::warn!(
         path = %allow.display(),
         "waiting for stream consent; create the allow file or the deny file"
     );
+    Ok(PromptFiles {
+        request,
+        allow,
+        deny,
+    })
+}
+
+fn check_prompt_decision(files: &PromptFiles) -> Option<Result<(), String>> {
+    if files.allow.exists() {
+        let _ = fs::remove_file(&files.request);
+        let _ = fs::remove_file(&files.allow);
+        return Some(Ok(()));
+    }
+    if files.deny.exists() {
+        let _ = fs::remove_file(&files.request);
+        let _ = fs::remove_file(&files.deny);
+        return Some(Err("the operator denied this remote desktop session".into()));
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn prompt(audit_path: &Path, viewer: &str, session_id: &str) -> Result<(), String> {
+    let files = prepare_prompt_files(audit_path, viewer, session_id)?;
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        if allow.exists() {
-            let _ = fs::remove_file(&request);
-            return Ok(());
-        }
-        if deny.exists() {
-            let _ = fs::remove_file(&request);
-            return Err("the operator denied this remote desktop session".into());
+        if let Some(decision) = check_prompt_decision(&files) {
+            return decision;
         }
         thread::sleep(Duration::from_millis(200));
     }
-    let _ = fs::remove_file(&request);
+    let _ = fs::remove_file(&files.request);
     Err("remote desktop consent timed out".into())
 }
 
-fn consent_dir(audit_path: &Path) -> PathBuf {
-    audit_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
+async fn prompt_async_with_timeout(
+    audit_path: &Path,
+    viewer: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let audit_owned = audit_path.to_path_buf();
+    let viewer_owned = viewer.to_string();
+    let session_owned = session_id.to_string();
+    let files = tokio::task::spawn_blocking(move || {
+        prepare_prompt_files(&audit_owned, &viewer_owned, &session_owned)
+    })
+    .await
+    .map_err(|err| format!("consent prepare task: {err}"))??;
+    // Alert the operator at the seat that a consent decision is pending.
+    if !cfg!(test) {
+        notify(viewer, session_id);
+    }
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(decision) = check_prompt_decision(&files) {
+            return decision;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = fs::remove_file(&files.request);
+    Err("remote desktop consent timed out".into())
+}
+
+pub(crate) fn consent_dir(audit_path: &Path) -> PathBuf {
+    if !audit_path.as_os_str().is_empty() {
+        if let Some(parent) = audit_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            return parent.join("stream-consent");
+        }
+    }
+    agentlink_core::config::default_data_dir("node")
+        .ok()
+        .unwrap_or_else(|| std::env::temp_dir().join("agentlink"))
         .join("stream-consent")
 }
 
@@ -385,5 +537,72 @@ mod tests {
             err.contains("unavailable"),
             "poisoned consent must not into_inner, got {err}"
         );
+    }
+
+    #[test]
+    fn windows_notification_uses_builtin_winrt_not_burnt_toast() {
+        let script = windows_notification_script();
+        assert!(
+            !script.contains("New-BurntToastNotification"),
+            "must not depend on third-party BurntToast module"
+        );
+        assert!(script.contains("ToastNotificationManager"));
+        assert!(script.contains("NotifyIcon"));
+        assert!(script.contains("$env:AGENTLINK_NOTIFY_BODY"));
+        assert!(script.contains("SecurityElement]::Escape"));
+    }
+
+    #[test]
+    fn offer_consent_ids_are_unique_per_offer() {
+        let a = offer_consent_id("alice");
+        let b = offer_consent_id("alice");
+        assert_ne!(a, b);
+        assert!(a.starts_with("pending-alice-"));
+        assert!(b.starts_with("pending-alice-"));
+    }
+
+    #[test]
+    fn consent_dir_never_falls_back_to_cwd_when_audit_path_empty_or_bare() {
+        let empty = consent_dir(Path::new(""));
+        assert_ne!(empty, PathBuf::from("./stream-consent"));
+        assert_ne!(empty, PathBuf::from("stream-consent"));
+        assert!(empty.is_absolute() || empty.components().count() >= 2);
+        let bare = consent_dir(Path::new("audit.log"));
+        assert_ne!(bare, PathBuf::from("./stream-consent"));
+        assert_ne!(bare, PathBuf::from("stream-consent"));
+        let explicit = consent_dir(Path::new("/tmp/agentlink-node/audit.log"));
+        assert_eq!(
+            explicit,
+            PathBuf::from("/tmp/agentlink-node").join("stream-consent")
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_async_approves_and_denies_without_blocking_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.log");
+        let allow_id = offer_consent_id("alice");
+        let allow_file = consent_dir(&audit_path).join(format!("{allow_id}.allow"));
+
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = fs::create_dir_all(allow_file.parent().unwrap());
+            fs::write(&allow_file, "ok").unwrap();
+        });
+        let res = prompt_async_with_timeout(&audit_path, "alice", &allow_id, Duration::from_secs(2))
+            .await;
+        writer.await.unwrap();
+        assert!(res.is_ok(), "expected allow, got {res:?}");
+
+        let deny_id = offer_consent_id("bob");
+        let deny_file = consent_dir(&audit_path).join(format!("{deny_id}.deny"));
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            fs::write(&deny_file, "no").unwrap();
+        });
+        let res = prompt_async_with_timeout(&audit_path, "bob", &deny_id, Duration::from_secs(2))
+            .await;
+        writer.await.unwrap();
+        assert!(res.is_err(), "expected deny error");
     }
 }

@@ -3,23 +3,37 @@
 //! it is installed and advertises NVENC, QSV, AMF, VAAPI, VideoToolbox, x264,
 //! or libvpx.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use crate::capture::Frame;
+use crate::capture::{prepare_frame_for_encoder, Frame};
 use crate::error::{msg, Result};
 
 use super::ffmpeg::FfmpegEncoder;
 
-/// After one hardware/ffmpeg encode failure, skip reopening it for later sessions.
-static HARDWARE_ENCODER_UNUSABLE: AtomicBool = AtomicBool::new(false);
+/// Cooldown after a hardware encoder failure before retrying hardware on a
+/// later session (replaces the permanent daemon-lifetime poison pill so a
+/// transient Windows TDR or lock screen does not disable HW encode forever).
+const HARDWARE_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+static HARDWARE_COOLDOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn is_in_cooldown(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|deadline| now < deadline)
+}
 
 fn hardware_encoder_unusable() -> bool {
-    HARDWARE_ENCODER_UNUSABLE.load(Ordering::Relaxed)
+    let guard = HARDWARE_COOLDOWN_UNTIL
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    is_in_cooldown(*guard, Instant::now())
 }
 
 fn mark_hardware_encoder_unusable() {
-    HARDWARE_ENCODER_UNUSABLE.store(true, Ordering::Relaxed);
+    let mut guard = HARDWARE_COOLDOWN_UNTIL
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *guard = Some(Instant::now() + HARDWARE_RETRY_COOLDOWN);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +112,11 @@ pub trait VideoEncoder: Send {
 pub fn open_encoder(request: &EncoderRequest) -> Result<Box<dyn VideoEncoder>> {
     let request = align_request(*request);
     if request.codec == Codec::H264 {
-        let primary = hardware_or_ffmpeg(&request);
+        // Prefer hardware, then ffmpeg libx264 (multi-threaded, higher quality),
+        // then in-process minih264 as the zero-dependency fallback.
+        let primary = hardware_or_ffmpeg(&request).or_else(|| {
+            FfmpegEncoder::open(&request, false).map(|enc| Box::new(enc) as Box<dyn VideoEncoder>)
+        });
         if primary.is_none() {
             return Ok(Box::new(MiniH264::open(&request)?));
         }
@@ -285,8 +303,14 @@ impl VideoEncoder for FallbackEncoder {
             }
         }
         if give_up {
+            let was_hardware = self
+                .primary
+                .as_ref()
+                .is_some_and(|primary| primary.info().hardware);
             self.primary = None;
-            mark_hardware_encoder_unusable();
+            if was_hardware {
+                mark_hardware_encoder_unusable();
+            }
         }
         self.software()?.encode(frame, true)
     }
@@ -392,8 +416,9 @@ impl VideoEncoder for MiniH264 {
     }
 
     fn encode(&mut self, frame: &Frame, force_keyframe: bool) -> Result<EncodedAccessUnit> {
+        let prepared = prepare_frame_for_encoder(frame, self.width as u32, self.height as u32)?;
         bgra_to_i420(
-            frame,
+            prepared.as_ref(),
             self.width as u32,
             self.height as u32,
             &mut self.y,
@@ -690,5 +715,52 @@ mod tests {
         nal_payloads(bytes)
             .iter()
             .any(|nal| nal.first().map(|b| b & 0x1f) == Some(7))
+    }
+
+    #[test]
+    fn hardware_cooldown_expires_instead_of_permanent_poison() {
+        let now = Instant::now();
+        assert!(!is_in_cooldown(None, now));
+        assert!(is_in_cooldown(Some(now + HARDWARE_RETRY_COOLDOWN), now));
+        assert!(!is_in_cooldown(
+            Some(now + HARDWARE_RETRY_COOLDOWN),
+            now + HARDWARE_RETRY_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn minih264_scales_oversized_frame_instead_of_cropping() {
+        // 128x64 source with white pixels ONLY in the bottom-right quadrant.
+        // Cropping to 64x32 would lose every white pixel; scaling preserves them.
+        let src_w = 128u32;
+        let src_h = 64u32;
+        let mut raw = vec![0u8; (src_w * src_h * 4) as usize];
+        for y in 32..src_h {
+            for x in 64..src_w {
+                let i = ((y * src_w + x) * 4) as usize;
+                raw[i] = 255;
+                raw[i + 1] = 255;
+                raw[i + 2] = 255;
+                raw[i + 3] = 255;
+            }
+        }
+        let frame = Frame::from_bgra(src_w, src_h, src_w * 4, &raw, "test").unwrap();
+        let mut enc = MiniH264::open(&EncoderRequest {
+            codec: Codec::H264,
+            width: 64,
+            height: 32,
+            src_width: src_w,
+            src_height: src_h,
+            fps: 30,
+            bitrate: 500_000,
+        })
+        .unwrap();
+        let unit = enc.encode(&frame, true).unwrap();
+        assert!(!unit.bytes.is_empty());
+        // Bottom-right pixel of the 64x32 luma plane must be bright (~235), not black (16).
+        let br_y = unsafe { *enc.y.ptr.add((31 * 64 + 63) as usize) };
+        assert!(br_y > 200, "expected scaled bright bottom-right luma, got {br_y}");
+        let tl_y = unsafe { *enc.y.ptr.add(0) };
+        assert!(tl_y < 32, "expected dark top-left luma, got {tl_y}");
     }
 }

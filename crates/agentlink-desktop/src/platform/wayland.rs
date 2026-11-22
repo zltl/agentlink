@@ -18,13 +18,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy};
 
-use crate::capture::{crop_frame, CaptureTarget, Frame, Rect};
+use crate::capture::{crop_frame, CaptureTarget, Frame, MonitorInfo, Rect};
 use crate::error::{msg, Result};
 use crate::keys::key_info;
 
@@ -32,6 +33,8 @@ pub struct WaylandDesk {
     conn: Connection,
     input: Option<RemoteSession>,
     libei: bool,
+    monitors: Mutex<Vec<MonitorInfo>>,
+    cached_size: Mutex<Option<(u32, u32)>>,
 }
 
 struct RemoteSession {
@@ -60,6 +63,8 @@ impl WaylandDesk {
             conn,
             input: None,
             libei: libei_present(),
+            monitors: Mutex::new(Vec::new()),
+            cached_size: Mutex::new(None),
         })
     }
 
@@ -75,6 +80,37 @@ impl WaylandDesk {
         }
     }
 
+    pub fn monitors(&self) -> Vec<MonitorInfo> {
+        if let Ok(list) = self.monitors.lock() {
+            if !list.is_empty() {
+                return list.clone();
+            }
+        }
+        let (width, height) = self
+            .cached_size
+            .lock()
+            .ok()
+            .and_then(|s| *s)
+            .unwrap_or((0, 0));
+        vec![MonitorInfo {
+            index: 0,
+            name: "wayland-session".into(),
+            x: 0,
+            y: 0,
+            width,
+            height,
+            primary: true,
+        }]
+    }
+
+    fn record_stream_monitors(&self, list: Vec<MonitorInfo>) {
+        if !list.is_empty() {
+            if let Ok(mut guard) = self.monitors.lock() {
+                *guard = list;
+            }
+        }
+    }
+
     pub fn session(&self) -> Result<(&str, u32)> {
         self.input
             .as_ref()
@@ -86,7 +122,8 @@ impl WaylandDesk {
         if self.input.is_some() {
             return Ok(());
         }
-        let (path, stream) = remote_desktop_start(&self.conn).await?;
+        let (path, stream, stream_monitors) = remote_desktop_start(&self.conn).await?;
+        self.record_stream_monitors(stream_monitors);
         self.input = Some(RemoteSession { path, stream });
         Ok(())
     }
@@ -94,6 +131,11 @@ impl WaylandDesk {
     pub async fn capture(&self, target: &CaptureTarget) -> Result<Frame> {
         let bytes = portal_screenshot(&self.conn).await?;
         let frame = decode_portal_image(&bytes, &self.backend_name())?;
+        if frame.width > 0 && frame.height > 0 {
+            if let Ok(mut slot) = self.cached_size.lock() {
+                *slot = Some((frame.width, frame.height));
+            }
+        }
         match target {
             CaptureTarget::FullScreen => Ok(frame),
             CaptureTarget::Monitor(0) => Ok(frame),
@@ -122,7 +164,10 @@ impl WaylandDesk {
             return None;
         }
         match screencast_node(&self.conn).await {
-            Ok((_session, node)) => Some(node),
+            Ok((_session, node, stream_monitors)) => {
+                self.record_stream_monitors(stream_monitors);
+                Some(node)
+            }
             Err(err) => {
                 tracing::info!(error = %err, "PipeWire screencast was not negotiated");
                 None
@@ -138,7 +183,10 @@ impl WaylandDesk {
             return None;
         }
         match open_pipewire_remote(&self.conn).await {
-            Ok(pair) => Some(pair),
+            Ok((fd, node, stream_monitors)) => {
+                self.record_stream_monitors(stream_monitors);
+                Some((fd, node))
+            }
             Err(err) => {
                 tracing::info!(error = %err, "ScreenCast PipeWire remote was not opened");
                 None
@@ -264,10 +312,41 @@ async fn portal_screenshot(conn: &Connection) -> Result<Vec<u8>> {
         .and_then(owned_str)
         .ok_or_else(|| msg("screenshot portal response had no uri"))?;
     let path = file_uri_path(&uri)?;
-    fs::read(&path).map_err(|err| msg(format!("read portal screenshot {}: {err}", path.display())))
+    let bytes =
+        fs::read(&path).map_err(|err| msg(format!("read portal screenshot {}: {err}", path.display())));
+    // Remove the temporary PNG created by xdg-desktop-portal so ~/Pictures or
+    // /tmp does not fill up with stale screenshots during streaming.
+    let _ = fs::remove_file(&path);
+    bytes
 }
 
-async fn remote_desktop_start(conn: &Connection) -> Result<(String, u32)> {
+fn monitors_from_portal_results(results: &HashMap<String, OwnedValue>) -> Vec<MonitorInfo> {
+    let Ok(streams) = super::portal_window::parse_portal_streams(results) else {
+        return Vec::new();
+    };
+    streams
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, s)| {
+            let (w, h) = s.size?;
+            if w <= 0 || h <= 0 {
+                return None;
+            }
+            let (x, y) = s.position.unwrap_or((0, 0));
+            Some(MonitorInfo {
+                index: idx as u32,
+                name: s.id.unwrap_or_else(|| format!("wayland-{idx}")),
+                x,
+                y,
+                width: w as u32,
+                height: h as u32,
+                primary: idx == 0,
+            })
+        })
+        .collect()
+}
+
+async fn remote_desktop_start(conn: &Connection) -> Result<(String, u32, Vec<MonitorInfo>)> {
     let portal = remote_proxy(conn).await?;
     let session_token = unique_token("rd");
     let session = session_path(conn, &session_token)?;
@@ -286,11 +365,30 @@ async fn remote_desktop_start(conn: &Connection) -> Result<(String, u32)> {
     .await?;
     ensure_ok(response, "RemoteDesktop session")?;
 
+    let persist_dir = super::portal_persist::default_persist_data_dir();
+    let persist = super::portal_persist::persist_enabled();
+    let saved_token = persist_dir
+        .as_ref()
+        .and_then(|dir| {
+            super::portal_persist::load_desktop_restore(dir, "remote-desktop")
+                .ok()
+                .flatten()
+        });
+
     let select_token = unique_token("rds");
     let (response, _) = call_and_wait(conn, &request_path(conn, &select_token)?, async {
         let mut options: HashMap<&str, Value<'_>> = HashMap::new();
         options.insert("handle_token", Value::from(select_token.as_str()));
         options.insert("types", Value::from(1u32 | 2u32));
+        if persist {
+            options.insert(
+                "persist_mode",
+                Value::from(super::portal_persist::PERSIST_UNTIL_REVOKED),
+            );
+            if let Some(tok) = saved_token.as_deref() {
+                options.insert("restore_token", Value::from(tok));
+            }
+        }
         portal
             .call::<_, _, OwnedObjectPath>("SelectDevices", &(&session, options))
             .await
@@ -299,6 +397,43 @@ async fn remote_desktop_start(conn: &Connection) -> Result<(String, u32)> {
     })
     .await?;
     ensure_ok(response, "RemoteDesktop devices")?;
+
+    // Combine ScreenCast.SelectSources on the same session handle per the
+    // freedesktop RemoteDesktop spec so Start returns a valid PipeWire stream
+    // id (`stream != 0`) for NotifyPointerMotionAbsolute plus monitor bounds.
+    if let Ok(sc_portal) = Proxy::new(
+        conn,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.ScreenCast",
+    )
+    .await
+    {
+        let sc_select_token = unique_token("rdsc");
+        let sc_res = call_and_wait(conn, &request_path(conn, &sc_select_token)?, async {
+            let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+            options.insert("handle_token", Value::from(sc_select_token.as_str()));
+            options.insert("types", Value::from(1u32));
+            if persist {
+                options.insert(
+                    "persist_mode",
+                    Value::from(super::portal_persist::PERSIST_UNTIL_REVOKED),
+                );
+                if let Some(tok) = saved_token.as_deref() {
+                    options.insert("restore_token", Value::from(tok));
+                }
+            }
+            sc_portal
+                .call::<_, _, OwnedObjectPath>("SelectSources", &(&session, options))
+                .await
+                .map_err(|err| msg(format!("ScreenCast.SelectSources (combined): {err}")))?;
+            Ok(())
+        })
+        .await;
+        if let Err(err) = sc_res {
+            tracing::debug!(error = %err, "combined ScreenCast.SelectSources on RemoteDesktop session skipped");
+        }
+    }
 
     let start_token = unique_token("rdt");
     let (response, results) = call_and_wait(conn, &request_path(conn, &start_token)?, async {
@@ -311,12 +446,31 @@ async fn remote_desktop_start(conn: &Connection) -> Result<(String, u32)> {
         Ok(())
     })
     .await?;
+    if response != 0 && saved_token.is_some() {
+        if let Some(dir) = persist_dir.as_ref() {
+            let _ = super::portal_persist::clear_desktop_restore(dir, "remote-desktop");
+        }
+    }
     ensure_ok(response, "RemoteDesktop start")?;
+    if persist {
+        if let (Some(dir), Some(tok)) = (
+            persist_dir.as_ref(),
+            results.get("restore_token").and_then(owned_str),
+        ) {
+            let _ = super::portal_persist::store_desktop_restore(
+                dir,
+                "remote-desktop",
+                &tok,
+                agentlink_core::util::unix_now(),
+            );
+        }
+    }
     let stream = first_stream(&results).unwrap_or(0);
-    Ok((session, stream))
+    let stream_monitors = monitors_from_portal_results(&results);
+    Ok((session, stream, stream_monitors))
 }
 
-async fn screencast_node(conn: &Connection) -> Result<(String, u32)> {
+async fn screencast_node(conn: &Connection) -> Result<(String, u32, Vec<MonitorInfo>)> {
     let portal = Proxy::new(
         conn,
         "org.freedesktop.portal.Desktop",
@@ -342,11 +496,30 @@ async fn screencast_node(conn: &Connection) -> Result<(String, u32)> {
     .await?;
     ensure_ok(response, "ScreenCast session")?;
 
+    let persist_dir = super::portal_persist::default_persist_data_dir();
+    let persist = super::portal_persist::persist_enabled();
+    let saved_token = persist_dir
+        .as_ref()
+        .and_then(|dir| {
+            super::portal_persist::load_desktop_restore(dir, "screencast")
+                .ok()
+                .flatten()
+        });
+
     let select_token = unique_token("scs");
     let (response, _) = call_and_wait(conn, &request_path(conn, &select_token)?, async {
         let mut options: HashMap<&str, Value<'_>> = HashMap::new();
         options.insert("handle_token", Value::from(select_token.as_str()));
         options.insert("types", Value::from(1u32));
+        if persist {
+            options.insert(
+                "persist_mode",
+                Value::from(super::portal_persist::PERSIST_UNTIL_REVOKED),
+            );
+            if let Some(tok) = saved_token.as_deref() {
+                options.insert("restore_token", Value::from(tok));
+            }
+        }
         portal
             .call::<_, _, OwnedObjectPath>("SelectSources", &(&session, options))
             .await
@@ -367,15 +540,36 @@ async fn screencast_node(conn: &Connection) -> Result<(String, u32)> {
         Ok(())
     })
     .await?;
+    if response != 0 && saved_token.is_some() {
+        if let Some(dir) = persist_dir.as_ref() {
+            let _ = super::portal_persist::clear_desktop_restore(dir, "screencast");
+        }
+    }
     ensure_ok(response, "ScreenCast start")?;
+    if persist {
+        if let (Some(dir), Some(tok)) = (
+            persist_dir.as_ref(),
+            results.get("restore_token").and_then(owned_str),
+        ) {
+            let _ = super::portal_persist::store_desktop_restore(
+                dir,
+                "screencast",
+                &tok,
+                agentlink_core::util::unix_now(),
+            );
+        }
+    }
     let node =
         first_stream(&results).ok_or_else(|| msg("ScreenCast start returned no PipeWire node"))?;
-    Ok((session, node))
+    let stream_monitors = monitors_from_portal_results(&results);
+    Ok((session, node, stream_monitors))
 }
 
 #[cfg(pipewire_headers)]
-async fn open_pipewire_remote(conn: &Connection) -> Result<(std::os::fd::OwnedFd, u32)> {
-    let (session, node) = screencast_node(conn).await?;
+async fn open_pipewire_remote(
+    conn: &Connection,
+) -> Result<(std::os::fd::OwnedFd, u32, Vec<MonitorInfo>)> {
+    let (session, node, stream_monitors) = screencast_node(conn).await?;
     let portal = Proxy::new(
         conn,
         "org.freedesktop.portal.Desktop",
@@ -389,7 +583,7 @@ async fn open_pipewire_remote(conn: &Connection) -> Result<(std::os::fd::OwnedFd
         .call("OpenPipeWireRemote", &(&session, options))
         .await
         .map_err(|err| msg(format!("OpenPipeWireRemote: {err}")))?;
-    Ok((std::os::fd::OwnedFd::from(fd), node))
+    Ok((std::os::fd::OwnedFd::from(fd), node, stream_monitors))
 }
 
 async fn call_and_wait<F>(

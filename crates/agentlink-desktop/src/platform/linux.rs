@@ -381,8 +381,12 @@ impl LinuxState {
             }
         }
         // A closed live session must not leave a PipeWire consumer or
-        // RemoteDesktop session around for the next Retry to trip over.
-        if self.sessions.is_empty() {
+        // Mutter session around for the next Retry to trip over, but keep
+        // a persistent Wayland portal handle alive across reconnects so the
+        // user is not re-prompted when portal persistence is enabled.
+        let keep_wayland = matches!(self.display.as_ref(), Some(DisplayConn::Wayland(_)))
+            && super::portal_persist::persist_enabled();
+        if self.sessions.is_empty() && !keep_wayland {
             self.shutdown_display();
         }
     }
@@ -438,13 +442,6 @@ impl LinuxState {
                         error = %err,
                         "AT-SPI InsertText unavailable; typing keysyms with IME guard"
                     );
-                    if !text.chars().all(|ch| {
-                        ch.is_ascii() && (ch.is_ascii_graphic() || ch.is_ascii_whitespace())
-                    }) {
-                        return Err(msg(format!(
-                            "{err}. Keysym fallback cannot type non-ASCII literally; InsertText needs a focused editable field"
-                        )));
-                    }
                 }
             }
             super::ime::ImeGuard::engage()
@@ -472,29 +469,11 @@ impl LinuxState {
         }
     }
 
-    fn tree(&mut self, depth: u32, nodes: u32) -> Result<UiNode> {
-        self.rt.block_on(super::atspi::tree(depth, nodes))
-    }
-
-    fn act(&mut self, id: &str, op: ElementOp, value: Option<&str>) -> Result<()> {
-        let value = value.map(str::to_string);
-        self.rt
-            .block_on(async { super::atspi::act(id, op, value.as_deref()).await })
-    }
-
     fn monitors(&mut self) -> Result<Vec<MonitorInfo>> {
         self.ensure()?;
         match self.display.as_ref().unwrap() {
             DisplayConn::X11(desk) => desk.monitors(),
-            DisplayConn::Wayland(_) => Ok(vec![MonitorInfo {
-                index: 0,
-                name: "wayland-session".into(),
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0,
-                primary: true,
-            }]),
+            DisplayConn::Wayland(desk) => Ok(desk.monitors()),
             #[cfg(pipewire_headers)]
             DisplayConn::Mutter(desk) => {
                 let monitors = desk.monitors();
@@ -813,15 +792,41 @@ fn auto_connect(rt: &Runtime) -> Result<DisplayConn> {
     ))
 }
 
+struct LinuxA11yState {
+    rt: Runtime,
+}
+
+impl LinuxA11yState {
+    fn new() -> Self {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a11y tokio runtime");
+        Self { rt }
+    }
+
+    fn tree(&mut self, depth: u32, nodes: u32) -> Result<UiNode> {
+        self.rt.block_on(super::atspi::tree(depth, nodes))
+    }
+
+    fn act(&mut self, id: &str, op: ElementOp, value: Option<&str>) -> Result<()> {
+        let value = value.map(str::to_string);
+        self.rt
+            .block_on(async { super::atspi::act(id, op, value.as_deref()).await })
+    }
+}
+
 #[derive(Clone)]
 struct LinuxDesktop {
     worker: Worker<LinuxState>,
+    a11y_worker: Worker<LinuxA11yState>,
 }
 
 impl LinuxDesktop {
     fn start() -> Self {
         Self {
-            worker: Worker::spawn(LinuxState::new),
+            worker: Worker::spawn_named("agentlink-linux-desktop", LinuxState::new),
+            a11y_worker: Worker::spawn_named("agentlink-linux-a11y", LinuxA11yState::new),
         }
     }
 }
@@ -1017,14 +1022,14 @@ impl A11yBackend for LinuxDesktop {
     }
 
     fn tree(&self, max_depth: u32, max_nodes: u32) -> Result<UiNode> {
-        self.worker
+        self.a11y_worker
             .call(move |state| state.tree(max_depth, max_nodes))
     }
 
     fn act(&self, id: &str, op: ElementOp, value: Option<&str>) -> Result<()> {
         let id = id.to_string();
         let value = value.map(str::to_string);
-        self.worker
+        self.a11y_worker
             .call(move |state| state.act(&id, op, value.as_deref()))
     }
 }

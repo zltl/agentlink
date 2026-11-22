@@ -9,6 +9,7 @@
 //! Per-monitor DPI awareness is requested on the desktop thread. Coordinates
 //! are virtual-screen pixels, the same space as `monitor.x` / `monitor.y`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,7 +35,8 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFOHEADER, DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationElementArray,
@@ -50,8 +52,8 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MapVirtualKeyW, SendInput, VkKeyScanW, INPUT, INPUT_0, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
@@ -84,33 +86,43 @@ fn werr(err: windows::core::Error) -> crate::error::DesktopError {
     msg(err.to_string())
 }
 
-struct WindowsState {
-    dup: Option<Duplication>,
-    automation: Option<IUIAutomation>,
-    elements: Vec<IUIAutomationElement>,
-    last_frame: Option<Frame>,
+struct WindowsCaptureState {
+    dups: HashMap<u32, Duplication>,
+    last_frames: HashMap<u32, Frame>,
+    last_any_frame: Option<Frame>,
+    com_initialized: bool,
 }
 
 struct Duplication {
-    index: u32,
     duplication: IDXGIOutputDuplication,
     context: ID3D11DeviceContext,
-    /// Kept so the duplication's device is not released while the output is live.
-    #[allow(dead_code)]
     device: ID3D11Device,
+    /// Reused across frames while capture dimensions are unchanged.
+    staging: Option<(u32, u32, ID3D11Texture2D)>,
 }
 
-impl WindowsState {
-    fn new() -> Self {
-        unsafe {
-            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+impl Drop for WindowsCaptureState {
+    fn drop(&mut self) {
+        self.dups.clear();
+        if self.com_initialized {
+            unsafe {
+                CoUninitialize();
+            }
         }
+    }
+}
+
+impl WindowsCaptureState {
+    fn new() -> Self {
+        let com_initialized = unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok()
+        };
         Self {
-            dup: None,
-            automation: None,
-            elements: Vec::new(),
-            last_frame: None,
+            dups: HashMap::new(),
+            last_frames: HashMap::new(),
+            last_any_frame: None,
+            com_initialized,
         }
     }
 
@@ -127,7 +139,12 @@ impl WindowsState {
         // The offer probe runs this before the pump. A static desktop then
         // times out in DXGI; the stream repeats this image instead of failing
         // the session with no pixels.
-        self.last_frame = Some(frame.clone());
+        if let CaptureTarget::Monitor(index) = request.target {
+            self.last_frames.insert(index, frame.clone());
+        } else {
+            self.last_frames.insert(0, frame.clone());
+        }
+        self.last_any_frame = Some(frame.clone());
         Ok(frame)
     }
 
@@ -146,11 +163,12 @@ impl WindowsState {
         match grab_dxgi(self, index) {
             DxgiGrab::Frame(frame) => {
                 let frame = scale_frame(frame, request.scale)?;
-                self.last_frame = Some(frame.clone());
+                self.last_frames.insert(index, frame.clone());
+                self.last_any_frame = Some(frame.clone());
                 Ok(frame)
             }
             DxgiGrab::Timeout => {
-                if let Some(prev) = self.last_frame.clone() {
+                if let Some(prev) = self.last_frames.get(&index).cloned() {
                     let mut frame = prev;
                     frame.mark_unchanged();
                     frame.captured_unix_ms = unix_ms();
@@ -159,12 +177,12 @@ impl WindowsState {
                 self.capture(request)
             }
             DxgiGrab::Failed(err) => {
-                tracing::warn!(error = %err, "DXGI stream grab failed; using the last frame or GDI");
-                self.dup = None;
+                tracing::warn!(error = %err, monitor = index, "DXGI stream grab failed; using the last frame or GDI");
+                self.dups.remove(&index);
                 match self.capture(request) {
                     Ok(frame) => Ok(frame),
                     Err(gdi_err) => {
-                        if let Some(prev) = self.last_frame.clone() {
+                        if let Some(prev) = self.last_frames.get(&index).cloned() {
                             tracing::warn!(error = %gdi_err, "GDI capture failed; repeating the last frame");
                             Ok(prev)
                         } else {
@@ -183,27 +201,29 @@ enum DxgiGrab {
     Failed(String),
 }
 
-fn grab_dxgi(state: &mut WindowsState, index: u32) -> DxgiGrab {
-    if state.dup.as_ref().map(|dup| dup.index) != Some(index) {
+fn grab_dxgi(state: &mut WindowsCaptureState, index: u32) -> DxgiGrab {
+    if !state.dups.contains_key(&index) {
         match open_duplication(index) {
-            Ok(dup) => state.dup = Some(dup),
+            Ok(dup) => {
+                state.dups.insert(index, dup);
+            }
             Err(err) => return DxgiGrab::Failed(err.to_string()),
         }
     }
-    let dup = state.dup.as_ref().unwrap();
+    let dup = state.dups.get_mut(&index).unwrap();
     match unsafe { acquire_frame(dup) } {
         Ok(frame) => DxgiGrab::Frame(frame),
         Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => DxgiGrab::Timeout,
         Err(err) => {
             // ACCESS_LOST and INVALID_CALL (a frame left acquired) both need a
             // new duplication. Keeping the dead object made every later grab fail.
-            state.dup = None;
+            state.dups.remove(&index);
             DxgiGrab::Failed(err.message().to_string())
         }
     }
 }
 
-fn capture_monitor(state: &mut WindowsState, index: u32) -> Result<Frame> {
+fn capture_monitor(state: &mut WindowsCaptureState, index: u32) -> Result<Frame> {
     match capture_dxgi(state, index) {
         Ok(frame) => Ok(frame),
         Err(err) => {
@@ -218,11 +238,11 @@ fn capture_monitor(state: &mut WindowsState, index: u32) -> Result<Frame> {
     }
 }
 
-fn capture_dxgi(state: &mut WindowsState, index: u32) -> Result<Frame> {
-    if state.dup.as_ref().map(|dup| dup.index) != Some(index) {
-        state.dup = Some(open_duplication(index)?);
+fn capture_dxgi(state: &mut WindowsCaptureState, index: u32) -> Result<Frame> {
+    if !state.dups.contains_key(&index) {
+        state.dups.insert(index, open_duplication(index)?);
     }
-    let dup = state.dup.as_ref().unwrap();
+    let dup = state.dups.get_mut(&index).unwrap();
     let grabbed = unsafe { acquire_frame(dup) };
     match grabbed {
         Ok(frame) => Ok(frame),
@@ -230,18 +250,24 @@ fn capture_dxgi(state: &mut WindowsState, index: u32) -> Result<Frame> {
             if err.code() == DXGI_ERROR_ACCESS_LOST || err.code() == DXGI_ERROR_WAIT_TIMEOUT =>
         {
             if err.code() == DXGI_ERROR_ACCESS_LOST {
-                state.dup = None;
+                state.dups.remove(&index);
             }
             Err(msg(err.message()))
         }
-        Err(err) => Err(msg(err.message())),
+        Err(err) => {
+            state.dups.remove(&index);
+            Err(msg(err.message()))
+        }
     }
 }
 
 fn open_duplication(index: u32) -> Result<Duplication> {
+    let want_device = list_monitors()
+        .ok()
+        .and_then(|ms| ms.into_iter().find(|m| m.index == index).map(|m| m.name));
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(werr)?;
-        let (adapter, output) = output_at(&factory, index)?;
+        let (adapter, output) = output_at(&factory, index, want_device.as_deref())?;
         let mut device = None;
         let mut context = None;
         D3D11CreateDevice(
@@ -266,15 +292,40 @@ fn open_duplication(index: u32) -> Result<Duplication> {
             ))
         })?;
         Ok(Duplication {
-            index,
             duplication,
             context,
             device,
+            staging: None,
         })
     }
 }
 
-unsafe fn output_at(factory: &IDXGIFactory1, index: u32) -> Result<(IDXGIAdapter1, IDXGIOutput)> {
+unsafe fn output_at(
+    factory: &IDXGIFactory1,
+    index: u32,
+    want_device: Option<&str>,
+) -> Result<(IDXGIAdapter1, IDXGIOutput)> {
+    // First pass: match the GDI monitor's `szDevice` (e.g. `\\.\DISPLAY1`) against
+    // DXGI_OUTPUT_DESC::DeviceName so multi-GPU/multi-monitor indices align.
+    if let Some(target_dev) = want_device.filter(|d| !d.is_empty()) {
+        for adapter_index in 0..16u32 {
+            let Ok(adapter) = factory.EnumAdapters1(adapter_index) else {
+                break;
+            };
+            for output_index in 0..16u32 {
+                let Ok(output) = adapter.EnumOutputs(output_index) else {
+                    break;
+                };
+                if let Ok(desc) = output.GetDesc() {
+                    let dev = utf16_cstr(&desc.DeviceName);
+                    if dev.eq_ignore_ascii_case(target_dev) {
+                        return Ok((adapter, output));
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: positional index.
     let mut seen = 0u32;
     for adapter_index in 0..16u32 {
         let Ok(adapter) = factory.EnumAdapters1(adapter_index) else {
@@ -305,7 +356,7 @@ fn pump_desktop_messages() {
     }
 }
 
-unsafe fn acquire_frame(dup: &Duplication) -> windows::core::Result<Frame> {
+unsafe fn acquire_frame(dup: &mut Duplication) -> windows::core::Result<Frame> {
     // The first call on a quiet desktop often times out. One more try, then the caller uses GDI.
     let mut last = None;
     for timeout_ms in [0u32, 100] {
@@ -318,7 +369,7 @@ unsafe fn acquire_frame(dup: &Duplication) -> windows::core::Result<Frame> {
         {
             Ok(()) => {
                 let copied = match resource {
-                    Some(resource) => copy_duplication(&dup.context, &resource),
+                    Some(resource) => copy_duplication(dup, &resource),
                     None => Err(windows::core::Error::from_win32()),
                 };
                 // Always release. Skipping this returns INVALID_CALL forever after.
@@ -338,7 +389,7 @@ unsafe fn acquire_frame(dup: &Duplication) -> windows::core::Result<Frame> {
 }
 
 unsafe fn copy_duplication(
-    context: &ID3D11DeviceContext,
+    dup: &mut Duplication,
     resource: &IDXGIResource,
 ) -> windows::core::Result<Frame> {
     let texture: ID3D11Texture2D = resource.cast()?;
@@ -349,28 +400,37 @@ unsafe fn copy_duplication(
     if width == 0 || height == 0 {
         return Err(windows::core::Error::from_win32());
     }
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-    desc.MiscFlags = 0;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc = DXGI_SAMPLE_DESC {
-        Count: 1,
-        Quality: 0,
-    };
-    let device = context.GetDevice()?;
-    let mut staging = None;
-    device.CreateTexture2D(&desc, None, Some(&mut staging))?;
-    let staging = staging.ok_or_else(windows::core::Error::from_win32)?;
+    let need_new = dup
+        .staging
+        .as_ref()
+        .map(|(w, h, _)| *w != width || *h != height)
+        .unwrap_or(true);
+    if need_new {
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc = DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        };
+        let mut created = None;
+        dup.device.CreateTexture2D(&desc, None, Some(&mut created))?;
+        let created = created.ok_or_else(windows::core::Error::from_win32)?;
+        dup.staging = Some((width, height, created));
+    }
+    let (_, _, staging) = dup.staging.as_ref().unwrap();
     let src: ID3D11Resource = texture.cast()?;
     let dst: ID3D11Resource = staging.cast()?;
-    context.CopyResource(&dst, &src);
+    dup.context.CopyResource(&dst, &src);
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    context.Map(&dst, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+    dup.context
+        .Map(&dst, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
     let frame = mapped_frame(mapped, width, height, "dxgi");
-    context.Unmap(&dst, 0);
+    dup.context.Unmap(&dst, 0);
     frame.map_err(|err| windows::core::Error::new(windows::core::HRESULT(-1), err.to_string()))
 }
 
@@ -637,7 +697,52 @@ fn utf16_cstr(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
-impl Pointer for WindowsState {
+const VK_SHIFT_CODE: u16 = 0x10;
+const ERROR_ACCESS_DENIED_CODE: u32 = 5;
+
+struct WindowsHidState {
+    user_shift_held: bool,
+    auto_shifted: HashMap<String, u16>,
+}
+
+impl WindowsHidState {
+    fn new() -> Self {
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        Self {
+            user_shift_held: false,
+            auto_shifted: HashMap::new(),
+        }
+    }
+
+    fn resolve_vk_and_shift(name: &str) -> Result<(u16, bool)> {
+        let mut chars = name.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next()) {
+            if ch.is_ascii_punctuation() {
+                let raw = unsafe { VkKeyScanW(ch as u16) };
+                if raw != -1 {
+                    let vk = (raw & 0xff) as u16;
+                    let shift_bits = (raw >> 8) & 0xff;
+                    if vk != 0 {
+                        return Ok((vk, (shift_bits & 1) != 0));
+                    }
+                }
+            }
+        }
+        let info = key_info(name).ok_or_else(|| msg(format!("unknown key '{name}'")))?;
+        Ok((info.vk, crate::keys::key_requires_shift(name)))
+    }
+}
+
+fn is_shift_key_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "shift" | "lshift" | "rshift" | "shift_l" | "shift_r"
+    )
+}
+
+impl Pointer for WindowsHidState {
     fn mouse_move(&mut self, x: i32, y: i32) -> Result<()> {
         send_mouse(
             x,
@@ -672,13 +777,41 @@ impl Pointer for WindowsState {
     }
 
     fn key_down(&mut self, key: &str) -> Result<()> {
-        let vk = virtual_key(key)?;
-        send_key(vk, false)
+        if is_shift_key_name(key) {
+            self.user_shift_held = true;
+            let vk = virtual_key(key)?;
+            return send_key(vk, false);
+        }
+        let (vk, need_shift) = Self::resolve_vk_and_shift(key)?;
+        if need_shift && !self.user_shift_held {
+            send_key(VK_SHIFT_CODE, false)?;
+            self.auto_shifted.insert(key.to_string(), vk);
+        }
+        if let Err(err) = send_key(vk, false) {
+            if self.auto_shifted.remove(key).is_some() {
+                let _ = send_key(VK_SHIFT_CODE, true);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn key_up(&mut self, key: &str) -> Result<()> {
-        let vk = virtual_key(key)?;
-        send_key(vk, true)
+        if is_shift_key_name(key) {
+            self.user_shift_held = false;
+            let vk = virtual_key(key)?;
+            return send_key(vk, true);
+        }
+        let auto_vk = self.auto_shifted.remove(key);
+        let vk = match auto_vk {
+            Some(v) => v,
+            None => Self::resolve_vk_and_shift(key)?.0,
+        };
+        let res = send_key(vk, true);
+        if auto_vk.is_some() && !self.user_shift_held {
+            let _ = send_key(VK_SHIFT_CODE, true);
+        }
+        res
     }
 
     fn type_text(&mut self, text: &str) -> Result<()> {
@@ -696,12 +829,8 @@ impl Pointer for WindowsState {
                 send_key(0x09, true)?;
                 continue;
             }
-            let mut units = [0u16; 2];
-            let len = ch.encode_utf16(&mut units).len();
-            for unit in &units[..len] {
-                send_unicode(*unit, false)?;
-                send_unicode(*unit, true)?;
-            }
+            let inputs = unicode_inputs_for_char(ch);
+            send_inputs(&inputs, "unicode")?;
         }
         Ok(())
     }
@@ -711,6 +840,28 @@ fn virtual_key(name: &str) -> Result<u16> {
     key_info(name)
         .map(|info| info.vk)
         .ok_or_else(|| msg(format!("unknown key '{name}'")))
+}
+
+fn format_send_input_error(what: &str, err_code: u32) -> String {
+    if err_code == ERROR_ACCESS_DENIED_CODE {
+        format!(
+            "SendInput {what} access denied (UIPI/UAC: target window is elevated; code {err_code})"
+        )
+    } else {
+        format!("SendInput {what} failed ({err_code})")
+    }
+}
+
+fn send_inputs(inputs: &[INPUT], what: &str) -> Result<()> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent == 0 {
+        let code = unsafe { GetLastError().0 };
+        return Err(msg(format_send_input_error(what, code)));
+    }
+    Ok(())
 }
 
 fn send_mouse(
@@ -727,28 +878,20 @@ fn send_mouse(
     } else {
         (0, 0, flags)
     };
-    unsafe {
-        let input = INPUT {
-            r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx,
-                    dy,
-                    mouseData: data,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
+    let input = INPUT {
+        r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: data,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
             },
-        };
-        if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 0 {
-            return Err(msg(format!(
-                "SendInput mouse failed ({})",
-                GetLastError().0
-            )));
-        }
-    }
-    Ok(())
+        },
+    };
+    send_inputs(&[input], "mouse")
 }
 
 fn send_key(vk: u16, up: bool) -> Result<()> {
@@ -760,56 +903,96 @@ fn send_key(vk: u16, up: bool) -> Result<()> {
     if crate::keys::is_windows_extended_vk(vk) {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
-    unsafe {
-        let scan = MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16;
-        let input = INPUT {
-            r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(vk),
-                    wScan: scan,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
+    let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16 };
+    let input = INPUT {
+        r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
             },
-        };
-        if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 0 {
-            return Err(msg(format!("SendInput key failed ({})", GetLastError().0)));
-        }
-    }
-    Ok(())
+        },
+    };
+    send_inputs(&[input], "key")
 }
 
-fn send_unicode(unit: u16, up: bool) -> Result<()> {
+fn unicode_input(unit: u16, up: bool) -> INPUT {
     let mut flags = KEYEVENTF_UNICODE;
     if up {
         flags |= KEYEVENTF_KEYUP;
     }
-    unsafe {
-        let input = INPUT {
-            r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: unit,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
+    INPUT {
+        r#type: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
             },
-        };
-        if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 0 {
-            return Err(msg(format!(
-                "SendInput unicode failed ({})",
-                GetLastError().0
-            )));
-        }
+        },
     }
-    Ok(())
 }
 
-fn ensure_uia(state: &mut WindowsState) -> Result<&IUIAutomation> {
+/// Build an atomic `SendInput` batch for one Unicode scalar value.
+/// Supplementary-plane characters (emoji, CJK Ext-B+) must send both UTF-16
+/// surrogate units down together in one `SendInput` call before releasing them,
+/// otherwise Win32 applications drop the pair.
+fn unicode_inputs_for_char(ch: char) -> Vec<INPUT> {
+    let mut units = [0u16; 2];
+    let encoded = ch.encode_utf16(&mut units);
+    if encoded.len() == 2 {
+        vec![
+            unicode_input(encoded[0], false),
+            unicode_input(encoded[1], false),
+            unicode_input(encoded[0], true),
+            unicode_input(encoded[1], true),
+        ]
+    } else {
+        vec![
+            unicode_input(encoded[0], false),
+            unicode_input(encoded[0], true),
+        ]
+    }
+}
+
+struct WindowsA11yState {
+    automation: Option<IUIAutomation>,
+    elements: Vec<IUIAutomationElement>,
+    com_initialized: bool,
+}
+
+impl Drop for WindowsA11yState {
+    fn drop(&mut self) {
+        self.elements.clear();
+        self.automation = None;
+        if self.com_initialized {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
+impl WindowsA11yState {
+    fn new() -> Self {
+        let com_initialized = unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok()
+        };
+        Self {
+            automation: None,
+            elements: Vec::new(),
+            com_initialized,
+        }
+    }
+}
+
+fn ensure_uia(state: &mut WindowsA11yState) -> Result<&IUIAutomation> {
     if state.automation.is_none() {
         let automation: IUIAutomation = unsafe {
             CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).map_err(|err| {
@@ -823,7 +1006,7 @@ fn ensure_uia(state: &mut WindowsState) -> Result<&IUIAutomation> {
     Ok(state.automation.as_ref().unwrap())
 }
 
-fn ui_tree(state: &mut WindowsState, max_depth: u32, max_nodes: u32) -> Result<UiNode> {
+fn ui_tree(state: &mut WindowsA11yState, max_depth: u32, max_nodes: u32) -> Result<UiNode> {
     let automation = ensure_uia(state)?.clone();
     state.elements.clear();
     let root = unsafe { automation.GetRootElement() }.map_err(|err| msg(err.to_string()))?;
@@ -834,7 +1017,7 @@ fn ui_tree(state: &mut WindowsState, max_depth: u32, max_nodes: u32) -> Result<U
 
 fn walk_uia(
     automation: &IUIAutomation,
-    state: &mut WindowsState,
+    state: &mut WindowsA11yState,
     element: IUIAutomationElement,
     depth: u32,
     budget: &mut u32,
@@ -954,7 +1137,13 @@ fn role_name(kind: windows::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID) -> &'s
     }
 }
 
-fn ui_act(state: &mut WindowsState, id: &str, op: ElementOp, value: Option<&str>) -> Result<()> {
+fn ui_act(
+    state: &mut WindowsA11yState,
+    hid: &Worker<WindowsHidState>,
+    id: &str,
+    op: ElementOp,
+    value: Option<&str>,
+) -> Result<()> {
     if state.elements.is_empty() {
         return Err(msg("call get_ui_tree before acting on a Windows element"));
     }
@@ -988,10 +1177,11 @@ fn ui_act(state: &mut WindowsState, id: &str, op: ElementOp, value: Option<&str>
                 .map_err(|err| msg(err.to_string()))?;
             let x = rect.left + (rect.right - rect.left) / 2;
             let y = rect.top + (rect.bottom - rect.top) / 2;
-            state.mouse_move(x, y)?;
-            state.mouse_button(MouseButton::Left, true)?;
-            state.mouse_button(MouseButton::Left, false)?;
-            Ok(())
+            hid.call(move |hid_state| {
+                hid_state.mouse_move(x, y)?;
+                hid_state.mouse_button(MouseButton::Left, true)?;
+                hid_state.mouse_button(MouseButton::Left, false)
+            })
         }
     }
 }
@@ -1005,7 +1195,7 @@ fn parse_uia_id(id: &str) -> Result<usize> {
 }
 
 struct WindowsSession {
-    worker: Worker<WindowsState>,
+    worker: Worker<WindowsCaptureState>,
     request: CaptureRequest,
     interval: Duration,
     last: Instant,
@@ -1031,13 +1221,17 @@ impl FrameSource for WindowsSession {
 
 #[derive(Clone)]
 struct WindowsDesktop {
-    worker: Worker<WindowsState>,
+    capture_worker: Worker<WindowsCaptureState>,
+    hid_worker: Worker<WindowsHidState>,
+    a11y_worker: Worker<WindowsA11yState>,
 }
 
 impl WindowsDesktop {
     fn start() -> Self {
         Self {
-            worker: Worker::spawn(WindowsState::new),
+            capture_worker: Worker::spawn_named("agentlink-win-capture", WindowsCaptureState::new),
+            hid_worker: Worker::spawn_named("agentlink-win-hid", WindowsHidState::new),
+            a11y_worker: Worker::spawn_named("agentlink-win-a11y", WindowsA11yState::new),
         }
     }
 }
@@ -1109,8 +1303,9 @@ pub fn windows_capturable_state() -> CapturableState {
     }
 }
 
-/// Heuristic: a frame that is almost entirely black often means the secure
-/// desktop (or a blanked output) rather than a real dark wallpaper.
+/// Heuristic: a frame that is 100% pure black (every sampled RGB byte is 0)
+/// indicates a secure desktop or blanked output. Dark wallpapers and dark
+/// terminals have non-zero UI/text/chrome pixels and are NOT flagged.
 pub fn frame_looks_blank(frame: &Frame) -> bool {
     let pixels = frame.pixels();
     if pixels.len() < 16 {
@@ -1118,19 +1313,18 @@ pub fn frame_looks_blank(frame: &Frame) -> bool {
     }
     let step = ((pixels.len() / 4) / 4096).max(1) * 4;
     let mut checked = 0u32;
-    let mut dark = 0u32;
     let mut i = 0;
     while i + 3 < pixels.len() {
-        let b = pixels[i] as u32;
-        let g = pixels[i + 1] as u32;
-        let r = pixels[i + 2] as u32;
+        let b = pixels[i];
+        let g = pixels[i + 1];
+        let r = pixels[i + 2];
         checked += 1;
-        if r | g | b < 8 {
-            dark += 1;
+        if (r | g | b) != 0 {
+            return false;
         }
         i += step;
     }
-    checked > 0 && dark * 100 / checked >= 98
+    checked > 0
 }
 
 pub fn open() -> Arc<Desktop> {
@@ -1148,7 +1342,7 @@ impl CaptureBackend for WindowsDesktop {
     }
 
     fn list_monitors(&self) -> Result<Vec<MonitorInfo>> {
-        self.worker.call(|state| state.monitors())
+        self.capture_worker.call(|state| state.monitors())
     }
 
     fn cursor(&self) -> Option<CursorSample> {
@@ -1179,8 +1373,8 @@ impl CaptureBackend for WindowsDesktop {
         if !input.capturable {
             return input;
         }
-        match self.worker.call(|state| {
-            Ok(match state.last_frame.as_ref() {
+        match self.capture_worker.call(|state| {
+            Ok(match state.last_any_frame.as_ref() {
                 Some(frame) if frame_looks_blank(frame) => CapturableState {
                     capturable: false,
                     reason: Some("secure desktop".into()),
@@ -1195,12 +1389,13 @@ impl CaptureBackend for WindowsDesktop {
 
     fn capture(&self, request: &CaptureRequest) -> Result<Frame> {
         let request = request.clone();
-        self.worker.call(move |state| state.capture(&request))
+        self.capture_worker
+            .call(move |state| state.capture(&request))
     }
 
     fn open_session(&self, request: &CaptureRequest) -> Result<Box<dyn FrameSource>> {
         Ok(Box::new(WindowsSession {
-            worker: self.worker.clone(),
+            worker: self.capture_worker.clone(),
             request: request.clone(),
             interval: stream_interval(request.max_fps),
             last: Instant::now()
@@ -1231,7 +1426,7 @@ impl HidBackend for WindowsDesktop {
             ));
         }
         let action = action.clone();
-        self.worker.call(move |state| perform(state, &action))
+        self.hid_worker.call(move |state| perform(state, &action))
     }
 }
 
@@ -1241,19 +1436,91 @@ impl A11yBackend for WindowsDesktop {
     }
 
     fn tree(&self, max_depth: u32, max_nodes: u32) -> Result<UiNode> {
-        self.worker
+        self.a11y_worker
             .call(move |state| ui_tree(state, max_depth, max_nodes))
     }
 
     fn act(&self, id: &str, op: ElementOp, value: Option<&str>) -> Result<()> {
         let id = id.to_string();
         let value = value.map(str::to_string);
-        self.worker
-            .call(move |state| ui_act(state, &id, op, value.as_deref()))
+        let hid = self.hid_worker.clone();
+        self.a11y_worker
+            .call(move |state| ui_act(state, &hid, &id, op, value.as_deref()))
     }
 }
 
 #[link(name = "user32")]
 extern "system" {
     fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_looks_blank_does_not_flag_dark_terminal_or_wallpaper() {
+        let all_black = Frame::from_bgra(16, 16, 64, &vec![0u8; 16 * 16 * 4], "test").unwrap();
+        assert!(frame_looks_blank(&all_black));
+
+        // Dark terminal background (#060606) must NOT be misclassified as secure desktop.
+        let mut dark_bg = vec![6u8; 16 * 16 * 4];
+        for px in dark_bg.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let dark_term = Frame::from_bgra(16, 16, 64, &dark_bg, "test").unwrap();
+        assert!(!frame_looks_blank(&dark_term));
+
+        // 99% pure black with a single lit pixel (cursor/prompt) is not blank.
+        let mut mostly_black = vec![0u8; 32 * 32 * 4];
+        mostly_black[0] = 255;
+        mostly_black[1] = 255;
+        mostly_black[2] = 255;
+        let prompt = Frame::from_bgra(32, 32, 128, &mostly_black, "test").unwrap();
+        assert!(!frame_looks_blank(&prompt));
+    }
+
+    #[test]
+    fn unicode_inputs_batches_surrogate_pairs_atomically() {
+        let bmp = unicode_inputs_for_char('A');
+        assert_eq!(bmp.len(), 2);
+        unsafe {
+            assert_eq!(bmp[0].Anonymous.ki.wScan, 'A' as u16);
+            assert_eq!(bmp[0].Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
+            assert_eq!(bmp[1].Anonymous.ki.wScan, 'A' as u16);
+            assert_eq!(
+                bmp[1].Anonymous.ki.dwFlags,
+                KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+            );
+        }
+
+        // U+1F600 (😀) encodes to surrogate pair [0xD83D, 0xDE00]; must emit
+        // [high_down, low_down, high_up, low_up] in one atomic SendInput slice.
+        let emoji = unicode_inputs_for_char('😀');
+        assert_eq!(emoji.len(), 4);
+        unsafe {
+            assert_eq!(emoji[0].Anonymous.ki.wScan, 0xD83D);
+            assert_eq!(emoji[0].Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
+            assert_eq!(emoji[1].Anonymous.ki.wScan, 0xDE00);
+            assert_eq!(emoji[1].Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
+            assert_eq!(emoji[2].Anonymous.ki.wScan, 0xD83D);
+            assert_eq!(
+                emoji[2].Anonymous.ki.dwFlags,
+                KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+            );
+            assert_eq!(emoji[3].Anonymous.ki.wScan, 0xDE00);
+            assert_eq!(
+                emoji[3].Anonymous.ki.dwFlags,
+                KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+            );
+        }
+    }
+
+    #[test]
+    fn format_send_input_error_flags_uipi_access_denied() {
+        let denied = format_send_input_error("key", ERROR_ACCESS_DENIED_CODE);
+        assert!(denied.contains("access denied") && denied.contains("UIPI"));
+        let other = format_send_input_error("mouse", 87);
+        assert!(other.contains("failed (87)"));
+    }
 }

@@ -28,31 +28,39 @@ fn main() {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-unused-variable")
         .flag_if_supported("-w");
-    if std::env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows") {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os == "windows" {
         build.flag_if_supported("/O2");
     }
     add_videotoolbox(&mut build);
-    match pkg_config::probe_library("libpipewire-0.3") {
-        Ok(lib) => {
-            // pkg-config only emits link flags here; the cc::Build needs the
-            // -I paths (e.g. /usr/include/pipewire-0.3, /usr/include/spa-0.2)
-            // or pipewire/pipewire.h cannot be found.
-            for path in &lib.include_paths {
-                build.include(path);
+    // PipeWire is Linux-only (and static musl builds cannot dynamically link
+    // libpipewire-0.3). Guarding the probe keeps Windows, macOS, and musl
+    // builds free of spurious warnings.
+    if target_os == "linux" && target_env != "musl" {
+        match pkg_config::probe_library("libpipewire-0.3") {
+            Ok(lib) => {
+                // pkg-config only emits link flags here; the cc::Build needs the
+                // -I paths (e.g. /usr/include/pipewire-0.3, /usr/include/spa-0.2)
+                // or pipewire/pipewire.h cannot be found.
+                for path in &lib.include_paths {
+                    build.include(path);
+                }
+                for (name, value) in &lib.defines {
+                    build.define(name, value.as_deref());
+                }
+                build.file("src/stream/native/pipewire_capture.c");
+                build.define("HAVE_PIPEWIRE", None);
+                println!("cargo:rustc-cfg=pipewire_headers");
             }
-            for (name, value) in &lib.defines {
-                build.define(name, value.as_deref());
+            Err(_) => {
+                println!("cargo:warning=libpipewire-0.3 not found; Wayland streaming falls back to the screenshot portal");
             }
-            build.file("src/stream/native/pipewire_capture.c");
-            build.define("HAVE_PIPEWIRE", None);
-            println!("cargo:rustc-cfg=pipewire_headers");
-        }
-        Err(_) => {
-            println!("cargo:warning=libpipewire-0.3 not found; Wayland streaming falls back to the screenshot portal");
         }
     }
     build.compile("agentlink_stream_native");
     println!("cargo:rerun-if-changed=src/stream/native/minih264_glue.c");
     println!("cargo:rerun-if-changed=src/stream/native/pipewire_capture.c");
+    println!("cargo:rerun-if-changed=src/stream/native/videotoolbox_encode.c");
     println!("cargo:rerun-if-changed=vendor/minih264e.h");
 }

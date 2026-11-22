@@ -24,6 +24,88 @@ const RESTORE_FILE: &str = "screencast-window.json";
 const RESTORE_SUBDIR: &str = "portal-restore";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopRestoreRecord {
+    /// Opaque portal token. Never log this value.
+    pub token: String,
+    pub portal_app_id: String,
+    pub kind: String,
+    pub created_unix: i64,
+}
+
+fn desktop_restore_path(data_dir: &Path, kind: &str) -> PathBuf {
+    let safe: String = kind
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    restore_dir(data_dir).join(format!("desktop-{safe}.json"))
+}
+
+pub fn store_desktop_restore(
+    data_dir: &Path,
+    kind: &str,
+    token: &str,
+    now_unix: i64,
+) -> Result<Option<PathBuf>> {
+    if !persist_enabled() {
+        return Ok(None);
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let dir = restore_dir(data_dir);
+    agentlink_core::util::ensure_dir(&dir).map_err(|err| msg(err.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+    let record = DesktopRestoreRecord {
+        token: token.to_string(),
+        portal_app_id: PORTAL_APP_ID.to_string(),
+        kind: norm(kind),
+        created_unix: now_unix,
+    };
+    let path = desktop_restore_path(data_dir, kind);
+    agentlink_core::util::write_secret(
+        &path,
+        serde_json::to_string_pretty(&record)
+            .map_err(|err| msg(err.to_string()))?
+            .as_bytes(),
+    )
+    .map_err(|err| msg(err.to_string()))?;
+    Ok(Some(path))
+}
+
+pub fn load_desktop_restore(data_dir: &Path, kind: &str) -> Result<Option<String>> {
+    if !persist_enabled() {
+        return Ok(None);
+    }
+    let path = desktop_restore_path(data_dir, kind);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|err| msg(format!("read desktop portal restore token: {err}")))?;
+    let record: DesktopRestoreRecord = serde_json::from_str(&text)
+        .map_err(|err| msg(format!("desktop portal restore token {}: {err}", path.display())))?;
+    let token = record.token.trim();
+    if token.is_empty() || record.portal_app_id != PORTAL_APP_ID {
+        return Ok(None);
+    }
+    Ok(Some(token.to_string()))
+}
+
+pub fn clear_desktop_restore(data_dir: &Path, kind: &str) -> Result<()> {
+    let path = desktop_restore_path(data_dir, kind);
+    if path.exists() {
+        fs::remove_file(&path)
+            .map_err(|err| msg(format!("clear desktop portal restore token: {err}")))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreRecord {
     /// Opaque portal token. Never log this value.
     pub token: String,
@@ -306,5 +388,34 @@ mod tests {
         assert!(body.contains("Exec=/opt/agentlink"));
         assert!(body.contains("NoDisplay=true"));
         assert!(body.contains("Name=agentlink"));
+    }
+
+    #[test]
+    fn desktop_restore_token_roundtrips_and_clears_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(store_desktop_restore(dir.path(), "screencast", "tok-sc-1", 100)
+            .unwrap()
+            .is_some());
+        assert!(store_desktop_restore(dir.path(), "remote-desktop", "tok-rd-2", 101)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            load_desktop_restore(dir.path(), "screencast").unwrap().as_deref(),
+            Some("tok-sc-1")
+        );
+        assert_eq!(
+            load_desktop_restore(dir.path(), "remote-desktop")
+                .unwrap()
+                .as_deref(),
+            Some("tok-rd-2")
+        );
+        clear_desktop_restore(dir.path(), "screencast").unwrap();
+        assert!(load_desktop_restore(dir.path(), "screencast").unwrap().is_none());
+        assert_eq!(
+            load_desktop_restore(dir.path(), "remote-desktop")
+                .unwrap()
+                .as_deref(),
+            Some("tok-rd-2")
+        );
     }
 }

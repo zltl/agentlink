@@ -34,6 +34,10 @@ pub struct X11Desk {
     shm: Option<ShmSlot>,
     shm_ok: bool,
     keymap: Option<Keymap>,
+    /// Persistent scratch keycode used for temporary Unicode keysym injection,
+    /// storing `(keycode, original_keysym)` so it is restored cleanly on Drop
+    /// instead of racing the X client immediately after KeyPress.
+    scratch_keycode: Option<(Keycode, u32)>,
     xwayland: bool,
     damage: Option<DamageWatch>,
 }
@@ -104,6 +108,7 @@ impl X11Desk {
             shm: None,
             shm_ok,
             keymap: None,
+            scratch_keycode: None,
             xwayland,
             damage: None,
         })
@@ -255,19 +260,31 @@ impl X11Desk {
         }
     }
 
+    fn current_root_size(&self) -> (u32, u32) {
+        if let Ok(cookie) = self.conn.get_geometry(self.root) {
+            if let Ok(geom) = cookie.reply() {
+                if geom.width > 0 && geom.height > 0 {
+                    return (geom.width as u32, geom.height as u32);
+                }
+            }
+        }
+        (self.width, self.height)
+    }
+
     pub fn monitors(&self) -> Result<Vec<MonitorInfo>> {
         if let Some(monitors) = self.randr_monitors() {
             if !monitors.is_empty() {
                 return Ok(monitors);
             }
         }
+        let (width, height) = self.current_root_size();
         Ok(vec![MonitorInfo {
             index: 0,
             name: "x11-0".into(),
             x: 0,
             y: 0,
-            width: self.width,
-            height: self.height,
+            width,
+            height,
             primary: true,
         }])
     }
@@ -315,7 +332,10 @@ impl X11Desk {
     }
 
     pub fn capture_full(&mut self) -> Result<Frame> {
-        self.grab(self.root, 0, 0, self.width, self.height)
+        let (width, height) = self.current_root_size();
+        self.width = width;
+        self.height = height;
+        self.grab(self.root, 0, 0, width, height)
     }
 
     pub fn capture_monitor(&mut self, index: u32) -> Result<Frame> {
@@ -405,11 +425,11 @@ impl X11Desk {
             .reply()
             .map_err(|err| msg(format!("shm get image: {err}")))?;
         let ptr = self.shm.as_ref().unwrap().ptr;
-        // The X server wrote the image into the shared mapping. Copy it out
-        // once so the next grab can reuse the segment.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) }.to_vec();
+        // Pack directly from the shared segment into the owned Frame buffer so
+        // we avoid an extra full-frame allocation and copy.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
         pack_ximage(
-            &bytes,
+            bytes,
             width as u32,
             height as u32,
             stride as u32,
@@ -475,6 +495,9 @@ impl X11Desk {
         }
         let ptr = unsafe { libc::shmat(shmid, std::ptr::null(), 0) };
         if ptr as isize == -1 {
+            unsafe {
+                libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut());
+            }
             return Err(msg(format!(
                 "shmat failed: {}",
                 std::io::Error::last_os_error()
@@ -612,18 +635,36 @@ impl X11Desk {
         Ok(self.keymap.as_ref().unwrap())
     }
 
-    fn keycode_for(&mut self, keysym: u32) -> Result<(Keycode, bool)> {
+    fn keycode_for(&mut self, keysym: u32) -> Result<(Keycode, KeyMod)> {
         let map = self.keymap()?;
         let per = map.per.max(1);
         for (index, chunk) in map.syms.chunks(per).enumerate() {
+            let code = map.min.saturating_add(index as u8);
             if chunk.first() == Some(&keysym) {
-                return Ok((map.min.saturating_add(index as u8), false));
+                return Ok((code, KeyMod::None));
             }
             if chunk.get(1) == Some(&keysym) {
-                return Ok((map.min.saturating_add(index as u8), true));
+                return Ok((code, KeyMod::Shift));
+            }
+        }
+        // Second pass for AltGr (ISO_Level3_Shift) levels 2 and 3.
+        for (index, chunk) in map.syms.chunks(per).enumerate() {
+            let code = map.min.saturating_add(index as u8);
+            if chunk.get(2) == Some(&keysym) {
+                return Ok((code, KeyMod::AltGr));
+            }
+            if chunk.get(3) == Some(&keysym) {
+                return Ok((code, KeyMod::ShiftAltGr));
             }
         }
         Err(msg(format!("keysym {keysym:#x} is not on the X keymap")))
+    }
+
+    fn altgr_keycode(&mut self) -> Result<Keycode> {
+        // Prefer ISO_Level3_Shift (0xfe03), fall back to Mode_switch (0xff7e).
+        self.keycode_for(0xfe03)
+            .or_else(|_| self.keycode_for(0xff7e))
+            .map(|(code, _)| code)
     }
 
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16, absolute: bool) -> Result<()> {
@@ -638,17 +679,36 @@ impl X11Desk {
 
     fn tap_keysym(&mut self, keysym: u32) -> Result<()> {
         match self.keycode_for(keysym) {
-            Ok((code, shift)) => {
-                if shift {
-                    let (shift_code, _) = self.keycode_for(0xffe1)?;
-                    self.fake(KEY_PRESS, shift_code, 0, 0, false)?;
-                    self.fake(KEY_PRESS, code, 0, 0, false)?;
-                    self.fake(KEY_RELEASE, code, 0, 0, false)?;
-                    self.fake(KEY_RELEASE, shift_code, 0, 0, false)?;
-                } else {
-                    self.fake(KEY_PRESS, code, 0, 0, false)?;
-                    self.fake(KEY_RELEASE, code, 0, 0, false)?;
-                }
+            Ok((code, KeyMod::None)) => {
+                self.fake(KEY_PRESS, code, 0, 0, false)?;
+                self.fake(KEY_RELEASE, code, 0, 0, false)?;
+                Ok(())
+            }
+            Ok((code, KeyMod::Shift)) => {
+                let (shift_code, _) = self.keycode_for(0xffe1)?;
+                self.fake(KEY_PRESS, shift_code, 0, 0, false)?;
+                self.fake(KEY_PRESS, code, 0, 0, false)?;
+                self.fake(KEY_RELEASE, code, 0, 0, false)?;
+                self.fake(KEY_RELEASE, shift_code, 0, 0, false)?;
+                Ok(())
+            }
+            Ok((code, KeyMod::AltGr)) => {
+                let altgr = self.altgr_keycode()?;
+                self.fake(KEY_PRESS, altgr, 0, 0, false)?;
+                self.fake(KEY_PRESS, code, 0, 0, false)?;
+                self.fake(KEY_RELEASE, code, 0, 0, false)?;
+                self.fake(KEY_RELEASE, altgr, 0, 0, false)?;
+                Ok(())
+            }
+            Ok((code, KeyMod::ShiftAltGr)) => {
+                let (shift_code, _) = self.keycode_for(0xffe1)?;
+                let altgr = self.altgr_keycode()?;
+                self.fake(KEY_PRESS, shift_code, 0, 0, false)?;
+                self.fake(KEY_PRESS, altgr, 0, 0, false)?;
+                self.fake(KEY_PRESS, code, 0, 0, false)?;
+                self.fake(KEY_RELEASE, code, 0, 0, false)?;
+                self.fake(KEY_RELEASE, altgr, 0, 0, false)?;
+                self.fake(KEY_RELEASE, shift_code, 0, 0, false)?;
                 Ok(())
             }
             Err(_) => self.tap_temporary(keysym),
@@ -656,32 +716,56 @@ impl X11Desk {
     }
 
     fn tap_temporary(&mut self, keysym: u32) -> Result<()> {
-        let setup = self.conn.setup();
-        let code = setup.max_keycode.saturating_sub(1).max(setup.min_keycode);
-        let previous = {
-            let map = self.keymap()?;
-            let per = map.per.max(1);
-            let index = code.saturating_sub(map.min) as usize * per;
-            map.syms.get(index).copied().unwrap_or(0)
+        let code = if let Some((scratch, _)) = self.scratch_keycode {
+            scratch
+        } else {
+            let setup = self.conn.setup();
+            let scratch = setup.max_keycode.saturating_sub(1).max(setup.min_keycode);
+            let previous = {
+                let map = self.keymap()?;
+                let per = map.per.max(1);
+                let index = scratch.saturating_sub(map.min) as usize * per;
+                map.syms.get(index).copied().unwrap_or(0)
+            };
+            self.scratch_keycode = Some((scratch, previous));
+            scratch
         };
         self.conn
             .change_keyboard_mapping(1, code, 1, &[keysym])
             .map_err(|err| msg(err.to_string()))?
             .check()
             .map_err(|err| msg(format!("ChangeKeyboardMapping: {err}")))?;
+        let _ = self.conn.flush();
+        // Give X clients a brief moment to process MappingNotify before the
+        // synthetic KeyPress arrives, and keep the mapping alive until the next
+        // temporary symbol or Drop so KeyPress is never resolved against a
+        // prematurely restored mapping.
+        std::thread::sleep(Duration::from_millis(12));
         self.fake(KEY_PRESS, code, 0, 0, false)?;
         self.fake(KEY_RELEASE, code, 0, 0, false)?;
-        if let Ok(cookie) = self.conn.change_keyboard_mapping(1, code, 1, &[previous]) {
-            let _ = cookie.check();
-        }
-        // The cached map is stale for that keycode. Drop it.
+        let _ = self.conn.flush();
+        // The cached map is stale for the scratch keycode. Drop it.
         self.keymap = None;
         Ok(())
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyMod {
+    None,
+    Shift,
+    AltGr,
+    ShiftAltGr,
+}
+
 impl Drop for X11Desk {
     fn drop(&mut self) {
+        if let Some((code, previous)) = self.scratch_keycode.take() {
+            if let Ok(cookie) = self.conn.change_keyboard_mapping(1, code, 1, &[previous]) {
+                let _ = cookie.check();
+            }
+            let _ = self.conn.flush();
+        }
         self.drop_shm();
     }
 }
@@ -794,7 +878,7 @@ fn pack_ximage(
             bgra[dst + 3] = 255;
         }
     }
-    Frame::from_bgra(width, height, width * 4, &bgra, backend)
+    Frame::from_bgra_owned(width, height, width * 4, bgra, backend)
 }
 
 #[cfg(test)]

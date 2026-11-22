@@ -26,10 +26,15 @@ impl<S: 'static> Clone for Worker<S> {
 }
 
 impl<S: 'static> Worker<S> {
+    #[allow(dead_code)]
     pub fn spawn(init: impl FnOnce() -> S + Send + 'static) -> Self {
+        Self::spawn_named("agentlink-desktop", init)
+    }
+
+    pub fn spawn_named(name: &str, init: impl FnOnce() -> S + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel::<Box<dyn FnOnce(&mut S) + Send>>();
         thread::Builder::new()
-            .name("agentlink-desktop".into())
+            .name(name.into())
             .spawn(move || {
                 let mut state = init();
                 while let Ok(job) = rx.recv() {

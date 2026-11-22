@@ -451,6 +451,67 @@ pub(crate) fn last_scale_us() -> u64 {
 
 static LAST_SCALE_US: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn scale_frame_to(frame: &Frame, dst_w: u32, dst_h: u32) -> Result<Frame> {
+    let dst_w = dst_w.max(1);
+    let dst_h = dst_h.max(1);
+    if frame.width == dst_w && frame.height == dst_h {
+        return Ok(frame.clone());
+    }
+    check_pixels(dst_w, dst_h)?;
+    let started = Instant::now();
+    let ratio = (dst_w as f32 / frame.width.max(1) as f32)
+        .min(dst_h as f32 / frame.height.max(1) as f32);
+    let bgra = if ratio <= 0.4 || dst_w > frame.width || dst_h > frame.height {
+        scale_bgra_nearest(
+            frame.pixels(),
+            frame.width,
+            frame.height,
+            frame.stride,
+            dst_w,
+            dst_h,
+        )
+    } else {
+        scale_bgra_box(
+            frame.pixels(),
+            frame.width,
+            frame.height,
+            frame.stride,
+            dst_w,
+            dst_h,
+        )
+    };
+    LAST_SCALE_US.store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let mut scaled = Frame::from_bgra_owned(dst_w, dst_h, dst_w * 4, bgra, frame.backend.clone())?;
+    scaled.captured_unix_ms = frame.captured_unix_ms;
+    scaled.unchanged = frame.unchanged;
+    Ok(scaled)
+}
+
+/// Prepare a captured BGRA frame for a fixed-dimension non-ffmpeg encoder
+/// (`MiniH264`, `MediaFoundation`, `VideoToolbox`).
+///
+/// - When `frame` already fits inside `(enc_w, enc_h)` and differs by less
+///   than one 16px macroblock on each axis (e.g. `1920x1080` -> `1920x1088`),
+///   keep it 1:1 so the encoder pads the bottom/right strip with black without
+///   blurring text.
+/// - Otherwise (e.g. a 2560x1440 or 4K frame entering a 1920x1088 encoder),
+///   scale the full frame to `(enc_w, enc_h)` instead of cropping the top-left
+///   quadrant.
+pub(crate) fn prepare_frame_for_encoder<'a>(
+    frame: &'a Frame,
+    enc_w: u32,
+    enc_h: u32,
+) -> Result<std::borrow::Cow<'a, Frame>> {
+    let only_mb_pad = frame.width <= enc_w
+        && frame.height <= enc_h
+        && enc_w.saturating_sub(frame.width) < 16
+        && enc_h.saturating_sub(frame.height) < 16;
+    if only_mb_pad {
+        return Ok(std::borrow::Cow::Borrowed(frame));
+    }
+    Ok(std::borrow::Cow::Owned(scale_frame_to(frame, enc_w, enc_h)?))
+}
+
 pub(crate) fn scale_frame(frame: Frame, scale: f32) -> Result<Frame> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err(msg("scale must be a positive finite number"));
@@ -601,6 +662,7 @@ pub(crate) fn bgra_to_rgba(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
     rgba
 }
 
+#[allow(dead_code)]
 pub(crate) fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut bgra = vec![0u8; rgba.len()];
     for (src, dst) in rgba.chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {

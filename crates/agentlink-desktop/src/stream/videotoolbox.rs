@@ -6,20 +6,32 @@
 //! then fails, which is what a Mac VM without the paravirtual scaler does.
 
 use std::os::raw::{c_int, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use crate::capture::Frame;
+use crate::capture::{prepare_frame_for_encoder, Frame};
 
 use super::encode::{
     annexb_keyframe, Codec, EncodedAccessUnit, EncoderInfo, EncoderRequest, VideoEncoder,
 };
 
-static ENCODE_FAILED: AtomicBool = AtomicBool::new(false);
+const VT_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+static ENCODE_COOLDOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// False after a session opened and then produced no packet. ffmpeg's
-/// `h264_videotoolbox` uses the same device and would fail the same way.
+/// False while in cooldown after a session opened and produced no packet.
+/// Unlike a permanent poison pill, retries after [`VT_RETRY_COOLDOWN`].
 pub(super) fn device_can_encode() -> bool {
-    !ENCODE_FAILED.load(Ordering::Acquire)
+    let guard = ENCODE_COOLDOWN_UNTIL
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    !guard.is_some_and(|until| Instant::now() < until)
+}
+
+fn mark_encode_failed() {
+    let mut guard = ENCODE_COOLDOWN_UNTIL
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *guard = Some(Instant::now() + VT_RETRY_COOLDOWN);
 }
 
 pub fn try_open(request: &EncoderRequest) -> Option<Box<dyn VideoEncoder>> {
@@ -37,7 +49,7 @@ pub fn try_open(request: &EncoderRequest) -> Option<Box<dyn VideoEncoder>> {
     )
     .ok()?;
     if let Err(err) = encoder.encode(&probe, true) {
-        ENCODE_FAILED.store(true, Ordering::Release);
+        mark_encode_failed();
         tracing::debug!("VideoToolbox produced no packet ({err}); using another encoder");
         return None;
     }
@@ -50,6 +62,7 @@ struct VideoToolbox {
     height: u32,
     codec: Codec,
     name: &'static str,
+    out: Vec<u8>,
 }
 
 unsafe impl Send for VideoToolbox {}
@@ -73,6 +86,9 @@ impl VideoToolbox {
         if rc != 0 || raw.is_null() {
             return Err(format!("VideoToolbox session failed ({rc})"));
         }
+        let out_cap = (width as usize)
+            .saturating_mul(height as usize)
+            .clamp(64 * 1024, 16 * 1024 * 1024);
         Ok(Self {
             raw,
             width,
@@ -83,6 +99,7 @@ impl VideoToolbox {
             } else {
                 "videotoolbox-h264"
             },
+            out: vec![0u8; out_cap],
         })
     }
 }
@@ -107,29 +124,58 @@ impl VideoEncoder for VideoToolbox {
         frame: &Frame,
         force_keyframe: bool,
     ) -> crate::error::Result<EncodedAccessUnit> {
-        let mut out = vec![0u8; (self.width as usize * self.height as usize).max(64 * 1024)];
+        let prepared = prepare_frame_for_encoder(frame, self.width, self.height)?;
+        let src = prepared.as_ref();
+        let src_w = src.width as usize;
+        let src_h = src.height as usize;
+        let src_stride = src.stride as usize;
+        let min_bytes = src_h
+            .saturating_sub(1)
+            .saturating_mul(src_stride)
+            .saturating_add(src_w.saturating_mul(4));
+        if src_w == 0 || src_h == 0 || src_stride < src_w * 4 || src.pixels().len() < min_bytes {
+            return Err(crate::error::msg("VideoToolbox input frame buffer too small"));
+        }
         let mut key = 0i32;
-        let written = unsafe {
+        let mut written = unsafe {
             al_vt_encode(
                 self.raw,
-                frame.pixels().as_ptr(),
-                frame.stride as c_int,
+                src.pixels().as_ptr(),
+                src.width as c_int,
+                src.height as c_int,
+                src.stride as c_int,
                 if force_keyframe { 1 } else { 0 },
-                out.as_mut_ptr(),
-                out.len() as c_int,
+                self.out.as_mut_ptr(),
+                self.out.len() as c_int,
                 &mut key,
             )
         };
+        if written == -4 && self.out.len() < 32 * 1024 * 1024 {
+            self.out.resize(self.out.len().saturating_mul(2), 0);
+            written = unsafe {
+                al_vt_encode(
+                    self.raw,
+                    src.pixels().as_ptr(),
+                    src.width as c_int,
+                    src.height as c_int,
+                    src.stride as c_int,
+                    1,
+                    self.out.as_mut_ptr(),
+                    self.out.len() as c_int,
+                    &mut key,
+                )
+            };
+        }
         if written <= 0 {
             return Err(crate::error::msg(format!(
                 "VideoToolbox encode failed ({written})"
             )));
         }
-        out.truncate(written as usize);
+        let bytes = self.out[..written as usize].to_vec();
         Ok(EncodedAccessUnit {
             codec: self.codec,
-            keyframe: key != 0 || annexb_keyframe(&out),
-            bytes: out,
+            keyframe: key != 0 || annexb_keyframe(&bytes),
+            bytes,
             width: self.width,
             height: self.height,
             captured_unix_ms: frame.captured_unix_ms,
@@ -153,7 +199,9 @@ extern "C" {
     fn al_vt_encode(
         enc: *mut c_void,
         bgra: *const u8,
-        stride: c_int,
+        src_w: c_int,
+        src_h: c_int,
+        src_stride: c_int,
         force_key: c_int,
         dst: *mut u8,
         dst_cap: c_int,

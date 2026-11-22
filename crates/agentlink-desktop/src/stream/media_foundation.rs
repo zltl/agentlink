@@ -12,12 +12,55 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::capture::Frame;
+use crate::capture::{prepare_frame_for_encoder, Frame};
 
 use super::encode::{
     annexb_keyframe, ensure_annexb, Codec, EncodedAccessUnit, EncoderInfo, EncoderRequest,
     VideoEncoder,
 };
+
+/// RAII balance for per-thread COM (`CoInitializeEx`) and Media Foundation
+/// (`MFStartup`). Kept as the LAST field of [`MfInner`] so the `IMFTransform`
+/// COM interface is released before `MFShutdown` / `CoUninitialize`.
+struct MfComGuard {
+    com_init: bool,
+    mf_started: bool,
+}
+
+impl MfComGuard {
+    fn acquire() -> Result<Self, String> {
+        use windows::Win32::Media::MediaFoundation::*;
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        unsafe {
+            // S_OK and S_FALSE both increment the thread COM refcount and must
+            // be balanced with CoUninitialize; RPC_E_CHANGED_MODE does not.
+            let com_hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let com_init = com_hr.is_ok();
+            let mut guard = Self {
+                com_init,
+                mf_started: false,
+            };
+            MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).map_err(|err| err.to_string())?;
+            guard.mf_started = true;
+            Ok(guard)
+        }
+    }
+}
+
+impl Drop for MfComGuard {
+    fn drop(&mut self) {
+        use windows::Win32::Media::MediaFoundation::MFShutdown;
+        use windows::Win32::System::Com::CoUninitialize;
+        unsafe {
+            if self.mf_started {
+                let _ = MFShutdown();
+            }
+            if self.com_init {
+                CoUninitialize();
+            }
+        }
+    }
+}
 
 pub fn try_open(request: &EncoderRequest) -> Option<Box<dyn VideoEncoder>> {
     if request.codec != Codec::H264 {
@@ -45,6 +88,8 @@ struct MfInner {
     nv12: bool,
     input_stream: u32,
     output_stream: u32,
+    /// Must remain the last field so `transform` drops before `MFShutdown`/`CoUninitialize`.
+    _com_mf: MfComGuard,
 }
 
 /// `IMFTransform` is not `Send`. It is created and used only on the encode thread.
@@ -76,12 +121,8 @@ impl MfEncoder {
 
 impl MfInner {
     fn open(request: &EncoderRequest) -> Result<Self, String> {
-        use windows::Win32::Media::MediaFoundation::*;
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-
+        let guard = MfComGuard::acquire()?;
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).map_err(|err| err.to_string())?;
             let activates = enum_hardware_encoders()?;
             let mut last = "no hardware H.264 encoder accepted NV12 or RGB32".to_string();
             for activate in activates {
@@ -102,6 +143,7 @@ impl MfInner {
                             nv12,
                             input_stream: 0,
                             output_stream: 0,
+                            _com_mf: guard,
                         });
                     }
                     Err(err) => last = err,
@@ -114,10 +156,8 @@ impl MfInner {
 
 fn hardware_mft_count() -> Result<u32, String> {
     use windows::Win32::Media::MediaFoundation::*;
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    let _guard = MfComGuard::acquire()?;
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).map_err(|err| err.to_string())?;
         let mut activates = std::ptr::null_mut();
         let mut count = 0u32;
         let flags =
@@ -353,10 +393,12 @@ impl MfInner {
                     .0
                     .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
             }
+            let prepared = prepare_frame_for_encoder(frame, self.width, self.height)
+                .map_err(|err| err.to_string())?;
             let sample = if self.nv12 {
-                sample_from_nv12(frame, self.width, self.height)?
+                sample_from_nv12(prepared.as_ref(), self.width, self.height)?
             } else {
-                sample_from_bgra(frame, self.width, self.height)?
+                sample_from_bgra(prepared.as_ref(), self.width, self.height)?
             };
             let _ = sample.SetSampleTime(ticks);
             let _ = sample.SetSampleDuration(duration);
@@ -430,7 +472,6 @@ impl MfInner {
     }
 
     fn retune(&mut self) -> Result<(), String> {
-        use windows::Win32::Media::MediaFoundation::*;
         unsafe {
             let ty = self
                 .transform
@@ -492,14 +533,22 @@ fn sample_from_bgra(
             .map_err(|err| err.to_string())?;
         let src = frame.pixels();
         let src_stride = frame.stride as usize;
-        for y in 0..height as usize {
-            let copy = row.min(src_stride);
-            if y < frame.height as usize && y * src_stride + copy <= src.len() && !data.is_null() {
-                std::ptr::copy_nonoverlapping(
-                    src.as_ptr().add(y * src_stride),
-                    data.add(y * row),
-                    copy,
-                );
+        if !data.is_null() {
+            // Zero-fill first so macroblock padding rows/columns never leak
+            // uninitialized heap memory into encoded frames.
+            std::ptr::write_bytes(data, 0, len);
+            let copy = row
+                .min(frame.width as usize * 4)
+                .min(src_stride);
+            let rows = (height as usize).min(frame.height as usize);
+            for y in 0..rows {
+                if y * src_stride + copy <= src.len() {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(y * src_stride),
+                        data.add(y * row),
+                        copy,
+                    );
+                }
             }
         }
         buffer.Unlock().map_err(|err| err.to_string())?;
@@ -581,7 +630,6 @@ fn blit_nv12(frame: &Frame, width: u32, height: u32, dst: &mut [u8]) {
 fn sample_bytes(
     sample: &windows::Win32::Media::MediaFoundation::IMFSample,
 ) -> Result<Vec<u8>, String> {
-    use windows::Win32::Media::MediaFoundation::*;
     unsafe {
         let buffer = sample
             .ConvertToContiguousBuffer()
