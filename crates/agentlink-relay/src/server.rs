@@ -31,8 +31,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit_http::{
-    append_audit, audit_page, audit_records_json, audit_records_json_for_session,
-    note_legacy_use,
+    append_node_audit, audit_page, audit_records_json, audit_records_json_for_session,
+    node_audit_path, note_legacy_use, open_private_append, read_audit_records_merged,
+    rotate_if_needed, AUDIT_RECORDS_DEFAULT_LIMIT, AUDIT_RECORDS_MAX_LIMIT, AUDIT_ROTATE_KEEP,
+    AUDIT_ROTATE_MAX_BYTES,
 };
 pub(crate) use crate::audit_http::audit_auth;
 use crate::db::{Database, OpenOptions};
@@ -40,11 +42,25 @@ use crate::models::{self, Caller, EnrolledNode, NodeMeta};
 
 const STALE_AFTER: Duration = agentlink_core::ws::RELAY_STALE_AFTER;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const DOWNLOAD_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap concurrent TLS connections (handshakes + live sessions) so Slowloris /
 /// accept floods cannot exhaust FDs or tasks. Excess accepts wait for a slot.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1_024;
+/// Cap concurrent unauthenticated `/dl/*` file streams so large artifact downloads
+/// cannot exhaust worker memory or bandwidth.
+const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+/// Hard per-frame and per-minute caps on node-uploaded `AuditBatch` records (SEC-08).
+const MAX_AUDIT_BATCH_ITEMS: usize = 200;
+const MAX_AUDIT_RECORD_BYTES: usize = 64 * 1024;
+const MAX_AUDIT_BATCHES_PER_MIN: u32 = 60;
+const MAX_AUDIT_RECORDS_PER_MIN: u32 = 2_000;
+const AUDIT_HTML_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
+const AUDIT_JSON_CSP: &str =
+    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'";
 static STALE_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 static MAX_CONN_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+static MAX_DOWNLOAD_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+static PUBLIC_URL_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
 
 /// Shorten the stale-socket reaper for tests. `None` restores 75s.
 ///
@@ -64,10 +80,43 @@ pub fn set_max_concurrent_connections_for_test(max: Option<usize>) {
     MAX_CONN_OVERRIDE.store(max.map(|n| n as u64).unwrap_or(0), Ordering::SeqCst);
 }
 
+/// Override [`MAX_CONCURRENT_DOWNLOADS`] for tests. `None` restores 16.
+#[doc(hidden)]
+pub fn set_max_concurrent_downloads_for_test(max: Option<usize>) {
+    MAX_DOWNLOAD_OVERRIDE.store(max.map(|n| n as u64).unwrap_or(0), Ordering::SeqCst);
+}
+
+/// Override `AGENTLINK_PUBLIC_URL` for tests. `None` restores environment lookup.
+#[doc(hidden)]
+pub fn set_public_url_for_test(url: Option<&str>) {
+    if let Ok(mut guard) = PUBLIC_URL_OVERRIDE.lock() {
+        *guard = url.map(str::to_string);
+    }
+}
+
 fn max_concurrent_connections() -> usize {
     match MAX_CONN_OVERRIDE.load(Ordering::SeqCst) {
         0 => MAX_CONCURRENT_CONNECTIONS,
         n => n as usize,
+    }
+}
+
+fn max_concurrent_downloads() -> usize {
+    match MAX_DOWNLOAD_OVERRIDE.load(Ordering::SeqCst) {
+        0 => MAX_CONCURRENT_DOWNLOADS,
+        n => n as usize,
+    }
+}
+
+fn resolve_configured_public_url() -> Result<Option<String>> {
+    let raw = PUBLIC_URL_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .or_else(|| std::env::var("AGENTLINK_PUBLIC_URL").ok());
+    match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(value) => Ok(Some(crate::web::parse_public_url(value)?)),
+        None => Ok(None),
     }
 }
 
@@ -127,6 +176,7 @@ impl RelayHandle {
     pub async fn spawn(config: RelayConfig) -> Result<Self> {
         util::ensure_dir(&config.data_dir)?;
         let trust_proxy = parse_proxy_cidrs(&config.trust_proxy)?;
+        let public_url = resolve_configured_public_url()?;
         let cert = agentlink_core::tls::RelayCert::load_or_create(&config.data_dir)?;
         let (legacy_enabled, legacy_ttl) = config
             .legacy_admin_override
@@ -158,6 +208,8 @@ impl RelayHandle {
 
         let shutdown = CancellationToken::new();
         let kick = Arc::new(Mutex::new(Vec::new()));
+        let audit_path = config.data_dir.join("audit.jsonl");
+        let node_audit_file = node_audit_path(&audit_path);
         let hub = Arc::new(Hub {
             db: opened.db,
             online: Mutex::new(HashMap::new()),
@@ -165,10 +217,12 @@ impl RelayHandle {
             punch: Mutex::new(HashMap::new()),
             kick: kick.clone(),
             generation: AtomicU64::new(1),
+            next_conn_id: AtomicU64::new(1),
             admins: Mutex::new(Vec::new()),
             clients: Mutex::new(Vec::new()),
             capture: config.capture.clone(),
-            audit_path: config.data_dir.join("audit.jsonl"),
+            audit_path,
+            node_audit_path: node_audit_file,
             data_dir: config.data_dir.clone(),
             admin_token: admin_token.clone(),
             admin_token_created_unix,
@@ -177,7 +231,10 @@ impl RelayHandle {
             view_tickets: Mutex::new(HashMap::new()),
             allow_signup: config.allow_signup,
             login_windows: Mutex::new(HashMap::new()),
+            audit_batch_windows: Mutex::new(HashMap::new()),
             trust_proxy,
+            public_url,
+            download_slots: Arc::new(Semaphore::new(max_concurrent_downloads())),
             connect_log: config.data_dir.join("connect.jsonl"),
         });
         let udp_hub = hub.clone();
@@ -402,6 +459,18 @@ impl Hub {
     pub(crate) fn audit_path(&self) -> &PathBuf {
         &self.audit_path
     }
+
+    pub(crate) fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
+    }
+
+    pub(crate) fn try_acquire_download_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.download_slots.clone().try_acquire_owned().ok()
+    }
+
+    fn next_conn_id(&self) -> u64 {
+        self.next_conn_id.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 pub(crate) struct Hub {
@@ -411,10 +480,12 @@ pub(crate) struct Hub {
     punch: Mutex<HashMap<String, (SocketAddr, Instant)>>,
     kick: Arc<Mutex<Vec<CancellationToken>>>,
     generation: AtomicU64,
+    next_conn_id: AtomicU64,
     admins: Mutex<Vec<LiveOperator>>,
     clients: Mutex<Vec<LiveClient>>,
     capture: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
     audit_path: PathBuf,
+    node_audit_path: PathBuf,
     data_dir: PathBuf,
     admin_token: String,
     admin_token_created_unix: i64,
@@ -423,7 +494,10 @@ pub(crate) struct Hub {
     view_tickets: Mutex<HashMap<String, ViewTicketRecord>>,
     allow_signup: bool,
     login_windows: Mutex<HashMap<String, (i64, u32)>>,
+    audit_batch_windows: Mutex<HashMap<String, (i64, u32, u32)>>,
     trust_proxy: Vec<ipnet::IpNet>,
+    public_url: Option<String>,
+    download_slots: Arc<Semaphore>,
     connect_log: PathBuf,
 }
 
@@ -437,8 +511,10 @@ struct LiveOperator {
 #[derive(Clone)]
 struct ViewTicketRecord {
     owner: String,
+    #[allow(dead_code)]
     client_id: String,
     node_id: String,
+    #[allow(dead_code)]
     grant: NodePolicy,
     expires_unix: i64,
     /// Set on the first websocket redeem. The bare ticket is then rejected.
@@ -446,18 +522,33 @@ struct ViewTicketRecord {
 }
 
 /// A browser session minted for one agent grant. It is not an admin.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ViewScope {
     node_id: String,
     grant: NodePolicy,
 }
 
+/// Typed relay principal category (SEC-03). Replaces loose boolean flags so
+/// every capability check routes through explicit enum-based authorization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PrincipalKind {
+    /// Relay administrator: either a logged-in admin operator (`legacy: false`)
+    /// or a legacy admin token (`legacy: true`).
+    Admin { legacy: bool },
+    /// Logged-in non-admin user session (device-bound access token).
+    Operator,
+    /// Registered agent public-key client (scoped strictly by per-node grants).
+    Agent,
+    /// Retired dashboard cookie WebSocket session.
+    Web { admin: bool },
+    /// Retired view-ticket session.
+    #[allow(dead_code)]
+    View(ViewScope),
+}
+
 #[derive(Clone)]
 struct Principal {
-    admin: bool,
-    /// Logged-in user session, as opposed to a legacy admin token or an agent key.
-    operator: bool,
-    legacy: bool,
+    kind: PrincipalKind,
     user: String,
     /// Kept so an operator session still records whether the account is an admin.
     #[allow(dead_code)]
@@ -466,24 +557,199 @@ struct Principal {
     access_hash: String,
     client_id: String,
     name: String,
-    view: Option<ViewScope>,
-    /// Dashboard cookie session. Files and a PTY only; no enrollment or policy.
-    web: bool,
     /// Raw `agentlink_session` cookie, so logout closes the socket.
     web_token: String,
     /// Returned once, on the redeem that binds a view ticket.
     view_session: Option<String>,
 }
 
-fn caller_of(principal: &Principal) -> Caller {
-    Caller {
-        user: if principal.user.is_empty() {
-            "admin".into()
-        } else {
-            principal.user.clone()
-        },
-        admin: principal.admin,
+impl Principal {
+    fn is_admin(&self) -> bool {
+        matches!(self.kind, PrincipalKind::Admin { .. })
     }
+
+    fn has_operator_session(&self) -> bool {
+        matches!(
+            self.kind,
+            PrincipalKind::Operator | PrincipalKind::Admin { legacy: false }
+        )
+    }
+
+    fn can_manage_account(&self) -> bool {
+        matches!(
+            self.kind,
+            PrincipalKind::Admin { .. } | PrincipalKind::Operator
+        )
+    }
+
+    fn is_operator_non_admin(&self) -> bool {
+        matches!(self.kind, PrincipalKind::Operator)
+    }
+
+    fn is_web(&self) -> bool {
+        matches!(self.kind, PrincipalKind::Web { .. })
+    }
+
+    fn view_scope(&self) -> Option<&ViewScope> {
+        match &self.kind {
+            PrincipalKind::View(scope) => Some(scope),
+            _ => None,
+        }
+    }
+
+    fn caller(&self) -> Caller {
+        Caller {
+            user: if self.user.is_empty() {
+                "admin".into()
+            } else {
+                self.user.clone()
+            },
+            admin: matches!(
+                self.kind,
+                PrincipalKind::Admin { .. } | PrincipalKind::Web { admin: true }
+            ),
+        }
+    }
+
+    /// Centralized capability gate for every client envelope (SEC-03).
+    fn authorize(&self, env: &Envelope) -> std::result::Result<(), &'static str> {
+        if self.is_web() {
+            return match env {
+                Envelope::Ping | Envelope::Cancel { .. } => Ok(()),
+                _ => Err("browser control is disabled: that path is plaintext at the relay, and a web login is not a node-local grant"),
+            };
+        }
+        if self.view_scope().is_some() {
+            return match env {
+                Envelope::Ping | Envelope::Invoke { .. } | Envelope::Cancel { .. } => Ok(()),
+                _ => Err("view ticket can only signal a desktop stream"),
+            };
+        }
+        match env {
+            Envelope::Ping
+            | Envelope::ListNodes { .. }
+            | Envelope::E2eHello { .. }
+            | Envelope::E2e { .. }
+            | Envelope::DirectOffer { .. }
+            | Envelope::Session { .. }
+            | Envelope::Cancel { .. }
+            | Envelope::IssueViewTicket { .. } => Ok(()),
+            Envelope::Invoke { .. } | Envelope::Transfer { .. } => {
+                if self.can_manage_account() {
+                    Ok(())
+                } else {
+                    Err("agents must use the end-to-end channel")
+                }
+            }
+            Envelope::CreatePairingToken { .. } => {
+                if self.can_manage_account() {
+                    Ok(())
+                } else {
+                    Err("login or admin token required")
+                }
+            }
+            Envelope::SetPolicy { .. } => {
+                if self.can_manage_account() {
+                    Ok(())
+                } else {
+                    Err("admin or operator login required")
+                }
+            }
+            Envelope::RegisterClient { .. }
+            | Envelope::SetClientGrant { .. }
+            | Envelope::RevokeClient { .. }
+            | Envelope::ListClients { .. }
+            | Envelope::ListApprovals { .. }
+            | Envelope::ResolveApproval { .. }
+            | Envelope::QueryAudit { .. }
+            | Envelope::SetAuditPolicy { .. } => {
+                if self.can_manage_account() {
+                    Ok(())
+                } else {
+                    Err("admin token required")
+                }
+            }
+            Envelope::Logout { .. }
+            | Envelope::ListDevices { .. }
+            | Envelope::RevokeDevice { .. }
+            | Envelope::ShareNode { .. }
+            | Envelope::UnshareNode { .. }
+            | Envelope::ListEnrollmentTokens { .. }
+            | Envelope::RevokeEnrollmentToken { .. }
+            | Envelope::SetUserAudit { .. } => {
+                if self.can_manage_account() {
+                    Ok(())
+                } else {
+                    Err("login required")
+                }
+            }
+            Envelope::EnrollSelf { .. }
+            | Envelope::TotpBegin { .. }
+            | Envelope::TotpConfirm { .. }
+            | Envelope::TotpDisable { .. } => {
+                if self.has_operator_session() {
+                    Ok(())
+                } else {
+                    Err("login required")
+                }
+            }
+            Envelope::UserAdd { .. }
+            | Envelope::UserList { .. }
+            | Envelope::UserSetDisabled { .. }
+            | Envelope::UserRemove { .. }
+            | Envelope::UserSetRole { .. } => {
+                if self.is_admin() {
+                    Ok(())
+                } else {
+                    Err("admin token required")
+                }
+            }
+            Envelope::UserPasswd { username, .. } => {
+                if self.is_admin() {
+                    Ok(())
+                } else if self.has_operator_session()
+                    && username.trim().eq_ignore_ascii_case(&self.user)
+                {
+                    Ok(())
+                } else {
+                    Err("admin or operator login required")
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Optional re-authentication fields extracted from raw JSON on `UserPasswd`
+/// and `TotpDisable` frames while keeping `agentlink-core`'s wire enum unchanged.
+#[derive(Default, Debug, Clone, serde::Deserialize)]
+struct WireReauth {
+    #[serde(default)]
+    current_password: Option<String>,
+    #[serde(default)]
+    totp: Option<String>,
+}
+
+fn extract_wire_reauth(msg: &Message) -> WireReauth {
+    let Message::Text(text) = msg else {
+        return WireReauth::default();
+    };
+    if text.contains("user_passwd") || text.contains("totp_disable") {
+        serde_json::from_str::<WireReauth>(text.as_str()).unwrap_or_default()
+    } else {
+        WireReauth::default()
+    }
+}
+
+pub(crate) fn auth_err_message(err: &Error) -> String {
+    match err {
+        Error::Auth(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn caller_of(principal: &Principal) -> Caller {
+    principal.caller()
 }
 
 fn stamp_actor(
@@ -504,34 +770,32 @@ fn stamp_actor(
 
 fn legacy_admin(name: String, client_id: String) -> Principal {
     Principal {
-        admin: true,
-        operator: false,
-        legacy: true,
+        kind: PrincipalKind::Admin { legacy: true },
         user: "admin".into(),
         role: "admin".into(),
         device_id: String::new(),
         access_hash: String::new(),
         client_id,
         name,
-        view: None,
-        web: false,
         web_token: String::new(),
         view_session: None,
     }
 }
 
 struct Route {
+    origin_conn_id: u64,
+    target_conn_id: u64,
     origin_tx: mpsc::Sender<Outbound>,
     target_tx: mpsc::Sender<Outbound>,
-    /// `None` when the origin is an admin client.
+    /// `None` when the origin is a client.
     origin_node: Option<String>,
-    #[allow(dead_code)]
     target_node: String,
     last_activity: Instant,
 }
 
 struct Online {
     generation: u64,
+    conn_id: u64,
     tx: mpsc::Sender<Outbound>,
     last_seen: Instant,
     cancel: CancellationToken,
@@ -562,6 +826,11 @@ impl Callback for Router {
                 Err(Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
+                    .header("cache-control", "no-store")
+                    .header("x-content-type-options", "nosniff")
+                    .header("x-frame-options", "DENY")
+                    .header("referrer-policy", "no-referrer")
+                    .header("content-security-policy", AUDIT_JSON_CSP)
                     .body(Some(body))
                     .expect("static response"))
             }
@@ -631,7 +900,8 @@ fn print_banner(handle: &RelayHandle, force_token: bool) {
         let _ = writeln!(out, "  bootstrap:    user admin password {password}");
         let _ = writeln!(
             out,
-            "  change it with `agentlink relay user passwd admin`. That deletes bootstrap.password."
+            "  change it with `agentlink relay --data-dir {} user passwd admin`. That deletes bootstrap.password.",
+            handle.data_dir.display()
         );
         let _ = writeln!(
             out,
@@ -752,16 +1022,6 @@ fn record_connect(
     tcp: SocketAddr,
     peer: IpAddr,
 ) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
     let line = serde_json::json!({
         "ts": agentlink_core::util::unix_now(),
         "role": role,
@@ -770,12 +1030,28 @@ fn record_connect(
         "peer": peer.to_string(),
         "tcp_peer": tcp.to_string(),
     });
-    let _ = writeln!(file, "{line}");
+    let text = format!("{line}\n");
+    rotate_if_needed(
+        path,
+        text.len() as u64,
+        AUDIT_ROTATE_MAX_BYTES,
+        AUDIT_ROTATE_KEEP,
+    );
+    let Ok(mut file) = open_private_append(path) else {
+        return;
+    };
+    let _ = file.write_all(text.as_bytes());
 }
 
 fn plain(status: u16, body: &str) -> ErrorResponse {
     Response::builder()
         .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("cache-control", "no-store")
+        .header("x-content-type-options", "nosniff")
+        .header("x-frame-options", "DENY")
+        .header("referrer-policy", "no-referrer")
+        .header("content-security-policy", AUDIT_JSON_CSP)
         .body(Some(body.to_string()))
         .expect("static response")
 }
@@ -784,13 +1060,11 @@ fn html_response(body: String) -> ErrorResponse {
     Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
+        .header("cache-control", "no-store")
         .header("x-content-type-options", "nosniff")
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
-        .header(
-            "content-security-policy",
-            "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
-        )
+        .header("content-security-policy", AUDIT_HTML_CSP)
         .body(Some(body))
         .expect("static response")
 }
@@ -901,65 +1175,122 @@ where
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
+            crate::web::WebOutcome::StreamFile {
+                path,
+                filename,
+                len,
+                permit,
+            } => {
+                let _permit = permit;
+                let mut file = match tokio::fs::File::open(&path).await {
+                    Ok(file) => file,
+                    Err(_) => {
+                        let reply = crate::web::HttpReply {
+                            status: 404,
+                            reason: "Not Found",
+                            content_type: "text/plain; charset=utf-8",
+                            body: b"not found".to_vec(),
+                            headers: Vec::new(),
+                            content_length: None,
+                        };
+                        let _ = stream.write_all(&reply.encode_for_method(method)).await;
+                        stream.flush().await.ok();
+                        return Ok(());
+                    }
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: {AUDIT_JSON_CSP}\r\nConnection: close\r\n\r\n"
+                );
+                timeout(DOWNLOAD_CHUNK_TIMEOUT, stream.write_all(header.as_bytes()))
+                    .await
+                    .map_err(|_| Error::Timeout)?
+                    .map_err(|e| Error::Ws(e.to_string()))?;
+                let mut remaining = len;
+                let mut buf = vec![0u8; 64 * 1024];
+                while remaining > 0 {
+                    let want = (remaining as usize).min(buf.len());
+                    let n = file
+                        .read(&mut buf[..want])
+                        .await
+                        .map_err(|e| Error::Ws(e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    timeout(DOWNLOAD_CHUNK_TIMEOUT, stream.write_all(&buf[..n]))
+                        .await
+                        .map_err(|_| Error::Timeout)?
+                        .map_err(|e| Error::Ws(e.to_string()))?;
+                    remaining -= n as u64;
+                }
+                stream.flush().await.ok();
+            }
         }
         return Ok(());
     }
     let web_session = crate::web::session_from(hub, &headers).await?;
     let head = method.eq_ignore_ascii_case("HEAD");
     let method_eff = if head { "GET" } else { method };
-    let (status, reason, content_type, body) = match (method_eff, path) {
-        ("GET", "/audit") => (200, "OK", "text/html; charset=utf-8", audit_page()),
-        ("GET", WS_WEBRTC_PATH) => (
-            404,
-            "Not Found",
-            "text/plain; charset=utf-8",
-            "webrtc signaling is a websocket".into(),
-        ),
+    let reply = match (method_eff, path) {
+        ("GET", "/audit") => crate::web::HttpReply {
+            status: 200,
+            reason: "OK",
+            content_type: "text/html; charset=utf-8",
+            body: audit_page().into_bytes(),
+            headers: vec![("Content-Security-Policy".into(), AUDIT_HTML_CSP.into())],
+            content_length: None,
+        },
+        ("GET", WS_WEBRTC_PATH) => crate::web::HttpReply {
+            status: 404,
+            reason: "Not Found",
+            content_type: "text/plain; charset=utf-8",
+            body: b"webrtc signaling is a websocket".to_vec(),
+            headers: vec![("Content-Security-Policy".into(), AUDIT_JSON_CSP.into())],
+            content_length: None,
+        },
         ("GET", "/audit/records") => {
             if http_authorized(hub, &headers) {
-                (
-                    200,
-                    "OK",
-                    "application/json",
-                    audit_records_json(&hub.audit_path, query),
-                )
+                crate::web::HttpReply {
+                    status: 200,
+                    reason: "OK",
+                    content_type: "application/json",
+                    body: audit_records_json(&hub.audit_path, query).into_bytes(),
+                    headers: vec![("Content-Security-Policy".into(), AUDIT_JSON_CSP.into())],
+                    content_length: None,
+                }
             } else if let Some(session) = web_session.as_ref() {
-                (
-                    200,
-                    "OK",
-                    "application/json",
-                    audit_records_json_for_session(&hub.audit_path, query, session),
-                )
+                crate::web::HttpReply {
+                    status: 200,
+                    reason: "OK",
+                    content_type: "application/json",
+                    body: audit_records_json_for_session(&hub.audit_path, query, session)
+                        .into_bytes(),
+                    headers: vec![("Content-Security-Policy".into(), AUDIT_JSON_CSP.into())],
+                    content_length: None,
+                }
             } else {
-                (
-                    401,
-                    "Unauthorized",
-                    "text/plain; charset=utf-8",
-                    "admin token required".into(),
-                )
+                crate::web::HttpReply {
+                    status: 401,
+                    reason: "Unauthorized",
+                    content_type: "text/plain; charset=utf-8",
+                    body: b"admin token required".to_vec(),
+                    headers: vec![("Content-Security-Policy".into(), AUDIT_JSON_CSP.into())],
+                    content_length: None,
+                }
             }
         }
-        _ => (
-            404,
-            "Not Found",
-            "text/plain; charset=utf-8",
-            "not found".into(),
-        ),
+        _ => crate::web::HttpReply {
+            status: 404,
+            reason: "Not Found",
+            content_type: "text/plain; charset=utf-8",
+            body: b"not found".to_vec(),
+            headers: vec![("Content-Security-Policy".into(), AUDIT_JSON_CSP.into())],
+            content_length: None,
+        },
     };
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
     stream
-        .write_all(header.as_bytes())
+        .write_all(&reply.encode_for_method(if head { "HEAD" } else { method }))
         .await
         .map_err(|e| Error::Ws(e.to_string()))?;
-    if !head {
-        stream
-            .write_all(body.as_bytes())
-            .await
-            .map_err(|e| Error::Ws(e.to_string()))?;
-    }
     stream.flush().await.ok();
     Ok(())
 }
@@ -978,7 +1309,7 @@ fn http_authorized(hub: &Hub, headers: &[(String, String)]) -> bool {
     presented_legacy(hub, got.trim())
 }
 
-fn presented_legacy(hub: &Hub, presented: &str) -> bool {
+pub(crate) fn presented_legacy(hub: &Hub, presented: &str) -> bool {
     if presented.is_empty() || !util::ct_eq(presented, &hub.admin_token) {
         return false;
     }
@@ -1199,7 +1530,7 @@ async fn handle_connection(
                 },
             )
             .await?;
-            tracing::info!(peer = %audit_ip, tcp_peer = %peer, admin = principal.admin, client = %principal.client_id, name = %principal.name, "client connected");
+            tracing::info!(peer = %audit_ip, tcp_peer = %peer, admin = principal.is_admin(), client = %principal.client_id, name = %principal.name, "client connected");
             record_connect(
                 &hub.connect_log,
                 "client",
@@ -1517,36 +1848,21 @@ async fn serve_web_socket(
     client_loop(ws, hub, peer, audit_ip, principal).await
 }
 
+#[allow(dead_code)]
 fn web_principal(session: &crate::models::WebSession, token: &str) -> Principal {
     let id = format!("web:{}", session.user);
     Principal {
-        admin: session.role == "admin",
-        operator: true,
-        legacy: false,
+        kind: PrincipalKind::Web {
+            admin: session.role == "admin",
+        },
         user: session.user.clone(),
         role: session.role.clone(),
         device_id: id.clone(),
         access_hash: String::new(),
         client_id: id,
         name: session.user.clone(),
-        view: None,
-        web: true,
         web_token: token.to_string(),
         view_session: None,
-    }
-}
-
-fn web_message_allowed(env: &Envelope) -> std::result::Result<(), String> {
-    match env {
-        Envelope::Ping | Envelope::Cancel { .. } => Ok(()),
-        Envelope::Invoke { .. } => Err(
-            "browser control is disabled: that path is plaintext at the relay, and a web login is not a node-local grant"
-                .into(),
-        ),
-        _ => Err(
-            "browser control is disabled: that path is plaintext at the relay, and a web login is not a node-local grant"
-                .into(),
-        ),
     }
 }
 
@@ -1683,17 +1999,13 @@ async fn client_principal(
         }
     };
     Ok(Principal {
-        admin: false,
-        operator: false,
-        legacy: false,
+        kind: PrincipalKind::Agent,
         user: record.owner.clone(),
         role: "agent".into(),
         device_id: String::new(),
         access_hash: String::new(),
         client_id: record.id,
         name: record.name,
-        view: None,
-        web: false,
         web_token: String::new(),
         view_session: None,
     })
@@ -1953,6 +2265,7 @@ async fn client_loop(
     audit_ip: IpAddr,
     principal: Principal,
 ) -> Result<()> {
+    let conn_id = hub.next_conn_id();
     let (sink, mut stream) = ws.split();
     let (tx, rx) = mpsc::channel(64);
     let session_id = if principal.client_id.is_empty() {
@@ -1967,11 +2280,11 @@ async fn client_loop(
             cancel: cancel.clone(),
         });
     }
-    if (principal.admin || principal.operator) && !principal.web {
+    if principal.can_manage_account() {
         if let Ok(mut admins) = hub.admins.lock() {
             admins.push(LiveOperator {
                 user: principal.user.clone(),
-                admin: principal.admin,
+                admin: principal.is_admin(),
                 tx: tx.clone(),
             });
         }
@@ -1988,10 +2301,20 @@ async fn client_loop(
                 _ => break,
             },
         };
+        let reauth = extract_wire_reauth(&msg);
         match ws::parse_incoming(msg)? {
             Incoming::Env(env) => {
-                if let Err(err) =
-                    handle_client(&hub, &tx, &session_id, &principal, env, audit_ip).await
+                if let Err(err) = handle_client(
+                    &hub,
+                    conn_id,
+                    &tx,
+                    &session_id,
+                    &principal,
+                    &reauth,
+                    env,
+                    audit_ip,
+                )
+                .await
                 {
                     tracing::debug!(%peer, error = %err, "client message failed");
                     if matches!(err, Error::Auth(_)) {
@@ -2003,7 +2326,7 @@ async fn client_loop(
                 let _ = tx.try_send(Outbound::Pong(payload));
             }
             Incoming::Binary(bytes) => {
-                if let Err(err) = route_binary(&hub, None, bytes).await {
+                if let Err(err) = route_binary(&hub, conn_id, bytes).await {
                     tracing::debug!(%peer, error = %err, "binary forward failed");
                 }
             }
@@ -2059,15 +2382,18 @@ async fn release_client(hub: &Hub, tx: &mpsc::Sender<Outbound>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     hub: &Hub,
+    conn_id: u64,
     tx: &mpsc::Sender<Outbound>,
     session_id: &str,
     principal: &Principal,
+    reauth: &WireReauth,
     env: Envelope,
     audit_ip: IpAddr,
 ) -> Result<()> {
-    if principal.web {
+    if principal.is_web() {
         match hub.db.web_session(&principal.web_token).await {
             Ok(Some(session)) if session.user == principal.user => {}
             _ => {
@@ -2082,15 +2408,8 @@ async fn handle_client(
                 return Err(Error::Auth("session expired".into()));
             }
         }
-        if let Err(why) = web_message_allowed(&env) {
-            return send_out(
-                tx,
-                &Envelope::result_err(env.request_id().unwrap_or("").to_string(), why),
-            )
-            .await;
-        }
     }
-    if principal.operator && !principal.access_hash.is_empty() {
+    if principal.has_operator_session() && !principal.access_hash.is_empty() {
         match hub.db.active_socket_session_valid(&principal.access_hash).await {
             Ok(true) => {}
             _ => {
@@ -2106,18 +2425,10 @@ async fn handle_client(
             }
         }
     }
-    if principal.view.is_some()
-        && !matches!(
-            env,
-            Envelope::Ping | Envelope::Invoke { .. } | Envelope::Cancel { .. }
-        )
-    {
+    if let Err(why) = principal.authorize(&env) {
         return send_out(
             tx,
-            &Envelope::result_err(
-                env.request_id().unwrap_or("").to_string(),
-                "view ticket can only signal a desktop stream",
-            ),
+            &Envelope::result_err(env.request_id().unwrap_or("").to_string(), why),
         )
         .await;
     }
@@ -2134,7 +2445,7 @@ async fn handle_client(
             ttl_secs,
             uses,
         } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "login or admin token required"),
@@ -2176,6 +2487,13 @@ async fn handle_client(
             node_id,
             policy,
         } => {
+            if !principal.can_manage_account() {
+                return send_out(
+                    tx,
+                    &Envelope::result_err(request_id, "admin or operator login required"),
+                )
+                .await;
+            }
             let updated = hub
                 .db
                 .set_node_policy(&caller_of(principal), &node_id, policy)
@@ -2195,7 +2513,7 @@ async fn handle_client(
             op,
             ..
         } => {
-            if principal.web || principal.view.is_some() {
+            if principal.is_web() || principal.view_scope().is_some() {
                 return send_out(
                     tx,
                     &Envelope::result_err(
@@ -2205,7 +2523,7 @@ async fn handle_client(
                 )
                 .await;
             }
-            let resolved = if principal.operator || principal.admin {
+            let resolved = if principal.can_manage_account() {
                 hub.db
                     .access_to(&caller_of(principal), &node_id)
                     .await
@@ -2219,7 +2537,7 @@ async fn handle_client(
                     return send_out(tx, &Envelope::result_err(request_id, err.to_string())).await;
                 }
             };
-            let (op, grant) = if let Some(view) = &principal.view {
+            let (op, grant) = if let Some(view) = principal.view_scope() {
                 if node.id != view.node_id {
                     return send_out(
                         tx,
@@ -2242,7 +2560,7 @@ async fn handle_client(
                     return send_out(tx, &Envelope::result_err(request_id, why)).await;
                 }
                 (stamp_stream_flags(op, &grant), Some(grant))
-            } else if principal.operator || principal.admin {
+            } else if principal.can_manage_account() {
                 let visible = match hub.db.access_to(&caller_of(principal), &node.id).await {
                     Ok(visible) => visible,
                     Err(err) => {
@@ -2267,14 +2585,16 @@ async fn handle_client(
                 )
                 .await;
             };
-            let online_tx = {
+            let online_target = {
                 let online = lock_online(hub)?;
                 match online.get(&node.id) {
-                    Some(live) if live.last_seen.elapsed() < STALE_AFTER => Some(live.tx.clone()),
+                    Some(live) if live.last_seen.elapsed() < STALE_AFTER => {
+                        Some((live.tx.clone(), live.conn_id))
+                    }
                     _ => None,
                 }
             };
-            let Some(node_tx) = online_tx else {
+            let Some((node_tx, target_conn_id)) = online_target else {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, format!("node offline: {}", node.name)),
@@ -2286,6 +2606,8 @@ async fn handle_client(
                 hub,
                 request_id.clone(),
                 Route {
+                    origin_conn_id: conn_id,
+                    target_conn_id,
                     origin_tx: tx.clone(),
                     target_tx: node_tx.clone(),
                     origin_node: None,
@@ -2339,14 +2661,14 @@ async fn handle_client(
             terminal,
             authz: _,
         } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "agents must use the end-to-end channel"),
                 )
                 .await;
             }
-            if principal.operator && !principal.admin {
+            if principal.is_operator_non_admin() {
                 let visible = match hub.db.access_to(&caller_of(principal), &node_id).await {
                     Ok(visible) => visible,
                     Err(err) => {
@@ -2397,7 +2719,18 @@ async fn handle_client(
                     }
                 }
             }
-            open_or_forward(hub, None, tx, request_id, node_id, client_id, msg, terminal).await
+            open_or_forward(
+                hub,
+                conn_id,
+                None,
+                tx,
+                request_id,
+                node_id,
+                client_id,
+                msg,
+                terminal,
+            )
+            .await
         }
         Envelope::DirectOffer {
             request_id,
@@ -2410,6 +2743,7 @@ async fn handle_client(
         } => {
             open_direct(
                 hub,
+                conn_id,
                 None,
                 Some(principal),
                 tx,
@@ -2424,14 +2758,14 @@ async fn handle_client(
             .await
         }
         Envelope::E2eHello { .. } | Envelope::E2e { .. } => {
-            route_e2e(hub, None, tx, Some(principal), env).await
+            route_e2e(hub, conn_id, None, tx, Some(principal), env).await
         }
         Envelope::RegisterClient {
             request_id,
             name,
             public_key,
         } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -2467,7 +2801,7 @@ async fn handle_client(
             node_id,
             policy,
         } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -2496,7 +2830,7 @@ async fn handle_client(
             request_id,
             client_id,
         } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -2519,14 +2853,14 @@ async fn handle_client(
             }
         }
         Envelope::ListClients { request_id } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
                 )
                 .await;
             }
-            let owner = if principal.admin {
+            let owner = if principal.is_admin() {
                 None
             } else {
                 Some(principal.user.as_str())
@@ -2548,7 +2882,7 @@ async fn handle_client(
             .await
         }
         Envelope::ListApprovals { request_id } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -2556,7 +2890,7 @@ async fn handle_client(
                 .await;
             }
             let items = hub.db.list_approvals().await.unwrap_or_default();
-            let items = if principal.admin {
+            let items = if principal.is_admin() {
                 items
             } else {
                 let owned: Vec<String> = hub
@@ -2581,7 +2915,7 @@ async fn handle_client(
             node_id,
             allow,
         } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -2590,7 +2924,9 @@ async fn handle_client(
             }
             let resolved = hub.db.access_to(&caller_of(principal), &node_id).await;
             let node = match resolved {
-                Ok(visible) if visible.relation != models::Relation::Shared || principal.admin => {
+                Ok(visible)
+                    if visible.relation != models::Relation::Shared || principal.is_admin() =>
+                {
                     visible.node
                 }
                 Ok(_) => {
@@ -2626,7 +2962,7 @@ async fn handle_client(
             .await
         }
         Envelope::QueryAudit { request_id, filter } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -2637,7 +2973,7 @@ async fn handle_client(
                 serde_json::from_value(filter).unwrap_or_default();
             // Visibility sets are resolved first so the JSONL scan can filter
             // before retaining — never load the whole audit file into memory.
-            let visibility = if principal.admin {
+            let visibility = if principal.is_admin() {
                 None
             } else {
                 let visible = hub
@@ -2653,25 +2989,29 @@ async fn handle_client(
                     .await
                     .unwrap_or_default();
                 let agent_ids: Vec<String> = agents.into_iter().map(|client| client.id).collect();
-                Some((principal.user.clone(), node_ids, agent_ids, principal.device_id.clone()))
+                Some((
+                    principal.user.clone(),
+                    node_ids,
+                    agent_ids,
+                    principal.device_id.clone(),
+                ))
             };
-            let limit = if parsed.limit == 0 { 200 } else { parsed.limit };
-            let records = agentlink_core::audit::page_from_jsonl(
-                &hub.audit_path,
-                limit,
-                0,
-                |record| {
-                    if !parsed.matches(record) {
-                        return false;
+            let limit = if parsed.limit == 0 {
+                AUDIT_RECORDS_DEFAULT_LIMIT
+            } else {
+                parsed.limit.min(AUDIT_RECORDS_MAX_LIMIT)
+            };
+            let records = read_audit_records_merged(&hub.audit_path, limit, 0, |record| {
+                if !parsed.matches(record) {
+                    return false;
+                }
+                match &visibility {
+                    None => true,
+                    Some((user, node_ids, agent_ids, device_id)) => {
+                        record_visible(record, user, node_ids, agent_ids, device_id)
                     }
-                    match &visibility {
-                        None => true,
-                        Some((user, node_ids, agent_ids, device_id)) => {
-                            record_visible(record, user, node_ids, agent_ids, device_id)
-                        }
-                    }
-                },
-            );
+                }
+            });
             let records = records
                 .into_iter()
                 .filter_map(|record| serde_json::to_value(record).ok())
@@ -2692,7 +3032,7 @@ async fn handle_client(
             user,
             ..
         } => {
-            if !principal.admin && !principal.operator {
+            if !principal.can_manage_account() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -2711,7 +3051,7 @@ async fn handle_client(
                 }
             }
             if let Some(username) = user.filter(|name| !name.is_empty()) {
-                if !principal.admin && username != principal.user {
+                if !principal.is_admin() && username != principal.user {
                     return send_out(tx, &Envelope::result_err(request_id, "not found")).await;
                 }
                 if let Err(err) = hub.db.set_user_audit(&username, &toml).await {
@@ -2757,9 +3097,25 @@ async fn handle_client(
             node_id,
             cursors,
         } => {
-            let Ok(node) = hub.db.resolve_node(&node_id).await else {
+            let Some(node) = principal_can_access_node(hub, principal, &node_id).await else {
                 return Ok(());
             };
+            let had_cursors = !cursors.is_empty();
+            let filtered_cursors = {
+                let routes = lock_routes(hub)?;
+                cursors
+                    .into_iter()
+                    .filter(|cursor| match routes.get(&cursor.request_id) {
+                        Some(route) => {
+                            route.origin_conn_id == conn_id && route.target_node == node.id
+                        }
+                        None => true,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if had_cursors && filtered_cursors.is_empty() {
+                return Ok(());
+            }
             let node_tx = lock_online(hub)?.get(&node.id).map(|live| live.tx.clone());
             if let Some(node_tx) = node_tx {
                 let _ = send_out(
@@ -2767,7 +3123,7 @@ async fn handle_client(
                     &Envelope::Session {
                         session_id,
                         node_id: node.id,
-                        cursors,
+                        cursors: filtered_cursors,
                     },
                 )
                 .await;
@@ -2778,10 +3134,17 @@ async fn handle_client(
             request_id,
             node_id,
         } => {
-            let resolved = hub.db.resolve_node(&node_id).await;
-            let Ok(node) = resolved else {
+            let Some(node) = principal_can_access_node(hub, principal, &node_id).await else {
                 return Ok(());
             };
+            {
+                let routes = lock_routes(hub)?;
+                if let Some(route) = routes.get(&request_id) {
+                    if route.origin_conn_id != conn_id || route.target_node != node.id {
+                        return Ok(());
+                    }
+                }
+            }
             let node_tx = {
                 let online = lock_online(hub)?;
                 online.get(&node.id).map(|n| n.tx.clone())
@@ -2798,11 +3161,58 @@ async fn handle_client(
             }
             Ok(())
         }
-        other => handle_account(hub, tx, principal, other).await,
+        other => handle_account(hub, tx, principal, reauth, other).await,
+    }
+}
+
+/// Resolve a target node only if `principal` is authorized to address it
+/// (Admin -> any enrolled node, Operator/Web -> owned or shared via `access_to`,
+/// Agent -> non-revoked client holding an explicit grant to the node under its
+/// owner's access, View -> single scoped node).
+async fn principal_can_access_node(
+    hub: &Hub,
+    principal: &Principal,
+    node_query: &str,
+) -> Option<EnrolledNode> {
+    match &principal.kind {
+        PrincipalKind::Admin { .. } => hub.db.resolve_node(node_query).await.ok(),
+        PrincipalKind::Operator | PrincipalKind::Web { .. } => hub
+            .db
+            .access_to(&principal.caller(), node_query)
+            .await
+            .ok()
+            .map(|v| v.node),
+        PrincipalKind::Agent => {
+            let record = hub.db.client_record(&principal.client_id).await.ok()??;
+            if record.revoked {
+                return None;
+            }
+            let node = hub.db.resolve_node(node_query).await.ok()?;
+            if !record.grants.contains_key(&node.id) {
+                return None;
+            }
+            if !record.owner.is_empty() {
+                let owner_caller = Caller {
+                    user: record.owner,
+                    admin: false,
+                };
+                hub.db.access_to(&owner_caller, &node.id).await.ok()?;
+            }
+            Some(node)
+        }
+        PrincipalKind::View(scope) => {
+            let node = hub.db.resolve_node(node_query).await.ok()?;
+            if node.id == scope.node_id {
+                Some(node)
+            } else {
+                None
+            }
+        }
     }
 }
 
 async fn node_loop(ws: RelaySocket, hub: Arc<Hub>, node_id: String) -> Result<()> {
+    let conn_id = hub.next_conn_id();
     let (sink, mut stream) = ws.split();
     let (tx, rx) = mpsc::channel(256);
     let cancel = CancellationToken::new();
@@ -2814,6 +3224,7 @@ async fn node_loop(ws: RelaySocket, hub: Arc<Hub>, node_id: String) -> Result<()
         node_id.clone(),
         Online {
             generation,
+            conn_id,
             tx: tx.clone(),
             last_seen: Instant::now(),
             cancel: cancel.clone(),
@@ -2863,13 +3274,13 @@ async fn node_loop(ws: RelaySocket, hub: Arc<Hub>, node_id: String) -> Result<()
                 match ws::parse_incoming(msg)? {
                     Incoming::Env(env) => {
                         mark_seen(&hub, &node_id).await;
-                        if let Err(err) = handle_node(&hub, &node_id, &tx, env).await {
+                        if let Err(err) = handle_node(&hub, conn_id, &node_id, &tx, env).await {
                             tracing::debug!(node = %node_id, error = %err, "node message failed");
                         }
                     }
                     Incoming::Binary(bytes) => {
                         mark_seen(&hub, &node_id).await;
-                        if let Err(err) = route_binary(&hub, Some(&node_id), bytes).await {
+                        if let Err(err) = route_binary(&hub, conn_id, bytes).await {
                             tracing::debug!(node = %node_id, error = %err, "binary forward failed");
                         }
                     }
@@ -2890,8 +3301,36 @@ async fn node_loop(ws: RelaySocket, hub: Arc<Hub>, node_id: String) -> Result<()
     Ok(())
 }
 
+/// Per-node rate limiter for `AuditBatch` frames (batches/min and records/min).
+fn allow_node_audit_batch(hub: &Hub, node_id: &str, record_count: u32) -> bool {
+    let Ok(mut windows) = hub.audit_batch_windows.lock() else {
+        return false;
+    };
+    let now = unix_now();
+    if !windows.contains_key(node_id) && windows.len() >= MAX_RATE_WINDOWS {
+        windows.retain(|_, (started, _, _)| now.saturating_sub(*started) < 60);
+        if windows.len() >= MAX_RATE_WINDOWS {
+            return false;
+        }
+    }
+    let entry = windows.entry(node_id.to_string()).or_insert((now, 0, 0));
+    if now.saturating_sub(entry.0) >= 60 {
+        *entry = (now, 0, 0);
+    }
+    if entry.1 >= MAX_AUDIT_BATCHES_PER_MIN {
+        return false;
+    }
+    if entry.2.saturating_add(record_count) > MAX_AUDIT_RECORDS_PER_MIN {
+        return false;
+    }
+    entry.1 = entry.1.saturating_add(1);
+    entry.2 = entry.2.saturating_add(record_count);
+    true
+}
+
 async fn handle_node(
     hub: &Hub,
+    conn_id: u64,
     node_id: &str,
     node_tx: &mpsc::Sender<Outbound>,
     env: Envelope,
@@ -2914,6 +3353,7 @@ async fn handle_node(
         } => {
             open_or_forward(
                 hub,
+                conn_id,
                 Some(node_id),
                 node_tx,
                 request_id,
@@ -2935,6 +3375,7 @@ async fn handle_node(
         } => {
             open_direct(
                 hub,
+                conn_id,
                 Some(node_id),
                 None,
                 node_tx,
@@ -2949,26 +3390,28 @@ async fn handle_node(
             .await
         }
         Envelope::E2eHello { .. } | Envelope::E2e { .. } => {
-            route_e2e(hub, Some(node_id), node_tx, None, env).await
+            route_e2e(hub, conn_id, Some(node_id), node_tx, None, env).await
         }
         Envelope::E2eWelcome { .. } => {
             let Some(id) = env.request_id().map(|s| s.to_string()) else {
                 return Ok(());
             };
-            forward_existing(hub, Some(node_id), &id, env, true).await
+            forward_existing(hub, conn_id, &id, env, true).await
         }
         Envelope::ApprovalRequest {
             request_id,
             approval_id,
-            node_id: origin,
+            node_id: _claimed_origin,
             client_id,
             category,
             summary,
             expires_unix,
         } => {
+            // Always stamp node_id from the authenticated WebSocket identity (SEC-08).
+            let authenticated_node = node_id.to_string();
             let info = ApprovalInfo {
                 approval_id: approval_id.clone(),
-                node_id: origin,
+                node_id: authenticated_node.clone(),
                 client_id,
                 category,
                 summary,
@@ -2978,7 +3421,7 @@ async fn handle_node(
             let note = Envelope::ApprovalRequest {
                 request_id: request_id.clone(),
                 approval_id,
-                node_id: info.node_id.clone(),
+                node_id: authenticated_node,
                 client_id: info.client_id.clone(),
                 category: info.category.clone(),
                 summary: info.summary.clone(),
@@ -2987,13 +3430,36 @@ async fn handle_node(
             // Deliver to the waiting invoke client (needed when that client is
             // not in the admin fanout set, and so dispatch can match request_id).
             if !request_id.is_empty() {
-                let _ = forward_existing(hub, Some(node_id), &request_id, note.clone(), false).await;
+                let _ = forward_existing(hub, conn_id, &request_id, note.clone(), false).await;
             }
             fanout_admins(hub, &note).await;
             Ok(())
         }
         Envelope::AuditBatch { records, .. } => {
-            append_audit(&hub.audit_path, &records);
+            let mut sanitized = Vec::with_capacity(records.len().min(MAX_AUDIT_BATCH_ITEMS));
+            for record in records.into_iter().take(MAX_AUDIT_BATCH_ITEMS) {
+                let serde_json::Value::Object(mut map) = record else {
+                    continue;
+                };
+                // Server-overwrite node_id from the authenticated WS identity (SEC-08).
+                map.insert(
+                    "node_id".into(),
+                    serde_json::Value::String(node_id.to_string()),
+                );
+                let val = serde_json::Value::Object(map);
+                if val.to_string().len() > MAX_AUDIT_RECORD_BYTES {
+                    continue;
+                }
+                sanitized.push(val);
+            }
+            if sanitized.is_empty() {
+                return Ok(());
+            }
+            if !allow_node_audit_batch(hub, node_id, sanitized.len() as u32) {
+                tracing::warn!(node = %node_id, count = sanitized.len(), "rate-limited node audit batch");
+                return Ok(());
+            }
+            append_node_audit(&hub.node_audit_path, &sanitized);
             Ok(())
         }
         other => {
@@ -3008,13 +3474,14 @@ async fn handle_node(
                 Envelope::E2eWelcome { .. } => true,
                 _ => false,
             };
-            forward_existing(hub, Some(node_id), &id, other, terminal).await
+            forward_existing(hub, conn_id, &id, other, terminal).await
         }
     }
 }
 
 async fn route_e2e(
     hub: &Hub,
+    sender_conn_id: u64,
     from_node: Option<&str>,
     from_tx: &mpsc::Sender<Outbound>,
     principal: Option<&Principal>,
@@ -3034,48 +3501,57 @@ async fn route_e2e(
         } => (request_id.clone(), node_id.clone(), class.clone()),
         _ => return Ok(()),
     };
-    if route_exists(hub, &request_id)? && !matches!(env, Envelope::E2eHello { .. }) {
-        let Some(bound) = route_target(hub, &request_id)? else {
-            return send_out(
-                from_tx,
-                &Envelope::result_err(request_id, "request route missing"),
-            )
-            .await;
-        };
-        // Authorization stays on the node that opened the route. A later frame
-        // must not name a different machine and reuse that route.
-        if !node_names_target(hub, &node_id, &bound).await? {
-            return send_out(
-                from_tx,
-                &Envelope::result_err(request_id, "node does not match the open request"),
-            )
-            .await;
+    if !matches!(env, Envelope::E2eHello { .. }) {
+        match route_endpoint_target(hub, &request_id, sender_conn_id)? {
+            RouteLookup::Forbidden => {
+                // Frame came from a connection that is neither endpoint of this route (SEC-05).
+                if from_node.is_none() {
+                    return send_out(
+                        from_tx,
+                        &Envelope::result_err(request_id, "request route denied"),
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
+            RouteLookup::Authorized { target_node: bound } => {
+                // Authorization stays on the node that opened the route. A later frame
+                // must not name a different machine and reuse that route.
+                if !node_names_target(hub, &node_id, &bound).await? {
+                    return send_out(
+                        from_tx,
+                        &Envelope::result_err(request_id, "node does not match the open request"),
+                    )
+                    .await;
+                }
+                if let Envelope::E2e {
+                    node_id,
+                    relay_admin,
+                    relay_grant,
+                    client_id,
+                    user,
+                    device_id,
+                    ..
+                } = &mut env
+                {
+                    *node_id = bound.clone();
+                    apply_e2e_auth(
+                        hub,
+                        from_node,
+                        principal,
+                        &bound,
+                        relay_admin,
+                        relay_grant,
+                        client_id,
+                    )
+                    .await?;
+                    stamp_actor(principal, user, device_id);
+                }
+                let terminal = matches!(env, Envelope::E2e { terminal: true, .. });
+                return forward_existing(hub, sender_conn_id, &request_id, env, terminal).await;
+            }
+            RouteLookup::Missing => {}
         }
-        if let Envelope::E2e {
-            node_id,
-            relay_admin,
-            relay_grant,
-            client_id,
-            user,
-            device_id,
-            ..
-        } = &mut env
-        {
-            *node_id = bound.clone();
-            apply_e2e_auth(
-                hub,
-                from_node,
-                principal,
-                &bound,
-                relay_admin,
-                relay_grant,
-                client_id,
-            )
-            .await?;
-            stamp_actor(principal, user, device_id);
-        }
-        let terminal = matches!(env, Envelope::E2e { terminal: true, .. });
-        return forward_existing(hub, from_node, &request_id, env, terminal).await;
     }
     let resolved = hub.db.resolve_node(&node_id).await;
     let node = match resolved {
@@ -3092,7 +3568,7 @@ async fn route_e2e(
         // never create a node->self loop route.
         return Ok(());
     }
-    let allowed = if principal.map(|p| p.admin).unwrap_or(false) {
+    let allowed = if principal.map(|p| p.is_admin()).unwrap_or(false) {
         node.effective()
     } else if let Some(from_id) = from_node {
         // A compromised node must not open E2E onto another account's machine.
@@ -3107,7 +3583,7 @@ async fn route_e2e(
             }
         }
     } else if let Some(principal) = principal {
-        if principal.operator {
+        if principal.has_operator_session() {
             hub.db
                 .access_to(&caller_of(principal), &node.id)
                 .await
@@ -3136,14 +3612,16 @@ async fn route_e2e(
         let message = "this login cannot route to that node".to_string();
         return send_out(from_tx, &Envelope::result_err(request_id, message)).await;
     }
-    let online_tx = {
+    let online_target = {
         let online = lock_online(hub)?;
         match online.get(&node.id) {
-            Some(live) if live.last_seen.elapsed() < STALE_AFTER => Some(live.tx.clone()),
+            Some(live) if live.last_seen.elapsed() < STALE_AFTER => {
+                Some((live.tx.clone(), live.conn_id))
+            }
             _ => None,
         }
     };
-    let Some(node_tx) = online_tx else {
+    let Some((node_tx, target_conn_id)) = online_target else {
         return send_out(
             from_tx,
             &Envelope::result_err(request_id, format!("node offline: {}", node.name)),
@@ -3154,6 +3632,8 @@ async fn route_e2e(
         hub,
         request_id.clone(),
         Route {
+            origin_conn_id: sender_conn_id,
+            target_conn_id,
             origin_tx: from_tx.clone(),
             target_tx: node_tx.clone(),
             origin_node: from_node.map(|id| id.to_string()),
@@ -3233,7 +3713,7 @@ async fn apply_e2e_auth(
     if !principal.client_id.is_empty() {
         *client_id = principal.client_id.clone();
     }
-    if principal.operator && !principal.admin {
+    if principal.is_operator_non_admin() {
         let access = hub
             .db
             .access_to(&caller_of(principal), node_id)
@@ -3244,8 +3724,8 @@ async fn apply_e2e_auth(
         *relay_grant = Some(access);
         return Ok(());
     }
-    *relay_admin = principal.admin;
-    if principal.admin {
+    *relay_admin = principal.is_admin();
+    if principal.is_admin() {
         *relay_grant = None;
         return Ok(());
     }
@@ -3293,8 +3773,10 @@ fn remember(hub: &Hub, env: &Envelope) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_or_forward(
     hub: &Hub,
+    sender_conn_id: u64,
     from_node: Option<&str>,
     from_tx: &mpsc::Sender<Outbound>,
     request_id: String,
@@ -3303,34 +3785,40 @@ async fn open_or_forward(
     msg: TransferMsg,
     terminal: bool,
 ) -> Result<()> {
-    if route_exists(hub, &request_id)? {
-        let Some(bound) = route_target(hub, &request_id)? else {
-            return fail_transfer(
-                from_tx,
-                request_id,
-                node_id,
-                "request route missing".into(),
-            )
-            .await;
-        };
-        if !node_names_target(hub, &node_id, &bound).await? {
-            return fail_transfer(
-                from_tx,
-                request_id,
-                bound,
-                "node does not match the open request".into(),
-            )
-            .await;
+    match route_endpoint_target(hub, &request_id, sender_conn_id)? {
+        RouteLookup::Forbidden => {
+            if from_node.is_none() {
+                return fail_transfer(
+                    from_tx,
+                    request_id,
+                    node_id,
+                    "request route denied".into(),
+                )
+                .await;
+            }
+            return Ok(());
         }
-        let env = Envelope::Transfer {
-            request_id: request_id.clone(),
-            node_id: bound,
-            client_id,
-            msg,
-            terminal,
-            authz: None,
-        };
-        return forward_existing(hub, from_node, &request_id, env, terminal).await;
+        RouteLookup::Authorized { target_node: bound } => {
+            if !node_names_target(hub, &node_id, &bound).await? {
+                return fail_transfer(
+                    from_tx,
+                    request_id,
+                    bound,
+                    "node does not match the open request".into(),
+                )
+                .await;
+            }
+            let env = Envelope::Transfer {
+                request_id: request_id.clone(),
+                node_id: bound,
+                client_id,
+                msg,
+                terminal,
+                authz: None,
+            };
+            return forward_existing(hub, sender_conn_id, &request_id, env, terminal).await;
+        }
+        RouteLookup::Missing => {}
     }
     let can_initiate = matches!(
         msg,
@@ -3363,14 +3851,16 @@ async fn open_or_forward(
     if let Err(why) = transfer_allowed(hub, &node, from_node, &msg).await {
         return fail_transfer(from_tx, request_id, node.name, why).await;
     }
-    let online_tx = {
+    let online_target = {
         let online = lock_online(hub)?;
         match online.get(&node.id) {
-            Some(live) if live.last_seen.elapsed() < STALE_AFTER => Some(live.tx.clone()),
+            Some(live) if live.last_seen.elapsed() < STALE_AFTER => {
+                Some((live.tx.clone(), live.conn_id))
+            }
             _ => None,
         }
     };
-    let Some(target_tx) = online_tx else {
+    let Some((target_tx, target_conn_id)) = online_target else {
         return fail_transfer(
             from_tx,
             request_id,
@@ -3383,6 +3873,8 @@ async fn open_or_forward(
         hub,
         request_id.clone(),
         Route {
+            origin_conn_id: sender_conn_id,
+            target_conn_id,
             origin_tx: from_tx.clone(),
             target_tx: target_tx.clone(),
             origin_node: from_node.map(|id| id.to_string()),
@@ -3482,8 +3974,10 @@ async fn transfer_allowed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_direct(
     hub: &Hub,
+    sender_conn_id: u64,
     from_node: Option<&str>,
     principal: Option<&Principal>,
     from_tx: &mpsc::Sender<Outbound>,
@@ -3495,17 +3989,21 @@ async fn open_direct(
     local_addrs: Vec<String>,
     reflexive: Option<String>,
 ) -> Result<()> {
-    if route_exists(hub, &request_id)? {
-        let env = Envelope::DirectOffer {
-            request_id: request_id.clone(),
-            node_id,
-            public_key,
-            cert_fp,
-            cert_sig,
-            local_addrs,
-            reflexive,
-        };
-        return forward_existing(hub, from_node, &request_id, env, false).await;
+    match route_endpoint_target(hub, &request_id, sender_conn_id)? {
+        RouteLookup::Forbidden => return Ok(()),
+        RouteLookup::Authorized { .. } => {
+            let env = Envelope::DirectOffer {
+                request_id: request_id.clone(),
+                node_id,
+                public_key,
+                cert_fp,
+                cert_sig,
+                local_addrs,
+                reflexive,
+            };
+            return forward_existing(hub, sender_conn_id, &request_id, env, false).await;
+        }
+        RouteLookup::Missing => {}
     }
     let resolved = hub.db.resolve_node(&node_id).await;
     let node = match resolved {
@@ -3526,8 +4024,8 @@ async fn open_direct(
         let Some(principal) = principal else {
             return Err(Error::PermissionDenied("direct offer requires a session".into()));
         };
-        if !principal.admin {
-            if principal.operator {
+        if !principal.is_admin() {
+            if principal.has_operator_session() {
                 hub.db
                     .access_to(&caller_of(principal), &node.id)
                     .await
@@ -3547,14 +4045,16 @@ async fn open_direct(
             }
         }
     }
-    let online_tx = {
+    let online_target = {
         let online = lock_online(hub)?;
         match online.get(&node.id) {
-            Some(live) if live.last_seen.elapsed() < STALE_AFTER => Some(live.tx.clone()),
+            Some(live) if live.last_seen.elapsed() < STALE_AFTER => {
+                Some((live.tx.clone(), live.conn_id))
+            }
             _ => None,
         }
     };
-    let Some(target_tx) = online_tx else {
+    let Some((target_tx, target_conn_id)) = online_target else {
         return Err(Error::Message(format!("node offline: {}", node.name)));
     };
     let reflexive = reflexive.or_else(|| punch_of(hub, &public_key));
@@ -3562,6 +4062,8 @@ async fn open_direct(
         hub,
         request_id.clone(),
         Route {
+            origin_conn_id: sender_conn_id,
+            target_conn_id,
             origin_tx: from_tx.clone(),
             target_tx: target_tx.clone(),
             origin_node: from_node.map(|id| id.to_string()),
@@ -3583,7 +4085,7 @@ async fn open_direct(
 
 async fn forward_existing(
     hub: &Hub,
-    from_node: Option<&str>,
+    sender_conn_id: u64,
     request_id: &str,
     mut env: Envelope,
     terminal: bool,
@@ -3598,43 +4100,59 @@ async fn forward_existing(
             *reflexive = punch_of(hub, public_key);
         }
     }
+    // Verify sender_conn_id matches one of the two route endpoints BEFORE
+    // mutating activity or removing the route on `terminal` (SEC-05).
     let tx = {
         let mut routes = lock_routes(hub)?;
+        let Some(dest) = routes
+            .get(request_id)
+            .and_then(|route| dest_tx(route, sender_conn_id))
+        else {
+            return Ok(());
+        };
         if terminal {
-            routes
-                .remove(request_id)
-                .map(|route| dest_tx(&route, from_node))
-        } else {
-            routes.get_mut(request_id).map(|route| {
-                route.last_activity = Instant::now();
-                dest_tx(route, from_node)
-            })
+            routes.remove(request_id);
+        } else if let Some(route) = routes.get_mut(request_id) {
+            route.last_activity = Instant::now();
         }
+        dest
     };
-    if let Some(tx) = tx {
-        remember(hub, &env);
-        send_out(&tx, &env).await?;
-    }
+    remember(hub, &env);
+    send_out(&tx, &env).await?;
     Ok(())
 }
 
-fn dest_tx(route: &Route, from_node: Option<&str>) -> mpsc::Sender<Outbound> {
-    let from_origin = match (&route.origin_node, from_node) {
-        (None, None) => true,
-        (Some(origin), Some(from)) if origin == from => true,
-        _ => false,
-    };
-    if from_origin {
-        route.target_tx.clone()
+fn dest_tx(route: &Route, sender_conn_id: u64) -> Option<mpsc::Sender<Outbound>> {
+    if sender_conn_id == route.origin_conn_id {
+        Some(route.target_tx.clone())
+    } else if sender_conn_id == route.target_conn_id {
+        Some(route.origin_tx.clone())
     } else {
-        route.origin_tx.clone()
+        None
     }
 }
 
-fn route_exists(hub: &Hub, request_id: &str) -> Result<bool> {
-    Ok(lock_routes(hub)?.contains_key(request_id))
+enum RouteLookup {
+    Missing,
+    Authorized { target_node: String },
+    Forbidden,
 }
 
+fn route_endpoint_target(hub: &Hub, request_id: &str, sender_conn_id: u64) -> Result<RouteLookup> {
+    let routes = lock_routes(hub)?;
+    let Some(route) = routes.get(request_id) else {
+        return Ok(RouteLookup::Missing);
+    };
+    if sender_conn_id == route.origin_conn_id || sender_conn_id == route.target_conn_id {
+        Ok(RouteLookup::Authorized {
+            target_node: route.target_node.clone(),
+        })
+    } else {
+        Ok(RouteLookup::Forbidden)
+    }
+}
+
+#[cfg(test)]
 fn route_target(hub: &Hub, request_id: &str) -> Result<Option<String>> {
     Ok(lock_routes(hub)?
         .get(request_id)
@@ -3653,27 +4171,29 @@ async fn node_names_target(hub: &Hub, named: &str, bound: &str) -> Result<bool> 
     }
 }
 
-async fn route_binary(hub: &Hub, from_node: Option<&str>, bytes: Vec<u8>) -> Result<()> {
+async fn route_binary(hub: &Hub, sender_conn_id: u64, bytes: Vec<u8>) -> Result<()> {
     let Some(request_id) = agentlink_core::frame::request_id(&bytes) else {
         return Ok(());
     };
     let tx = {
         let mut routes = lock_routes(hub)?;
-        routes.get_mut(&request_id).map(|route| {
-            route.last_activity = Instant::now();
-            dest_tx(route, from_node)
-        })
+        let Some(route) = routes.get_mut(&request_id) else {
+            return Ok(());
+        };
+        let Some(dest) = dest_tx(route, sender_conn_id) else {
+            return Ok(());
+        };
+        route.last_activity = Instant::now();
+        dest
     };
-    if let Some(tx) = tx {
-        if let Some(capture) = &hub.capture {
-            if let Ok(mut guard) = capture.lock() {
-                guard.push(bytes.clone());
-            }
+    if let Some(capture) = &hub.capture {
+        if let Ok(mut guard) = capture.lock() {
+            guard.push(bytes.clone());
         }
-        tx.send(Outbound::Binary(bytes))
-            .await
-            .map_err(|_| Error::Message("connection closed".into()))?;
     }
+    tx.send(Outbound::Binary(bytes))
+        .await
+        .map_err(|_| Error::Message("connection closed".into()))?;
     Ok(())
 }
 
@@ -3713,6 +4233,12 @@ fn reap_closed_routes(hub: &Hub) {
 fn try_insert_route(hub: &Hub, request_id: String, route: Route) -> Result<()> {
     let mut routes = lock_routes(hub)?;
     if let Some(existing) = routes.get_mut(&request_id) {
+        if !existing.origin_tx.is_closed()
+            && !existing.target_tx.is_closed()
+            && existing.origin_conn_id != route.origin_conn_id
+        {
+            return Err(Error::PermissionDenied("request id already in use".into()));
+        }
         *existing = route;
         return Ok(());
     }
@@ -3812,7 +4338,7 @@ async fn snapshot_nodes(hub: &Hub, principal: &Principal) -> Vec<NodeInfo> {
             .map(|(id, live)| (id.clone(), live.last_seen.elapsed() < STALE_AFTER))
             .collect::<HashMap<_, _>>()
     };
-    if let Some(view) = &principal.view {
+    if let Some(view) = principal.view_scope() {
         let Ok(node) = hub.db.resolve_node(&view.node_id).await else {
             return Vec::new();
         };
@@ -3823,7 +4349,7 @@ async fn snapshot_nodes(hub: &Hub, principal: &Principal) -> Vec<NodeInfo> {
         info.effective = view.grant.intersect(node.effective());
         return vec![info];
     }
-    if principal.operator || principal.admin {
+    if principal.can_manage_account() {
         let Ok(nodes) = hub.db.visible(&caller_of(principal)).await else {
             return Vec::new();
         };
@@ -3988,18 +4514,19 @@ fn operator_principal(
     device_id: String,
     access_hash: String,
 ) -> Principal {
+    let kind = if role == "admin" {
+        PrincipalKind::Admin { legacy: false }
+    } else {
+        PrincipalKind::Operator
+    };
     Principal {
-        admin: role == "admin",
-        operator: true,
-        legacy: false,
+        kind,
         name: user.clone(),
         user,
         role,
         device_id: device_id.clone(),
         access_hash,
         client_id: device_id,
-        view: None,
-        web: false,
         web_token: String::new(),
         view_session: None,
     }
@@ -4347,19 +4874,20 @@ async fn login_and_enter(
         {
             Ok(account) => account,
             Err(err) => {
+                let message = auth_err_message(&err);
                 audit_auth(
                     &hub.audit_path,
                     "login",
                     &username,
                     "",
                     false,
-                    &err.to_string(),
+                    &message,
                 );
                 let _ = send_env(
                     &mut ws,
                     &Envelope::LoginErr {
                         request_id,
-                        message: err.to_string(),
+                        message,
                     },
                 )
                 .await;
@@ -4371,19 +4899,20 @@ async fn login_and_enter(
         if !already_checked {
             let _ = hub.db.note_failure(&account.username).await;
         }
+        let message = auth_err_message(&err);
         audit_auth(
             &hub.audit_path,
             "login",
             &account.username,
             &public_key,
             false,
-            &err.to_string(),
+            &message,
         );
         let _ = send_env(
             &mut ws,
             &Envelope::LoginErr {
                 request_id,
-                message: err.to_string(),
+                message,
             },
         )
         .await;
@@ -4400,7 +4929,7 @@ async fn login_and_enter(
                 &mut ws,
                 &Envelope::LoginErr {
                     request_id,
-                    message: err.to_string(),
+                    message: auth_err_message(&err),
                 },
             )
             .await;
@@ -4464,7 +4993,7 @@ async fn refresh_and_enter(
             &mut ws,
             &Envelope::LoginErr {
                 request_id,
-                message: err.to_string(),
+                message: auth_err_message(&err),
             },
         )
         .await;
@@ -4473,19 +5002,20 @@ async fn refresh_and_enter(
     let session = match hub.db.rotate_refresh(&refresh_token, &public_key).await {
         Ok(session) => session,
         Err(err) => {
+            let message = auth_err_message(&err);
             audit_auth(
                 &hub.audit_path,
                 "refresh",
                 "",
                 &public_key,
                 false,
-                &err.to_string(),
+                &message,
             );
             let _ = send_env(
                 &mut ws,
                 &Envelope::LoginErr {
                     request_id,
-                    message: err.to_string(),
+                    message,
                 },
             )
             .await;
@@ -4527,10 +5057,11 @@ async fn handle_account(
     hub: &Hub,
     tx: &mpsc::Sender<Outbound>,
     principal: &Principal,
+    reauth: &WireReauth,
     env: Envelope,
 ) -> Result<()> {
     let require_login = |request_id: &str| {
-        if principal.operator || principal.admin {
+        if principal.can_manage_account() {
             None
         } else {
             Some(request_id.to_string())
@@ -4567,9 +5098,7 @@ async fn handle_account(
             if let Some(id) = require_login(&request_id) {
                 return send_out(tx, &Envelope::result_err(id, "login required")).await;
             }
-            let owner = if principal.admin && !principal.operator {
-                None
-            } else if principal.admin {
+            let owner = if principal.is_admin() {
                 None
             } else {
                 Some(principal.user.as_str())
@@ -4602,7 +5131,7 @@ async fn handle_account(
             if let Some(id) = require_login(&request_id) {
                 return send_out(tx, &Envelope::result_err(id, "login required")).await;
             }
-            let owner = if principal.admin {
+            let owner = if principal.is_admin() {
                 None
             } else {
                 Some(principal.user.as_str())
@@ -4685,7 +5214,7 @@ async fn handle_account(
             if let Some(id) = require_login(&request_id) {
                 return send_out(tx, &Envelope::result_err(id, "login required")).await;
             }
-            let owner = if principal.admin {
+            let owner = if principal.is_admin() {
                 None
             } else {
                 Some(principal.user.as_str())
@@ -4713,7 +5242,7 @@ async fn handle_account(
             if let Some(request) = require_login(&request_id) {
                 return send_out(tx, &Envelope::result_err(request, "login required")).await;
             }
-            let owner = if principal.admin {
+            let owner = if principal.is_admin() {
                 None
             } else {
                 Some(principal.user.as_str())
@@ -4748,7 +5277,7 @@ async fn handle_account(
             arch,
             version,
         } => {
-            if !principal.operator {
+            if !principal.has_operator_session() {
                 return send_out(tx, &Envelope::result_err(request_id, "login required")).await;
             }
             let message = format!("agentlink-enroll-v1:{request_id}:{public_key}");
@@ -4809,7 +5338,7 @@ async fn handle_account(
             role,
             admin,
         } => {
-            if !principal.admin {
+            if !principal.is_admin() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -4836,7 +5365,7 @@ async fn handle_account(
             }
         }
         Envelope::UserList { request_id } => {
-            if !principal.admin {
+            if !principal.is_admin() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -4861,14 +5390,42 @@ async fn handle_account(
             username,
             password,
         } => {
-            if !principal.admin && username != principal.user {
-                return send_out(
-                    tx,
-                    &Envelope::result_err(request_id, "admin token required"),
-                )
-                .await;
+            let target = username.trim().to_ascii_lowercase();
+            if !principal.is_admin() {
+                if !principal.has_operator_session() || target != principal.user {
+                    return send_out(
+                        tx,
+                        &Envelope::result_err(request_id, "admin or operator login required"),
+                    )
+                    .await;
+                }
+                let Some(current_password) = reauth
+                    .current_password
+                    .as_deref()
+                    .filter(|pw| !pw.is_empty())
+                else {
+                    return send_out(
+                        tx,
+                        &Envelope::result_err(
+                            request_id,
+                            "current password required to change own password",
+                        ),
+                    )
+                    .await;
+                };
+                if let Err(err) = hub
+                    .db
+                    .verify_reauth(&principal.user, current_password, reauth.totp.as_deref())
+                    .await
+                {
+                    return send_out(
+                        tx,
+                        &Envelope::result_err(request_id, auth_err_message(&err)),
+                    )
+                    .await;
+                }
             }
-            match hub.db.set_password(&username, &password).await {
+            match hub.db.set_password(&target, &password).await {
                 Ok(()) => {
                     send_out(
                         tx,
@@ -4884,7 +5441,7 @@ async fn handle_account(
             username,
             disabled,
         } => {
-            if !principal.admin {
+            if !principal.is_admin() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -4906,7 +5463,7 @@ async fn handle_account(
             request_id,
             username,
         } => {
-            if !principal.admin {
+            if !principal.is_admin() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -4929,7 +5486,7 @@ async fn handle_account(
             username,
             role,
         } => {
-            if !principal.admin {
+            if !principal.is_admin() {
                 return send_out(
                     tx,
                     &Envelope::result_err(request_id, "admin token required"),
@@ -4948,7 +5505,7 @@ async fn handle_account(
             }
         }
         Envelope::TotpBegin { request_id } => {
-            if !principal.operator {
+            if !principal.has_operator_session() {
                 return send_out(tx, &Envelope::result_err(request_id, "login required")).await;
             }
             match hub.db.begin_totp(&principal.user).await {
@@ -4967,7 +5524,7 @@ async fn handle_account(
             }
         }
         Envelope::TotpConfirm { request_id, code } => {
-            if !principal.operator {
+            if !principal.has_operator_session() {
                 return send_out(tx, &Envelope::result_err(request_id, "login required")).await;
             }
             match hub.db.confirm_totp(&principal.user, &code).await {
@@ -4982,8 +5539,33 @@ async fn handle_account(
             }
         }
         Envelope::TotpDisable { request_id } => {
-            if !principal.operator {
+            if !principal.has_operator_session() {
                 return send_out(tx, &Envelope::result_err(request_id, "login required")).await;
+            }
+            let Some(current_password) = reauth
+                .current_password
+                .as_deref()
+                .filter(|pw| !pw.is_empty())
+            else {
+                return send_out(
+                    tx,
+                    &Envelope::result_err(
+                        request_id,
+                        "current password required to disable TOTP",
+                    ),
+                )
+                .await;
+            };
+            if let Err(err) = hub
+                .db
+                .verify_reauth(&principal.user, current_password, reauth.totp.as_deref())
+                .await
+            {
+                return send_out(
+                    tx,
+                    &Envelope::result_err(request_id, auth_err_message(&err)),
+                )
+                .await;
             }
             match hub.db.disable_totp(&principal.user).await {
                 Ok(()) => {
@@ -5001,11 +5583,11 @@ async fn handle_account(
             username,
             toml,
         } => {
-            if !principal.operator && !principal.admin {
+            if !principal.can_manage_account() {
                 return send_out(tx, &Envelope::result_err(request_id, "login required")).await;
             }
             let username = username.unwrap_or_else(|| principal.user.clone());
-            if !principal.admin && username != principal.user {
+            if !principal.is_admin() && username != principal.user {
                 return send_out(tx, &Envelope::result_err(request_id, "not found")).await;
             }
             match agentlink_core::audit::AuditPolicy::parse(&toml) {
@@ -5321,17 +5903,13 @@ mod route_rebind_tests {
 
     fn principal(user: &str) -> Principal {
         Principal {
-            admin: false,
-            operator: true,
-            legacy: false,
+            kind: PrincipalKind::Operator,
             user: user.into(),
             role: "user".into(),
             device_id: "device".into(),
             access_hash: String::new(),
             client_id: format!("client-{user}"),
             name: "phone".into(),
-            view: None,
-            web: false,
             web_token: String::new(),
             view_session: None,
         }
@@ -5428,11 +6006,15 @@ mod route_rebind_tests {
         let request_id = "req-existing".to_string();
         let (origin_tx, mut origin_rx) = mpsc::channel(4);
         let (target_tx, mut target_rx) = mpsc::channel(4);
+        let origin_conn_id = 101;
+        let target_conn_id = 202;
         {
             let mut routes = lock_routes(hub).unwrap();
             routes.insert(
                 request_id.clone(),
                 Route {
+                    origin_conn_id,
+                    target_conn_id,
                     origin_tx: origin_tx.clone(),
                     target_tx: target_tx.clone(),
                     origin_node: None,
@@ -5444,6 +6026,7 @@ mod route_rebind_tests {
 
         route_e2e(
             hub,
+            origin_conn_id,
             None,
             &origin_tx,
             Some(&principal("alice")),
@@ -5486,6 +6069,7 @@ mod route_rebind_tests {
 
         route_e2e(
             hub,
+            origin_conn_id,
             None,
             &origin_tx,
             Some(&principal("alice")),
@@ -5518,6 +6102,7 @@ mod route_rebind_tests {
 
         route_e2e(
             hub,
+            origin_conn_id,
             None,
             &origin_tx,
             Some(&principal("bob")),
@@ -5584,6 +6169,7 @@ mod route_rebind_tests {
             alice_node.id.clone(),
             Online {
                 generation: 1,
+                conn_id: 500,
                 tx: target_tx,
                 last_seen: Instant::now(),
                 cancel: CancellationToken::new(),
@@ -5595,6 +6181,7 @@ mod route_rebind_tests {
         for idx in 0..300 {
             route_e2e(
                 hub,
+                501,
                 None,
                 &origin_tx,
                 Some(&p),
@@ -5671,6 +6258,7 @@ mod route_rebind_tests {
             alice_node.id.clone(),
             Online {
                 generation: 2,
+                conn_id: 502,
                 tx: node_self_tx.clone(),
                 last_seen: Instant::now(),
                 cancel: CancellationToken::new(),
@@ -5679,6 +6267,7 @@ mod route_rebind_tests {
         // Orphan E2e reply sent by node after client route already closed:
         route_e2e(
             hub,
+            502,
             Some(&alice_node.id),
             &node_self_tx,
             None,
@@ -5689,6 +6278,7 @@ mod route_rebind_tests {
         // Orphan non-initiating Transfer reply sent by node:
         open_or_forward(
             hub,
+            502,
             Some(&alice_node.id),
             &node_self_tx,
             "orphan-xfer-1".into(),
@@ -5716,6 +6306,7 @@ mod route_rebind_tests {
         let (innocent_tx, _innocent_rx) = mpsc::channel(8);
         route_e2e(
             hub,
+            503,
             None,
             &innocent_tx,
             Some(&p),
@@ -5726,6 +6317,7 @@ mod route_rebind_tests {
         for idx in 0..MAX_ROUTES_PER_ORIGIN {
             route_e2e(
                 hub,
+                501,
                 None,
                 &origin_tx,
                 Some(&p),
@@ -5743,6 +6335,7 @@ mod route_rebind_tests {
         // WITHOUT evicting `innocent_tx`'s 2h-idle route!
         route_e2e(
             hub,
+            501,
             None,
             &origin_tx,
             Some(&p),
@@ -5756,5 +6349,874 @@ mod route_rebind_tests {
             "cross-origin pressure unfairly evicted innocent client's idle route!"
         );
         assert!(guard.contains_key("sat-after-ttl"));
+    }
+}
+
+#[cfg(test)]
+mod wave1_security_tests {
+    use super::*;
+    use agentlink_core::protocol::SessionCursor;
+
+    async fn spawn_test_relay(dir: &std::path::Path) -> RelayHandle {
+        RelayHandle::spawn(RelayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.to_path_buf(),
+            capture: None,
+            database_url: None,
+            allow_signup: false,
+            bootstrap_admin: false,
+            db_schema: None,
+            trust_proxy: Vec::new(),
+            print_admin_token: false,
+            legacy_admin_override: Some((true, Some(86_400))),
+        })
+        .await
+        .unwrap()
+    }
+
+    fn meta(name: &str) -> NodeMeta {
+        NodeMeta {
+            name: name.into(),
+            hostname: "host".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            version: "test".into(),
+            ceiling: NodePolicy::full(),
+            has_display: None,
+        }
+    }
+
+    fn agent_principal(owner: &str, client_id: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::Agent,
+            user: owner.into(),
+            role: "agent".into(),
+            device_id: String::new(),
+            access_hash: String::new(),
+            client_id: client_id.into(),
+            name: "agent".into(),
+            web_token: String::new(),
+            view_session: None,
+        }
+    }
+
+    fn operator_user(user: &str) -> Principal {
+        Principal {
+            kind: PrincipalKind::Operator,
+            user: user.into(),
+            role: "user".into(),
+            device_id: format!("dev-{user}"),
+            access_hash: String::new(),
+            client_id: format!("dev-{user}"),
+            name: user.into(),
+            web_token: String::new(),
+            view_session: None,
+        }
+    }
+
+    fn recv_env(rx: &mut mpsc::Receiver<Outbound>) -> Envelope {
+        let Outbound::Text(text) = rx.try_recv().expect("expected envelope reply") else {
+            panic!("expected text envelope");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_key_cannot_change_owner_password_or_modify_node_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = spawn_test_relay(dir.path()).await;
+        let hub = &relay.hub;
+        hub.db
+            .create_user("alice", "alice-original-pw", "admin")
+            .await
+            .unwrap();
+        let node = hub
+            .db
+            .enroll_self(
+                "alice",
+                agentlink_core::Identity::generate().public_hex(),
+                "alice-node",
+                NodePolicy::read_only(),
+                meta("alice-node"),
+            )
+            .await
+            .unwrap();
+        let agent_id = agentlink_core::Identity::generate().public_hex().to_string();
+        hub.db
+            .register_client("alice", "read-agent", &agent_id)
+            .await
+            .unwrap();
+        let agent = agent_principal("alice", &agent_id);
+        let (tx, mut rx) = mpsc::channel(8);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // 1. Agent key attempting UserPasswd targeting its admin owner MUST be denied (SEC-03).
+        handle_client(
+            hub,
+            10,
+            &tx,
+            "s1",
+            &agent,
+            &WireReauth {
+                current_password: Some("alice-original-pw".into()),
+                totp: None,
+            },
+            Envelope::UserPasswd {
+                request_id: "pw-1".into(),
+                username: "alice".into(),
+                password: "hijacked-password".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        match recv_env(&mut rx) {
+            Envelope::Result {
+                ok: false, error, ..
+            } => {
+                assert!(error.unwrap_or_default().contains("required"));
+            }
+            other => panic!("expected denial, got {other:?}"),
+        }
+        // Verify Alice's password was NOT overwritten!
+        assert!(hub
+            .db
+            .check_login("alice", "alice-original-pw", None)
+            .await
+            .is_ok());
+        assert!(hub
+            .db
+            .check_login("alice", "hijacked-password", None)
+            .await
+            .is_err());
+
+        // 2. Agent key attempting SetPolicy on owner's node MUST be denied (SEC-03).
+        handle_client(
+            hub,
+            10,
+            &tx,
+            "s1",
+            &agent,
+            &WireReauth::default(),
+            Envelope::SetPolicy {
+                request_id: "pol-1".into(),
+                node_id: node.id.clone(),
+                policy: NodePolicy::full(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        match recv_env(&mut rx) {
+            Envelope::Result { ok: false, .. } => {}
+            other => panic!("agent SetPolicy must fail, got {other:?}"),
+        }
+        let persisted = hub.db.resolve_node(&node.id).await.unwrap();
+        assert_eq!(persisted.policy, NodePolicy::read_only());
+    }
+
+    #[tokio::test]
+    async fn operator_self_passwd_and_totp_disable_require_reauth() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = spawn_test_relay(dir.path()).await;
+        let hub = &relay.hub;
+        hub.db
+            .create_user("alice", "alice-pw-1", "user")
+            .await
+            .unwrap();
+        hub.db
+            .create_user("bob", "bob-pw-1", "user")
+            .await
+            .unwrap();
+        let alice = operator_user("alice");
+        let (tx, mut rx) = mpsc::channel(16);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Operator cannot change Bob's password even with Alice's password.
+        handle_client(
+            hub,
+            11,
+            &tx,
+            "s1",
+            &alice,
+            &WireReauth {
+                current_password: Some("alice-pw-1".into()),
+                totp: None,
+            },
+            Envelope::UserPasswd {
+                request_id: "pw-bob".into(),
+                username: "bob".into(),
+                password: "hacked-bob-pw".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_env(&mut rx), Envelope::Result { ok: false, .. }));
+
+        // Operator self UserPasswd without current_password fails.
+        handle_client(
+            hub,
+            11,
+            &tx,
+            "s1",
+            &alice,
+            &WireReauth::default(),
+            Envelope::UserPasswd {
+                request_id: "pw-missing".into(),
+                username: "alice".into(),
+                password: "alice-pw-2".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        match recv_env(&mut rx) {
+            Envelope::Result {
+                ok: false, error, ..
+            } => assert!(error.unwrap_or_default().contains("current password")),
+            other => panic!("expected current-password denial, got {other:?}"),
+        }
+
+        // Operator self UserPasswd with wrong current_password fails.
+        handle_client(
+            hub,
+            11,
+            &tx,
+            "s1",
+            &alice,
+            &WireReauth {
+                current_password: Some("wrong-pw".into()),
+                totp: None,
+            },
+            Envelope::UserPasswd {
+                request_id: "pw-wrong".into(),
+                username: "alice".into(),
+                password: "alice-pw-2".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_env(&mut rx), Envelope::Result { ok: false, .. }));
+
+        // Enable TOTP on Alice (using an earlier time step so current window is fresh).
+        let (secret, _) = hub.db.begin_totp("alice").await.unwrap();
+        let past = unix_now() - 120;
+        let past_code = accounts::totp_at(&secret, past).unwrap();
+        hub.db.confirm_totp_at("alice", &past_code, past).await.unwrap();
+
+        // Self UserPasswd with right password but missing TOTP fails when TOTP is enabled!
+        handle_client(
+            hub,
+            11,
+            &tx,
+            "s1",
+            &alice,
+            &WireReauth {
+                current_password: Some("alice-pw-1".into()),
+                totp: None,
+            },
+            Envelope::UserPasswd {
+                request_id: "pw-no-totp".into(),
+                username: "alice".into(),
+                password: "alice-pw-2".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        match recv_env(&mut rx) {
+            Envelope::Result {
+                ok: false, error, ..
+            } => assert!(error.unwrap_or_default().contains("totp")),
+            other => panic!("expected totp required, got {other:?}"),
+        }
+
+        // Self UserPasswd with valid password + fresh TOTP succeeds!
+        let now_code = accounts::totp_at(&secret, unix_now()).unwrap();
+        handle_client(
+            hub,
+            11,
+            &tx,
+            "s1",
+            &alice,
+            &WireReauth {
+                current_password: Some("alice-pw-1".into()),
+                totp: Some(now_code.clone()),
+            },
+            Envelope::UserPasswd {
+                request_id: "pw-ok".into(),
+                username: "alice".into(),
+                password: "alice-pw-2".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_env(&mut rx), Envelope::Result { ok: true, .. }));
+
+        // TotpDisable without current_password fails.
+        handle_client(
+            hub,
+            11,
+            &tx,
+            "s1",
+            &alice,
+            &WireReauth::default(),
+            Envelope::TotpDisable {
+                request_id: "td-1".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_env(&mut rx), Envelope::Result { ok: false, .. }));
+
+        // TotpDisable replaying the ALREADY-USED TOTP code fails!
+        handle_client(
+            hub,
+            11,
+            &tx,
+            "s1",
+            &alice,
+            &WireReauth {
+                current_password: Some("alice-pw-2".into()),
+                totp: Some(now_code),
+            },
+            Envelope::TotpDisable {
+                request_id: "td-replay".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_env(&mut rx), Envelope::Result { ok: false, .. }));
+        assert!(hub.db.account("alice").await.unwrap().unwrap().totp_enabled);
+
+        // TotpDisable with valid password + next (+30s skew) TOTP code succeeds!
+        let next_code = accounts::totp_at(&secret, unix_now() + 30).unwrap();
+        handle_client(
+            hub,
+            11,
+            &tx,
+            "s1",
+            &alice,
+            &WireReauth {
+                current_password: Some("alice-pw-2".into()),
+                totp: Some(next_code),
+            },
+            Envelope::TotpDisable {
+                request_id: "td-ok".into(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_env(&mut rx), Envelope::Result { ok: true, .. }));
+        assert!(!hub.db.account("alice").await.unwrap().unwrap().totp_enabled);
+    }
+
+    #[tokio::test]
+    async fn connection_bound_routes_block_cross_connection_hijack_and_binary_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = spawn_test_relay(dir.path()).await;
+        let hub = &relay.hub;
+        hub.db
+            .create_user("alice", "password-alice", "user")
+            .await
+            .unwrap();
+        let node = hub
+            .db
+            .enroll_self(
+                "alice",
+                agentlink_core::Identity::generate().public_hex(),
+                "alice-box",
+                NodePolicy::full(),
+                meta("alice-box"),
+            )
+            .await
+            .unwrap();
+
+        let (victim_client_tx, mut victim_client_rx) = mpsc::channel(8);
+        let (victim_node_tx, mut victim_node_rx) = mpsc::channel(8);
+        let (attacker_tx, mut attacker_rx) = mpsc::channel(8);
+        let victim_client_conn = 1001;
+        let victim_node_conn = 1002;
+        let attacker_conn = 9999;
+
+        let req_id = uuid::Uuid::new_v4().to_string();
+        lock_online(hub).unwrap().insert(
+            node.id.clone(),
+            Online {
+                generation: 1,
+                conn_id: victim_node_conn,
+                tx: victim_node_tx.clone(),
+                last_seen: Instant::now(),
+                cancel: CancellationToken::new(),
+            },
+        );
+        try_insert_route(
+            hub,
+            req_id.clone(),
+            Route {
+                origin_conn_id: victim_client_conn,
+                target_conn_id: victim_node_conn,
+                origin_tx: victim_client_tx.clone(),
+                target_tx: victim_node_tx.clone(),
+                origin_node: None,
+                target_node: node.id.clone(),
+                last_activity: Instant::now(),
+            },
+        )
+        .unwrap();
+
+        // 1. Compromised third connection tries to inject a terminal Result (teardown + spoof).
+        forward_existing(
+            hub,
+            attacker_conn,
+            &req_id,
+            Envelope::result_ok(req_id.clone(), serde_json::json!({"spoof": true})),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(victim_client_rx.try_recv().is_err());
+        assert!(victim_node_rx.try_recv().is_err());
+        assert!(
+            lock_routes(hub).unwrap().contains_key(&req_id),
+            "unauthorized terminal frame must NOT delete the victim's route"
+        );
+
+        // 2. Third connection tries binary frame injection on the victim's request_id.
+        let frame = agentlink_core::frame::encode(&agentlink_core::frame::DataFrame {
+            request_id: req_id.clone(),
+            offset: 0,
+            raw_len: 10,
+            compressed: false,
+            hole: false,
+            tar: false,
+            payload: b"evil-bytes".to_vec(),
+        })
+        .unwrap();
+        route_binary(hub, attacker_conn, frame.clone()).await.unwrap();
+        assert!(victim_client_rx.try_recv().is_err());
+        assert!(victim_node_rx.try_recv().is_err());
+        // Legitimate endpoint binary frame IS delivered.
+        route_binary(hub, victim_node_conn, frame).await.unwrap();
+        assert!(matches!(victim_client_rx.try_recv(), Ok(Outbound::Binary(_))));
+
+        // 3. Third connection tries E2e injection on victim's request_id.
+        let attacker_principal = operator_user("alice");
+        route_e2e(
+            hub,
+            attacker_conn,
+            None,
+            &attacker_tx,
+            Some(&attacker_principal),
+            Envelope::E2e {
+                request_id: req_id.clone(),
+                node_id: node.id.clone(),
+                client_id: String::new(),
+                class: "exec".into(),
+                terminal: true,
+                body_b64: "aa".into(),
+                user: None,
+                device_id: None,
+                relay_admin: false,
+                relay_grant: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_env(&mut attacker_rx),
+            Envelope::Result { ok: false, .. }
+        ));
+        assert!(victim_node_rx.try_recv().is_err());
+        assert!(lock_routes(hub).unwrap().contains_key(&req_id));
+
+        // 4. Third connection cannot overwrite the active route via try_insert_route.
+        let collide = try_insert_route(
+            hub,
+            req_id.clone(),
+            Route {
+                origin_conn_id: attacker_conn,
+                target_conn_id: victim_node_conn,
+                origin_tx: attacker_tx.clone(),
+                target_tx: victim_node_tx.clone(),
+                origin_node: None,
+                target_node: node.id.clone(),
+                last_activity: Instant::now(),
+            },
+        );
+        assert!(collide.is_err());
+
+        // 5. Real target node endpoint (victim_node_conn) still delivers cleanly to victim client.
+        forward_existing(
+            hub,
+            victim_node_conn,
+            &req_id,
+            Envelope::result_ok(req_id.clone(), serde_json::json!({"real": true})),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_env(&mut victim_client_rx),
+            Envelope::Result { ok: true, .. }
+        ));
+        assert!(!lock_routes(hub).unwrap().contains_key(&req_id));
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_and_cross_conn_cancel_and_session_are_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = spawn_test_relay(dir.path()).await;
+        let hub = &relay.hub;
+        hub.db
+            .create_user("alice", "password-alice", "user")
+            .await
+            .unwrap();
+        hub.db
+            .create_user("bob", "password-bob", "user")
+            .await
+            .unwrap();
+        let alice_node = hub
+            .db
+            .enroll_self(
+                "alice",
+                agentlink_core::Identity::generate().public_hex(),
+                "alice-node",
+                NodePolicy::full(),
+                meta("alice-node"),
+            )
+            .await
+            .unwrap();
+
+        let (node_tx, mut node_rx) = mpsc::channel(8);
+        let (alice_tx, _alice_rx) = mpsc::channel(8);
+        let (bob_tx, _bob_rx) = mpsc::channel(8);
+        let node_conn = 200;
+        let alice_conn = 201;
+        let bob_conn = 202;
+        lock_online(hub).unwrap().insert(
+            alice_node.id.clone(),
+            Online {
+                generation: 1,
+                conn_id: node_conn,
+                tx: node_tx.clone(),
+                last_seen: Instant::now(),
+                cancel: CancellationToken::new(),
+            },
+        );
+        try_insert_route(
+            hub,
+            "req-alice-op".into(),
+            Route {
+                origin_conn_id: alice_conn,
+                target_conn_id: node_conn,
+                origin_tx: alice_tx.clone(),
+                target_tx: node_tx.clone(),
+                origin_node: None,
+                target_node: alice_node.id.clone(),
+                last_activity: Instant::now(),
+            },
+        )
+        .unwrap();
+
+        let alice = operator_user("alice");
+        let bob = operator_user("bob");
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // 1. Cross-tenant Bob (no access to alice_node) sends Cancel & Session -> dropped!
+        handle_client(
+            hub,
+            bob_conn,
+            &bob_tx,
+            "s-bob",
+            &bob,
+            &WireReauth::default(),
+            Envelope::Cancel {
+                request_id: "req-alice-op".into(),
+                node_id: alice_node.id.clone(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        handle_client(
+            hub,
+            bob_conn,
+            &bob_tx,
+            "s-bob",
+            &bob,
+            &WireReauth::default(),
+            Envelope::Session {
+                session_id: "s-bob".into(),
+                node_id: alice_node.id.clone(),
+                cursors: vec![SessionCursor {
+                    request_id: "req-alice-op".into(),
+                    seq: 99,
+                }],
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(
+            node_rx.try_recv().is_err(),
+            "cross-tenant Cancel/Session must never reach Alice's node"
+        );
+
+        // 2. Even after Alice shares the node with Bob, Bob CANNOT cancel or tamper cursors
+        //    of Alice's live route on conn_id=alice_conn!
+        hub.db
+            .share(
+                &Caller {
+                    user: "alice".into(),
+                    admin: false,
+                },
+                &alice_node.id,
+                "bob",
+                NodePolicy::full(),
+            )
+            .await
+            .unwrap();
+        handle_client(
+            hub,
+            bob_conn,
+            &bob_tx,
+            "s-bob",
+            &bob,
+            &WireReauth::default(),
+            Envelope::Cancel {
+                request_id: "req-alice-op".into(),
+                node_id: alice_node.id.clone(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        handle_client(
+            hub,
+            bob_conn,
+            &bob_tx,
+            "s-bob",
+            &bob,
+            &WireReauth::default(),
+            Envelope::Session {
+                session_id: "s-bob".into(),
+                node_id: alice_node.id.clone(),
+                cursors: vec![SessionCursor {
+                    request_id: "req-alice-op".into(),
+                    seq: 99,
+                }],
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(
+            node_rx.try_recv().is_err(),
+            "shared user must not cancel or tamper cursors of another connection's active route"
+        );
+
+        // 3. Alice on her own owning connection CAN cancel her own route.
+        handle_client(
+            hub,
+            alice_conn,
+            &alice_tx,
+            "s-alice",
+            &alice,
+            &WireReauth::default(),
+            Envelope::Cancel {
+                request_id: "req-alice-op".into(),
+                node_id: alice_node.id.clone(),
+            },
+            ip,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_env(&mut node_rx), Envelope::Cancel { .. }));
+    }
+
+    #[tokio::test]
+    async fn node_approval_and_audit_batch_overwrite_node_id_cap_isolate_and_clamp_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = spawn_test_relay(dir.path()).await;
+        let hub = &relay.hub;
+        hub.db
+            .create_user("alice", "password-alice", "user")
+            .await
+            .unwrap();
+        hub.db
+            .create_user("bob", "password-bob", "user")
+            .await
+            .unwrap();
+        let alice_node = hub
+            .db
+            .enroll_self(
+                "alice",
+                agentlink_core::Identity::generate().public_hex(),
+                "alice-node",
+                NodePolicy::full(),
+                meta("alice-node"),
+            )
+            .await
+            .unwrap();
+        let bob_node = hub
+            .db
+            .enroll_self(
+                "bob",
+                agentlink_core::Identity::generate().public_hex(),
+                "bob-node",
+                NodePolicy::full(),
+                meta("bob-node"),
+            )
+            .await
+            .unwrap();
+
+        // Seed a chained relay auth record so we verify node batches never corrupt audit.jsonl.
+        note_legacy_use(&hub.audit_path, true, "");
+
+        let (bob_node_tx, _bob_node_rx) = mpsc::channel(8);
+        let (alice_admin_tx, mut alice_admin_rx) = mpsc::channel(8);
+        let (bob_admin_tx, mut bob_admin_rx) = mpsc::channel(8);
+        hub.admins.lock().unwrap().push(LiveOperator {
+            user: "alice".into(),
+            admin: false,
+            tx: alice_admin_tx,
+        });
+        hub.admins.lock().unwrap().push(LiveOperator {
+            user: "bob".into(),
+            admin: false,
+            tx: bob_admin_tx,
+        });
+
+        // 1. Compromised Bob node sends ApprovalRequest claiming Alice's node_id -> server overwrites!
+        handle_node(
+            hub,
+            300,
+            &bob_node.id,
+            &bob_node_tx,
+            Envelope::ApprovalRequest {
+                request_id: String::new(),
+                approval_id: "appr-spoof".into(),
+                node_id: alice_node.id.clone(),
+                client_id: "attacker".into(),
+                category: "exec".into(),
+                summary: "rm -rf /".into(),
+                expires_unix: unix_now() + 60,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            alice_admin_rx.try_recv().is_err(),
+            "Alice must NOT receive spoofed approval prompts from Bob's node"
+        );
+        match recv_env(&mut bob_admin_rx) {
+            Envelope::ApprovalRequest { node_id, .. } => {
+                assert_eq!(node_id, bob_node.id);
+            }
+            other => panic!("expected approval for Bob's real node, got {other:?}"),
+        }
+        let stored = hub.db.list_approvals().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].node_id, bob_node.id);
+
+        // 2. Compromised Bob node sends 250 AuditBatch records claiming Alice's node_id
+        //    (plus forged hashes). Must be capped at 200, stamped with bob_node.id, and
+        //    written ONLY to isolated node-audit.jsonl (not audit.jsonl).
+        let mut batch = Vec::new();
+        for i in 0..250 {
+            batch.push(serde_json::json!({
+                "seq": i + 1,
+                "ts": format!("{}", unix_now() + i as i64),
+                "node_id": alice_node.id,
+                "node_name": "spoofed",
+                "client_id": "c",
+                "category": "op",
+                "op": format!("op-{i}"),
+                "result": "ok",
+                "duration_ms": 0,
+                "prev_hash": "forged",
+                "hash": "forged",
+            }));
+        }
+        handle_node(
+            hub,
+            300,
+            &bob_node.id,
+            &bob_node_tx,
+            Envelope::AuditBatch {
+                node_id: alice_node.id.clone(),
+                records: batch,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Relay audit.jsonl remains completely untouched by node records with valid chain!
+        note_legacy_use(&hub.audit_path, true, "");
+        let relay_records =
+            agentlink_core::audit::page_from_jsonl(&hub.audit_path, 50, 0, |_| true);
+        assert_eq!(relay_records.len(), 2);
+        agentlink_core::audit::verify_chain(&relay_records).unwrap();
+
+        // Isolated node-audit.jsonl holds exactly MAX_AUDIT_BATCH_ITEMS (200), all stamped bob_node.id.
+        let node_records =
+            agentlink_core::audit::page_from_jsonl(&hub.node_audit_path, 500, 0, |_| true);
+        assert_eq!(node_records.len(), MAX_AUDIT_BATCH_ITEMS);
+        assert!(node_records.iter().all(|r| r.node_id == bob_node.id));
+
+        // 3. Seed > AUDIT_RECORDS_MAX_LIMIT records in node-audit.jsonl and verify QueryAudit
+        //    clamps `limit: usize::MAX` to AUDIT_RECORDS_MAX_LIMIT (SEC-09).
+        let mut extra = Vec::new();
+        for i in 0..1_200 {
+            extra.push(serde_json::json!({
+                "seq": i + 1,
+                "ts": format!("{}", unix_now() + 1_000 + i as i64),
+                "node_id": bob_node.id,
+                "node_name": "bob-node",
+                "client_id": "c",
+                "category": "op",
+                "op": format!("bulk-{i}"),
+                "result": "ok",
+                "duration_ms": 0,
+                "prev_hash": "0",
+                "hash": "off",
+            }));
+        }
+        append_node_audit(&hub.node_audit_path, &extra);
+
+        let admin = legacy_admin("admin".into(), String::new());
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_client(
+            hub,
+            301,
+            &tx,
+            "s-admin",
+            &admin,
+            &WireReauth::default(),
+            Envelope::QueryAudit {
+                request_id: "qa-max".into(),
+                filter: serde_json::json!({"limit": usize::MAX}),
+            },
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        match recv_env(&mut rx) {
+            Envelope::AuditPage { records, .. } => {
+                assert_eq!(
+                    records.len(),
+                    AUDIT_RECORDS_MAX_LIMIT,
+                    "QueryAudit must clamp limit to AUDIT_RECORDS_MAX_LIMIT"
+                );
+            }
+            other => panic!("expected AuditPage, got {other:?}"),
+        }
     }
 }

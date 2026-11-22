@@ -53,6 +53,7 @@ pub fn public_config_json() -> String {
         String::new(),
         String::new(),
         turn_auth,
+        0,
     )
 }
 
@@ -72,6 +73,7 @@ pub fn session_config_json(user_id: &str) -> String {
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
         .unwrap_or(agentlink_core::turn::DEFAULT_TURN_TTL_SECS);
+    let clamped_ttl = agentlink_core::turn::clamp_ttl(ttl);
     let (username, credential, turn_auth) = if turn_urls.is_empty() {
         (String::new(), String::new(), "none")
     } else if secret.trim().is_empty() {
@@ -81,7 +83,7 @@ pub fn session_config_json(user_id: &str) -> String {
             secret.trim(),
             user_id,
             agentlink_core::util::unix_now(),
-            ttl,
+            clamped_ttl,
         ) {
             Ok((username, credential, _)) => (username, credential, "rest"),
             Err(_) => (String::new(), String::new(), "unconfigured"),
@@ -93,6 +95,7 @@ pub fn session_config_json(user_id: &str) -> String {
         username,
         credential,
         turn_auth,
+        clamped_ttl,
     )
 }
 
@@ -112,6 +115,7 @@ fn config_from(
     username: String,
     credential: String,
     turn_auth: &str,
+    ttl_secs: i64,
 ) -> String {
     let stun = agentlink_core::stun_urls(stun_env.as_deref());
     let include_secret = !username.is_empty() && !credential.is_empty();
@@ -126,6 +130,11 @@ fn config_from(
     } else {
         vec![json!({ "urls": turn_urls })]
     };
+    let mut ice_servers = Vec::new();
+    if !stun.is_empty() {
+        ice_servers.push(json!({ "urls": stun }));
+    }
+    ice_servers.extend(turn.iter().cloned());
     let attempt_user = if include_secret {
         username.as_str()
     } else {
@@ -144,6 +153,8 @@ fn config_from(
     json!({
         "protocol": agentlink_core::protocol::PROTOCOL_VERSION,
         "media": "dtls-srtp",
+        "ice_servers": ice_servers,
+        "ttl_secs": ttl_secs,
         "stun": stun,
         "turn": turn,
         "turn_auth": turn_auth,
@@ -164,7 +175,7 @@ fn split_env(name: &str) -> Vec<String> {
 
 fn http_ok_for(content_type: &str, body: &[u8], head: bool) -> Vec<u8> {
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut out = header.into_bytes();
@@ -192,8 +203,10 @@ mod tests {
 
     #[test]
     fn unset_stun_defaults_and_turn_stays_empty() {
-        let text = config_from(None, Vec::new(), String::new(), String::new(), "none");
+        let text = config_from(None, Vec::new(), String::new(), String::new(), "none", 600);
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["ttl_secs"], 600);
+        assert_eq!(value["ice_servers"].as_array().unwrap().len(), 1);
         let stun: Vec<String> = value["stun"]
             .as_array()
             .unwrap()
@@ -227,6 +240,7 @@ mod tests {
             String::new(),
             String::new(),
             "rest",
+            0,
         );
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(value["stun"].as_array().unwrap().is_empty());
@@ -244,8 +258,12 @@ mod tests {
             "1700000600:web:alice".into(),
             "c2VjcmV0".into(),
             "rest",
+            600,
         );
         let authed: serde_json::Value = serde_json::from_str(&authed).unwrap();
+        assert_eq!(authed["ttl_secs"], 600);
+        assert_eq!(authed["ice_servers"][0]["username"], "1700000600:web:alice");
+        assert_eq!(authed["ice_servers"][0]["credential"], "c2VjcmV0");
         assert_eq!(authed["turn"][0]["username"], "1700000600:web:alice");
         assert_eq!(authed["turn"][0]["credential"], "c2VjcmV0");
         assert!(authed["attempts"]
@@ -261,6 +279,7 @@ mod tests {
             String::new(),
             String::new(),
             "none",
+            600,
         );
         let value: serde_json::Value = serde_json::from_str(&custom).unwrap();
         assert_eq!(value["stun"][0], "stun:turn.example:3478");

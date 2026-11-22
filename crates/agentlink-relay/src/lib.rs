@@ -29,6 +29,6 @@ mod accounts_test;
 pub use db::{Database, OpenOptions, Opened};
 pub use models::UserAccount;
 pub use server::{
-    serve, set_max_concurrent_connections_for_test, set_stale_after_for_test, RelayConfig,
-    RelayHandle,
+    serve, set_max_concurrent_connections_for_test, set_max_concurrent_downloads_for_test,
+    set_public_url_for_test, set_stale_after_for_test, RelayConfig, RelayHandle,
 };

@@ -195,6 +195,8 @@ async fn lost_refresh_response_can_be_retried_until_the_new_token_is_used() {
         .await
         .unwrap()
         .is_some());
+    // Replaying the already-rotated parent refresh token after its successor
+    // was acknowledged must revoke the entire device session family (SEC-16).
     let replay = db
         .rotate_refresh(&issued.refresh_token, &device)
         .await
@@ -203,12 +205,23 @@ async fn lost_refresh_response_can_be_retried_until_the_new_token_is_used() {
         replay.to_string().contains("invalid") || replay.to_string().contains("revoked"),
         "{replay}"
     );
-    // The committed token still slides. The replay did not revoke it.
-    let next = db
-        .rotate_refresh(&retried.refresh_token, &device)
-        .await
-        .unwrap();
-    assert_ne!(next.refresh_token, retried.refresh_token);
+    assert!(
+        db.access_session(&retried.access_token)
+            .await
+            .unwrap()
+            .is_none(),
+        "replay must immediately invalidate active access tokens in the device family"
+    );
+    assert!(
+        db.rotate_refresh(&retried.refresh_token, &device)
+            .await
+            .is_err(),
+        "replay must revoke the committed successor refresh token too"
+    );
+    assert!(
+        db.device(&device).await.unwrap().unwrap().revoked,
+        "replay must mark the device revoked"
+    );
 }
 
 #[tokio::test]
@@ -258,6 +271,7 @@ async fn postgres_accounts_when_available() {
     again.drop_test_schema().await.unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn install_script_dry_run_skips_the_network() {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
