@@ -21,7 +21,10 @@ import java.util.concurrent.atomic.AtomicReference
  * Pinch-zoom and fullscreen chrome stay on the desktop column. This view only
  * letterboxes the picture so the existing touch mapping still lines up.
  */
-class H264Player(context: android.content.Context) {
+class H264Player(
+    context: android.content.Context,
+    private val onRequestKeyframe: () -> Unit = {},
+) {
     val view: TextureView = TextureView(context)
     private val thread = HandlerThread("agentlink-h264").also { it.start() }
     private val handler = Handler(thread.looper)
@@ -32,7 +35,9 @@ class H264Player(context: android.content.Context) {
     private var configured = false
     private var width = 0
     private var height = 0
-    private var lastKeyframe: ByteArray? = null
+    private var lastConfig: ByteArray? = null
+    private var maxInputSize = 1 shl 20
+    private var awaitingKeyframe = false
     private var timestampUs = 0L
     @Volatile private var released = false
 
@@ -41,10 +46,12 @@ class H264Player(context: android.content.Context) {
             override fun onSurfaceTextureAvailable(texture: android.graphics.SurfaceTexture, w: Int, h: Int) {
                 val created = Surface(texture)
                 handler.post {
+                    releaseCodec()
                     releaseSurface()
                     surface = created
+                    awaitingKeyframe = true
                     applyBufferSize()
-                    replayKeyframe()
+                    onRequestKeyframe()
                 }
             }
 
@@ -66,10 +73,15 @@ class H264Player(context: android.content.Context) {
 
     fun setVideoSize(videoWidth: Int, videoHeight: Int) {
         handler.post {
+            val changed = width != videoWidth || height != videoHeight
             width = videoWidth
             height = videoHeight
             applyBufferSize()
-            replayKeyframe()
+            if (changed && configured) {
+                releaseCodec()
+                awaitingKeyframe = true
+                onRequestKeyframe()
+            }
         }
     }
 
@@ -79,16 +91,36 @@ class H264Player(context: android.content.Context) {
         handler.post {
             if (released) return@post
             val unit = avcAccessUnit(copy) ?: return@post
-            if (unit.keyframe || keyframe) lastKeyframe = copy
+            val isIdr = unit.keyframe || keyframe
+            if (unit.sample.size > maxInputSize) {
+                maxInputSize = (unit.sample.size + 65_536).coerceAtMost(8 shl 20)
+                if (configured) {
+                    releaseCodec()
+                }
+            }
+            if (configured && unit.config != null && lastConfig != null && !unit.config.contentEquals(lastConfig)) {
+                // SPS/PPS changed (dynamic resolution or profile update): reconfigure decoder.
+                releaseCodec()
+            }
             if (!configured) {
-                val config = unit.config
-                if (config != null && (unit.keyframe || keyframe)) {
+                val config = unit.config ?: lastConfig
+                if (config != null && isIdr) {
                     if (!startCodec(config)) return@post
+                    lastConfig = config
+                    awaitingKeyframe = false
                 } else {
+                    if (!awaitingKeyframe) {
+                        awaitingKeyframe = true
+                        onRequestKeyframe()
+                    }
                     return@post
                 }
             }
-            if (configured) queueSample(unit.sample, unit.keyframe || keyframe)
+            if (awaitingKeyframe) {
+                if (!isIdr) return@post
+                awaitingKeyframe = false
+            }
+            if (configured) queueSample(unit.sample, isIdr)
         }
     }
 
@@ -104,14 +136,6 @@ class H264Player(context: android.content.Context) {
             releaseSurface()
         }
         thread.quitSafely()
-    }
-
-    private fun replayKeyframe() {
-        val bytes = lastKeyframe ?: return
-        if (configured || surface == null || width <= 0 || height <= 0) return
-        val unit = avcAccessUnit(bytes) ?: return
-        val config = unit.config ?: return
-        if (startCodec(config)) queueSample(unit.sample, true)
     }
 
     private fun startCodec(config: ByteArray): Boolean {
@@ -152,7 +176,9 @@ class H264Player(context: android.content.Context) {
         return try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             format.setByteBuffer("csd-0", ByteBuffer.wrap(config))
-            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 shl 20)
+            val desiredInput = maxOf(maxInputSize, (width.toLong() * height.toLong() * 3L / 2L).toInt().coerceAtLeast(1 shl 20))
+                .coerceAtMost(8 shl 20)
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, desiredInput)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             format.setFloat(MediaFormat.KEY_OPERATING_RATE, 30f)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -177,8 +203,20 @@ class H264Player(context: android.content.Context) {
         val current = codec ?: return
         try {
             val index = current.dequeueInputBuffer(10_000)
-            if (index < 0) return
+            if (index < 0) {
+                awaitingKeyframe = true
+                onRequestKeyframe()
+                return
+            }
             val buffer = current.getInputBuffer(index) ?: return
+            if (sample.size > buffer.capacity()) {
+                current.queueInputBuffer(index, 0, 0, timestampUs, 0)
+                maxInputSize = (sample.size + 65_536).coerceAtMost(8 shl 20)
+                releaseCodec()
+                awaitingKeyframe = true
+                onRequestKeyframe()
+                return
+            }
             buffer.clear()
             buffer.put(sample)
             val flags = if (keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0

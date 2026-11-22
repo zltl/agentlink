@@ -12,6 +12,7 @@ import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.Signature
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.spec.GCMParameterSpec
@@ -112,7 +113,12 @@ class KeystoreSigner internal constructor(
             writeSeed(file, seed)
             return seed
         }
-        return open(file.readBytes())
+        val blob = file.readBytes()
+        val (seed, migrated) = open(blob)
+        if (migrated) {
+            runCatching { writeSeed(file, seed) }
+        }
+        return seed
     }
 
     private fun ensureWrapKey() {
@@ -144,30 +150,58 @@ class KeystoreSigner internal constructor(
         }
     }
 
+    private fun aadBytes(): ByteArray = "agentlink.seed.v1:$alias".toByteArray(Charsets.UTF_8)
+
     private fun seal(seed: ByteArray): ByteArray {
+        val key = store.getKey(alias, null)
+            ?: throw GeneralSecurityException("wrap key missing for $alias")
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, store.getKey(alias, null))
+        cipher.init(Cipher.ENCRYPT_MODE, key)
+        cipher.updateAAD(aadBytes())
         val iv = cipher.iv
         val body = cipher.doFinal(seed)
         return byteArrayOf(iv.size.toByte()) + iv + body
     }
 
-    private fun open(blob: ByteArray): ByteArray {
+    private fun open(blob: ByteArray): Pair<ByteArray, Boolean> {
+        if (blob.size < 1 + MIN_GCM_IV_BYTES + GCM_TAG_BYTES) {
+            throw GeneralSecurityException("wrapped device key blob is truncated")
+        }
         val ivLen = blob[0].toInt() and 0xff
+        if (ivLen !in MIN_GCM_IV_BYTES..MAX_GCM_IV_BYTES || 1 + ivLen + GCM_TAG_BYTES > blob.size) {
+            throw GeneralSecurityException("wrapped device key has invalid IV length $ivLen")
+        }
         val iv = blob.copyOfRange(1, 1 + ivLen)
         val body = blob.copyOfRange(1 + ivLen, blob.size)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(
-            Cipher.DECRYPT_MODE,
-            store.getKey(alias, null),
-            GCMParameterSpec(128, iv),
-        )
-        return cipher.doFinal(body)
+        val key = store.getKey(alias, null)
+            ?: throw GeneralSecurityException("wrap key missing for $alias")
+        val (plain, migrated) = try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            cipher.updateAAD(aadBytes())
+            cipher.doFinal(body) to false
+        } catch (_: AEADBadTagException) {
+            // Legacy blobs written before AAD binding had no AAD; decrypt once and migrate.
+            val legacy = Cipher.getInstance("AES/GCM/NoPadding")
+            legacy.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            legacy.doFinal(body) to true
+        }
+        if (plain.size != 32) {
+            plain.fill(0)
+            throw GeneralSecurityException("wrapped device key has invalid seed length ${plain.size}")
+        }
+        return plain to migrated
     }
 
     private fun seedFile(): File {
         val dir = File(appContext.noBackupFilesDir, "keys").apply { mkdirs() }
         return File(dir, "$alias.seed")
+    }
+
+    companion object {
+        private const val MIN_GCM_IV_BYTES = 12
+        private const val MAX_GCM_IV_BYTES = 16
+        private const val GCM_TAG_BYTES = 16
     }
 }
 

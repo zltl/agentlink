@@ -11,17 +11,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
 
 use agentlink_core::e2e::{self, Direction, Endpoint};
 use agentlink_core::engine::{self, Link, Wire, XferOpts};
 use agentlink_core::frame;
-use agentlink_core::p2p::{self, QuicPeer};
 use agentlink_core::protocol::{CompressPref, Envelope, TransferMsg, TransferStats};
 use agentlink_core::ws::{self, Outbound};
 use agentlink_core::{Error, NodePolicy, Result};
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::audit::AuditHub;
@@ -29,6 +26,7 @@ use crate::files;
 use crate::host::{self, NodeHost};
 use crate::paths::{self, GuestTarget, Roots};
 
+#[allow(dead_code)]
 pub struct DirectReply {
     pub public_key: String,
     pub cert_fp: String,
@@ -132,11 +130,8 @@ const SESSION_WIRE_BOUND: usize = 256;
 pub struct TransferHost {
     pub sessions: Arc<Mutex<HashMap<String, mpsc::Sender<Wire>>>>,
     pub direct_wait: Arc<Mutex<HashMap<String, oneshot::Sender<DirectReply>>>>,
-    pub allowed: Arc<Mutex<HashMap<String, Instant>>>,
-    pub quic: Option<Arc<QuicPeer>>,
     pub tx: mpsc::Sender<Outbound>,
     pub policy: Arc<RwLock<NodePolicy>>,
-    pub max_policy: NodePolicy,
     pub paths: Arc<PathMap>,
     pub e2e: Endpoint,
     pub node_id: String,
@@ -144,46 +139,27 @@ pub struct TransferHost {
     pub audit: Arc<AuditHub>,
 }
 
-pub fn spawn_accept(
-    peer: Arc<QuicPeer>,
-    allowed: Arc<Mutex<HashMap<String, Instant>>>,
-    policy: Arc<RwLock<NodePolicy>>,
-    max_policy: NodePolicy,
-    paths: Arc<PathMap>,
-    audit: Arc<AuditHub>,
-    shutdown: CancellationToken,
-) {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                accepted = peer.accept_one(&allowed) => {
-                    match accepted {
-                        Ok(link) => {
-                            let policy = policy.clone();
-                            let paths = paths.clone();
-                            let audit = audit.clone();
-                            tokio::spawn(async move {
-                                if let Err(err) = serve_quic(link, &policy, max_policy, &paths, &audit).await {
-                                    tracing::debug!(error = %err, "direct transfer ended");
-                                }
-                            });
-                        }
-                        Err(Error::Timeout) | Err(Error::Auth(_)) => {}
-                        Err(err) => {
-                            tracing::debug!(error = %err, "quic accept ended");
-                            if shutdown.is_cancelled() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
+pub fn fail_session(host: &TransferHost, request_id: &str, message: String) {
+    fail_session_for_peer(host, request_id, None, message);
 }
 
-pub fn fail_session(host: &TransferHost, request_id: &str, message: String) {
+pub fn fail_session_for_peer(
+    host: &TransferHost,
+    request_id: &str,
+    caller_peer: Option<&str>,
+    message: String,
+) {
+    if let Some(caller) = caller_peer {
+        let owner_matches = host
+            .seals
+            .lock()
+            .ok()
+            .and_then(|map| map.get(request_id).map(|seal| seal.peer == caller))
+            .unwrap_or(false);
+        if !owner_matches {
+            return;
+        }
+    }
     let Some(tx) = host
         .sessions
         .lock()
@@ -198,9 +174,10 @@ pub fn fail_session(host: &TransferHost, request_id: &str, message: String) {
 pub async fn on_transfer(
     host: Arc<TransferHost>,
     request_id: String,
-    client_id: String,
+    grantee: String,
     msg: TransferMsg,
     session: Option<std::sync::Arc<Direction>>,
+    effective_policy: NodePolicy,
 ) {
     if let Some(tx) = host
         .sessions
@@ -208,24 +185,37 @@ pub async fn on_transfer(
         .ok()
         .and_then(|map| map.get(&request_id).cloned())
     {
+        // Verify the caller owns this transfer session before forwarding.
+        let owner_ok = host
+            .seals
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&request_id).map(|seal| seal.peer == grantee))
+            .unwrap_or(false);
+        if !owner_ok {
+            tracing::warn!(
+                request_id = %request_id,
+                peer = %grantee,
+                "rejected cross-peer transfer message for existing session"
+            );
+            return;
+        }
         if tx.try_send(Wire::Msg(msg)).is_err() {
             if let Ok(mut map) = host.sessions.lock() {
                 map.remove(&request_id);
             }
+            if let Ok(mut seals) = host.seals.lock() {
+                seals.remove(&request_id);
+            }
         }
         return;
     }
-    if let Ok(mut seals) = host.seals.lock() {
-        seals.insert(
-            request_id.clone(),
-            SealTarget {
-                peer: client_id.clone(),
-                node_id: host.node_id.clone(),
-                client_id: client_id.clone(),
-                session,
-            },
-        );
-    }
+    let seal_target = SealTarget {
+        peer: grantee.clone(),
+        node_id: host.node_id.clone(),
+        client_id: grantee.clone(),
+        session,
+    };
     let reply_node = request_id.clone();
     match msg {
         TransferMsg::Push {
@@ -237,10 +227,10 @@ pub async fn on_transfer(
             mtime_unix,
             ..
         } => {
-            let mut link = attach(&host, &request_id, &reply_node);
+            let mut link = attach(&host, &request_id, &reply_node, Some(seal_target));
             tokio::spawn(async move {
                 let outcome = async {
-                    ensure(&host, true)?;
+                    ensure(&host, effective_policy, true)?;
                     let staged = host.paths.stage(&path, true).await?;
                     push_file(
                         host.paths.as_ref(),
@@ -257,7 +247,7 @@ pub async fn on_transfer(
                     .await
                 }
                 .await;
-                finish(&host, &client_id, "push", &path, outcome, &mut link).await;
+                finish(&host, &grantee, "push", &path, outcome, &mut link).await;
             });
         }
         TransferMsg::Pull {
@@ -268,10 +258,10 @@ pub async fn on_transfer(
             compress,
             sigs,
         } => {
-            let mut link = attach(&host, &request_id, &reply_node);
+            let mut link = attach(&host, &request_id, &reply_node, Some(seal_target));
             tokio::spawn(async move {
                 let outcome = async {
-                    ensure(&host, false)?;
+                    ensure(&host, effective_policy, false)?;
                     let staged = host.paths.stage(&path, false).await?;
                     let opts = xfer_opts(chunk_size, 8, 4, compress, "relay");
                     engine::serve_pull(
@@ -286,19 +276,19 @@ pub async fn on_transfer(
                     .await
                 }
                 .await;
-                finish(&host, &client_id, "pull", &path, outcome, &mut link).await;
+                finish(&host, &grantee, "pull", &path, outcome, &mut link).await;
             });
         }
         TransferMsg::PushDir { dest, entries, .. } => {
-            let mut link = attach(&host, &request_id, &reply_node);
+            let mut link = attach(&host, &request_id, &reply_node, Some(seal_target));
             tokio::spawn(async move {
                 let outcome = async {
-                    ensure(&host, true)?;
+                    ensure(&host, effective_policy, true)?;
                     let staged = host.paths.stage(&dest, true).await?;
                     push_dir(host.paths.as_ref(), &mut link, &staged, entries, "relay").await
                 }
                 .await;
-                finish(&host, &client_id, "push_dir", &dest, outcome, &mut link).await;
+                finish(&host, &grantee, "push_dir", &dest, outcome, &mut link).await;
             });
         }
         TransferMsg::PullDir {
@@ -307,28 +297,28 @@ pub async fn on_transfer(
             chunk_size,
             compress,
         } => {
-            let mut link = attach(&host, &request_id, &reply_node);
+            let mut link = attach(&host, &request_id, &reply_node, Some(seal_target));
             tokio::spawn(async move {
                 let outcome = async {
-                    ensure(&host, false)?;
+                    ensure(&host, effective_policy, false)?;
                     let staged = host.paths.stage(&path, false).await?;
                     let opts = xfer_opts(chunk_size, 8, 4, compress, "relay");
                     engine::serve_pull_dir(&staged.real, have, &mut link, &request_id, &opts).await
                 }
                 .await;
-                finish(&host, &client_id, "pull_dir", &path, outcome, &mut link).await;
+                finish(&host, &grantee, "pull_dir", &path, outcome, &mut link).await;
             });
         }
         TransferMsg::PushStream { path, .. } => {
-            let mut link = attach(&host, &request_id, &reply_node);
+            let mut link = attach(&host, &request_id, &reply_node, Some(seal_target));
             tokio::spawn(async move {
                 let outcome = async {
-                    ensure(&host, true)?;
+                    ensure(&host, effective_policy, true)?;
                     let staged = host.paths.stage(&path, true).await?;
                     push_stream(host.paths.as_ref(), &mut link, &staged, "relay").await
                 }
                 .await;
-                finish(&host, &client_id, "push_stream", &path, outcome, &mut link).await;
+                finish(&host, &grantee, "push_stream", &path, outcome, &mut link).await;
             });
         }
         TransferMsg::PullStream {
@@ -339,10 +329,10 @@ pub async fn on_transfer(
             window,
             compress,
         } => {
-            let mut link = attach(&host, &request_id, &reply_node);
+            let mut link = attach(&host, &request_id, &reply_node, Some(seal_target));
             tokio::spawn(async move {
                 let outcome = async {
-                    ensure(&host, false)?;
+                    ensure(&host, effective_policy, false)?;
                     let staged = host.paths.stage(&path, false).await?;
                     engine::serve_pull_stream(
                         &staged.real,
@@ -358,7 +348,7 @@ pub async fn on_transfer(
                     .await
                 }
                 .await;
-                finish(&host, &client_id, "pull_stream", &path, outcome, &mut link).await;
+                finish(&host, &grantee, "pull_stream", &path, outcome, &mut link).await;
             });
         }
         TransferMsg::PeerCopy {
@@ -371,11 +361,19 @@ pub async fn on_transfer(
             compress,
             direct,
         } => {
-            let client_link = attach(&host, &request_id, &reply_node);
+            let client_link = attach(&host, &request_id, &reply_node, Some(seal_target));
             tokio::spawn(async move {
                 let detail = format!("{src_path} -> {dst_node}:{dst_path}");
                 let outcome = peer_copy(
-                    &host, &src_path, &dst_node, &dst_path, chunk_size, window, parallel, compress,
+                    &host,
+                    effective_policy,
+                    &src_path,
+                    &dst_node,
+                    &dst_path,
+                    chunk_size,
+                    window,
+                    parallel,
+                    compress,
                     direct,
                 )
                 .await;
@@ -384,22 +382,24 @@ pub async fn on_transfer(
                         crate::audit::submit_op(
                             &host.audit,
                             "peer_copy",
-                            &client_id,
+                            &grantee,
                             &detail,
                             true,
                             None,
-                        );
+                        )
+                        .await;
                         let _ = client_link.send_msg(TransferMsg::Done { stats }).await;
                     }
                     Err(err) => {
                         crate::audit::submit_op(
                             &host.audit,
                             "peer_copy",
-                            &client_id,
+                            &grantee,
                             &detail,
                             false,
                             Some(err.to_string()),
-                        );
+                        )
+                        .await;
                         let _ = client_link
                             .send_msg(TransferMsg::Failed {
                                 message: err.to_string(),
@@ -483,9 +483,19 @@ pub fn on_direct_answer(host: &TransferHost, env: Envelope) {
     }
 }
 
-fn attach(host: &TransferHost, request_id: &str, reply_node: &str) -> Link {
+fn attach(
+    host: &TransferHost,
+    request_id: &str,
+    reply_node: &str,
+    seal: Option<SealTarget>,
+) -> Link {
     let (worker, mut adapter) = Link::pair(64);
     let (tx, mut rx) = mpsc::channel(SESSION_WIRE_BOUND);
+    if let Some(target) = seal {
+        if let Ok(mut seals) = host.seals.lock() {
+            seals.insert(request_id.to_string(), target);
+        }
+    }
     if let Ok(mut map) = host.sessions.lock() {
         map.insert(request_id.to_string(), tx);
     }
@@ -520,6 +530,9 @@ fn attach(host: &TransferHost, request_id: &str, reply_node: &str) -> Link {
         }
         if let Ok(mut map) = sessions.lock() {
             map.remove(&request_id);
+        }
+        if let Ok(mut seals) = ctx.seals.lock() {
+            seals.remove(&request_id);
         }
     });
     worker
@@ -830,7 +843,9 @@ async fn finish(
     link: &mut Link,
 ) {
     match outcome {
-        Ok(_) => crate::audit::submit_op(&host.audit, op, client_id, detail, true, None),
+        Ok(_) => {
+            crate::audit::submit_op(&host.audit, op, client_id, detail, true, None).await;
+        }
         Err(err) => {
             crate::audit::submit_op(
                 &host.audit,
@@ -839,7 +854,8 @@ async fn finish(
                 detail,
                 false,
                 Some(err.to_string()),
-            );
+            )
+            .await;
             let _ = link
                 .send_msg(TransferMsg::Failed {
                     message: err.to_string(),
@@ -851,6 +867,7 @@ async fn finish(
 
 async fn peer_copy(
     host: &TransferHost,
+    effective_policy: NodePolicy,
     src_path: &str,
     dst_node: &str,
     dst_path: &str,
@@ -860,12 +877,12 @@ async fn peer_copy(
     compress: CompressPref,
     direct: bool,
 ) -> Result<TransferStats> {
-    ensure(host, false)?;
+    ensure(host, effective_policy, false)?;
     let staged = host.paths.stage(src_path, false).await?;
     let dir = staged.real.is_dir();
     let _direct = direct;
     let request_id = Uuid::new_v4().to_string();
-    let mut link = attach(host, &request_id, dst_node);
+    let mut link = attach(host, &request_id, dst_node, None);
     let opts = xfer_opts(chunk_size, window, parallel, compress, "relay");
     if dir {
         engine::perform_push_dir(&staged.real, dst_path, &mut link, &request_id, &opts, &None).await
@@ -874,38 +891,19 @@ async fn peer_copy(
     }
 }
 
-
-
-async fn serve_quic(
-    mut link: Link,
-    policy: &RwLock<NodePolicy>,
-    max_policy: NodePolicy,
-    paths: &PathMap,
-    audit: &AuditHub,
-) -> Result<()> {
-    drop(link);
-    let _ = (policy, max_policy, paths, audit);
-    Err(Error::Message(
-        "direct file transfer is disabled; file bytes stay on the sealed relay session".into(),
-    ))
+fn ensure(host: &TransferHost, effective: NodePolicy, write: bool) -> Result<()> {
+    let current = read_policy(&host.policy)?;
+    check_policy(current.intersect(effective), write)
 }
 
-fn audit_result(hub: &AuditHub, op: &str, detail: &str, result: &Result<TransferStats>) {
-    match result {
-        Ok(_) => crate::audit::submit_op(hub, op, "quic", detail, true, None),
-        Err(err) => crate::audit::submit_op(hub, op, "quic", detail, false, Some(err.to_string())),
-    }
-}
-
-fn ensure(host: &TransferHost, write: bool) -> Result<()> {
-    ensure_policy(&host.policy, write)
-}
-
-fn ensure_policy(policy: &RwLock<NodePolicy>, write: bool) -> Result<()> {
-    let current = policy
+fn read_policy(policy: &RwLock<NodePolicy>) -> Result<NodePolicy> {
+    policy
         .read()
         .map(|guard| *guard)
-        .map_err(|_| Error::Message("node policy is unavailable".into()))?;
+        .map_err(|_| Error::Message("node policy is unavailable".into()))
+}
+
+fn check_policy(current: NodePolicy, write: bool) -> Result<()> {
     if write && !current.allow_write {
         return Err(Error::PermissionDenied(
             "write is not allowed on this node".into(),
@@ -917,6 +915,11 @@ fn ensure_policy(policy: &RwLock<NodePolicy>, write: bool) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn ensure_policy(policy: &RwLock<NodePolicy>, write: bool) -> Result<()> {
+    check_policy(read_policy(policy)?, write)
 }
 
 #[cfg(test)]
@@ -1003,6 +1006,175 @@ mod tests {
             err.to_string().contains("unavailable"),
             "must not fall back to max_policy, got {err}"
         );
+    }
+
+    struct DummyHost;
+
+    impl NodeHost for DummyHost {
+        fn unary(&self, _: String, _: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn open_session(&self, _: String, _: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn poll_session(&self, _: String, _: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn session_input(&self, _: String, _: String, _: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn close_session(&self, _: String, _: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn release_session(&self, _: String, _: String) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn prepare_path(&self, _: String, _: bool) -> String {
+            r#"{"ok":false,"error":"unused"}"#.into()
+        }
+        fn publish_path(&self, _: String, _: String) -> String {
+            r#"{"ok":true,"body":{}}"#.into()
+        }
+        fn on_status(&self, _: String) {}
+    }
+
+    fn test_host(dir: &std::path::Path, ceiling: NodePolicy) -> Arc<TransferHost> {
+        let files = dir.join("files");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let identity = agentlink_core::Identity::generate();
+        let node_id = identity.node_id().to_string();
+        let (tx, _rx) = mpsc::channel(16);
+        Arc::new(TransferHost {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            direct_wait: Arc::new(Mutex::new(HashMap::new())),
+            tx,
+            policy: Arc::new(RwLock::new(ceiling)),
+            paths: Arc::new(PathMap {
+                roots: Roots {
+                    files,
+                    cache,
+                    storage: None,
+                    audit: dir.join("audit.log"),
+                },
+                host: Arc::new(DummyHost),
+            }),
+            e2e: Endpoint::new(identity),
+            node_id: node_id.clone(),
+            seals: Arc::new(Mutex::new(HashMap::new())),
+            audit: Arc::new(AuditHub::open(dir, &node_id, "phone")),
+        })
+    }
+
+    #[tokio::test]
+    async fn transfer_enforces_effective_policy_peer_ownership_and_cleans_seals() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = test_host(dir.path(), NodePolicy::full());
+
+        // 1. Read-only grant cannot write even when phone ceiling is full.
+        let read_only = NodePolicy::read_only();
+        assert!(ensure(&host, read_only, false).is_ok());
+        assert!(ensure(&host, read_only, true).is_err());
+
+        // Remote-view-only grant cannot read OR write files.
+        let mut view_only = NodePolicy::read_only();
+        view_only.allow_read = false;
+        view_only.allow_remote_view = true;
+        assert!(ensure(&host, view_only, false).is_err());
+        assert!(ensure(&host, view_only, true).is_err());
+
+        // 2. Non-initiating transfer message must NOT insert into host.seals.
+        on_transfer(
+            host.clone(),
+            "orphan-req".into(),
+            "peer-alice".into(),
+            TransferMsg::Accept {
+                mode: AcceptMode::Skip,
+            },
+            None,
+            NodePolicy::full(),
+        )
+        .await;
+        assert!(
+            !host.seals.lock().unwrap().contains_key("orphan-req"),
+            "non-initiating TransferMsg must not leak into host.seals"
+        );
+
+        // 3. Cross-peer hijack on existing request_id is rejected without disrupting owner.
+        let (sess_tx, mut sess_rx) = mpsc::channel(4);
+        host.sessions
+            .lock()
+            .unwrap()
+            .insert("req-1".into(), sess_tx);
+        host.seals.lock().unwrap().insert(
+            "req-1".into(),
+            SealTarget {
+                peer: "peer-alice".into(),
+                node_id: host.node_id.clone(),
+                client_id: "peer-alice".into(),
+                session: None,
+            },
+        );
+        on_transfer(
+            host.clone(),
+            "req-1".into(),
+            "peer-eve".into(),
+            TransferMsg::Failed {
+                message: "hijack".into(),
+            },
+            None,
+            NodePolicy::full(),
+        )
+        .await;
+        assert!(
+            sess_rx.try_recv().is_err(),
+            "cross-peer frame must not reach owner session"
+        );
+        assert!(host.sessions.lock().unwrap().contains_key("req-1"));
+
+        // Owner frame still passes through.
+        on_transfer(
+            host.clone(),
+            "req-1".into(),
+            "peer-alice".into(),
+            TransferMsg::Accept {
+                mode: AcceptMode::Skip,
+            },
+            None,
+            NodePolicy::full(),
+        )
+        .await;
+        assert!(matches!(
+            sess_rx.try_recv(),
+            Ok(Wire::Msg(TransferMsg::Accept { .. }))
+        ));
+
+        // 4. attach removes both sessions and seals entries on exit.
+        let link = attach(
+            &host,
+            "req-cleanup",
+            "req-cleanup",
+            Some(SealTarget {
+                peer: "peer-alice".into(),
+                node_id: host.node_id.clone(),
+                client_id: "peer-alice".into(),
+                session: None,
+            }),
+        );
+        assert!(host.seals.lock().unwrap().contains_key("req-cleanup"));
+        drop(link);
+        for _ in 0..50 {
+            if !host.seals.lock().unwrap().contains_key("req-cleanup") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !host.seals.lock().unwrap().contains_key("req-cleanup"),
+            "host.seals must be cleaned up when attach exits"
+        );
+        assert!(!host.sessions.lock().unwrap().contains_key("req-cleanup"));
     }
 }
 

@@ -43,6 +43,7 @@ internal fun MachineHub(
     refreshing: Boolean,
     onRefresh: () -> Unit,
     onOpen: (MachineAction) -> Unit,
+    onManageGrant: (() -> Unit)? = null,
 ) {
     val actions = machineActions(machine)
     PullToRefreshBox(
@@ -86,6 +87,15 @@ internal fun MachineHub(
                             ActionRow(state, onOpen)
                         }
                     }
+                }
+            }
+            if (onManageGrant != null) {
+                item {
+                    SecondaryButton(
+                        text = "Manage signed grant",
+                        onClick = onManageGrant,
+                        modifier = Modifier.fillMaxWidth().testTag("machine-manage-grant"),
+                    )
                 }
             }
         }

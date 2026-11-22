@@ -2,6 +2,7 @@ package app.agentlink.node
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Intent
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
@@ -20,6 +21,11 @@ class AgentAccessibilityService : AccessibilityService() {
         instance = this
     }
 
+    override fun onUnbind(intent: Intent?): Boolean {
+        if (instance === this) instance = null
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
         if (instance === this) instance = null
         super.onDestroy()
@@ -32,6 +38,7 @@ class AgentAccessibilityService : AccessibilityService() {
     fun tap(x: Float, y: Float): Boolean = swipe(x, y, x, y, 40)
 
     fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long): Boolean {
+        if (isGuardedSystemUiActive()) return false
         val path = Path().apply {
             moveTo(x1, y1)
             if (x1 != x2 || y1 != y2) lineTo(x2, y2)
@@ -50,12 +57,14 @@ class AgentAccessibilityService : AccessibilityService() {
      * and they are not global hardware keys.
      */
     fun typeText(text: String): Boolean {
+        if (isGuardedSystemUiActive()) return false
         val keys = rawKeysForText(text)
         if (keys != null && sendRaw(keys)) return true
         return replaceText(text)
     }
 
     fun key(name: String): Boolean {
+        if (isGuardedSystemUiActive()) return false
         val keys = rawKeysForName(name)
         if (keys != null && sendRaw(keys)) return true
         return when (name.lowercase()) {
@@ -66,13 +75,19 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     fun enter(): Boolean {
+        if (isGuardedSystemUiActive()) return false
         if (sendRaw(listOf(RawKey(KeyEvent.KEYCODE_ENTER)))) return true
         val node = focusedEditable() ?: return false
-        if (Build.VERSION.SDK_INT >= 30) {
-            val enter = AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER
-            if (node.performAction(enter.id)) return true
+        return try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                val enter = AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER
+                node.performAction(enter.id)
+            } else {
+                false
+            }
+        } finally {
+            recycleSafely(node)
         }
-        return false
     }
 
     private fun sendRaw(keys: List<RawKey>): Boolean {
@@ -90,23 +105,31 @@ class AgentAccessibilityService : AccessibilityService() {
 
     private fun replaceText(text: String): Boolean {
         val node = focusedEditable() ?: return false
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        return try {
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+            }
+            node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } finally {
+            recycleSafely(node)
         }
-        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
     private fun backspaceFallback(): Boolean {
         val node = focusedEditable() ?: return false
-        val current = node.text?.toString().orEmpty()
-        if (current.isEmpty()) return false
-        val args = Bundle().apply {
-            putCharSequence(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                current.dropLast(1),
-            )
+        return try {
+            val current = node.text?.toString().orEmpty()
+            if (current.isEmpty()) return false
+            val args = Bundle().apply {
+                putCharSequence(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                    current.dropLast(1),
+                )
+            }
+            node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } finally {
+            recycleSafely(node)
         }
-        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
     fun global(name: String): Boolean {
@@ -123,15 +146,34 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     fun clickElement(text: String?, id: String?): Boolean {
+        if (isGuardedSystemUiActive()) return false
         val root = rootInActiveWindow ?: windows.firstOrNull()?.root ?: return false
-        val hit = find(root, text, id) ?: return false
-        if (hit.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
-        var parent = hit.parent
-        while (parent != null) {
-            if (parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
-            parent = parent.parent
+        val hit = find(root, text, id)
+        if (hit == null) {
+            recycleSafely(root)
+            return false
         }
-        return false
+        try {
+            if (hit.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            var parent = hit.parent
+            while (parent != null) {
+                val next = parent.parent
+                val clicked = try {
+                    parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                } finally {
+                    if (parent !== root && parent !== hit) recycleSafely(parent)
+                }
+                if (clicked) {
+                    if (next != null && next !== root && next !== hit) recycleSafely(next)
+                    return true
+                }
+                parent = next
+            }
+            return false
+        } finally {
+            if (hit !== root) recycleSafely(hit)
+            recycleSafely(root)
+        }
     }
 
     fun tree(): JSONObject {
@@ -142,63 +184,124 @@ class AgentAccessibilityService : AccessibilityService() {
             count++
             val bounds = Rect()
             node.getBoundsInScreen(bounds)
+            val password = node.isPassword
             nodes.put(
                 JSONObject()
-                    .put("text", node.text?.toString() ?: "")
-                    .put("desc", node.contentDescription?.toString() ?: "")
+                    .put("text", if (password) "" else (node.text?.toString() ?: ""))
+                    .put("desc", if (password) "" else (node.contentDescription?.toString() ?: ""))
                     .put("id", node.viewIdResourceName ?: "")
                     .put("class", node.className?.toString() ?: "")
                     .put("clickable", node.isClickable)
                     .put("editable", node.isEditable)
+                    .put("password", password)
                     .put("bounds", JSONArray(listOf(bounds.left, bounds.top, bounds.right, bounds.bottom))),
             )
             for (i in 0 until node.childCount) {
                 val child = node.getChild(i)
-                walk(child, depth + 1)
-                child?.recycle()
+                try {
+                    walk(child, depth + 1)
+                } finally {
+                    recycleSafely(child)
+                }
             }
         }
         val roots = windows.mapNotNull { it.root }.ifEmpty { listOfNotNull(rootInActiveWindow) }
         for (root in roots) {
-            walk(root, 0)
-            root.recycle()
+            try {
+                walk(root, 0)
+            } finally {
+                recycleSafely(root)
+            }
         }
         return JSONObject().put("nodes", nodes).put("truncated", count >= 200)
     }
 
+    private fun isGuardedSystemUiActive(): Boolean {
+        if (allowSystemDialogControl) return false
+        val root = rootInActiveWindow ?: return false
+        return try {
+            val pkg = root.packageName?.toString()?.trim()?.lowercase().orEmpty()
+            isGuardedPackage(pkg)
+        } finally {
+            recycleSafely(root)
+        }
+    }
+
     private fun focusedEditable(): AccessibilityNodeInfo? {
-        val focused = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        if (focused != null && focused.isEditable) return focused
-        return firstEditable(rootInActiveWindow)
+        val root = rootInActiveWindow ?: return null
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focused != null) {
+            if (focused.isEditable) {
+                if (focused !== root) recycleSafely(root)
+                return focused
+            }
+            if (focused !== root) recycleSafely(focused)
+        }
+        val hit = firstEditable(root)
+        if (hit !== root) recycleSafely(root)
+        return hit
     }
 
     private fun firstEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
         if (node == null) return null
         if (node.isEditable) return node
         for (i in 0 until node.childCount) {
-            val hit = firstEditable(node.getChild(i))
-            if (hit != null) return hit
+            val child = node.getChild(i) ?: continue
+            val hit = firstEditable(child)
+            if (hit != null) {
+                if (hit !== child) recycleSafely(child)
+                return hit
+            }
+            recycleSafely(child)
         }
         return null
     }
 
     private fun find(node: AccessibilityNodeInfo?, text: String?, id: String?): AccessibilityNodeInfo? {
         if (node == null) return null
-        val label = node.text?.toString().orEmpty()
-        val desc = node.contentDescription?.toString().orEmpty()
+        val password = node.isPassword
+        val label = if (password) "" else node.text?.toString().orEmpty()
+        val desc = if (password) "" else node.contentDescription?.toString().orEmpty()
         val viewId = node.viewIdResourceName.orEmpty()
         val textHit = !text.isNullOrBlank() && (label.contains(text, true) || desc.contains(text, true))
         val idHit = !id.isNullOrBlank() && viewId == id
         if (textHit || idHit) return node
         for (i in 0 until node.childCount) {
-            val hit = find(node.getChild(i), text, id)
-            if (hit != null) return hit
+            val child = node.getChild(i) ?: continue
+            val hit = find(child, text, id)
+            if (hit != null) {
+                if (hit !== child) recycleSafely(child)
+                return hit
+            }
+            recycleSafely(child)
         }
         return null
+    }
+
+    private fun recycleSafely(node: AccessibilityNodeInfo?) {
+        if (node == null) return
+        @Suppress("DEPRECATION")
+        runCatching { node.recycle() }
     }
 
     companion object {
         @Volatile
         var instance: AgentAccessibilityService? = null
+
+        @Volatile
+        var allowSystemDialogControl: Boolean = false
+
+        private val GUARDED_PACKAGES = setOf(
+            "com.android.permissioncontroller",
+            "com.google.android.permissioncontroller",
+            "com.android.packageinstaller",
+            "com.google.android.packageinstaller",
+            "com.android.settings",
+            "moe.shizuku.privileged.api",
+        )
+
+        internal fun isGuardedPackage(packageName: String): Boolean {
+            return packageName.trim().lowercase() in GUARDED_PACKAGES
+        }
     }
 }

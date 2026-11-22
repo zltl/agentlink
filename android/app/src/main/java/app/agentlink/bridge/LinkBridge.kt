@@ -62,6 +62,9 @@ data class LiveInfo(
     val width: Int,
     val height: Int,
     val control: Boolean,
+    val srcWidth: Int = width,
+    val srcHeight: Int = height,
+    val cursorPresentation: String = "embedded",
 )
 
 data class LiveFrame(
@@ -72,7 +75,28 @@ data class LiveFrame(
     val height: Int,
 )
 
-data class LiveCursor(val x: Int, val y: Int, val shape: String)
+data class LiveCursor(
+    val x: Int,
+    val y: Int,
+    val shape: String,
+    val visible: Boolean = true,
+    val hotspotX: Int = 0,
+    val hotspotY: Int = 0,
+)
+
+data class LiveClipboardRow(val text: String, val truncated: Boolean)
+
+data class NodePinRow(val name: String, val nodeId: String)
+
+data class GrantRow(
+    val nodeId: String,
+    val granteeId: String,
+    val issuerId: String,
+    val jti: String,
+    val nbfUnix: Long,
+    val expUnix: Long,
+    val preset: String,
+)
 
 data class LiveStats(val frames: ULong, val bytes: ULong, val loss: Double, val latencyMs: Long)
 
@@ -80,14 +104,19 @@ interface LiveDesktop {
     fun info(): LiveInfo
     fun pollFrame(timeoutMs: UInt): LiveFrame?
     fun pollCursor(): LiveCursor?
+    fun pollClipboard(): LiveClipboardRow? = null
     fun stats(): LiveStats
     fun sendControl(json: String): Boolean
+    fun sendClipboard(text: String): Boolean = false
     fun requestKeyframe()
     fun failed(): Boolean
     fun close()
 }
 
 interface ClientSession {
+    fun updateAccessToken(token: String) = Unit
+    fun setIceServers(iceServersJson: String) = Unit
+    fun refreshIceServers(): String = "[]"
     fun listMachines(): List<MachineRow>
     fun listDir(node: String, path: String): List<FileRow>
     fun readBytes(node: String, path: String, offset: ULong, maxBytes: ULong): ByteArray
@@ -95,6 +124,33 @@ interface ClientSession {
     fun mkdir(node: String, path: String, recursive: Boolean)
     fun remove(node: String, path: String, recursive: Boolean)
     fun rename(node: String, from: String, to: String)
+    fun findFiles(
+        node: String,
+        path: String,
+        pattern: String,
+        regex: Boolean = false,
+        includeHidden: Boolean = false,
+        caseInsensitive: Boolean = true,
+        limit: UInt = 200u,
+    ): String = ""
+    fun searchContent(
+        node: String,
+        path: String,
+        pattern: String,
+        literal: Boolean = true,
+        includeHidden: Boolean = false,
+        caseInsensitive: Boolean = true,
+        limit: UInt = 200u,
+    ): String = ""
+    fun queryAudit(nodeId: String, limit: UInt = 80u): String = ""
+    fun sysInfo(node: String): String = ""
+    fun listNodePins(): List<NodePinRow> = emptyList()
+    fun clearNodePin(name: String): Boolean = false
+    fun nodePinWarnings(): List<String> = emptyList()
+    fun listGrants(): List<GrantRow> = emptyList()
+    fun importGrant(grantJson: String): GrantRow = throw UnsupportedOperationException("importGrant")
+    fun deleteGrant(nodeId: String): Boolean = false
+    fun revokeDevice(deviceId: String) = Unit
     fun exec(
         node: String,
         program: String,

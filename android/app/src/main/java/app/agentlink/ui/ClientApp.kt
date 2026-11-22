@@ -26,12 +26,15 @@ import app.agentlink.account.looksLikeSessionExpiry
 import app.agentlink.bridge.ClientSession
 import app.agentlink.bridge.LinkBridge
 import app.agentlink.bridge.MachineRow
+import app.agentlink.bridge.PtySession
 import app.agentlink.model.fingerprintProblem
 import app.agentlink.model.relayProblem
 import app.agentlink.node.ClientStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.concurrent.thread
 
 class ClientViewModel(private val bridge: LinkBridge, context: Context) : ViewModel() {
     private val store = ClientStore(context.applicationContext)
@@ -40,14 +43,44 @@ class ClientViewModel(private val bridge: LinkBridge, context: Context) : ViewMo
     var token by mutableStateOf(store.token())
     var fingerprint by mutableStateOf(store.fingerprint())
     var machines by mutableStateOf<List<MachineRow>>(emptyList())
+    var pinWarnings by mutableStateOf<List<String>>(emptyList())
     var error by mutableStateOf<String?>(null)
     var busy by mutableStateOf(false)
     var refreshing by mutableStateOf(false)
     var loadedOnce by mutableStateOf(false)
     var sessionExpired by mutableStateOf<String?>(null)
     private var sessionEpoch = 0
+    private val retainedPtys = ConcurrentHashMap<String, PtySession>()
     var session: ClientSession? = null
         private set
+
+    fun retainedPty(machineId: String): PtySession? = retainedPtys[machineId]
+
+    fun retainPty(machineId: String, pty: PtySession) {
+        val previous = retainedPtys.put(machineId, pty)
+        if (previous != null && previous !== pty) {
+            closePtyAsync(previous)
+        }
+    }
+
+    fun releasePty(machineId: String, expected: PtySession? = null) {
+        val removed = if (expected == null) {
+            retainedPtys.remove(machineId)
+        } else if (retainedPtys.remove(machineId, expected)) {
+            expected
+        } else {
+            null
+        }
+        if (removed != null) {
+            closePtyAsync(removed)
+        }
+    }
+
+    fun updateAccessToken(newToken: String) {
+        val current = session ?: return
+        current.updateAccessToken(newToken)
+        sessionExpired = null
+    }
 
     fun connect(onReady: () -> Unit) {
         val relayProblem = relayProblem(relay)
@@ -81,9 +114,12 @@ class ClientViewModel(private val bridge: LinkBridge, context: Context) : ViewMo
 
     fun disconnect() {
         sessionEpoch += 1
-        session?.close()
+        closeAllPtysAsync()
+        val old = session
         session = null
+        if (old != null) closeSessionAsync(old)
         machines = emptyList()
+        pinWarnings = emptyList()
         error = null
         busy = false
         refreshing = false
@@ -102,13 +138,20 @@ class ClientViewModel(private val bridge: LinkBridge, context: Context) : ViewMo
         }
         viewModelScope.launch {
             if (machines.isEmpty()) busy = true else refreshing = true
-            val result = withContext(Dispatchers.IO) { runCatching { current.listMachines() } }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val listed = current.listMachines()
+                    val warnings = runCatching { current.nodePinWarnings() }.getOrDefault(emptyList())
+                    listed to warnings
+                }
+            }
             if (epoch != sessionEpoch) return@launch
             busy = false
             refreshing = false
             loadedOnce = true
-            result.onSuccess {
-                machines = it
+            result.onSuccess { (listed, warnings) ->
+                machines = listed
+                pinWarnings = warnings
                 error = null
                 onReady()
             }.onFailure {
@@ -122,8 +165,34 @@ class ClientViewModel(private val bridge: LinkBridge, context: Context) : ViewMo
     private fun openSession(connected: ClientSession) {
         sessionEpoch += 1
         sessionExpired = null
-        session?.close()
+        closeAllPtysAsync()
+        val old = session
         session = connected
+        if (old != null && old !== connected) {
+            closeSessionAsync(old)
+        }
+    }
+
+    private fun closeAllPtysAsync() {
+        val keys = retainedPtys.keys.toList()
+        val closing = keys.mapNotNull { retainedPtys.remove(it) }
+        if (closing.isNotEmpty()) {
+            thread(name = "agentlink-pty-close", isDaemon = true) {
+                closing.forEach { runCatching { it.close() } }
+            }
+        }
+    }
+
+    private fun closePtyAsync(pty: PtySession) {
+        thread(name = "agentlink-pty-close", isDaemon = true) {
+            runCatching { pty.close() }
+        }
+    }
+
+    private fun closeSessionAsync(old: ClientSession) {
+        thread(name = "agentlink-client-close", isDaemon = true) {
+            runCatching { old.close() }
+        }
     }
 
     fun refreshIfConnected() {
@@ -150,7 +219,10 @@ class ClientViewModel(private val bridge: LinkBridge, context: Context) : ViewMo
     }
 
     override fun onCleared() {
-        session?.close()
+        closeAllPtysAsync()
+        val old = session
+        session = null
+        if (old != null) closeSessionAsync(old)
     }
 }
 
@@ -184,7 +256,7 @@ fun ClientLogin(model: ClientViewModel, onConnected: () -> Unit) {
             onRelay = { model.relay = it },
             fingerprint = model.fingerprint,
             onFingerprint = { model.fingerprint = it },
-            startOpen = model.fingerprint.isNotBlank() || model.relay.trim() != DEFAULT_RELAY,
+            startOpen = model.relay.isBlank() || model.fingerprint.isNotBlank() || model.relay.trim() != DEFAULT_RELAY,
         )
         model.error?.let { ErrorNote(it) }
         PrimaryButton(

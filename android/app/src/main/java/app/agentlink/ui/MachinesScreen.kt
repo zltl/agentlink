@@ -67,6 +67,7 @@ fun ClientHome(
     val loading = !model.loadedOnce && model.machines.isEmpty() && model.error == null
     MachinesBody(
         machines = model.machines,
+        pinWarnings = model.pinWarnings,
         error = model.error,
         refreshing = model.refreshing,
         loading = loading,
@@ -87,12 +88,14 @@ fun MachinesBody(
     onOpen: (MachineRow) -> Unit,
     onPair: () -> Unit,
     showHeader: Boolean = true,
+    pinWarnings: List<String> = emptyList(),
 ) {
-    val context = LocalContext.current
     val ordered = remember(machines) {
         machines.sortedWith(compareByDescending<MachineRow> { it.online }.thenBy { it.name.lowercase() })
     }
-    val pinNote = remember(ordered) { nodePinWarning(context, ordered) }
+    val pinNote = remember(pinWarnings) {
+        pinWarnings.filter { it.isNotBlank() }.takeIf { it.isNotEmpty() }?.joinToString(" ")
+    }
     val online = ordered.count { it.online }
     val offline = ordered.size - online
     Column(modifier = Modifier.fillMaxSize().testTag("machines-root")) {
@@ -358,26 +361,4 @@ internal fun PairBody(
             SupportingText("Expires in about an hour. The machine keeps its own key after this token is used.")
         }
     }
-}
-
-private const val NODE_PINS = "agentlink.nodePins"
-
-/** Trust-on-first-use for node name → Ed25519 id. A later id change is shown, not silently accepted. */
-private fun nodePinWarning(context: Context, machines: List<MachineRow>): String? {
-    if (machines.isEmpty()) return null
-    val prefs = context.getSharedPreferences(NODE_PINS, Context.MODE_PRIVATE)
-    val editor = prefs.edit()
-    val warnings = mutableListOf<String>()
-    for (machine in machines) {
-        if (machine.name.isBlank() || machine.id.isBlank()) continue
-        val key = "name." + machine.name
-        val pinned = prefs.getString(key, null)
-        if (pinned == null) {
-            editor.putString(key, machine.id)
-        } else if (pinned != machine.id) {
-            warnings += "${machine.name} changed its id. The saved pin was kept."
-        }
-    }
-    editor.apply()
-    return warnings.takeIf { it.isNotEmpty() }?.joinToString(" ")
 }

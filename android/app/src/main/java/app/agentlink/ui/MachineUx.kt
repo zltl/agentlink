@@ -133,21 +133,35 @@ fun platformLabel(machine: MachineRow): String {
 }
 
 fun pathCrumbs(path: String): List<Pair<String, String>> {
-    val trimmed = path.trim()
+    val trimmed = path.trim().replace('\\', '/')
     if (trimmed.isEmpty()) return emptyList()
     val schemeIndex = trimmed.indexOf(":/")
-    if (schemeIndex < 0) return listOf(trimmed to trimmed)
-    val root = trimmed.substring(0, schemeIndex + 2)
-    val crumbs = mutableListOf(root to root.removeSuffix("/"))
-    val rest = trimmed.removePrefix(root).trim('/')
-    if (rest.isEmpty()) return crumbs
-    var acc = root
-    for (part in rest.split('/')) {
-        if (part.isEmpty()) continue
-        acc = childPath(acc, part)
-        crumbs += acc to part
+    if (schemeIndex >= 0) {
+        val root = trimmed.substring(0, schemeIndex + 2)
+        val crumbs = mutableListOf(root to root.removeSuffix("/"))
+        val rest = trimmed.removePrefix(root).trim('/')
+        if (rest.isEmpty()) return crumbs
+        var acc = root
+        for (part in rest.split('/')) {
+            if (part.isEmpty()) continue
+            acc = childPath(acc, part)
+            crumbs += acc to part
+        }
+        return crumbs
     }
-    return crumbs
+    if (trimmed.startsWith("/")) {
+        val crumbs = mutableListOf("/" to "/")
+        val rest = trimmed.trim('/')
+        if (rest.isEmpty()) return crumbs
+        var acc = "/"
+        for (part in rest.split('/')) {
+            if (part.isEmpty()) continue
+            acc = childPath(acc, part)
+            crumbs += acc to part
+        }
+        return crumbs
+    }
+    return listOf(trimmed to trimmed)
 }
 
 fun formatBytes(size: ULong): String {

@@ -23,6 +23,8 @@ import app.agentlink.model.mapTouch
 import app.agentlink.model.oneFingerRelease
 import app.agentlink.model.panViewport
 import app.agentlink.model.zoomViewport
+import app.agentlink.model.defaultRootPath
+import app.agentlink.model.defaultTransferPath
 import app.agentlink.model.parentPath
 import app.agentlink.model.parseSafGuest
 import app.agentlink.model.PtyKey
@@ -35,10 +37,21 @@ import app.agentlink.model.rawKeysForText
 import app.agentlink.model.relayProblem
 import app.agentlink.model.searchFiles
 import app.agentlink.model.webrtcFallsBackToScreenshot
+import app.agentlink.node.AgentAccessibilityService
+import app.agentlink.node.SafStore
+import app.agentlink.node.isPathInside
+import app.agentlink.node.mergeSafWrite
+import app.agentlink.node.skipFully
+import app.agentlink.ui.pathCrumbs
 import android.view.KeyEvent
+import java.io.ByteArrayInputStream
+import java.io.File
+import java.io.FilterInputStream
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -260,5 +273,98 @@ class ModelTest {
         val body = """{"status":"unavailable","fallback":"screenshot","reason":"phase 3"}"""
         assertTrue(webrtcFallsBackToScreenshot(body))
         assertFalse(webrtcFallsBackToScreenshot("""{"status":"ok"}"""))
+    }
+
+    @Test
+    fun planCommandPreservesRawShellCommandWhenArgsEmpty() {
+        val shell = planCommand("echo hi && ls", emptyList(), shell = true, shizuku = false, root = false)
+        assertEquals(listOf("/system/bin/sh", "-c", "echo hi && ls"), shell.argv)
+        assertEquals("shell", shell.via)
+        val rooted = planCommand("id && whoami", emptyList(), shell = true, shizuku = false, root = true)
+        assertEquals(listOf("su", "-c", "id && whoami"), rooted.argv)
+        assertEquals("root", rooted.via)
+        val shizuku = planCommand("ps -A | head", emptyList(), shell = true, shizuku = true, root = false)
+        assertEquals(listOf("/system/bin/sh", "-c", "ps -A | head"), shizuku.argv)
+        assertEquals("shizuku", shizuku.via)
+    }
+
+    @Test
+    fun osAwareDefaultPathsAndBreadcrumbsWorkAcrossPlatforms() {
+        assertEquals("app:/", defaultRootPath("android"))
+        assertEquals("/", defaultRootPath("linux"))
+        assertEquals("/", defaultRootPath("darwin"))
+        assertEquals("C:/", defaultRootPath("windows"))
+        assertEquals("/tmp/from-phone.bin", defaultTransferPath("linux"))
+        assertEquals("C:/Users/Public/from-phone.bin", defaultTransferPath("windows"))
+        assertEquals("app:/files/from-phone.bin", defaultTransferPath("android"))
+
+        assertEquals("/usr", parentPath("/usr/local"))
+        assertEquals("/", parentPath("/usr"))
+        assertNull(parentPath("/"))
+        assertEquals("C:/Users", parentPath("C:/Users/alice"))
+        assertEquals("C:/", parentPath("C:/Users"))
+        assertNull(parentPath("C:/"))
+
+        assertEquals(listOf("/" to "/", "/usr" to "usr", "/usr/local" to "local"), pathCrumbs("/usr/local"))
+        assertEquals(listOf("C:/" to "C:", "C:/Users" to "Users"), pathCrumbs("C:/Users"))
+    }
+
+    @Test
+    fun terminalSupportsNonBmpEmojiTrueColorAndReverseVideo() {
+        val screen = TerminalScreen(4, 20)
+        val emoji = "\uD83D\uDE00" // U+1F600 GRINNING FACE
+        val cjkExtB = "\uD840\uDC00" // U+20000 CJK Extension B
+        screen.feed("\u001b[38;2;12;34;56;48;2;78;90;123;7;4mA${emoji}${cjkExtB}\u001b[27;24mB".encodeToByteArray())
+        assertEquals("A${emoji}${cjkExtB}B", screen.rowText(0))
+        assertEquals(0x1F600, screen.codePointAt(0, 1))
+        assertEquals(TerminalScreen.packRgb(12, 34, 56), screen.fgAt(0, 0))
+        assertEquals(TerminalScreen.packRgb(78, 90, 123), screen.bgAt(0, 0))
+        assertTrue(screen.inverseAt(0, 0))
+        assertTrue(screen.underlineAt(0, 0))
+        val bCol = 1 + screen.widthAt(0, 1) + screen.widthAt(0, 1 + screen.widthAt(0, 1))
+        assertFalse(screen.inverseAt(0, bCol))
+        assertFalse(screen.underlineAt(0, bCol))
+        assertArrayEquals(byteArrayOf(0x1b, 0x03), ptyText("c", ctrl = true, alt = true))
+    }
+
+    @Test
+    fun safHelpersHandleShortSkipNonTruncateWriteCapAndSiblingPathEscape() {
+        val shortSkipStream = object : FilterInputStream(ByteArrayInputStream("0123456789".toByteArray())) {
+            override fun skip(n: Long): Long = super.skip(minOf(n, 2L))
+        }
+        assertTrue(skipFully(shortSkipStream, 7L))
+        assertEquals('7'.code, shortSkipStream.read())
+
+        val overwritten = mergeSafWrite("abcdef".toByteArray(), 0L, "XY".toByteArray())
+        assertEquals("XYcdef", overwritten.decodeToString())
+        assertThrows(IllegalStateException::class.java) {
+            mergeSafWrite(ByteArray(0), SafStore.MAX_SAF_REWRITE_BYTES.toLong() + 1L, ByteArray(1))
+        }
+        assertThrows(IllegalStateException::class.java) {
+            mergeSafWrite(ByteArray(0), Long.MAX_VALUE - 2, ByteArray(4))
+        }
+
+        val tmp = File(System.getProperty("java.io.tmpdir"), "agentlink-saf-test-${System.nanoTime()}")
+        val root = File(tmp, "cache")
+        val sibling = File(tmp, "cache-evil/file.txt")
+        assertFalse(isPathInside(sibling, root))
+        assertTrue(isPathInside(File(root, "ok/file.txt"), root))
+    }
+
+    @Test
+    fun jsonFieldHandlesNestedKeysEscapesAndEmbeddedSubstrings() {
+        val raw = """{"detail":"ignored \"state\":\"fake\"","nested":{"state":"inner"},"state":"online","unicode":"ok\u0021"}"""
+        assertEquals("online", jsonField(raw, "state"))
+        assertEquals("ok!", jsonField(raw, "unicode"))
+        assertNull(jsonField("""{"ok":true}""", "ok"))
+        assertNull(jsonField("not json", "state"))
+    }
+
+    @Test
+    fun accessibilityGuardsSensitiveSystemPackages() {
+        assertTrue(AgentAccessibilityService.isGuardedPackage("com.android.permissioncontroller"))
+        assertTrue(AgentAccessibilityService.isGuardedPackage("com.android.settings"))
+        assertTrue(AgentAccessibilityService.isGuardedPackage("moe.shizuku.privileged.api"))
+        assertFalse(AgentAccessibilityService.isGuardedPackage("com.example.notes"))
     }
 }

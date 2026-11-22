@@ -25,6 +25,7 @@ import app.agentlink.bridge.ClientSession
 import app.agentlink.ui.AgentTheme
 import app.agentlink.ui.UserLogin
 import android.net.Uri
+import android.os.Build
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -76,8 +77,9 @@ class LoginFlowTest {
                 )
             }
         }
-        assertAbsent("server")
-        assertAbsent("fingerprint")
+        // Relay URL auto-expands when no built-in relay is configured.
+        rule.onNodeWithTag("server").assertExists()
+        rule.onNodeWithTag("fingerprint").assertExists()
         assertAbsent("totp")
         enterFixtureRelay()
         rule.onNodeWithTag("username").performTextInput("alice")
@@ -86,7 +88,8 @@ class LoginFlowTest {
         assertEquals(1, api.loginCalls)
         assertEquals(FIXTURE_RELAY, api.lastServer)
         assertEquals("", api.lastFingerprint)
-        assertEquals("android", api.lastDevice)
+        val expectedDevice = Build.MODEL?.takeIf { it.isNotBlank() } ?: "android"
+        assertEquals(expectedDevice, api.lastDevice)
         assertEquals("alice", sessions.load()?.user)
         rule.onNodeWithTag("session-user").assertTextEquals("alice")
         rule.onNodeWithTag("nodes").assertTextContains("laptop", substring = true)
@@ -148,7 +151,6 @@ class LoginFlowTest {
                 )
             }
         }
-        rule.onNodeWithTag("advanced-relay").performScrollTo().activate()
         val server = rule.onNodeWithTag("server").fetchSemanticsNode().config.getOrNull(SemanticsProperties.EditableText)?.text
         assertEquals("", server)
         rule.onNodeWithTag("server").performTextReplacement("wss://relay.example:7443")
@@ -312,8 +314,10 @@ private fun SemanticsNodeInteraction.activate() = performSemanticsAction(Semanti
 private const val FIXTURE_RELAY = "wss://relay.example:7443"
 
 private fun LoginFlowTest.enterFixtureRelay(url: String = FIXTURE_RELAY) {
-    rule.onNodeWithTag("advanced-relay").performScrollTo().activate()
-    rule.onNodeWithTag("server").performTextReplacement(url)
+    if (rule.onAllNodesWithTag("server").fetchSemanticsNodes().isEmpty()) {
+        rule.onNodeWithTag("advanced-relay").performScrollTo().activate()
+    }
+    rule.onNodeWithTag("server").performScrollTo().performTextReplacement(url)
 }
 
 private fun LoginFlowTest.assertAbsent(tag: String) {

@@ -1,5 +1,6 @@
 package app.agentlink.ui
 
+import android.content.ClipboardManager
 import android.view.ViewGroup
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
@@ -33,6 +34,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -59,6 +61,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
@@ -89,6 +92,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
@@ -112,6 +116,10 @@ internal fun DesktopView(
     onViewportChange: (DesktopViewport) -> Unit,
     livePlayer: H264Player? = null,
     cursor: LiveCursor? = null,
+    srcWidth: Int = shotW,
+    srcHeight: Int = shotH,
+    cursorPresentation: String = "embedded",
+    onSendClipboard: ((String) -> Unit)? = null,
     emptyText: String? = null,
     liveButton: String = "Request live view",
     liveButtonEnabled: Boolean = true,
@@ -135,10 +143,16 @@ internal fun DesktopView(
             emptyText = pictureText,
             shotW = shotW,
             shotH = shotH,
+            srcWidth = srcWidth,
+            srcHeight = srcHeight,
+            cursorPresentation = cursorPresentation,
             viewport = viewport,
             onViewportChange = onViewportChange,
             control = capability.control,
+            typed = typed,
+            onTyped = onTyped,
             onInject = onInject,
+            onSendClipboard = onSendClipboard,
             livePlayer = livePlayer,
             cursor = cursor,
             onClose = { changeFullscreen(false) },
@@ -151,12 +165,16 @@ internal fun DesktopView(
             frame = frame,
             shotW = shotW,
             shotH = shotH,
+            srcWidth = srcWidth,
+            srcHeight = srcHeight,
+            cursorPresentation = cursorPresentation,
             stream = stream,
             onStream = onStream,
             typed = typed,
             onTyped = onTyped,
             onLive = onLive,
             onInject = onInject,
+            onSendClipboard = onSendClipboard,
             onFullscreen = { changeFullscreen(true) },
             viewport = viewport,
             onViewportChange = onViewportChange,
@@ -178,12 +196,16 @@ private fun DesktopEmbedded(
     frame: ImageBitmap?,
     shotW: Int,
     shotH: Int,
+    srcWidth: Int,
+    srcHeight: Int,
+    cursorPresentation: String,
     stream: Boolean,
     onStream: (Boolean) -> Unit,
     typed: String,
     onTyped: (String) -> Unit,
     onLive: () -> Unit,
     onInject: (JSONObject) -> Unit,
+    onSendClipboard: ((String) -> Unit)?,
     onFullscreen: () -> Unit,
     viewport: DesktopViewport,
     onViewportChange: (DesktopViewport) -> Unit,
@@ -205,6 +227,9 @@ private fun DesktopEmbedded(
                     emptyText = emptyText,
                     shotW = shotW,
                     shotH = shotH,
+                    srcWidth = srcWidth,
+                    srcHeight = srcHeight,
+                    cursorPresentation = cursorPresentation,
                     viewport = viewport,
                     onViewportChange = onViewportChange,
                     control = capability.control,
@@ -251,6 +276,7 @@ private fun DesktopEmbedded(
                     onTyped = onTyped,
                     onLive = onLive,
                     onInject = onInject,
+                    onSendClipboard = onSendClipboard,
                     liveButton = liveButton,
                     liveButtonEnabled = liveButtonEnabled,
                     maxHeight = 132.dp,
@@ -281,6 +307,9 @@ private fun DesktopEmbedded(
                     emptyText = emptyText,
                     shotW = shotW,
                     shotH = shotH,
+                    srcWidth = srcWidth,
+                    srcHeight = srcHeight,
+                    cursorPresentation = cursorPresentation,
                     viewport = viewport,
                     onViewportChange = onViewportChange,
                     control = capability.control,
@@ -296,6 +325,7 @@ private fun DesktopEmbedded(
                     onTyped = onTyped,
                     onLive = onLive,
                     onInject = onInject,
+                    onSendClipboard = onSendClipboard,
                     liveButton = liveButton,
                     liveButtonEnabled = liveButtonEnabled,
                     maxHeight = 220.dp,
@@ -365,11 +395,13 @@ private fun DesktopControls(
     onTyped: (String) -> Unit,
     onLive: () -> Unit,
     onInject: (JSONObject) -> Unit,
+    onSendClipboard: ((String) -> Unit)?,
     liveButton: String,
     liveButtonEnabled: Boolean,
     maxHeight: Dp,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     if (!capability.live && !capability.control) {
         if (capability.available) {
             SupportingText("Input stays off for this preset.", modifier.padding(vertical = 4.dp))
@@ -393,6 +425,14 @@ private fun DesktopControls(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
             ) {
+                if (onSendClipboard != null) {
+                    SecondaryButton("Paste clip", onClick = {
+                        val cm = context.getSystemService(ClipboardManager::class.java)
+                        val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }
+                            ?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                        if (text.isNotEmpty()) onSendClipboard(text)
+                    })
+                }
                 listOf("back", "home", "recents", "notifications").forEach { name ->
                     SecondaryButton(name, onClick = { onInject(globalPayload(name)) })
                 }
@@ -422,14 +462,22 @@ private fun DesktopFullscreen(
     emptyText: String,
     shotW: Int,
     shotH: Int,
+    srcWidth: Int,
+    srcHeight: Int,
+    cursorPresentation: String,
     viewport: DesktopViewport,
     onViewportChange: (DesktopViewport) -> Unit,
     control: Boolean,
+    typed: String,
+    onTyped: (String) -> Unit,
     onInject: (JSONObject) -> Unit,
+    onSendClipboard: ((String) -> Unit)?,
     livePlayer: H264Player?,
     cursor: LiveCursor?,
     onClose: () -> Unit,
 ) {
+    val context = LocalContext.current
+    var showToolbar by remember { mutableStateOf(false) }
     Dialog(
         onDismissRequest = onClose,
         properties = DialogProperties(
@@ -451,6 +499,9 @@ private fun DesktopFullscreen(
                 emptyText = emptyText,
                 shotW = shotW,
                 shotH = shotH,
+                srcWidth = srcWidth,
+                srcHeight = srcHeight,
+                cursorPresentation = cursorPresentation,
                 viewport = viewport,
                 onViewportChange = onViewportChange,
                 control = control,
@@ -460,16 +511,72 @@ private fun DesktopFullscreen(
                 cursor = cursor,
                 modifier = Modifier.fillMaxSize().testTag("desktop-viewport"),
             )
-            IconButton(
-                onClick = onClose,
+            Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .windowInsetsPadding(WindowInsets.safeDrawing)
-                    .padding(8.dp)
-                    .background(Color.Black.copy(alpha = 0.55f), CircleShape)
-                    .testTag("desktop-close"),
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Icon(Icons.Filled.Close, contentDescription = "Close fullscreen", tint = Color.White)
+                IconButton(
+                    onClick = onClose,
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.55f), CircleShape)
+                        .testTag("desktop-close"),
+                ) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close fullscreen", tint = Color.White)
+                }
+                if (control) {
+                    IconButton(
+                        onClick = { showToolbar = !showToolbar },
+                        modifier = Modifier
+                            .background(Color.Black.copy(alpha = 0.55f), CircleShape)
+                            .testTag("desktop-toolbar-toggle"),
+                    ) {
+                        Icon(Icons.Filled.Keyboard, contentDescription = "Toggle input bar", tint = Color.White)
+                    }
+                }
+            }
+            if (control && showToolbar) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .windowInsetsPadding(WindowInsets.safeDrawing)
+                        .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.92f))
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                        .testTag("desktop-fullscreen-toolbar"),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        AgentField(typed, onTyped, "Type text", Modifier.weight(1f))
+                        PrimaryButton("Send", onClick = {
+                            if (typed.isNotEmpty()) {
+                                onInject(JSONObject().put("action", "type").put("text", typed))
+                                onTyped("")
+                            }
+                        })
+                    }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    ) {
+                        if (onSendClipboard != null) {
+                            SecondaryButton("Paste clip", onClick = {
+                                val cm = context.getSystemService(ClipboardManager::class.java)
+                                val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }
+                                    ?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                                if (text.isNotEmpty()) onSendClipboard(text)
+                            })
+                        }
+                        listOf("escape", "tab", "enter", "backspace", "up", "down", "left", "right").forEach { name ->
+                            SecondaryButton(name, onClick = { onInject(keyPayload(name)) })
+                        }
+                    }
+                }
             }
         }
     }
@@ -511,6 +618,9 @@ private fun RemoteFrame(
     emptyText: String,
     shotW: Int,
     shotH: Int,
+    srcWidth: Int,
+    srcHeight: Int,
+    cursorPresentation: String,
     viewport: DesktopViewport,
     onViewportChange: (DesktopViewport) -> Unit,
     control: Boolean,
@@ -551,7 +661,17 @@ private fun RemoteFrame(
                     )
                 },
             )
-            CursorMark(cursor, shotW, shotH, viewSize, viewport)
+            if (cursorPresentation == "metadata") {
+                CursorMark(
+                    cursor = cursor,
+                    shotW = shotW,
+                    shotH = shotH,
+                    srcW = if (srcWidth > 0) srcWidth else shotW,
+                    srcH = if (srcHeight > 0) srcHeight else shotH,
+                    viewSize = viewSize,
+                    viewport = viewport,
+                )
+            }
         } else if (frame == null) {
             Text(
                 emptyText,
@@ -634,11 +754,16 @@ private fun BoxScope.CursorMark(
     cursor: LiveCursor?,
     shotW: Int,
     shotH: Int,
+    srcW: Int,
+    srcH: Int,
     viewSize: IntSize,
     viewport: DesktopViewport,
 ) {
     val mark = cursor ?: return
-    if (shotW <= 0 || shotH <= 0 || viewSize == IntSize.Zero) return
+    if (!mark.visible) return
+    val refW = if (srcW > 0) srcW else shotW
+    val refH = if (srcH > 0) srcH else shotH
+    if (shotW <= 0 || shotH <= 0 || refW <= 0 || refH <= 0 || viewSize == IntSize.Zero) return
     val box = displayedFrame(
         viewSize.width.toFloat(),
         viewSize.height.toFloat(),
@@ -646,8 +771,8 @@ private fun BoxScope.CursorMark(
         shotH.toFloat(),
         viewport,
     )
-    val left = box.imageLeft + (mark.x.toFloat() / shotW) * box.imageWidth
-    val top = box.imageTop + (mark.y.toFloat() / shotH) * box.imageHeight
+    val left = box.imageLeft + ((mark.x - mark.hotspotX).toFloat() / refW) * box.imageWidth
+    val top = box.imageTop + ((mark.y - mark.hotspotY).toFloat() / refH) * box.imageHeight
     Box(
         modifier = Modifier
             .align(Alignment.TopStart)
@@ -678,18 +803,30 @@ private suspend fun PointerInputScope.watchDesktop(
             val slop = viewConfiguration.touchSlop
             var transformed = false
             var panning = false
+            var longPressed = false
+            var scrollAccumY = 0f
             val start = down.position
             var last = down.position
-            var startNorm = mapAt(viewSize, shotW, shotH, viewport, start.x, start.y)
+            val startNorm = mapAt(viewSize, shotW, shotH, viewport, start.x, start.y)
             var lastNorm = startNorm
+            val longPressJob = if (control() && startNorm != null) {
+                launch {
+                    delay(viewConfiguration.longPressTimeoutMillis)
+                    longPressed = true
+                    onInject(rightClickPayload(startNorm.first, startNorm.second))
+                }
+            } else {
+                null
+            }
 
             while (true) {
                 val event = awaitPointerEvent()
                 val pressed = event.changes.filter { it.pressed }
                 if (pressed.isEmpty()) {
+                    longPressJob?.cancel()
                     val up = event.changes.firstOrNull()
                     if (up != null) last = up.position
-                    if (!transformed && !panning && control()) {
+                    if (!transformed && !panning && !longPressed && control()) {
                         val from = startNorm
                         val to = lastNorm ?: from
                         if (from != null && to != null) {
@@ -732,6 +869,7 @@ private suspend fun PointerInputScope.watchDesktop(
                     break
                 }
                 if (pressed.size >= 2) {
+                    longPressJob?.cancel()
                     transformed = true
                     panning = false
                     val zoom = event.calculateZoom()
@@ -739,27 +877,42 @@ private suspend fun PointerInputScope.watchDesktop(
                     val centroid = event.calculateCentroid(useCurrent = true)
                     val size = viewSize()
                     if (centroid != Offset.Unspecified && size.width > 0 && size.height > 0) {
-                        val zoomed = zoomViewport(
-                            size.width.toFloat(),
-                            size.height.toFloat(),
-                            shotW().toFloat(),
-                            shotH().toFloat(),
-                            viewport(),
-                            centroid.x,
-                            centroid.y,
-                            zoom,
-                        )
-                        onViewport(
-                            panViewport(
+                        val isPinching = abs(zoom - 1f) >= 0.04f || !viewport().isFitted()
+                        if (!isPinching && control() && abs(pan.y) > 0f) {
+                            // Two-finger vertical drag at fit scale scrolls the remote desktop.
+                            scrollAccumY += pan.y
+                            val step = (size.height * 0.03f).coerceAtLeast(18f)
+                            val notches = (scrollAccumY / step).toInt()
+                            if (notches != 0) {
+                                scrollAccumY -= notches * step
+                                val norm = mapAt(viewSize, shotW, shotH, viewport, centroid.x, centroid.y)
+                                if (norm != null) {
+                                    onInject(scrollPayload(norm.first, norm.second, 0f, notches.toFloat()))
+                                }
+                            }
+                        } else {
+                            val zoomed = zoomViewport(
                                 size.width.toFloat(),
                                 size.height.toFloat(),
                                 shotW().toFloat(),
                                 shotH().toFloat(),
-                                zoomed,
-                                pan.x,
-                                pan.y,
-                            ),
-                        )
+                                viewport(),
+                                centroid.x,
+                                centroid.y,
+                                zoom,
+                            )
+                            onViewport(
+                                panViewport(
+                                    size.width.toFloat(),
+                                    size.height.toFloat(),
+                                    shotW().toFloat(),
+                                    shotH().toFloat(),
+                                    zoomed,
+                                    pan.x,
+                                    pan.y,
+                                ),
+                            )
+                        }
                     }
                     event.changes.forEach { if (it.positionChanged()) it.consume() }
                 } else {
@@ -769,6 +922,9 @@ private suspend fun PointerInputScope.watchDesktop(
                     val mapped = mapAt(viewSize, shotW, shotH, viewport, last.x, last.y)
                     if (mapped != null) lastNorm = mapped
                     val travel = hypot(last.x - start.x, last.y - start.y)
+                    if (travel > slop) {
+                        longPressJob?.cancel()
+                    }
                     if (!transformed && !viewport().isFitted() && travel > slop) {
                         panning = true
                         val size = viewSize()
@@ -822,6 +978,19 @@ private fun emptyFrameText(capability: DesktopCapability): String {
 
 private fun tapPayload(x: Float, y: Float): JSONObject {
     return JSONObject().put("action", "tap").put("x", x.toDouble()).put("y", y.toDouble())
+}
+
+private fun rightClickPayload(x: Float, y: Float): JSONObject {
+    return JSONObject().put("action", "right_click").put("x", x.toDouble()).put("y", y.toDouble())
+}
+
+private fun scrollPayload(x: Float, y: Float, dx: Float, dy: Float): JSONObject {
+    return JSONObject()
+        .put("action", "scroll")
+        .put("x", x.toDouble())
+        .put("y", y.toDouble())
+        .put("dx", dx.toDouble())
+        .put("dy", dy.toDouble())
 }
 
 private fun swipePayload(from: Pair<Float, Float>, to: Pair<Float, Float>): JSONObject {

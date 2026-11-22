@@ -1,8 +1,30 @@
 package app.agentlink.model
 
+import org.json.JSONObject
+
 data class DirItem(val name: String, val isDir: Boolean)
 
 data class SafGuest(val id: String, val relative: String)
+
+fun defaultRootPath(os: String): String {
+    val lower = os.trim().lowercase()
+    return when {
+        "android" in lower -> "app:/"
+        "darwin" in lower || "mac" in lower -> "/"
+        lower.startsWith("win") -> "C:/"
+        else -> "/"
+    }
+}
+
+fun defaultTransferPath(os: String): String {
+    val lower = os.trim().lowercase()
+    return when {
+        "android" in lower -> "app:/files/from-phone.bin"
+        "darwin" in lower || "mac" in lower -> "/tmp/from-phone.bin"
+        lower.startsWith("win") -> "C:/Users/Public/from-phone.bin"
+        else -> "/tmp/from-phone.bin"
+    }
+}
 
 fun childPath(parent: String, name: String): String {
     val base = if (parent.endsWith("/")) parent.dropLast(1) else parent
@@ -10,9 +32,13 @@ fun childPath(parent: String, name: String): String {
 }
 
 fun parentPath(path: String): String? {
-    val trimmed = path.trimEnd('/')
+    val normalized = path.trim().replace('\\', '/')
+    if (normalized.isEmpty() || normalized == "/") return null
+    val trimmed = normalized.trimEnd('/')
+    if (trimmed.isEmpty()) return null
     val slash = trimmed.lastIndexOf('/')
-    if (slash <= 0) return null
+    if (slash < 0) return null
+    if (slash == 0) return "/"
     val parent = trimmed.substring(0, slash)
     return if (parent.endsWith(":")) "$parent/" else parent
 }
@@ -101,12 +127,14 @@ fun shellJoin(program: String, args: List<String>): String =
 data class ShellPlan(val argv: List<String>, val via: String)
 
 fun planCommand(program: String, args: List<String>, shell: Boolean, shizuku: Boolean, root: Boolean): ShellPlan {
-    val joined = shellJoin(program, args)
+    // When shell=true with no separate args, `program` is already a raw shell
+    // command line (e.g. "echo hi && ls") and must not be single-quoted.
+    val command = if (shell && args.isEmpty()) program else shellJoin(program, args)
     return when {
-        root -> ShellPlan(listOf("su", "-c", joined), "root")
-        shizuku && shell -> ShellPlan(listOf("/system/bin/sh", "-c", joined), "shizuku")
+        root -> ShellPlan(listOf("su", "-c", command), "root")
+        shizuku && shell -> ShellPlan(listOf("/system/bin/sh", "-c", command), "shizuku")
         shizuku -> ShellPlan(listOf(program) + args, "shizuku")
-        shell -> ShellPlan(listOf("/system/bin/sh", "-c", joined), "shell")
+        shell -> ShellPlan(listOf("/system/bin/sh", "-c", command), "shell")
         else -> ShellPlan(listOf(program) + args, "exec")
     }
 }
@@ -147,28 +175,145 @@ fun auditRecord(
     return out.toString()
 }
 
+private val hasRealOrgJson: Boolean by lazy {
+    try {
+        JSONObject("{\"a\":\"b\"}").opt("a") == "b"
+    } catch (_: Throwable) {
+        false
+    }
+}
+
 fun jsonField(json: String, key: String): String? {
-    val needle = "\"$key\""
-    val keyAt = json.indexOf(needle)
-    if (keyAt < 0) return null
-    val colon = json.indexOf(':', keyAt + needle.length)
-    if (colon < 0) return null
-    var i = colon + 1
-    while (i < json.length && json[i].isWhitespace()) i++
-    if (i >= json.length || json[i] != '"') return null
-    val start = i + 1
-    val end = StringBuilder()
-    var j = start
-    while (j < json.length) {
-        val ch = json[j]
-        if (ch == '\\' && j + 1 < json.length) {
-            end.append(json[j + 1])
-            j += 2
-            continue
+    if (hasRealOrgJson) {
+        return try {
+            val obj = JSONObject(json)
+            if (!obj.has(key) || obj.isNull(key)) return null
+            obj.opt(key) as? String
+        } catch (_: Throwable) {
+            null
         }
-        if (ch == '"') return end.toString()
-        end.append(ch)
-        j++
+    }
+    return parseTopLevelJsonStringField(json, key)
+}
+
+private fun parseTopLevelJsonStringField(json: String, targetKey: String): String? {
+    var i = 0
+    val n = json.length
+    fun skipWs() {
+        while (i < n && json[i] in " \t\r\n") i++
+    }
+    fun readString(): String? {
+        if (i >= n || json[i] != '"') return null
+        i++
+        val sb = StringBuilder()
+        while (i < n) {
+            val ch = json[i++]
+            when (ch) {
+                '"' -> return sb.toString()
+                '\\' -> {
+                    if (i >= n) return null
+                    when (val esc = json[i++]) {
+                        '"', '\\', '/' -> sb.append(esc)
+                        'b' -> sb.append('\b')
+                        'f' -> sb.append('\u000C')
+                        'n' -> sb.append('\n')
+                        'r' -> sb.append('\r')
+                        't' -> sb.append('\t')
+                        'u' -> {
+                            if (i + 4 > n) return null
+                            val hex = json.substring(i, i + 4).toIntOrNull(16) ?: return null
+                            sb.append(hex.toChar())
+                            i += 4
+                        }
+                        else -> return null
+                    }
+                }
+                else -> {
+                    if (ch.code < 0x20) return null
+                    sb.append(ch)
+                }
+            }
+        }
+        return null
+    }
+    fun skipValue(): Boolean {
+        skipWs()
+        if (i >= n) return false
+        return when (json[i]) {
+            '"' -> readString() != null
+            '{' -> {
+                i++
+                skipWs()
+                if (i < n && json[i] == '}') {
+                    i++
+                    return true
+                }
+                while (i < n) {
+                    skipWs()
+                    if (readString() == null) return false
+                    skipWs()
+                    if (i >= n || json[i] != ':') return false
+                    i++
+                    if (!skipValue()) return false
+                    skipWs()
+                    if (i >= n) return false
+                    when (json[i++]) {
+                        ',' -> continue
+                        '}' -> return true
+                        else -> return false
+                    }
+                }
+                false
+            }
+            '[' -> {
+                i++
+                skipWs()
+                if (i < n && json[i] == ']') {
+                    i++
+                    return true
+                }
+                while (i < n) {
+                    if (!skipValue()) return false
+                    skipWs()
+                    if (i >= n) return false
+                    when (json[i++]) {
+                        ',' -> continue
+                        ']' -> return true
+                        else -> return false
+                    }
+                }
+                false
+            }
+            else -> {
+                val start = i
+                while (i < n && json[i] !in ",}] \t\r\n") i++
+                i > start
+            }
+        }
+    }
+    skipWs()
+    if (i >= n || json[i] != '{') return null
+    i++
+    skipWs()
+    if (i < n && json[i] == '}') return null
+    while (i < n) {
+        skipWs()
+        val k = readString() ?: return null
+        skipWs()
+        if (i >= n || json[i] != ':') return null
+        i++
+        skipWs()
+        if (k == targetKey) {
+            return if (i < n && json[i] == '"') readString() else null
+        }
+        if (!skipValue()) return null
+        skipWs()
+        if (i >= n) return null
+        when (json[i++]) {
+            ',' -> continue
+            '}' -> return null
+            else -> return null
+        }
     }
     return null
 }

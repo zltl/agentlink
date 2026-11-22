@@ -3,7 +3,6 @@ package app.agentlink.node
 import android.content.Context
 import android.os.Build
 import android.util.DisplayMetrics
-import android.view.WindowManager
 import app.agentlink.BuildConfig
 import org.json.JSONArray
 import org.json.JSONObject
@@ -17,7 +16,8 @@ class AndroidHost(
     private val capture: ScreenGrabber,
     private val allowShizuku: Boolean,
     private val allowRoot: Boolean,
-    private val onStatus: (String) -> Unit,
+    private val statusCallback: (String) -> Unit,
+    private val stageCacheDir: File = File(context.cacheDir, "node-cache"),
 ) : NodeHost {
     override fun unary(kind: String, payloadJson: String): String = guard {
         val payload = jsonObject(payloadJson)
@@ -90,17 +90,18 @@ class AndroidHost(
     }
 
     override fun preparePath(guest: String, write: Boolean): String = guard {
-        val real = saf.stage(guest, write, context.cacheDir)
+        stageCacheDir.mkdirs()
+        val real = saf.stage(guest, write, stageCacheDir)
         hostOk(JSONObject().put("real_path", real.absolutePath))
     }
 
     override fun publishPath(guest: String, realPath: String): String = guard {
-        saf.publish(guest, realPath)
+        saf.publish(guest, realPath, stageCacheDir)
         hostOk(JSONObject())
     }
 
     override fun onStatus(statusJson: String) {
-        onStatus(statusJson)
+        statusCallback(statusJson)
     }
 
     private fun extension(name: String, payload: JSONObject): JSONObject {
@@ -219,12 +220,7 @@ class AndroidHost(
             .put("saf_roots", safRoots)
     }
 
-    private fun realMetrics(): DisplayMetrics {
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        context.getSystemService(WindowManager::class.java).defaultDisplay.getRealMetrics(metrics)
-        return metrics
-    }
+    private fun realMetrics(): DisplayMetrics = currentDisplayMetrics(context)
 
     private fun px(fraction: Double, span: Int): Float {
         return (fraction.coerceIn(0.0, 1.0) * span).toFloat()

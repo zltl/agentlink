@@ -31,6 +31,16 @@ class NativeBridge : LinkBridge {
 }
 
 internal class NativeClient(private val client: MobileClient) : ClientSession {
+    override fun updateAccessToken(token: String) {
+        call { client.updateAccessToken(token) }
+    }
+
+    override fun setIceServers(iceServersJson: String) {
+        call { client.setIceServers(iceServersJson) }
+    }
+
+    override fun refreshIceServers(): String = call { client.refreshIceServers() }
+
     override fun listMachines(): List<MachineRow> = call {
         client.listMachines().map { it.toRow() }
     }
@@ -65,6 +75,85 @@ internal class NativeClient(private val client: MobileClient) : ClientSession {
 
     override fun rename(node: String, from: String, to: String) {
         call { client.rename(node, from, to) }
+    }
+
+    override fun findFiles(
+        node: String,
+        path: String,
+        pattern: String,
+        regex: Boolean,
+        includeHidden: Boolean,
+        caseInsensitive: Boolean,
+        limit: UInt,
+    ): String = call {
+        client.findFiles(node, path, pattern, regex, includeHidden, caseInsensitive, limit)
+    }
+
+    override fun searchContent(
+        node: String,
+        path: String,
+        pattern: String,
+        literal: Boolean,
+        includeHidden: Boolean,
+        caseInsensitive: Boolean,
+        limit: UInt,
+    ): String = call {
+        client.searchContent(node, path, pattern, literal, includeHidden, caseInsensitive, limit)
+    }
+
+    override fun queryAudit(nodeId: String, limit: UInt): String = call {
+        client.queryAudit(nodeId, limit)
+    }
+
+    override fun sysInfo(node: String): String = call {
+        client.sysInfo(node)
+    }
+
+    override fun listNodePins(): List<NodePinRow> = call {
+        client.listNodePins().map { NodePinRow(name = it.name, nodeId = it.nodeId) }
+    }
+
+    override fun clearNodePin(name: String): Boolean = call {
+        client.clearNodePin(name)
+    }
+
+    override fun nodePinWarnings(): List<String> = call {
+        client.nodePinWarnings()
+    }
+
+    override fun listGrants(): List<GrantRow> = call {
+        client.listGrants().map {
+            GrantRow(
+                nodeId = it.nodeId,
+                granteeId = it.granteeId,
+                issuerId = it.issuerId,
+                jti = it.jti,
+                nbfUnix = it.nbfUnix,
+                expUnix = it.expUnix,
+                preset = it.preset,
+            )
+        }
+    }
+
+    override fun importGrant(grantJson: String): GrantRow = call {
+        val g = client.importGrant(grantJson)
+        GrantRow(
+            nodeId = g.nodeId,
+            granteeId = g.granteeId,
+            issuerId = g.issuerId,
+            jti = g.jti,
+            nbfUnix = g.nbfUnix,
+            expUnix = g.expUnix,
+            preset = g.preset,
+        )
+    }
+
+    override fun deleteGrant(nodeId: String): Boolean = call {
+        client.deleteGrant(nodeId)
+    }
+
+    override fun revokeDevice(deviceId: String) {
+        call { client.revokeDevice(deviceId) }
     }
 
     override fun exec(
@@ -173,6 +262,9 @@ private class NativeLive(private val live: DesktopLive) : LiveDesktop {
             width = info.width.toInt(),
             height = info.height.toInt(),
             control = info.control,
+            srcWidth = info.srcWidth.toInt(),
+            srcHeight = info.srcHeight.toInt(),
+            cursorPresentation = info.cursorPresentation,
         )
     }
 
@@ -189,7 +281,19 @@ private class NativeLive(private val live: DesktopLive) : LiveDesktop {
 
     override fun pollCursor(): LiveCursor? {
         val cursor = call { live.pollCursor() } ?: return null
-        return LiveCursor(cursor.x, cursor.y, cursor.shape)
+        return LiveCursor(
+            x = cursor.x,
+            y = cursor.y,
+            shape = cursor.shape,
+            visible = cursor.visible,
+            hotspotX = cursor.hotspotX.toInt(),
+            hotspotY = cursor.hotspotY.toInt(),
+        )
+    }
+
+    override fun pollClipboard(): LiveClipboardRow? {
+        val clip = call { live.pollClipboard() } ?: return null
+        return LiveClipboardRow(text = clip.text, truncated = clip.truncated)
     }
 
     override fun stats(): LiveStats {
@@ -198,6 +302,8 @@ private class NativeLive(private val live: DesktopLive) : LiveDesktop {
     }
 
     override fun sendControl(json: String): Boolean = call { live.sendControl(json) }
+
+    override fun sendClipboard(text: String): Boolean = call { live.sendClipboard(text) }
 
     override fun requestKeyframe() {
         call { live.requestKeyframe() }

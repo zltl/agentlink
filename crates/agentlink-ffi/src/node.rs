@@ -8,13 +8,12 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use agentlink_core::e2e::{self, Endpoint};
-use agentlink_core::p2p::QuicPeer;
 use agentlink_core::protocol::{Envelope, Op, Role, PROTOCOL_VERSION};
 use agentlink_core::tls;
 use agentlink_core::util::{self, FILE_CHUNK};
@@ -66,20 +65,27 @@ pub struct NodeIo {
     pub node_id: Arc<Mutex<String>>,
 }
 
+struct CancelEntry {
+    token: CancellationToken,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
+}
+
 struct PhoneLive {
     socket: Arc<SocketSlot>,
     sessions: Arc<Sessions>,
-    cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    cancels: Arc<Mutex<HashMap<String, CancelEntry>>>,
     shells: Arc<PhonePty>,
     host_sessions: Arc<crate::host::HostSessionRegistry>,
     /// Node data dir. Owner keys are reloaded from here before each authz
     /// decision so `grant trust-owner` applies without a restart.
     data_dir: PathBuf,
     /// Last good trusted owner issuer keys. Non-empty enables signed-grant authz.
-    owner_keys: RwLock<std::collections::BTreeSet<String>>,
+    owner_keys: RwLock<BTreeSet<String>>,
     /// Last good revoked-jti deny-list, reloaded from the data dir before each
     /// authz decision so `grant revoke --data-dir` applies without a restart.
-    revoked_jtis: RwLock<std::collections::BTreeSet<String>>,
+    revoked_jtis: RwLock<BTreeSet<String>>,
     node_id: String,
 }
 
@@ -142,38 +148,12 @@ pub async fn serve_node(
         host: host.clone(),
     });
     let policy = Arc::new(RwLock::new(config.ceiling));
-    let allowed = Arc::new(Mutex::new(HashMap::new()));
-    let relay_udp = agentlink_core::p2p::relay_addr_from_url(&config.relay_url).ok();
-    let quic = match QuicPeer::bind(&identity, relay_udp) {
-        Ok(peer) => {
-            let peer = Arc::new(peer);
-            transfer::spawn_accept(
-                peer.clone(),
-                allowed.clone(),
-                policy.clone(),
-                config.ceiling,
-                paths.clone(),
-                audit.clone(),
-                shutdown.clone(),
-            );
-            Some(peer)
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "direct path unavailable; transfers stay on the relay");
-            None
-        }
-    };
     let endpoint = Endpoint::new(identity);
     let token = Arc::new(Mutex::new(config.pairing_token.clone()));
     let tools = Arc::new(ToolState::default());
-    let owner_keys = agentlink_core::grant::refresh_owner_keys(
-        &config.data_dir,
-        &std::collections::BTreeSet::new(),
-    );
-    let revoked_jtis = agentlink_core::grant::refresh_revoked_jtis(
-        &config.data_dir,
-        &std::collections::BTreeSet::new(),
-    );
+    let owner_keys = agentlink_core::grant::refresh_owner_keys(&config.data_dir, &BTreeSet::new());
+    let revoked_jtis =
+        agentlink_core::grant::refresh_revoked_jtis(&config.data_dir, &BTreeSet::new());
     let live = PhoneLive {
         socket: Arc::new(SocketSlot::default()),
         sessions: Arc::new(Sessions::default()),
@@ -211,6 +191,7 @@ pub async fn serve_node(
         if shutdown.is_cancelled() {
             tools.shutdown();
             live.shells.close_all();
+            release_all_host_sessions(&live.host_sessions, &host);
             publish(&host, &io, "stopped", &node_id, config.ceiling, "stopped");
             return Ok(());
         }
@@ -223,8 +204,6 @@ pub async fn serve_node(
             &host,
             &io,
             policy.clone(),
-            allowed.clone(),
-            quic.clone(),
             paths.clone(),
             token.clone(),
             tools.clone(),
@@ -236,6 +215,7 @@ pub async fn serve_node(
             Err(err) if err.is_fatal() && !err.to_string().contains("already used") => {
                 tools.shutdown();
                 live.shells.close_all();
+                release_all_host_sessions(&live.host_sessions, &host);
                 publish(
                     &host,
                     &io,
@@ -249,6 +229,7 @@ pub async fn serve_node(
             Err(err) if err.to_string().contains("relay url") => {
                 tools.shutdown();
                 live.shells.close_all();
+                release_all_host_sessions(&live.host_sessions, &host);
                 publish(
                     &host,
                     &io,
@@ -278,6 +259,7 @@ pub async fn serve_node(
             _ = shutdown.cancelled() => {
                 tools.shutdown();
                 live.shells.close_all();
+                release_all_host_sessions(&live.host_sessions, &host);
                 publish(&host, &io, "stopped", &node_id, config.ceiling, "stopped");
                 return Ok(());
             }
@@ -296,8 +278,6 @@ async fn connect_once(
     host_cb: &Arc<dyn NodeHost>,
     io: &NodeIo,
     policy: Arc<RwLock<NodePolicy>>,
-    allowed: Arc<Mutex<HashMap<String, Instant>>>,
-    quic: Option<Arc<QuicPeer>>,
     paths: Arc<PathMap>,
     pairing_token: Arc<Mutex<Option<String>>>,
     tools: Arc<ToolState>,
@@ -432,12 +412,13 @@ async fn connect_once(
         &config.relay_url,
         true,
         None,
-    );
+    )
+    .await;
 
     let (sink, mut stream) = ws.split();
     let (tx, rx) = mpsc::channel(256);
     let generation = live.socket.attach(tx.clone());
-    spawn_grant_watch(live, generation);
+    spawn_grant_watch(live, &tools, host_cb, generation);
     let writer = ws::WriterTask::spawn(sink, rx, shutdown.clone());
     let dead_after = ws::silence_limit(heartbeat_secs);
     let ping_tx = tx.clone();
@@ -468,11 +449,8 @@ async fn connect_once(
     let transfer_host = Arc::new(TransferHost {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         direct_wait: Arc::new(Mutex::new(HashMap::new())),
-        allowed,
-        quic,
         tx: tx.clone(),
         policy: policy.clone(),
-        max_policy: config.ceiling,
         paths,
         e2e: endpoint.clone(),
         node_id: endpoint.identity().node_id().to_string(),
@@ -484,10 +462,7 @@ async fn connect_once(
         match ws::wait_for_frame(&mut stream, dead_after, shutdown, writer.stopped()).await {
             Err(err) => break Err(err),
             Ok(ws::FrameWait::Shutdown) => {
-                live.socket.detach(generation);
-                cancel_all(&live.cancels);
-                live.shells.close_all();
-                audit_hub.set_tx(None);
+                drop_link(live, &tools, host_cb, generation, audit_hub);
                 return Ok(());
             }
             Ok(ws::FrameWait::Silent) => {
@@ -537,7 +512,7 @@ async fn connect_once(
             }
         }
     };
-    drop_link(live, generation, audit_hub);
+    drop_link(live, &tools, host_cb, generation, audit_hub);
     end
 }
 
@@ -620,7 +595,6 @@ async fn handle_env(
             (
                 inner,
                 Some(PhoneSeal {
-                    endpoint: endpoint.clone(),
                     peer,
                     node_id: endpoint.identity().node_id().to_string(),
                     session,
@@ -638,8 +612,11 @@ async fn handle_env(
                 Ok(Some(sanitized)) => {
                     match sanitized.to_toml() {
                         Ok(clean_toml) => {
-                            if let Err(err) =
-                                std::fs::write(config.data_dir.join("audit.toml"), clean_toml)
+                            let path = config.data_dir.join("audit.toml");
+                            if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
+                                std::fs::write(path, clean_toml)
+                            })
+                            .await
                             {
                                 tracing::warn!(error = %err, "could not save pushed audit policy");
                             }
@@ -671,16 +648,26 @@ async fn handle_env(
             publish(host_cb, io, "online", "", effective, "policy updated");
         }
         Envelope::Session { cursors, .. } => {
+            let Some(seal_ref) = seal.as_ref() else {
+                tracing::debug!("ignoring unsealed session cursor update");
+                return;
+            };
             let pairs: Vec<(String, u64)> = cursors
                 .into_iter()
                 .map(|cursor| (cursor.request_id, cursor.seq))
                 .collect();
-            live.sessions.note_cursors(&pairs);
+            live.sessions.note_cursors(&seal_ref.peer, &pairs);
         }
         Envelope::Cancel { request_id, .. } => {
+            let Some(seal_ref) = seal.as_ref() else {
+                tracing::debug!("ignoring unsealed cancel");
+                return;
+            };
             if let Ok(map) = live.cancels.lock() {
-                if let Some(token) = map.get(&request_id) {
-                    token.cancel();
+                if let Some(entry) = map.get(&request_id) {
+                    if entry.owner_peer == seal_ref.peer {
+                        entry.token.cancel();
+                    }
                 }
             }
         }
@@ -692,32 +679,9 @@ async fn handle_env(
             authz,
             ..
         } => {
-            if let Some(log) = live.sessions.existing(&request_id) {
-                replay_log(&log, live.sessions.cursor(&request_id), seal.as_ref(), tx).await;
-                return;
-            }
-            let Some(log) = live.sessions.begin(&request_id) else {
-                return;
-            };
-            let token = CancellationToken::new();
-            if let Ok(mut map) = live.cancels.lock() {
-                map.insert(request_id.clone(), token.clone());
-            }
-            let resp = Responder {
-                socket: live.socket.clone(),
-                request_id: request_id.clone(),
-                seal: seal.clone(),
-                log,
-            };
-            if let agentlink_core::protocol::Op::RevokeGrant { .. } = &op {
-                let _ = resp
-                    .err("grant list is local to this node; revoke on the node host")
-                    .await;
-                return;
-            }
             let Some(seal_ref) = seal.as_ref() else {
                 let deny = Envelope::result_err(
-                    request_id.clone(),
+                    request_id,
                     "control requires an end-to-end session; plaintext relay invokes are disabled",
                 );
                 if let Ok(out) = ws::encode(&deny) {
@@ -725,27 +689,35 @@ async fn handle_env(
                 }
                 return;
             };
+            if let Op::RevokeGrant { .. } = &op {
+                send_sealed_err(
+                    seal_ref,
+                    tx,
+                    request_id,
+                    "grant list is local to this node; revoke on the node host",
+                )
+                .await;
+                return;
+            }
             let grantee = seal_ref.peer.clone();
             let _relay_says = (&client_id, relay_admin, relay_grant);
             let ceiling = match live_policy(policy) {
                 Ok(policy) => policy,
                 Err(err) => {
-                    let deny = Envelope::result_err(request_id.clone(), err.to_string());
-                    if let Ok(out) = ws::encode(&deny) {
-                        let _ = tx.send(out).await;
-                    }
+                    send_sealed_err(seal_ref, tx, request_id, err.to_string()).await;
                     return;
                 }
             };
             let owner_keys = live.current_owner_keys();
             let revoked_jtis = live.current_revoked_jtis();
+            let now_unix = agentlink_core::util::unix_now();
             let policy_now = match agentlink_core::grant::resolve_e2e_policy(
                 &owner_keys,
                 &revoked_jtis,
                 authz.as_ref(),
                 &live.node_id,
                 &grantee,
-                agentlink_core::util::unix_now(),
+                now_unix,
                 ceiling,
                 false,
                 None,
@@ -755,12 +727,50 @@ async fn handle_env(
                 Ok(policy) => policy.intersect(config.ceiling),
                 Err(err) => {
                     tracing::warn!(error = %err, "e2e authz rejected");
-                    let deny = Envelope::result_err(request_id.clone(), err.to_string());
-                    if let Ok(out) = ws::encode(&deny) {
-                        let _ = tx.send(out).await;
-                    }
+                    send_sealed_err(seal_ref, tx, request_id, err.to_string()).await;
                     return;
                 }
+            };
+            if let Some(log) = live.sessions.existing(&request_id) {
+                if !log.is_authorized_for(&grantee, &revoked_jtis, now_unix) {
+                    send_sealed_err(
+                        seal_ref,
+                        tx,
+                        request_id,
+                        "session not found for this peer or grant is no longer active",
+                    )
+                    .await;
+                    return;
+                }
+                let cursor = live.sessions.cursor(&grantee, &request_id);
+                replay_log(&log, cursor, seal_ref, tx).await;
+                return;
+            }
+            let grant_jti = authz.as_ref().map(|g| g.jti.clone()).unwrap_or_default();
+            let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
+            let Some(log) =
+                live.sessions
+                    .begin(&request_id, &grantee, &grant_jti, grant_exp_unix)
+            else {
+                return;
+            };
+            let token = CancellationToken::new();
+            if let Ok(mut map) = live.cancels.lock() {
+                map.insert(
+                    request_id.clone(),
+                    CancelEntry {
+                        token: token.clone(),
+                        owner_peer: grantee.clone(),
+                        grant_jti: grant_jti.clone(),
+                        grant_exp_unix,
+                    },
+                );
+            }
+            let resp = Responder {
+                socket: live.socket.clone(),
+                request_id: request_id.clone(),
+                seal: Some(seal_ref.clone()),
+                log: log.clone(),
             };
             let paths = transfer_host.paths.clone();
             let host_cb = host_cb.clone();
@@ -769,10 +779,13 @@ async fn handle_env(
             let host_sessions = live.host_sessions.clone();
             let tools = tools.clone();
             let audit_hub = audit_hub.clone();
-            let grant_jti = authz.as_ref().map(|g| g.jti.clone()).unwrap_or_default();
-            let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
             let peer = grantee.clone();
             tokio::spawn(async move {
+                let _cleanup = InvokeCleanup {
+                    cancels,
+                    request_id: request_id.clone(),
+                    log,
+                };
                 dispatch(
                     op,
                     resp,
@@ -790,9 +803,6 @@ async fn handle_env(
                     &tools,
                 )
                 .await;
-                if let Ok(mut map) = cancels.lock() {
-                    map.remove(&request_id);
-                }
             });
         }
         Envelope::Result {
@@ -801,9 +811,10 @@ async fn handle_env(
             error,
             ..
         } => {
-            transfer::fail_session(
+            transfer::fail_session_for_peer(
                 transfer_host,
                 &request_id,
+                seal.as_ref().map(|s| s.peer.as_str()),
                 error.unwrap_or_else(|| "transfer rejected".into()),
             );
         }
@@ -829,16 +840,13 @@ async fn handle_env(
             let ceiling = match live_policy(policy) {
                 Ok(policy) => policy,
                 Err(err) => {
-                    let deny = Envelope::result_err(request_id, err.to_string());
-                    if let Ok(out) = ws::encode(&deny) {
-                        let _ = tx.send(out).await;
-                    }
+                    send_sealed_err(seal_ref, tx, request_id, err.to_string()).await;
                     return;
                 }
             };
             let owner_keys = live.current_owner_keys();
             let revoked_jtis = live.current_revoked_jtis();
-            if let Err(err) = agentlink_core::grant::resolve_e2e_policy(
+            let policy_now = match agentlink_core::grant::resolve_e2e_policy(
                 &owner_keys,
                 &revoked_jtis,
                 authz.as_ref(),
@@ -850,18 +858,19 @@ async fn handle_env(
                 None,
                 None,
             ) {
-                let deny = Envelope::result_err(request_id, err.to_string());
-                if let Ok(out) = ws::encode(&deny) {
-                    let _ = tx.send(out).await;
+                Ok(policy) => policy.intersect(config.ceiling),
+                Err(err) => {
+                    send_sealed_err(seal_ref, tx, request_id, err.to_string()).await;
+                    return;
                 }
-                return;
-            }
+            };
             transfer::on_transfer(
                 transfer_host.clone(),
                 request_id,
                 grantee.clone(),
                 msg,
                 Some(seal_ref.session.clone()),
+                policy_now,
             )
             .await;
         }
@@ -875,9 +884,43 @@ async fn handle_env(
     }
 }
 
+struct InvokeCleanup {
+    cancels: Arc<Mutex<HashMap<String, CancelEntry>>>,
+    request_id: String,
+    log: Arc<ReplayLog>,
+}
+
+impl Drop for InvokeCleanup {
+    fn drop(&mut self) {
+        self.log.mark_finished();
+        if let Ok(mut map) = self.cancels.lock() {
+            map.remove(&self.request_id);
+        }
+    }
+}
+
+async fn send_sealed_err(
+    seal: &PhoneSeal,
+    tx: &mpsc::Sender<Outbound>,
+    request_id: String,
+    message: impl Into<String>,
+) {
+    let deny = Envelope::result_err(request_id, message);
+    let encoded = match e2e::seal_envelope_session(&seal.session, &seal.node_id, &seal.peer, &deny)
+    {
+        Ok(wrapped) => ws::encode(&wrapped),
+        Err(err) => {
+            tracing::debug!(error = %err, "seal error reply failed");
+            return;
+        }
+    };
+    if let Ok(out) = encoded {
+        let _ = tx.send(out).await;
+    }
+}
+
 #[derive(Clone)]
 struct PhoneSeal {
-    endpoint: Endpoint,
     peer: String,
     node_id: String,
     session: std::sync::Arc<agentlink_core::e2e::Direction>,
@@ -951,7 +994,7 @@ async fn dispatch(
     cancel: CancellationToken,
     policy: NodePolicy,
     paths: &PathMap,
-    audit_hub: &AuditHub,
+    audit_hub: &Arc<AuditHub>,
     client_id: &str,
     peer: &str,
     grant_jti: &str,
@@ -964,7 +1007,6 @@ async fn dispatch(
     let kind = op.kind();
     let detail = op.audit_detail();
     if cancel.is_cancelled() {
-        let _ = resp.err("cancelled").await;
         audit::submit_op(
             audit_hub,
             &kind,
@@ -972,12 +1014,14 @@ async fn dispatch(
             &detail,
             false,
             Some("cancelled".into()),
-        );
+        )
+        .await;
+        let _ = resp.err("cancelled").await;
         return;
     }
     if let Err(why) = policy.allows(&op) {
-        let _ = resp.err(why.clone()).await;
-        audit::submit_op(audit_hub, &kind, client_id, &detail, false, Some(why));
+        audit::submit_op(audit_hub, &kind, client_id, &detail, false, Some(why.clone())).await;
+        let _ = resp.err(why).await;
         return;
     }
     let audit_this = !matches!(op, Op::PtyInput { .. });
@@ -998,7 +1042,7 @@ async fn dispatch(
     .await;
     if audit_this {
         match &result {
-            Ok(()) => audit::submit_op(audit_hub, &kind, client_id, &detail, true, None),
+            Ok(_) => audit::submit_op(audit_hub, &kind, client_id, &detail, true, None).await,
             Err(err) => {
                 audit::submit_op(
                     audit_hub,
@@ -1007,12 +1051,19 @@ async fn dispatch(
                     &detail,
                     false,
                     Some(err.to_string()),
-                );
+                )
+                .await;
             }
         }
     }
-    if let Err(err) = result {
-        let _ = resp.err(err.to_string()).await;
+    match result {
+        Ok(Some(body)) => {
+            let _ = resp.ok(body).await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            let _ = resp.err(err.to_string()).await;
+        }
     }
 }
 
@@ -1029,15 +1080,26 @@ async fn perform(
     peer: &str,
     grant_jti: &str,
     grant_exp_unix: Option<i64>,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     match op {
         Op::Stat { path } => {
-            let stat = files::stat_guest(&paths.roots, host, path)?;
-            resp.ok(serde_json::to_value(stat)?).await?;
+            let roots = paths.roots.clone();
+            let host = host.clone();
+            let path = path.clone();
+            let stat = tokio::task::spawn_blocking(move || files::stat_guest(&roots, &host, &path))
+                .await
+                .map_err(|e| Error::Message(format!("file task: {e}")))??;
+            Ok(Some(serde_json::to_value(stat)?))
         }
         Op::ListDir { path } => {
-            let entries = files::list_guest(&paths.roots, host, path)?;
-            resp.ok(serde_json::to_value(entries)?).await?;
+            let roots = paths.roots.clone();
+            let host = host.clone();
+            let path = path.clone();
+            let entries =
+                tokio::task::spawn_blocking(move || files::list_guest(&roots, &host, &path))
+                    .await
+                    .map_err(|e| Error::Message(format!("file task: {e}")))??;
+            Ok(Some(serde_json::to_value(entries)?))
         }
         Op::ReadFile {
             path,
@@ -1045,6 +1107,7 @@ async fn perform(
             max_bytes,
         } => {
             read_chunks(resp, cancel, paths, host, path, *offset, *max_bytes).await?;
+            Ok(None)
         }
         Op::WriteFile {
             path,
@@ -1053,21 +1116,47 @@ async fn perform(
             truncate,
         } => {
             let data = util::b64_decode(data_b64)?;
-            let n = files::write_guest(&paths.roots, host, path, *offset, &data, *truncate)?;
-            resp.ok(json!({"path": path, "offset": offset, "bytes": n}))
-                .await?;
+            let roots = paths.roots.clone();
+            let host = host.clone();
+            let path_s = path.clone();
+            let off = *offset;
+            let trunc = *truncate;
+            let n = tokio::task::spawn_blocking(move || {
+                files::write_guest(&roots, &host, &path_s, off, &data, trunc)
+            })
+            .await
+            .map_err(|e| Error::Message(format!("file task: {e}")))??;
+            Ok(Some(json!({"path": path, "offset": offset, "bytes": n})))
         }
         Op::Mkdir { path, recursive } => {
-            files::mkdir_guest(&paths.roots, host, path, *recursive)?;
-            resp.ok(json!({"path": path})).await?;
+            let roots = paths.roots.clone();
+            let host = host.clone();
+            let path_s = path.clone();
+            let rec = *recursive;
+            tokio::task::spawn_blocking(move || files::mkdir_guest(&roots, &host, &path_s, rec))
+                .await
+                .map_err(|e| Error::Message(format!("file task: {e}")))??;
+            Ok(Some(json!({"path": path})))
         }
         Op::Remove { path, recursive } => {
-            files::remove_guest(&paths.roots, host, path, *recursive)?;
-            resp.ok(json!({"removed": path})).await?;
+            let roots = paths.roots.clone();
+            let host = host.clone();
+            let path_s = path.clone();
+            let rec = *recursive;
+            tokio::task::spawn_blocking(move || files::remove_guest(&roots, &host, &path_s, rec))
+                .await
+                .map_err(|e| Error::Message(format!("file task: {e}")))??;
+            Ok(Some(json!({"removed": path})))
         }
         Op::Rename { from, to } => {
-            files::rename_guest(&paths.roots, host, from, to)?;
-            resp.ok(json!({"from": from, "to": to})).await?;
+            let roots = paths.roots.clone();
+            let host = host.clone();
+            let from_s = from.clone();
+            let to_s = to.clone();
+            tokio::task::spawn_blocking(move || files::rename_guest(&roots, &host, &from_s, &to_s))
+                .await
+                .map_err(|e| Error::Message(format!("file task: {e}")))??;
+            Ok(Some(json!({"from": from, "to": to})))
         }
         Op::Exec {
             program,
@@ -1092,8 +1181,11 @@ async fn perform(
                 *shell,
                 stdin_b64.as_deref(),
                 peer,
+                grant_jti,
+                grant_exp_unix,
             )
             .await?;
+            Ok(None)
         }
         Op::PtyOpen {
             command,
@@ -1115,6 +1207,7 @@ async fn perform(
                 grant_exp_unix,
             )
             .await?;
+            Ok(None)
         }
         Op::Search {
             path,
@@ -1148,7 +1241,7 @@ async fn perform(
                 },
             )
             .await?;
-            resp.ok(value).await?;
+            Ok(Some(value))
         }
         Op::Find {
             path,
@@ -1174,7 +1267,7 @@ async fn perform(
                 },
             )
             .await?;
-            resp.ok(value).await?;
+            Ok(Some(value))
         }
         Op::Replace {
             path,
@@ -1190,7 +1283,7 @@ async fn perform(
                 *replace_all,
             )
             .await?;
-            resp.ok(value).await?;
+            Ok(Some(value))
         }
         Op::EditLines {
             path,
@@ -1206,29 +1299,34 @@ async fn perform(
                 content.clone(),
             )
             .await?;
-            resp.ok(value).await?;
+            Ok(Some(value))
         }
         Op::ApplyPatch { root, patch } => {
             let value =
                 tools::apply_patch(paths.roots.clone(), root.clone(), patch.clone()).await?;
-            resp.ok(value).await?;
+            Ok(Some(value))
         }
-        Op::WatchStart { path, recursive } => {
-            resp.ok(tools::watch_start(tools, &paths.roots, path, *recursive)?)
-                .await?;
-        }
+        Op::WatchStart { path, recursive } => Ok(Some(
+            tools::watch_start(
+                tools,
+                &paths.roots,
+                path,
+                *recursive,
+                peer,
+                grant_jti,
+                grant_exp_unix,
+            )
+            .await?,
+        )),
         Op::WatchPoll {
             watch_id,
             cursor,
             timeout_ms,
             limit,
-        } => {
-            resp.ok(tools::watch_poll(tools, watch_id, *cursor, *timeout_ms, *limit).await?)
-                .await?;
-        }
-        Op::WatchStop { watch_id } => {
-            resp.ok(tools::watch_stop(tools, watch_id)?).await?;
-        }
+        } => Ok(Some(
+            tools::watch_poll(tools, watch_id, *cursor, *timeout_ms, *limit, peer).await?,
+        )),
+        Op::WatchStop { watch_id } => Ok(Some(tools::watch_stop(tools, watch_id, peer)?)),
         Op::BgStart {
             program,
             args,
@@ -1236,8 +1334,8 @@ async fn perform(
             env,
             shell,
             stdin_b64,
-        } => {
-            resp.ok(tools::bg_start(
+        } => Ok(Some(
+            tools::bg_start(
                 tools,
                 &paths.roots,
                 program,
@@ -1246,43 +1344,36 @@ async fn perform(
                 env,
                 *shell,
                 stdin_b64.as_deref(),
-            )?)
-            .await?;
-        }
-        Op::BgList => {
-            resp.ok(tools::bg_list(tools)?).await?;
-        }
+                peer,
+                grant_jti,
+                grant_exp_unix,
+            )
+            .await?,
+        )),
+        Op::BgList => Ok(Some(tools::bg_list(tools, peer)?)),
         Op::BgOutput {
             id,
             stdout_cursor,
             stderr_cursor,
             max_bytes,
-        } => {
-            resp.ok(tools::bg_output(
-                tools,
-                id,
-                *stdout_cursor,
-                *stderr_cursor,
-                *max_bytes,
-            )?)
-            .await?;
-        }
-        Op::BgStatus { id } => {
-            resp.ok(tools::bg_status(tools, id)?).await?;
-        }
-        Op::BgKill { id } => {
-            resp.ok(tools::bg_kill(tools, id)?).await?;
-        }
-        Op::SysInfo => {
-            resp.ok(tools::system_info().await?).await?;
-        }
+        } => Ok(Some(tools::bg_output(
+            tools,
+            id,
+            *stdout_cursor,
+            *stderr_cursor,
+            *max_bytes,
+            peer,
+        )?)),
+        Op::BgStatus { id } => Ok(Some(tools::bg_status(tools, id, peer)?)),
+        Op::BgKill { id } => Ok(Some(tools::bg_kill(tools, id, peer).await?)),
+        Op::SysInfo => Ok(Some(tools::system_info().await?)),
         Op::PtyInput {
             session_id,
             data_b64,
         } => {
             let data = util::b64_decode(data_b64)?;
             shells.write(session_id, &data, Some(peer))?;
-            resp.ok(json!({"bytes": data.len()})).await?;
+            Ok(Some(json!({"bytes": data.len()})))
         }
         Op::PtyResize {
             session_id,
@@ -1290,17 +1381,15 @@ async fn perform(
             cols,
         } => {
             shells.resize(session_id, *rows, *cols, Some(peer))?;
-            resp.ok(json!({"rows": rows, "cols": cols})).await?;
+            Ok(Some(json!({"rows": rows, "cols": cols})))
         }
         Op::PtyClose { session_id } => {
             shells.close(session_id, Some(peer))?;
-            resp.ok(json!({"closed": session_id})).await?;
+            Ok(Some(json!({"closed": session_id})))
         }
-        Op::RevokeGrant { .. } => {
-            return Err(Error::Message(
-                "revoke_grant is only handled by the E2E node daemon".into(),
-            ));
-        }
+        Op::RevokeGrant { .. } => Err(Error::Message(
+            "revoke_grant is only handled by the E2E node daemon".into(),
+        )),
         Op::Extension { name, payload } => {
             let mut payload = payload.clone();
             // Overwrite flags and stamp the verified grant. Client-supplied
@@ -1322,10 +1411,9 @@ async fn perform(
                         .into(),
                 ));
             }
-            resp.ok(body).await?;
+            Ok(Some(body))
         }
     }
-    Ok(())
 }
 
 async fn read_chunks(
@@ -1347,7 +1435,15 @@ async fn read_chunks(
             return Ok(());
         }
         let ask = left.min(FILE_CHUNK) as u32;
-        let bytes = files::read_guest(&paths.roots, host, path, offset, ask)?;
+        let roots = paths.roots.clone();
+        let host_c = host.clone();
+        let path_s = path.to_string();
+        let off = offset;
+        let bytes = tokio::task::spawn_blocking(move || {
+            files::read_guest(&roots, &host_c, &path_s, off, ask)
+        })
+        .await
+        .map_err(|e| Error::Message(format!("file task: {e}")))??;
         if bytes.is_empty() {
             break;
         }
@@ -1376,6 +1472,8 @@ async fn run_exec(
     shell: bool,
     stdin_b64: Option<&str>,
     peer: &str,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
 ) -> Result<()> {
     if program.is_empty() {
         return Err(Error::Message("command is empty".into()));
@@ -1406,7 +1504,15 @@ async fn run_exec(
         .and_then(|v| v.as_str())
         .unwrap_or(&session_id)
         .to_string();
-    host_sessions.register(&session_id, peer, &release)?;
+    if let Err(err) =
+        host_sessions.register_with_grant(&session_id, peer, &release, grant_jti, grant_exp_unix)
+    {
+        let host_release = host.clone();
+        let sid = session_id.clone();
+        let rel = release.clone();
+        let _ = tokio::task::spawn_blocking(move || host_release.release_session(sid, rel)).await;
+        return Err(err);
+    }
     let res = poll_until_end(
         resp,
         cancel,
@@ -1485,6 +1591,11 @@ async fn run_pty(
             PtyPoll::Exit(code) => {
                 shells.close(&session_id, None).ok();
                 resp.end(Some(code), None).await?;
+                return Ok(());
+            }
+            PtyPoll::Error(err) => {
+                shells.close(&session_id, None).ok();
+                resp.end(None, Some(err)).await?;
                 return Ok(());
             }
         }
@@ -1619,7 +1730,12 @@ fn publish(
     if let Ok(mut slot) = io.status.lock() {
         *slot = body.clone();
     }
-    host.on_status(body);
+    let host_cb = host.clone();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || host_cb.on_status(body));
+    } else {
+        host_cb.on_status(body);
+    }
 }
 
 
@@ -1661,8 +1777,18 @@ fn stamp_verified_grant(
     }
 }
 
-fn spawn_grant_watch(live: &PhoneLive, generation: u64) {
+fn spawn_grant_watch(
+    live: &PhoneLive,
+    tools: &Arc<ToolState>,
+    host: &Arc<dyn NodeHost>,
+    generation: u64,
+) {
     let shells = live.shells.clone();
+    let host_sessions = live.host_sessions.clone();
+    let cancels = live.cancels.clone();
+    let sessions = live.sessions.clone();
+    let tools = tools.clone();
+    let host = host.clone();
     let data_dir = live.data_dir.clone();
     let socket = live.socket.clone();
     tokio::spawn(async move {
@@ -1673,24 +1799,85 @@ fn spawn_grant_watch(live: &PhoneLive, generation: u64) {
             if socket.generation() != generation {
                 break;
             }
-            match agentlink_core::grant::load_revoked_jtis(&data_dir) {
-                Ok(revoked) => {
-                    shells.close_inactive(&revoked);
-                }
-                Err(_) => {
-                    // Deny-list unreadable: close every session the hook
-                    // already treats as inactive (hook is fail-closed).
-                    shells.close_inactive(&std::collections::BTreeSet::new());
-                }
+            let dir = data_dir.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                agentlink_core::grant::load_revoked_jtis(&dir)
+            })
+            .await
+            .ok();
+            let now = agentlink_core::util::unix_now();
+            let (revoked, fail_closed) = match loaded {
+                Some(Ok(revoked)) => (revoked, false),
+                _ => (BTreeSet::new(), true),
+            };
+            shells.close_inactive(&revoked);
+            cancel_inactive(&cancels, &revoked, now, fail_closed);
+            sessions.purge_inactive(&revoked, now);
+            let host_victims = host_sessions.take_inactive(&revoked, now, fail_closed);
+            if !host_victims.is_empty() {
+                let host_cb = host.clone();
+                tokio::task::spawn_blocking(move || {
+                    for (sid, rel) in host_victims {
+                        let _ = host_cb.release_session(sid, rel);
+                    }
+                });
             }
+            let tools_c = tools.clone();
+            let revoked_c = revoked;
+            tokio::task::spawn_blocking(move || {
+                tools_c.close_inactive(&revoked_c, now, fail_closed);
+            });
         }
     });
 }
 
-fn cancel_all(cancels: &Mutex<HashMap<String, CancellationToken>>) {
+fn cancel_inactive(
+    cancels: &Mutex<HashMap<String, CancelEntry>>,
+    revoked: &BTreeSet<String>,
+    now_unix: i64,
+    fail_closed: bool,
+) {
     if let Ok(map) = cancels.lock() {
-        for token in map.values() {
-            token.cancel();
+        for entry in map.values() {
+            let expired = entry.grant_exp_unix.is_some_and(|exp| now_unix >= exp);
+            let jti = entry.grant_jti.trim();
+            let is_revoked = !jti.is_empty()
+                && revoked
+                    .iter()
+                    .any(|item| item.trim().eq_ignore_ascii_case(jti));
+            if expired || is_revoked || fail_closed {
+                entry.token.cancel();
+            }
+        }
+    }
+}
+
+fn cancel_all(cancels: &Mutex<HashMap<String, CancelEntry>>) {
+    if let Ok(map) = cancels.lock() {
+        for entry in map.values() {
+            entry.token.cancel();
+        }
+    }
+}
+
+fn release_all_host_sessions(
+    host_sessions: &crate::host::HostSessionRegistry,
+    host: &Arc<dyn NodeHost>,
+) {
+    let all = host_sessions.take_all();
+    if all.is_empty() {
+        return;
+    }
+    let host_cb = host.clone();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || {
+            for (sid, rel) in all {
+                let _ = host_cb.release_session(sid, rel);
+            }
+        });
+    } else {
+        for (sid, rel) in all {
+            let _ = host_cb.release_session(sid, rel);
         }
     }
 }
@@ -1702,35 +1889,45 @@ fn normalized_relay(relay_url: &str, fingerprint: &str) -> (String, Option<Strin
     (relay_url, trust)
 }
 
-fn drop_link(live: &PhoneLive, generation: u64, audit: &AuditHub) {
+fn drop_link(
+    live: &PhoneLive,
+    tools: &Arc<ToolState>,
+    host: &Arc<dyn NodeHost>,
+    generation: u64,
+    audit: &AuditHub,
+) {
     live.socket.detach(generation);
-    // Stop PTY immediately. A reconnect grace window must not leave an
-    // inbound shell or media pump running after the relay is gone.
+    // Stop PTY, background procs, watches, and host sessions immediately.
+    // A reconnect grace window must not leave inbound shells or media pumps
+    // running after the relay is gone.
     live.shells.close_all();
     cancel_all(&live.cancels);
+    release_all_host_sessions(&live.host_sessions, host);
+    let tools_c = tools.clone();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || tools_c.shutdown());
+    } else {
+        tools_c.shutdown();
+    }
     audit.set_tx(None);
 }
 
 async fn replay_log(
     log: &ReplayLog,
     cursor: u64,
-    seal: Option<&PhoneSeal>,
+    seal: &PhoneSeal,
     tx: &mpsc::Sender<Outbound>,
 ) {
     for env in log.snapshot() {
         if env.seq() != 0 && env.seq() <= cursor {
             continue;
         }
-        let encoded = if let Some(seal) = seal {
-            match e2e::seal_envelope_session(&seal.session, &seal.node_id, &seal.peer, &env) {
-                Ok(wrapped) => ws::encode(&wrapped),
-                Err(err) => {
-                    tracing::debug!(error = %err, "replay seal failed");
-                    continue;
-                }
+        let encoded = match e2e::seal_envelope_session(&seal.session, &seal.node_id, &seal.peer, &env) {
+            Ok(wrapped) => ws::encode(&wrapped),
+            Err(err) => {
+                tracing::debug!(error = %err, "replay seal failed");
+                continue;
             }
-        } else {
-            ws::encode(&env)
         };
         if let Ok(out) = encoded {
             if tx.send(out).await.is_err() {
@@ -1926,5 +2123,252 @@ mod tests {
         );
         assert!(registry.authorize_caller("sess-bad", "peer-alice").is_err());
         assert_eq!(bad_impl.released.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unsealed_invoke_cannot_replay_cached_output_or_leak_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let identity = Identity::generate();
+        let node_id = identity.node_id().to_string();
+        let endpoint = Endpoint::new(identity);
+        let audit_hub = Arc::new(AuditHub::open(dir.path(), &node_id, "phone"));
+        let host: Arc<dyn NodeHost> = Arc::new(ExitTestHost {
+            released: Mutex::new(Vec::new()),
+            event: r#"{"ok":true,"body":{"event":"exit","code":0}}"#.into(),
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let policy = Arc::new(RwLock::new(NodePolicy::full()));
+        let config = ServeConfig {
+            relay_url: "wss://127.0.0.1:7443".into(),
+            fingerprint: "system".into(),
+            trust: None,
+            data_dir: dir.path().to_path_buf(),
+            files_dir: files.clone(),
+            cache_dir: cache.clone(),
+            storage_dir: None,
+            name: "phone".into(),
+            pairing_token: None,
+            hostname: "phone".into(),
+            os: "android".into(),
+            arch: "arm64".into(),
+            version: "0.1.0".into(),
+            ceiling: NodePolicy::full(),
+        };
+        let io = NodeIo {
+            status: Arc::new(Mutex::new(String::new())),
+            node_id: Arc::new(Mutex::new(node_id.clone())),
+        };
+        let transfer_host = Arc::new(TransferHost {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            direct_wait: Arc::new(Mutex::new(HashMap::new())),
+            tx: tx.clone(),
+            policy: policy.clone(),
+            paths: Arc::new(PathMap {
+                roots: Roots {
+                    files,
+                    cache,
+                    storage: None,
+                    audit: dir.path().join("audit.log"),
+                },
+                host: host.clone(),
+            }),
+            e2e: endpoint.clone(),
+            node_id: node_id.clone(),
+            seals: Arc::new(Mutex::new(HashMap::new())),
+            audit: audit_hub.clone(),
+        });
+        let tools = Arc::new(ToolState::default());
+        let live = PhoneLive {
+            socket: Arc::new(SocketSlot::default()),
+            sessions: Arc::new(Sessions::default()),
+            cancels: Arc::new(Mutex::new(HashMap::new())),
+            shells: Arc::new(PhonePty::default()),
+            host_sessions: Arc::new(crate::host::HostSessionRegistry::default()),
+            data_dir: dir.path().to_path_buf(),
+            owner_keys: RwLock::new(BTreeSet::new()),
+            revoked_jtis: RwLock::new(BTreeSet::new()),
+            node_id: node_id.clone(),
+        };
+
+        // Pre-populate a victim ReplayLog with secret output and an active Cancel entry.
+        let victim_log = live
+            .sessions
+            .begin("victim-req", "peer-alice", "jti-alice", Some(agentlink_core::util::unix_now() + 600))
+            .expect("victim log");
+        victim_log.push(Envelope::Chunk {
+            request_id: "victim-req".into(),
+            stream: "file".into(),
+            data_b64: util::b64_encode(b"TOP-SECRET-FILE"),
+            seq: 0,
+        });
+        let victim_cancel = CancellationToken::new();
+        live.cancels.lock().unwrap().insert(
+            "victim-req".into(),
+            CancelEntry {
+                token: victim_cancel.clone(),
+                owner_peer: "peer-alice".into(),
+                grant_jti: "jti-alice".into(),
+                grant_exp_unix: Some(agentlink_core::util::unix_now() + 600),
+            },
+        );
+
+        // 1. Unsealed Invoke for victim-req must NOT replay secret chunk!
+        handle_env(
+            Envelope::Invoke {
+                request_id: "victim-req".into(),
+                node_id: node_id.clone(),
+                client_id: "relay-attacker".into(),
+                op: Op::SysInfo,
+                grant: None,
+                authz: None,
+                device_id: None,
+                user: None,
+            },
+            &tx,
+            &policy,
+            &config,
+            &host,
+            &io,
+            &transfer_host,
+            &tools,
+            &endpoint,
+            &audit_hub,
+            &live,
+        )
+        .await;
+        let out = rx.try_recv().expect("error reply");
+        let text = match out {
+            Outbound::Text(s) => s,
+            _ => panic!("expected text error"),
+        };
+        assert!(!text.contains("TOP-SECRET-FILE") && !text.contains(&util::b64_encode(b"TOP-SECRET-FILE")));
+        assert!(text.contains("end-to-end session"), "{text}");
+
+        // 2. Unsealed Cancel and Session must be ignored.
+        handle_env(
+            Envelope::Cancel {
+                request_id: "victim-req".into(),
+                node_id: node_id.clone(),
+            },
+            &tx,
+            &policy,
+            &config,
+            &host,
+            &io,
+            &transfer_host,
+            &tools,
+            &endpoint,
+            &audit_hub,
+            &live,
+        )
+        .await;
+        assert!(!victim_cancel.is_cancelled(), "unsealed cancel must be ignored");
+
+        // 3. Unsealed new Invoke must NOT insert into cancels or sessions.
+        handle_env(
+            Envelope::Invoke {
+                request_id: "fresh-unsealed".into(),
+                node_id: node_id.clone(),
+                client_id: "relay-attacker".into(),
+                op: Op::SysInfo,
+                grant: None,
+                authz: None,
+                device_id: None,
+                user: None,
+            },
+            &tx,
+            &policy,
+            &config,
+            &host,
+            &io,
+            &transfer_host,
+            &tools,
+            &endpoint,
+            &audit_hub,
+            &live,
+        )
+        .await;
+        assert!(!live.cancels.lock().unwrap().contains_key("fresh-unsealed"));
+        assert!(live.sessions.existing("fresh-unsealed").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_exec_releases_host_session_on_register_failure_and_revocation_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let host_impl = Arc::new(ExitTestHost {
+            released: Mutex::new(Vec::new()),
+            event: r#"{"ok":true,"body":{"event":"exit","code":0}}"#.into(),
+        });
+        let host: Arc<dyn NodeHost> = host_impl.clone();
+        let paths = PathMap {
+            roots: Roots {
+                files,
+                cache,
+                storage: None,
+                audit: dir.path().join("audit.log"),
+            },
+            host: host.clone(),
+        };
+        let registry = crate::host::HostSessionRegistry::default();
+        let resp = Responder {
+            socket: Arc::new(SocketSlot::default()),
+            request_id: "req-fail-reg".into(),
+            seal: None,
+            log: Arc::new(ReplayLog::default()),
+        };
+        // Empty peer forces register_with_grant() to fail AFTER open_session() succeeded.
+        let err = run_exec(
+            &resp,
+            &CancellationToken::new(),
+            &paths,
+            &host,
+            &registry,
+            "echo",
+            &[],
+            None,
+            &[],
+            Some(5_000),
+            false,
+            None,
+            "",
+            "jti-x",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("owner"), "{err}");
+        assert_eq!(
+            host_impl.released.lock().unwrap().len(),
+            1,
+            "already-opened host session must be released when register fails"
+        );
+
+        // Grant revocation & expiry sweep in HostSessionRegistry.
+        let rel1 = crate::host::HostSessionRegistry::mint_release();
+        let rel2 = crate::host::HostSessionRegistry::mint_release();
+        let rel3 = crate::host::HostSessionRegistry::mint_release();
+        let now = agentlink_core::util::unix_now();
+        registry
+            .register_with_grant("s-revoked", "alice", &rel1, "jti-bad", Some(now + 600))
+            .unwrap();
+        registry
+            .register_with_grant("s-expired", "alice", &rel2, "jti-ok", Some(now - 1))
+            .unwrap();
+        registry
+            .register_with_grant("s-active", "alice", &rel3, "jti-good", Some(now + 600))
+            .unwrap();
+        let victims = registry.take_inactive(&BTreeSet::from(["jti-bad".into()]), now, false);
+        assert_eq!(victims.len(), 2);
+        assert!(registry.authorize_caller("s-active", "alice").is_ok());
+        assert!(registry.authorize_caller("s-revoked", "alice").is_err());
+        assert!(registry.authorize_caller("s-expired", "alice").is_err());
     }
 }

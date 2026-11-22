@@ -4,19 +4,21 @@
 //! `copy_download`, which are the fast path: binary frames, a sliding window,
 //! BLAKE3, zstd, and a direct QUIC attempt that falls back to the relay.
 
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use agentlink_core::engine::XferOpts;
+use agentlink_core::grant::SignedGrant;
 use agentlink_core::protocol::Op;
 use agentlink_core::{
     apply_relay_defaults, Client, ClientSettings, ExecRequest, Identity, NodePolicy, PtySession,
     PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -163,14 +165,40 @@ pub struct FfiDevice {
     pub revoked: bool,
 }
 
+#[derive(uniffi::Record)]
+pub struct FfiNodePin {
+    pub name: String,
+    pub node_id: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiGrant {
+    pub node_id: String,
+    pub grantee_id: String,
+    pub issuer_id: String,
+    pub jti: String,
+    pub nbf_unix: i64,
+    pub exp_unix: i64,
+    pub preset: String,
+    pub policy: FfiPolicy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PinFile {
+    #[serde(default)]
+    nodes: BTreeMap<String, String>,
+}
+
 #[derive(uniffi::Object)]
 pub struct MobileClient {
     handle: tokio::runtime::Handle,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
-    settings: ClientSettings,
+    settings: RwLock<ClientSettings>,
     identity: ClientIdentity,
     client: Mutex<Option<Arc<Client>>>,
+    connect_lock: Mutex<()>,
     pins: Option<PathBuf>,
+    ice_servers: Mutex<Option<Vec<Value>>>,
 }
 
 enum ClientIdentity {
@@ -227,15 +255,32 @@ impl MobileClient {
         Ok(Self {
             handle,
             runtime: Mutex::new(Some(runtime)),
-            settings: ClientSettings {
+            settings: RwLock::new(ClientSettings {
                 relay,
                 token,
                 fingerprint,
                 trust,
-            },
+            }),
             identity,
             client: Mutex::new(None),
+            connect_lock: Mutex::new(()),
             pins,
+            ice_servers: Mutex::new(None),
+        })
+    }
+
+    fn current_settings(&self) -> Result<ClientSettings, LinkError> {
+        self.settings
+            .read()
+            .map(|guard| guard.clone())
+            .map_err(|_| LinkError::Fail {
+                detail: "client settings lock poisoned".into(),
+            })
+    }
+
+    fn require_store_dir(&self) -> Result<PathBuf, LinkError> {
+        self.pin_dir().ok_or_else(|| LinkError::Fail {
+            detail: "client data directory is not configured".into(),
         })
     }
 
@@ -292,16 +337,31 @@ impl MobileClient {
     }
 
     fn session(&self) -> Result<Arc<Client>, LinkError> {
-        let guard = self.client.lock().map_err(|_| LinkError::Fail {
-            detail: "client lock poisoned".into(),
-        })?;
-        if let Some(client) = guard.as_ref() {
-            if client.is_alive() {
-                return Ok(client.clone());
+        {
+            let guard = self.client.lock().map_err(|_| LinkError::Fail {
+                detail: "client lock poisoned".into(),
+            })?;
+            if let Some(client) = guard.as_ref() {
+                if client.is_alive() {
+                    return Ok(client.clone());
+                }
             }
         }
-        drop(guard);
-        let settings = self.settings.clone();
+        // Serialize reconnects so concurrent callers do not open duplicate sockets.
+        let _connecting = self.connect_lock.lock().map_err(|_| LinkError::Fail {
+            detail: "client connect lock poisoned".into(),
+        })?;
+        {
+            let guard = self.client.lock().map_err(|_| LinkError::Fail {
+                detail: "client lock poisoned".into(),
+            })?;
+            if let Some(client) = guard.as_ref() {
+                if client.is_alive() {
+                    return Ok(client.clone());
+                }
+            }
+        }
+        let settings = self.current_settings()?;
         let identity = self.load_identity()?;
         let client = drive(&self.handle, async move {
             let use_token = !settings.token.is_empty();
@@ -565,8 +625,10 @@ impl MobileClient {
         name: String,
         payload_json: String,
     ) -> Result<String, LinkError> {
+        let payload: Value = serde_json::from_str(&payload_json).map_err(|err| LinkError::Fail {
+            detail: format!("invalid extension payload json: {err}"),
+        })?;
         let client = self.session()?;
-        let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
         let body = drive(&self.handle, async move {
             client.call_op(&node, Op::Extension { name, payload }).await
         })?;
@@ -662,6 +724,254 @@ impl MobileClient {
         Ok(())
     }
 
+    /// Update the access token used on future reconnects and relay API calls
+    /// without interrupting active PTY, live desktop, or file transfer sessions.
+    pub fn update_access_token(&self, token: String) -> Result<(), LinkError> {
+        let mut guard = self.settings.write().map_err(|_| LinkError::Fail {
+            detail: "client settings lock poisoned".into(),
+        })?;
+        guard.token = token;
+        Ok(())
+    }
+
+    pub fn revoke_device(&self, device_id: String) -> Result<(), LinkError> {
+        let client = self.session()?;
+        drive(&self.handle, async move {
+            client.revoke_device(&device_id).await
+        })?;
+        Ok(())
+    }
+
+    pub fn list_node_pins(&self) -> Result<Vec<FfiNodePin>, LinkError> {
+        let dir = self.require_store_dir()?;
+        let path = agentlink_core::node_pin::pin_path(&dir);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = std::fs::read_to_string(&path).map_err(|err| LinkError::Fail {
+            detail: format!("node-pins.json: {err}"),
+        })?;
+        let file = serde_json::from_str::<PinFile>(&text).map_err(|err| LinkError::Fail {
+            detail: format!("node-pins.json: {err}"),
+        })?;
+        Ok(file
+            .nodes
+            .into_iter()
+            .map(|(name, node_id)| FfiNodePin { name, node_id })
+            .collect())
+    }
+
+    pub fn clear_node_pin(&self, name: String) -> Result<bool, LinkError> {
+        let target = name.trim();
+        if target.is_empty() {
+            return Ok(false);
+        }
+        let dir = self.require_store_dir()?;
+        let path = agentlink_core::node_pin::pin_path(&dir);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let text = std::fs::read_to_string(&path).map_err(|err| LinkError::Fail {
+            detail: format!("node-pins.json: {err}"),
+        })?;
+        let mut file = serde_json::from_str::<PinFile>(&text).map_err(|err| LinkError::Fail {
+            detail: format!("node-pins.json: {err}"),
+        })?;
+        let removed = if file.nodes.remove(target).is_some() {
+            true
+        } else if let Some(found) = file
+            .nodes
+            .keys()
+            .find(|key| key.eq_ignore_ascii_case(target))
+            .cloned()
+        {
+            file.nodes.remove(&found).is_some()
+        } else {
+            false
+        };
+        if removed {
+            let encoded = serde_json::to_string_pretty(&file).map_err(|err| LinkError::Fail {
+                detail: format!("encode node-pins.json: {err}"),
+            })?;
+            agentlink_core::util::write_secret(&path, encoded.as_bytes()).map_err(|err| {
+                LinkError::Fail {
+                    detail: format!("write node-pins.json: {err}"),
+                }
+            })?;
+        }
+        Ok(removed)
+    }
+
+    pub fn node_pin_warnings(&self) -> Vec<String> {
+        self.client
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|c| c.node_pin_warnings()))
+            .unwrap_or_default()
+    }
+
+    pub fn list_grants(&self) -> Result<Vec<FfiGrant>, LinkError> {
+        let dir = self.require_store_dir()?;
+        let stored = agentlink_core::grant::list_stored_grants(&dir).map_err(|err| {
+            LinkError::Fail {
+                detail: err.to_string(),
+            }
+        })?;
+        Ok(stored
+            .into_iter()
+            .map(|item| ffi_grant_of(&item.grant))
+            .collect())
+    }
+
+    pub fn import_grant(&self, grant_json: String) -> Result<FfiGrant, LinkError> {
+        let dir = self.require_store_dir()?;
+        let grant: SignedGrant =
+            serde_json::from_str(grant_json.trim()).map_err(|err| LinkError::Fail {
+                detail: format!("invalid grant json: {err}"),
+            })?;
+        if grant.node_id.trim().is_empty()
+            || grant.grantee_id.trim().is_empty()
+            || grant.issuer_id.trim().is_empty()
+            || grant.jti.trim().is_empty()
+            || grant.sig_hex.trim().is_empty()
+        {
+            return Err(LinkError::Fail {
+                detail: "grant is missing required fields".into(),
+            });
+        }
+        let identity = self.load_identity()?;
+        agentlink_core::grant::validate_grant_for(
+            &grant,
+            &grant.node_id,
+            identity.public_hex(),
+            agentlink_core::util::unix_now(),
+        )
+        .map_err(|err| LinkError::Fail {
+            detail: err.to_string(),
+        })?;
+        agentlink_core::grant::save_grant(&dir, &grant).map_err(|err| LinkError::Fail {
+            detail: err.to_string(),
+        })?;
+        Ok(ffi_grant_of(&grant))
+    }
+
+    pub fn delete_grant(&self, node_id: String) -> Result<bool, LinkError> {
+        let dir = self.require_store_dir()?;
+        agentlink_core::grant::delete_grant(&dir, &node_id).map_err(|err| LinkError::Fail {
+            detail: err.to_string(),
+        })
+    }
+
+    pub fn find_files(
+        &self,
+        node: String,
+        path: String,
+        pattern: String,
+        regex: bool,
+        include_hidden: bool,
+        case_insensitive: bool,
+        limit: u32,
+    ) -> Result<String, LinkError> {
+        let client = self.session()?;
+        let value = drive(&self.handle, async move {
+            client
+                .find(
+                    &node,
+                    &path,
+                    &pattern,
+                    regex,
+                    true,
+                    include_hidden,
+                    case_insensitive,
+                    0,
+                    limit,
+                )
+                .await
+        })?;
+        Ok(value.to_string())
+    }
+
+    pub fn search_content(
+        &self,
+        node: String,
+        path: String,
+        pattern: String,
+        literal: bool,
+        include_hidden: bool,
+        case_insensitive: bool,
+        limit: u32,
+    ) -> Result<String, LinkError> {
+        let client = self.session()?;
+        let value = drive(&self.handle, async move {
+            client
+                .search(
+                    &node,
+                    &path,
+                    &pattern,
+                    literal,
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                    include_hidden,
+                    case_insensitive,
+                    0,
+                    0,
+                    0,
+                    limit,
+                )
+                .await
+        })?;
+        Ok(value.to_string())
+    }
+
+    pub fn query_audit(&self, node_id: String, limit: u32) -> Result<String, LinkError> {
+        let client = self.session()?;
+        let filter = json!({
+            "node_id": node_id,
+            "limit": limit.clamp(1, 500),
+        });
+        let records = drive(&self.handle, async move { client.query_audit(filter).await })?;
+        Ok(Value::Array(records).to_string())
+    }
+
+    pub fn sys_info(&self, node: String) -> Result<String, LinkError> {
+        let client = self.session()?;
+        let value = drive(&self.handle, async move { client.sysinfo(&node).await })?;
+        Ok(value.to_string())
+    }
+
+    /// Override or clear (`""`) the ICE/TURN servers used by [`Self::open_live`].
+    pub fn set_ice_servers(&self, ice_servers_json: String) -> Result<(), LinkError> {
+        let trimmed = ice_servers_json.trim();
+        let next = if trimmed.is_empty() {
+            None
+        } else {
+            let parsed: Value = serde_json::from_str(trimmed).map_err(|err| LinkError::Fail {
+                detail: format!("invalid ice_servers json: {err}"),
+            })?;
+            Some(crate::live::parse_ice_document(&parsed))
+        };
+        let mut guard = self.ice_servers.lock().map_err(|_| LinkError::Fail {
+            detail: "ice_servers lock poisoned".into(),
+        })?;
+        *guard = next;
+        Ok(())
+    }
+
+    /// Fetch fresh ICE/TURN servers from the relay (`/api/ice` with fallback to
+    /// `/view/config.json`) using the current relay settings and access token.
+    pub fn refresh_ice_servers(&self) -> Result<String, LinkError> {
+        let settings = self.current_settings()?;
+        let fetched = drive(&self.handle, async move {
+            Ok(crate::live::fetch_ice_servers(&settings).await)
+        })?;
+        let encoded = Value::Array(fetched.clone()).to_string();
+        if let Ok(mut guard) = self.ice_servers.lock() {
+            *guard = Some(fetched);
+        }
+        Ok(encoded)
+    }
+
     /// Open the phase-3 desktop stream. The returned object depacketizes
     /// RTP H.264 to Annex-B. Screenshot polling stays in the UI and runs
     /// only when this returns an error.
@@ -673,7 +983,43 @@ impl MobileClient {
         monitor: u32,
     ) -> Result<Arc<crate::live::DesktopLive>, LinkError> {
         let client = self.session()?;
-        crate::live::open(client, self.handle.clone(), node, max_fps, bitrate, monitor)
+        let cached = self
+            .ice_servers
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let ice_servers = match cached {
+            Some(servers) => servers,
+            None => {
+                let settings = self.current_settings()?;
+                drive(&self.handle, async move {
+                    Ok(crate::live::fetch_ice_servers(&settings).await)
+                })
+                .unwrap_or_default()
+            }
+        };
+        crate::live::open(
+            client,
+            self.handle.clone(),
+            node,
+            max_fps,
+            bitrate,
+            monitor,
+            ice_servers,
+        )
+    }
+}
+
+fn ffi_grant_of(grant: &SignedGrant) -> FfiGrant {
+    FfiGrant {
+        node_id: grant.node_id.clone(),
+        grantee_id: grant.grantee_id.clone(),
+        issuer_id: grant.issuer_id.clone(),
+        jti: grant.jti.clone(),
+        nbf_unix: grant.nbf_unix,
+        exp_unix: grant.exp_unix,
+        preset: grant.policy.preset_name().to_string(),
+        policy: grant.policy.into(),
     }
 }
 
@@ -899,5 +1245,79 @@ fn drive<T: Send + 'static>(
         Err(_) => Err(LinkError::Fail {
             detail: "client runtime stopped".into(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mobile_client_pins_grants_token_update_and_json_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().display().to_string();
+        let client = MobileClient::connect(
+            "wss://127.0.0.1:7443".into(),
+            "old-token".into(),
+            "system".into(),
+            data_dir,
+        )
+        .unwrap();
+
+        // 1. update_access_token updates settings in-place without dropping state.
+        client.update_access_token("new-token".into()).unwrap();
+        assert_eq!(client.current_settings().unwrap().token, "new-token");
+
+        // 2. extension() rejects invalid JSON before touching the network.
+        let err = client
+            .extension("node-1".into(), "screenshot".into(), "{bad json".into())
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid extension payload json"), "{err}");
+
+        // 3. set_ice_servers rejects invalid JSON and accepts valid ICE documents.
+        assert!(client.set_ice_servers("{not-json".into()).is_err());
+        client
+            .set_ice_servers(r#"[{"urls":["stun:stun.example:3478"]}]"#.into())
+            .unwrap();
+        assert_eq!(
+            client.ice_servers.lock().unwrap().as_ref().map(Vec::len),
+            Some(1)
+        );
+        client.set_ice_servers(String::new()).unwrap();
+        assert!(client.ice_servers.lock().unwrap().is_none());
+
+        // 4. list_node_pins / clear_node_pin roundtrip on node-pins.json.
+        let node_id = "ab".repeat(32);
+        agentlink_core::node_pin::observe(dir.path(), "laptop", &node_id).unwrap();
+        let pins = client.list_node_pins().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].name, "laptop");
+        assert_eq!(pins[0].node_id, node_id);
+        assert!(client.clear_node_pin("LAPTOP".into()).unwrap());
+        assert!(!client.clear_node_pin("laptop".into()).unwrap());
+        assert!(client.list_node_pins().unwrap().is_empty());
+
+        // 5. import_grant / list_grants / delete_grant roundtrip.
+        let issuer = Identity::generate();
+        let grantee = client.load_identity().unwrap().public_hex().to_string();
+        let now = agentlink_core::util::unix_now();
+        let signed = SignedGrant::sign(
+            &issuer,
+            &grantee,
+            &node_id,
+            NodePolicy::read_only(),
+            now - 10,
+            now + 3600,
+            "jti-ffi-test",
+        )
+        .unwrap();
+        let grant_json = serde_json::to_string(&signed).unwrap();
+        let imported = client.import_grant(grant_json).unwrap();
+        assert_eq!(imported.node_id, node_id);
+        assert_eq!(imported.jti, "jti-ffi-test");
+        let listed = client.list_grants().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(client.delete_grant(node_id.clone()).unwrap());
+        assert!(client.list_grants().unwrap().is_empty());
     }
 }

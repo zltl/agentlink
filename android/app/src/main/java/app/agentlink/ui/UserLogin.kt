@@ -1,5 +1,6 @@
 package app.agentlink.ui
 
+import android.os.Build
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,6 +16,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,19 +60,27 @@ fun UserLogin(
     onPairPhone: (() -> Unit)? = null,
     showIntro: Boolean = true,
 ) {
-    var server by remember { mutableStateOf(DEFAULT_RELAY) }
-    var fingerprint by remember { mutableStateOf("") }
-    var username by remember { mutableStateOf("") }
+    var server by rememberSaveable { mutableStateOf(DEFAULT_RELAY) }
+    var fingerprint by rememberSaveable { mutableStateOf("") }
+    var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
-    var totp by remember { mutableStateOf("") }
-    var account by remember { mutableStateOf<UserAccount?>(sessions.load()) }
+    var totp by rememberSaveable { mutableStateOf("") }
+    var account by remember { mutableStateOf<UserAccount?>(null) }
     var nodes by remember { mutableStateOf<List<NodeRow>>(emptyList()) }
     var devices by remember { mutableStateOf<List<DeviceRow>>(emptyList()) }
     var status by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
-    var askTotp by remember { mutableStateOf(false) }
+    var askTotp by rememberSaveable { mutableStateOf(false) }
     val totpFocus = remember { FocusRequester() }
     val totpNeeded = askTotp || totp.isNotEmpty()
+    val deviceName = remember { Build.MODEL?.takeIf { it.isNotBlank() } ?: "android" }
+
+    LaunchedEffect(sessions) {
+        val loaded = withContext(background) { runCatching { sessions.load() }.getOrNull() }
+        if (account == null && loaded != null) {
+            account = loaded
+        }
+    }
 
     LaunchedEffect(account?.user, account?.deviceId) {
         val saved = account ?: return@LaunchedEffect
@@ -175,9 +185,8 @@ fun UserLogin(
                     val totpNow = totp.trim()
                     runOffMain(background) {
                         val result = runCatching {
-                            api.login(serverNow, fingerprintNow, usernameNow, passwordNow, totpNow, "android")
+                            api.login(serverNow, fingerprintNow, usernameNow, passwordNow, totpNow, deviceName)
                         }
-                        val listed = result.map { api.listNodes(it) }
                         applyOnMain(ui) {
                             busy = false
                             result.onSuccess {
@@ -194,7 +203,6 @@ fun UserLogin(
                                 if (message.contains("totp", ignoreCase = true)) askTotp = true
                                 status = loginHint(message)
                             }
-                            listed.onSuccess { nodes = it }
                         }
                     }
                 },

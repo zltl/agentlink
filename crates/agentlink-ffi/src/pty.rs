@@ -9,20 +9,28 @@
 //! `portable-pty` is not used here. Its `termios` dependency does not compile
 //! for `target_os = "android"`.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+#[cfg(unix)]
+use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
+#[cfg(unix)]
 use std::thread;
-use std::time::Duration;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use agentlink_core::{Error, Result};
 
 pub type PtyGrantHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+#[allow(dead_code)]
 pub enum PtyPoll {
     Pending,
     Chunk(Vec<u8>),
     Exit(i32),
+    Error(String),
 }
 
 #[cfg(unix)]
@@ -47,6 +55,7 @@ impl PhonePty {
         }
     }
 
+    #[cfg(unix)]
     fn grant_hook(&self) -> Option<PtyGrantHook> {
         self.grant_active.read().ok().and_then(|guard| guard.clone())
     }
@@ -293,13 +302,27 @@ mod unix {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Condvar;
+
+    const MAX_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+    const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+    const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
+    const SIGHUP_GRACE: Duration = Duration::from_millis(400);
+
+    struct ChunkQueue {
+        chunks: VecDeque<Vec<u8>>,
+        bytes: usize,
+        overflowed: bool,
+    }
 
     pub struct Live {
         master: Arc<Mutex<File>>,
         writer: Arc<Mutex<File>>,
         pid: i32,
-        chunks: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        queue: Arc<(Mutex<ChunkQueue>, Condvar)>,
         exit_code: Arc<Mutex<Option<i32>>>,
+        closed: Arc<AtomicBool>,
+        reap_state: Arc<(Mutex<bool>, Condvar)>,
     }
 
     pub fn spawn(command: Option<&str>, rows: u16, cols: u16, cwd: &Path) -> Result<Live> {
@@ -346,6 +369,19 @@ mod unix {
                 std::io::Error::last_os_error()
             )));
         }
+        // Set FD_CLOEXEC immediately after openpty so concurrent forks in other
+        // threads never inherit master_fd or slave_fd. In the child, login_tty
+        // dup2s slave_fd to 0/1/2 (clearing CLOEXEC on 0/1/2) and closes slave_fd.
+        unsafe {
+            libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let close_limit = if max_fd > 3 {
+            (max_fd as libc::c_int).min(4096)
+        } else {
+            1024
+        };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             unsafe {
@@ -363,6 +399,9 @@ mod unix {
                 if libc::login_tty(slave_fd) != 0 {
                     libc::_exit(127);
                 }
+                for fd in 3..close_limit {
+                    libc::close(fd);
+                }
                 if libc::chdir(cwd_c.as_ptr()) != 0 {
                     libc::_exit(127);
                 }
@@ -372,7 +411,6 @@ mod unix {
         }
         unsafe {
             libc::close(slave_fd);
-            libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC);
         }
         let master_file = unsafe { File::from_raw_fd(master_fd) };
         let reader = master_file
@@ -381,24 +419,66 @@ mod unix {
         let writer = master_file
             .try_clone()
             .map_err(|e| Error::Message(format!("pty writer: {e}")))?;
-        let chunks = Arc::new(Mutex::new(VecDeque::new()));
+        let queue = Arc::new((
+            Mutex::new(ChunkQueue {
+                chunks: VecDeque::new(),
+                bytes: 0,
+                overflowed: false,
+            }),
+            Condvar::new(),
+        ));
         let exit_code = Arc::new(Mutex::new(None));
         let reader_done = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let reap_state = Arc::new((Mutex::new(false), Condvar::new()));
         {
-            let chunks = chunks.clone();
+            let queue = queue.clone();
             let reader_done = reader_done.clone();
+            let closed = closed.clone();
             thread::Builder::new()
                 .name("agentlink-pty-read".into())
                 .spawn(move || {
                     let mut reader = reader;
                     let mut buf = [0u8; 4096];
                     loop {
+                        if closed.load(Ordering::SeqCst) {
+                            break;
+                        }
                         match reader.read(&mut buf) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
-                                if let Ok(mut queue) = chunks.lock() {
-                                    queue.push_back(buf[..n].to_vec());
+                                let (lock, cvar) = &*queue;
+                                let mut guard = match lock.lock() {
+                                    Ok(g) => g,
+                                    Err(_) => break,
+                                };
+                                let deadline = Instant::now() + BACKPRESSURE_TIMEOUT;
+                                while guard.bytes.saturating_add(n) > MAX_QUEUE_BYTES
+                                    && !closed.load(Ordering::SeqCst)
+                                {
+                                    let Some(rem) =
+                                        deadline.checked_duration_since(Instant::now())
+                                    else {
+                                        guard.overflowed = true;
+                                        break;
+                                    };
+                                    guard = match cvar.wait_timeout(guard, rem) {
+                                        Ok((g, _)) => g,
+                                        Err(poison) => {
+                                            let mut g = poison.into_inner().0;
+                                            g.overflowed = true;
+                                            g
+                                        }
+                                    };
+                                    if guard.overflowed {
+                                        break;
+                                    }
                                 }
+                                if closed.load(Ordering::SeqCst) || guard.overflowed {
+                                    break;
+                                }
+                                guard.bytes = guard.bytes.saturating_add(n);
+                                guard.chunks.push_back(buf[..n].to_vec());
                             }
                         }
                     }
@@ -408,19 +488,40 @@ mod unix {
         }
         {
             let exit_code = exit_code.clone();
+            let closed = closed.clone();
+            let reap_state = reap_state.clone();
             thread::Builder::new()
                 .name("agentlink-pty-wait".into())
                 .spawn(move || {
-                    let mut status: libc::c_int = 0;
-                    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-                    let code = if waited < 0 {
-                        -1
-                    } else if libc::WIFEXITED(status) {
-                        libc::WEXITSTATUS(status)
-                    } else {
-                        -1
+                    let code = loop {
+                        let mut status: libc::c_int = 0;
+                        let (lock, cvar) = &*reap_state;
+                        let mut reaped = match lock.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                        if waited > 0 {
+                            *reaped = true;
+                            cvar.notify_all();
+                            break if libc::WIFEXITED(status) {
+                                libc::WEXITSTATUS(status)
+                            } else {
+                                -1
+                            };
+                        }
+                        if waited < 0 {
+                            *reaped = true;
+                            cvar.notify_all();
+                            break -1;
+                        }
+                        let _ = cvar.wait_timeout(reaped, Duration::from_millis(20));
                     };
-                    while !reader_done.load(Ordering::SeqCst) {
+                    let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+                    while !reader_done.load(Ordering::SeqCst)
+                        && !closed.load(Ordering::SeqCst)
+                        && Instant::now() < drain_deadline
+                    {
                         thread::sleep(Duration::from_millis(5));
                     }
                     if let Ok(mut slot) = exit_code.lock() {
@@ -433,8 +534,10 @@ mod unix {
             master: Arc::new(Mutex::new(master_file)),
             writer: Arc::new(Mutex::new(writer)),
             pid,
-            chunks,
+            queue,
             exit_code,
+            closed,
+            reap_state,
         })
     }
 
@@ -445,9 +548,15 @@ mod unix {
         let Some(session) = sessions.get(session_id) else {
             return PtyPoll::Exit(-1);
         };
-        if let Ok(mut queue) = session.live.chunks.lock() {
-            if let Some(chunk) = queue.pop_front() {
+        let (lock, cvar) = &*session.live.queue;
+        if let Ok(mut queue) = lock.lock() {
+            if let Some(chunk) = queue.chunks.pop_front() {
+                queue.bytes = queue.bytes.saturating_sub(chunk.len());
+                cvar.notify_all();
                 return PtyPoll::Chunk(chunk);
+            }
+            if queue.overflowed {
+                return PtyPoll::Error("pty output queue exceeded limit".into());
             }
         }
         if let Ok(slot) = session.live.exit_code.lock() {
@@ -521,8 +630,56 @@ mod unix {
     }
 
     pub fn kill_live(live: Live) {
-        unsafe {
-            libc::kill(-live.pid, libc::SIGHUP);
+        live.closed.store(true, Ordering::SeqCst);
+        live.queue.1.notify_all();
+        let pid = live.pid;
+        let reap_state = live.reap_state.clone();
+        // Drop master/writer so the child observes EOF/hangup on the PTY.
+        drop(live.master);
+        drop(live.writer);
+        let needs_escalation = {
+            let (lock, cvar) = &*reap_state;
+            let reaped = match lock.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if *reaped {
+                false
+            } else {
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGHUP);
+                }
+                cvar.notify_all();
+                true
+            }
+        };
+        if needs_escalation {
+            let _ = thread::Builder::new()
+                .name("agentlink-pty-kill".into())
+                .spawn(move || {
+                    let (lock, cvar) = &*reap_state;
+                    let mut reaped = match lock.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    let deadline = Instant::now() + SIGHUP_GRACE;
+                    while !*reaped {
+                        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                            break;
+                        };
+                        reaped = match cvar.wait_timeout(reaped, rem) {
+                            Ok((g, _)) => g,
+                            Err(p) => p.into_inner().0,
+                        };
+                    }
+                    if !*reaped {
+                        unsafe {
+                            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                        }
+                        cvar.notify_all();
+                    }
+                });
         }
     }
 
@@ -584,6 +741,7 @@ mod tests {
             match pty.poll(&sid) {
                 PtyPoll::Chunk(bytes) => out.extend(bytes),
                 PtyPoll::Exit(code) => break code,
+                PtyPoll::Error(err) => panic!("pty error: {err}"),
                 PtyPoll::Pending => {
                     assert!(
                         Instant::now() < deadline,

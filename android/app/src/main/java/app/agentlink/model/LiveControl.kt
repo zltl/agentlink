@@ -160,12 +160,32 @@ fun liveControlMessages(
     y2: Float = 0f,
     text: String = "",
     name: String = "",
+    dx: Float = 0f,
+    dy: Float = 0f,
 ): List<String> {
     return when (kind) {
         "tap" -> {
             val px = remotePixel(x, width)
             val py = remotePixel(y, height)
             listOf(liveMouse("down", px, py), liveMouse("up", px, py))
+        }
+        "right_click" -> {
+            val px = remotePixel(x, width)
+            val py = remotePixel(y, height)
+            listOf(liveMouse("down", px, py, "right"), liveMouse("up", px, py, "right"))
+        }
+        "scroll" -> {
+            val px = remotePixel(x, width)
+            val py = remotePixel(y, height)
+            listOf(
+                JSONObject()
+                    .put("type", "wheel")
+                    .put("x", px)
+                    .put("y", py)
+                    .put("dx", dx.toDouble())
+                    .put("dy", dy.toDouble())
+                    .toString(),
+            )
         }
         "swipe" -> {
             val ax = remotePixel(x, width)
