@@ -260,9 +260,10 @@ fn modifier_flag_for(name: &str) -> u64 {
         "shift" | "lshift" | "rshift" | "shift_l" | "shift_r" => FLAG_SHIFT,
         "ctrl" | "control" | "lctrl" | "rctrl" | "control_l" | "control_r" => FLAG_CONTROL,
         "alt" | "option" | "opt" | "lalt" | "ralt" | "alt_l" | "alt_r" => FLAG_ALTERNATE,
-        "meta" | "cmd" | "command" | "super" | "win" | "lwin" | "rwin" | "super_l"
+        "meta" | "cmd" | "command" | "super" | "win" | "gui" | "lgui" | "rgui" | "lcmd"
+        | "rcmd" | "lmeta" | "rmeta" | "lsuper" | "rsuper" | "lwin" | "rwin" | "super_l"
         | "super_r" => FLAG_COMMAND,
-        "capslock" | "caps_lock" => FLAG_ALPHA_SHIFT,
+        "capslock" | "caps_lock" | "caps-lock" => FLAG_ALPHA_SHIFT,
         _ => 0,
     }
 }
