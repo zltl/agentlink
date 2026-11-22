@@ -3,23 +3,32 @@
 //! Signaling uses [`agentlink_view::Viewer`], the same offerer the Android
 //! app uses. The window thread only receives events and pictures.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::client::{login_user, maintain_session_skew};
 use agentlink_core::{
-    apply_relay_defaults, parse_access, Client, ClientSettings, DirEntry, Identity, NodeInfo, Op,
-    PtyEvent, PtySession, RelayTrust, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
+    apply_relay_defaults, fetch_relay_ice_servers, parse_access, turn_servers_from_env, Client,
+    ClientSettings, DirEntry, Identity, NodeInfo, Op, PtyEvent, PtySession, RelayTrust,
+    PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
 };
 use agentlink_view::{is_screenshot_fallback, IceFault, LiveOptions, Signal, Viewer};
 use base64::Engine;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 
-use super::decode::{decode_image, H264Decoder};
+use super::decode::{annex_b_has_idr, decode_image, DecodeOutcome, H264Decoder};
 use super::diagnostics::{self, DiagEvent};
-use super::model::enroll_command;
+use super::indicator::SharedEguiCtx;
+use super::model::{
+    enroll_commands, inspect_file_for_editor, LoadedFile, MAX_EDITABLE_FILE_BYTES,
+};
+use super::ordered_send::{
+    should_extension_fallback, ControlKind, EnqueueError, OrderedControlQueue,
+};
 
 fn identity_fp_for(config_dir: &std::path::Path) -> Option<String> {
     Identity::load(&config_dir.join("identity.json"))
@@ -130,7 +139,7 @@ pub struct LiveHud {
 }
 
 /// Latest remote cursor sprite metadata from the `cursor` data channel.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DeskCursor {
     pub shape: String,
     pub visible: bool,
@@ -139,6 +148,26 @@ pub struct DeskCursor {
     pub bitmap_w: u32,
     pub bitmap_h: u32,
     pub bitmap_rgba: Option<Vec<u8>>,
+    /// Monotonic revision bumped on each cursor update so the UI only
+    /// re-uploads the GPU cursor texture when the bitmap actually changes.
+    pub rev: u64,
+}
+
+impl Default for DeskCursor {
+    fn default() -> Self {
+        Self {
+            shape: String::new(),
+            // Default visible so the pointer is never hidden before the first
+            // cursor metadata packet arrives from the node (`DESK-11`).
+            visible: true,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bitmap_w: 0,
+            bitmap_h: 0,
+            bitmap_rgba: None,
+            rev: 0,
+        }
+    }
 }
 
 /// Sliding client-side timing samples (microseconds / counts) for `--perf-log` and debug `state`.
@@ -236,11 +265,12 @@ pub enum UiEvent {
         path: String,
         entries: Vec<DirEntry>,
     },
-    File {
-        path: String,
-        text: String,
+    File(LoadedFile),
+    Enrolled {
+        unix: String,
+        powershell: String,
+        token: String,
     },
-    Enrolled(String),
     Link(String),
     Pins(Vec<String>),
     Monitors(Vec<MonitorEntry>),
@@ -267,6 +297,14 @@ pub enum Cmd {
         cols: u16,
         gen: u64,
     },
+    /// Switch the active PTY target without closing other open shells.
+    PtySelect {
+        gen: u64,
+    },
+    /// Close a specific PTY generation without disturbing other open shells.
+    PtyCloseGen {
+        gen: u64,
+    },
     PtyWrite {
         data: Vec<u8>,
     },
@@ -283,11 +321,22 @@ pub enum Cmd {
     Read {
         node: String,
         path: String,
+        size_hint: Option<u64>,
     },
     Write {
         node: String,
         path: String,
         text: String,
+    },
+    Upload {
+        node: String,
+        local_path: std::path::PathBuf,
+        remote_path: String,
+    },
+    Download {
+        node: String,
+        remote_path: String,
+        local_path: std::path::PathBuf,
     },
     Mkdir {
         node: String,
@@ -311,6 +360,10 @@ pub enum Cmd {
         retry: bool,
     },
     LiveStop,
+    /// Toggle automatic bidirectional clipboard sync for desktop sessions (`DESK-18`).
+    ClipboardSync {
+        enabled: bool,
+    },
     Input {
         node: String,
         live: String,
@@ -331,6 +384,7 @@ pub enum Cmd {
     Shot {
         node: String,
         path: String,
+        monitor: Option<u32>,
     },
     Enroll {
         name: String,
@@ -349,8 +403,12 @@ enum PtyCmd {
 pub struct Shared {
     events: Mutex<Vec<UiEvent>>,
     picture: Mutex<Option<Picture>>,
+    rgba_pool: Mutex<Vec<Vec<u8>>>,
     cursor: Mutex<DeskCursor>,
+    cursor_rev: AtomicU64,
     seq: AtomicU64,
+    live_gen: AtomicU64,
+    egui_ctx: SharedEguiCtx,
     /// Once a terminal handshake is published, progress/cleanup stages
     /// must not overwrite it until the next live attempt.
     terminal_handshake: AtomicBool,
@@ -362,17 +420,44 @@ impl Shared {
         Self {
             events: Mutex::new(Vec::new()),
             picture: Mutex::new(None),
+            rgba_pool: Mutex::new(Vec::new()),
             cursor: Mutex::new(DeskCursor::default()),
+            cursor_rev: AtomicU64::new(0),
             seq: AtomicU64::new(0),
+            live_gen: AtomicU64::new(0),
+            egui_ctx: Arc::new(OnceLock::new()),
             terminal_handshake: AtomicBool::new(false),
             perf: ClientPerf::default(),
         }
+    }
+
+    pub fn set_egui_ctx(&self, ctx: eframe::egui::Context) {
+        let _ = self.egui_ctx.set(ctx);
+    }
+
+    pub fn egui_ctx_slot(&self) -> SharedEguiCtx {
+        Arc::clone(&self.egui_ctx)
+    }
+
+    pub fn request_repaint(&self) {
+        if let Some(ctx) = self.egui_ctx.get() {
+            ctx.request_repaint();
+        }
+    }
+
+    pub fn bump_live_gen(&self) -> u64 {
+        self.live_gen.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn current_live_gen(&self) -> u64 {
+        self.live_gen.load(Ordering::Acquire)
     }
 
     pub fn push(&self, event: UiEvent) {
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
         }
+        self.request_repaint();
     }
 
     pub fn drain(&self) -> Vec<UiEvent> {
@@ -382,34 +467,75 @@ impl Shared {
             .unwrap_or_default()
     }
 
+    pub fn take_rgba_buf(&self) -> Option<Vec<u8>> {
+        self.rgba_pool.lock().ok().and_then(|mut pool| pool.pop())
+    }
+
+    pub fn recycle_rgba(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 {
+            return;
+        }
+        buf.clear();
+        if let Ok(mut pool) = self.rgba_pool.lock() {
+            if pool.len() < 2 {
+                pool.push(buf);
+            }
+        }
+    }
+
     pub fn set_picture(&self, rgba: Vec<u8>, width: usize, height: usize, kind: &str, path: &str) {
         if rgba.len() != width.saturating_mul(height).saturating_mul(4) || width == 0 {
             return;
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Ok(mut slot) = self.picture.lock() {
-            *slot = Some(Picture {
+        let replaced = if let Ok(mut slot) = self.picture.lock() {
+            slot.replace(Picture {
                 rgba,
                 width,
                 height,
                 kind: kind.to_string(),
                 path: path.to_string(),
                 seq,
-            });
+            })
+        } else {
+            None
+        };
+        if let Some(old) = replaced {
+            self.recycle_rgba(old.rgba);
         }
+        self.request_repaint();
     }
 
     pub fn latest_picture(&self) -> Option<Picture> {
         self.picture.lock().ok().and_then(|mut slot| slot.take())
     }
 
+    pub fn clear_picture(&self) {
+        let old = self.picture.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(old) = old {
+            self.recycle_rgba(old.rgba);
+        }
+    }
+
     pub fn set_hud(&self, hud: LiveHud) {
         self.push(UiEvent::Hud(hud));
     }
 
-    pub fn set_cursor(&self, cursor: DeskCursor) {
+    pub fn set_cursor(&self, mut cursor: DeskCursor) {
+        cursor.rev = self.cursor_rev.fetch_add(1, Ordering::Relaxed) + 1;
         if let Ok(mut slot) = self.cursor.lock() {
             *slot = cursor;
+        }
+        self.request_repaint();
+    }
+
+    pub fn reset_cursor(&self) {
+        let rev = self.cursor_rev.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut slot) = self.cursor.lock() {
+            *slot = DeskCursor {
+                rev,
+                ..DeskCursor::default()
+            };
         }
     }
 
@@ -638,6 +764,175 @@ impl Signal for ClientSignal {
 struct Live {
     stop: Arc<AtomicBool>,
     viewer: Arc<Mutex<Option<Arc<Viewer>>>>,
+    /// True once the WebRTC `input` DataChannel has accepted at least one message.
+    /// Before this flips true (during ICE connect while JPEG stills are live),
+    /// input routes via relay `inject_input` fallback (`DESK-12`). Once true,
+    /// `should_extension_fallback(true, ..)` prevents route-switch reordering.
+    dc_ready: Arc<AtomicBool>,
+}
+
+type ClientSlot = Arc<tokio::sync::Mutex<Option<Arc<Client>>>>;
+type LiveHolder = Arc<Mutex<(Option<Live>, Option<tokio::task::JoinHandle<()>>)>>;
+
+enum PtyEntry {
+    Opening {
+        pending_writes: Vec<Vec<u8>>,
+        pending_resize: Option<(u16, u16)>,
+    },
+    Live(UnboundedSender<PtyCmd>),
+}
+
+#[derive(Default)]
+struct PtyHub {
+    active_gen: u64,
+    sessions: HashMap<u64, PtyEntry>,
+}
+
+impl PtyHub {
+    fn close_all(&mut self) -> Vec<UnboundedSender<PtyCmd>> {
+        self.active_gen = 0;
+        let drained: Vec<_> = self.sessions.drain().collect();
+        drained
+            .into_iter()
+            .filter_map(|(_, entry)| match entry {
+                PtyEntry::Live(tx) => Some(tx),
+                PtyEntry::Opening { .. } => None,
+            })
+            .collect()
+    }
+}
+
+struct QueuedInput {
+    node: String,
+    live: String,
+    inject: String,
+    barrier: bool,
+}
+
+fn stop_live_holder(holder: &LiveHolder, shared: &Shared) {
+    shared.bump_live_gen();
+    shared.clear_picture();
+    let (live, shots) = holder
+        .lock()
+        .map(|mut slot| (slot.0.take(), slot.1.take()))
+        .unwrap_or((None, None));
+    if let Some(session) = live {
+        session.stop.store(true, Ordering::Relaxed);
+        if let Ok(slot) = session.viewer.lock() {
+            if let Some(viewer) = slot.as_ref().cloned() {
+                drop(slot);
+                tokio::spawn(async move {
+                    viewer.close_async().await;
+                });
+            }
+        }
+    }
+    if let Some(task) = shots {
+        task.abort();
+    }
+}
+
+async fn slot_ensure_client(
+    slot: &ClientSlot,
+    config_dir: &std::path::Path,
+    force: bool,
+) -> Result<Arc<Client>, String> {
+    let mut guard = slot.lock().await;
+    ensure_worker_client(&mut guard, config_dir, force).await
+}
+
+async fn slot_clear_if_same(slot: &ClientSlot, dead: &Arc<Client>) {
+    let mut guard = slot.lock().await;
+    if let Some(current) = guard.as_ref() {
+        if Arc::ptr_eq(current, dead) {
+            *guard = None;
+        }
+    }
+}
+
+async fn slot_run_idempotent<T, OpFn>(
+    slot: &ClientSlot,
+    config_dir: &std::path::Path,
+    mut op: OpFn,
+) -> Result<(T, bool), String>
+where
+    OpFn: FnMut(
+        Arc<Client>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>,
+{
+    let current = slot_ensure_client(slot, config_dir, false).await?;
+    match op(Arc::clone(&current)).await {
+        Ok(value) => Ok((value, false)),
+        Err(err) if super::model::session_needs_rebootstrap(&err) => {
+            slot_clear_if_same(slot, &current).await;
+            let next = slot_ensure_client(slot, config_dir, true).await?;
+            let value = op(next).await?;
+            Ok((value, true))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn slot_run_non_idempotent<T, OpFn>(
+    slot: &ClientSlot,
+    config_dir: &std::path::Path,
+    action_label: &'static str,
+    op: OpFn,
+) -> Result<T, String>
+where
+    OpFn: FnOnce(
+        Arc<Client>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>,
+{
+    let current = slot_ensure_client(slot, config_dir, false).await?;
+    match op(Arc::clone(&current)).await {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let dead_after = !current.is_alive();
+            let transport_lost = super::model::session_needs_rebootstrap(&err)
+                || (dead_after && err.to_ascii_lowercase().contains("session expired"));
+            if dead_after || super::model::session_needs_rebootstrap(&err) {
+                slot_clear_if_same(slot, &current).await;
+            }
+            if transport_lost {
+                Err(format!(
+                    "Connection closed before confirming {action_label} ({err}); outcome is unknown and was not automatically retried to avoid duplicate execution."
+                ))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+async fn refresh_with_rebootstrap(
+    slot: &ClientSlot,
+    config_dir: &std::path::Path,
+    shared: &Shared,
+) {
+    match slot_run_idempotent(slot, config_dir, |current| {
+        Box::pin(async move {
+            let mut nodes = current.list_nodes().await.map_err(|err| err.to_string())?;
+            nodes.sort_by(|left, right| {
+                right
+                    .online
+                    .cmp(&left.online)
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            });
+            let pins = current.node_pin_warnings();
+            Ok((nodes, pins))
+        })
+    })
+    .await
+    {
+        Ok(((nodes, pins), _)) => {
+            if !pins.is_empty() {
+                shared.push(UiEvent::Pins(pins));
+            }
+            shared.push(UiEvent::Nodes(nodes));
+        }
+        Err(err) => shared.push(UiEvent::Failed(err)),
+    }
 }
 
 pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std::path::PathBuf) {
@@ -653,443 +948,74 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
         }
     };
     runtime.block_on(async move {
-        let mut client: Option<Arc<Client>> = None;
-        let mut pty: Option<UnboundedSender<PtyCmd>> = None;
-        let mut active_pty_gen: u64 = 0;
-        let mut live: Option<Live> = None;
-        let mut shots: Option<tokio::task::JoinHandle<()>> = None;
-        loop {
-            let Some(cmd) = rx.recv().await else {
-                break;
-            };
-            match cmd {
-                Cmd::Bootstrap => {
-                    diag_client(
-                        &config_dir,
-                        "bootstrap_begin",
-                        Some("Bootstrap"),
-                        None,
-                        None,
-                    );
-                    match saved_client(&config_dir).await {
-                        Ok(Some((next, user))) => {
-                            diag_client(
-                                &config_dir,
-                                "bootstrap_ok",
-                                Some("Bootstrap"),
-                                Some(next.as_ref()),
-                                None,
-                            );
-                            client = Some(next);
-                            shared.push(UiEvent::Ready { user: Some(user) });
-                            refresh(client.as_ref(), &shared).await;
-                        }
-                        Ok(None) => {
-                            diag_client(
-                                &config_dir,
-                                "bootstrap_none",
-                                Some("Bootstrap"),
-                                None,
-                                None,
-                            );
-                            shared.push(UiEvent::Ready { user: None });
-                        }
-                        Err(err) => {
-                            // Typed connect failures already emitted inside `saved_client`.
-                            shared.push(UiEvent::Ready { user: None });
-                            shared.push(UiEvent::Failed(err));
-                        }
-                    }
-                }
-                Cmd::Login {
-                    username,
-                    password,
-                    totp,
-                    relay,
-                    pin,
-                    trust,
-                } => match sign_in(
-                    &config_dir,
-                    &username,
-                    &password,
-                    &totp,
-                    &relay,
-                    &pin,
-                    &trust,
-                )
-                .await
-                {
-                    Ok((next, user)) => {
-                        client = Some(next);
-                        shared.push(UiEvent::Ready {
-                            user: Some(user.clone()),
-                        });
-                        shared.push(UiEvent::Notice(format!("Signed in as {user}")));
-                        refresh(client.as_ref(), &shared).await;
-                    }
-                    Err(err) => {
-                        if super::model::asks_for_totp(&err) {
-                            shared.push(UiEvent::TotpRequired(err));
-                        } else {
-                            shared.push(UiEvent::Failed(err));
-                        }
-                    }
-                },
-                Cmd::Logout => {
-                    stop_live(&mut live, &mut shots);
-                    active_pty_gen = 0;
-                    close_pty(&mut pty).await;
-                    client = None;
-                    if let Err(err) = crate::tray::sign_out(&config_dir).await {
-                        shared.push(UiEvent::Failed(err.to_string()));
-                    }
-                    shared.push(UiEvent::Ready { user: None });
-                    shared.push(UiEvent::Notice("Signed out".into()));
-                }
-                Cmd::Refresh => {
-                    if client.as_ref().is_some_and(|cur| !cur.is_alive()) {
-                        close_pty(&mut pty).await;
-                    }
-                    if let Err(err) = ensure_worker_client(&mut client, &config_dir, false).await {
-                        shared.push(UiEvent::Failed(err));
-                    } else {
-                        refresh(client.as_ref(), &shared).await;
-                    }
-                }
-                Cmd::PtyOpen {
-                    node,
-                    rows,
-                    cols,
-                    gen,
-                } => {
-                    close_pty(&mut pty).await;
-                    active_pty_gen = gen;
-                    let node_arg = node;
-                    match run_non_idempotent_with_live_worker_client(
-                        &mut client,
-                        &config_dir,
-                        "opening terminal session",
-                        |current| {
-                            let node = node_arg.clone();
-                            Box::pin(async move {
-                                current
-                                    .open_pty(&node, None, None, rows, cols)
-                                    .await
-                                    .map_err(|err| err.to_string())
-                            })
-                        },
-                    )
-                    .await
-                    {
-                        Ok(session) => {
-                            pty = Some(spawn_pty(
-                                session,
-                                Arc::clone(&shared),
-                                gen,
-                                (rows, cols),
-                            ));
-                        }
-                        Err(err) => {
-                            shared.push(UiEvent::PtyFailed { gen, message: err });
-                            shared.push(UiEvent::PtyDone { gen });
-                        }
-                    }
-                }
-                Cmd::PtyWrite { data } => {
-                    let closed = match &pty {
-                        Some(tx) => tx.send(PtyCmd::Write(data)).is_err(),
-                        None => false,
+        let client_slot: ClientSlot = Arc::new(tokio::sync::Mutex::new(None));
+        let pty_hub: Arc<Mutex<PtyHub>> = Arc::new(Mutex::new(PtyHub::default()));
+        let live_holder: LiveHolder = Arc::new(Mutex::new((None, None)));
+        let clipboard_sync_enabled = Arc::new(AtomicBool::new(false));
+
+        // Dedicated fast-lane ordered input consumer (`DESK-11`, `DESK-12`, `ordered_send`).
+        let input_queue: Arc<Mutex<OrderedControlQueue<QueuedInput>>> =
+            Arc::new(Mutex::new(OrderedControlQueue::new(256)));
+        let input_notify = Arc::new(Notify::new());
+        let input_closed = Arc::new(AtomicBool::new(false));
+        let input_task = {
+            let input_queue = Arc::clone(&input_queue);
+            let input_notify = Arc::clone(&input_notify);
+            let input_closed = Arc::clone(&input_closed);
+            let live_holder = Arc::clone(&live_holder);
+            let client_slot = Arc::clone(&client_slot);
+            let config_dir = config_dir.clone();
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                loop {
+                    let notified = input_notify.notified();
+                    let next = {
+                        let mut q = input_queue.lock().unwrap_or_else(|e| e.into_inner());
+                        q.pop()
                     };
-                    if closed {
-                        pty = None;
-                        if active_pty_gen != 0 {
-                            shared.push(UiEvent::PtyFailed {
-                                gen: active_pty_gen,
-                                message:
-                                    "Shell session is no longer active; reopen shell to continue."
-                                        .into(),
-                            });
-                            shared.push(UiEvent::PtyDone {
-                                gen: active_pty_gen,
-                            });
+                    let Some((_kind, item)) = next else {
+                        if input_closed.load(Ordering::Acquire) {
+                            break;
                         }
-                    }
-                }
-                Cmd::PtyResize { rows, cols } => {
-                    if let Some(tx) = &pty {
-                        let _ = tx.send(PtyCmd::Resize(rows, cols));
-                    }
-                }
-                Cmd::PtyProbe => {
-                    if let Some(tx) = &pty {
-                        let _ = tx.send(PtyCmd::Probe);
-                    }
-                }
-                Cmd::PtyClose => {
-                    active_pty_gen = 0;
-                    close_pty(&mut pty).await;
-                }
-                Cmd::List { node, path } => {
-                    let node_arg = node;
-                    let path_arg = path.clone();
-                    match run_idempotent_with_once_rebootstrap(
-                        &mut client,
-                        &config_dir,
-                        |current| {
-                            let node = node_arg.clone();
-                            let path = path_arg.clone();
-                            Box::pin(async move {
-                                current
-                                    .list_dir(&node, &path)
-                                    .await
-                                    .map_err(|err| err.to_string())
-                            })
-                        },
-                    )
-                    .await
-                    {
-                        Ok((entries, _)) => shared.push(UiEvent::Dir { path, entries }),
-                        Err(err) => shared.push(UiEvent::Failed(err)),
-                    }
-                }
-                Cmd::Read { node, path } => {
-                    let node_arg = node;
-                    let path_arg = path.clone();
-                    match run_idempotent_with_once_rebootstrap(
-                        &mut client,
-                        &config_dir,
-                        |current| {
-                            let node = node_arg.clone();
-                            let path = path_arg.clone();
-                            Box::pin(async move {
-                                current
-                                    .read_file(&node, &path, 0, 256 * 1024)
-                                    .await
-                                    .map_err(|err| err.to_string())
-                            })
-                        },
-                    )
-                    .await
-                    {
-                        Ok((bytes, _)) if super::model::looks_textual(&bytes) => {
-                            let text = String::from_utf8_lossy(&bytes).to_string();
-                            shared.push(UiEvent::File { path, text });
-                        }
-                        Ok(_) => shared.push(UiEvent::Failed(
-                            "That file is not text. The browser can still download it.".into(),
-                        )),
-                        Err(err) => shared.push(UiEvent::Failed(err)),
-                    }
-                }
-                Cmd::Write { node, path, text } => {
-                    let node_arg = node;
-                    let path_arg = path.clone();
-                    let text_arg = text.clone();
-                    match run_non_idempotent_with_live_worker_client(
-                        &mut client,
-                        &config_dir,
-                        "saving file",
-                        |current| {
-                            let node = node_arg.clone();
-                            let path = path_arg.clone();
-                            let text = text_arg.clone();
-                            Box::pin(async move {
-                                current
-                                    .write_file(&node, &path, text.as_bytes())
-                                    .await
-                                    .map_err(|err| err.to_string())
-                            })
-                        },
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            shared.push(UiEvent::Notice(format!("Saved {path}")));
-                            shared.push(UiEvent::File { path, text });
-                        }
-                        Err(err) => shared.push(UiEvent::Failed(err)),
-                    }
-                }
-                Cmd::Mkdir { node, path } => {
-                    let parent = super::model::parent_path(&path);
-                    let node_arg = node.clone();
-                    let path_arg = path;
-                    match run_non_idempotent_with_live_worker_client(
-                        &mut client,
-                        &config_dir,
-                        "creating folder",
-                        |current| {
-                            let node = node_arg.clone();
-                            let path = path_arg.clone();
-                            Box::pin(async move {
-                                current
-                                    .mkdir(&node, &path, true)
-                                    .await
-                                    .map_err(|err| err.to_string())
-                            })
-                        },
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            let parent_arg = parent.clone();
-                            match run_idempotent_with_once_rebootstrap(
-                                &mut client,
-                                &config_dir,
-                                |current| {
-                                    let node = node.clone();
-                                    let parent = parent_arg.clone();
-                                    Box::pin(async move {
-                                        current
-                                            .list_dir(&node, &parent)
-                                            .await
-                                            .map_err(|err| err.to_string())
-                                    })
-                                },
-                            )
-                            .await
-                            {
-                                Ok((entries, _)) => shared.push(UiEvent::Dir {
-                                    path: parent,
-                                    entries,
-                                }),
-                                Err(err) => shared.push(UiEvent::Failed(err)),
-                            }
-                        }
-                        Err(err) => shared.push(UiEvent::Failed(err)),
-                    }
-                }
-                Cmd::Remove { node, path } => {
-                    let parent = super::model::parent_path(&path);
-                    let node_arg = node.clone();
-                    let path_arg = path;
-                    match run_non_idempotent_with_live_worker_client(
-                        &mut client,
-                        &config_dir,
-                        "removing path",
-                        |current| {
-                            let node = node_arg.clone();
-                            let path = path_arg.clone();
-                            Box::pin(async move {
-                                current
-                                    .remove(&node, &path, false)
-                                    .await
-                                    .map_err(|err| err.to_string())
-                            })
-                        },
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            let parent_arg = parent.clone();
-                            match run_idempotent_with_once_rebootstrap(
-                                &mut client,
-                                &config_dir,
-                                |current| {
-                                    let node = node.clone();
-                                    let parent = parent_arg.clone();
-                                    Box::pin(async move {
-                                        current
-                                            .list_dir(&node, &parent)
-                                            .await
-                                            .map_err(|err| err.to_string())
-                                    })
-                                },
-                            )
-                            .await
-                            {
-                                Ok((entries, _)) => shared.push(UiEvent::Dir {
-                                    path: parent,
-                                    entries,
-                                }),
-                                Err(err) => shared.push(UiEvent::Failed(err)),
-                            }
-                        }
-                        Err(err) => shared.push(UiEvent::Failed(err)),
-                    }
-                }
-                Cmd::Live {
-                    node,
-                    control,
-                    monitor,
-                    quality,
-                    scale,
-                    max_fps,
-                    retry,
-                } => {
-                    stop_live(&mut live, &mut shots);
-                    diag_client(
-                        &config_dir,
-                        if retry { "retry" } else { "cmd" },
-                        Some("Live"),
-                        client.as_ref().map(|c| c.as_ref()),
-                        None,
-                    );
-                    let current = match ensure_worker_client(&mut client, &config_dir, false).await
-                    {
-                        Ok(current) => current,
-                        Err(err) => {
-                            diag_client(&config_dir, "live_ensure_err", Some("Live"), None, None);
-                            shared.push(UiEvent::Failed(err));
-                            continue;
-                        }
+                        notified.await;
+                        continue;
                     };
-                    diag_client(
-                        &config_dir,
-                        "live_ensure_ok",
-                        Some("Live"),
-                        Some(current.as_ref()),
-                        None,
-                    );
-                    shared.push(UiEvent::Link(if control {
-                        "connecting · control".into()
-                    } else {
-                        "connecting · view".into()
-                    }));
-                    let started = start_live(
-                        current,
-                        node,
-                        control,
-                        monitor,
-                        quality,
-                        scale,
-                        max_fps,
-                        Arc::clone(&shared),
-                    );
-                    shots = Some(started.shots);
-                    live = Some(started.live);
-                }
-                Cmd::LiveStop => {
-                    stop_live(&mut live, &mut shots);
-                    shared.set_hud(LiveHud::default());
-                    shared.push(UiEvent::Link("relay".into()));
-                }
-                Cmd::Input {
-                    node,
-                    live: body,
-                    inject,
-                    barrier,
-                } => {
-                    // One ordered live route: never switch to Extension while a
-                    // viewer exists (saturation would reorder barriers ahead of
-                    // queued RTC downs). Extension only when there is no live
-                    // session (stills / pre-connect).
-                    let viewer = live
-                        .as_ref()
-                        .and_then(|session| session.viewer.lock().ok())
-                        .and_then(|slot| slot.clone());
-                    if let Some(viewer) = viewer {
-                        let _sent = if barrier {
-                            viewer.send_control_barrier(&body).await
+                    let live_pair = live_holder.lock().ok().and_then(|slot| {
+                        let session = slot.0.as_ref()?;
+                        let viewer = session.viewer.lock().ok()?.clone()?;
+                        Some((viewer, Arc::clone(&session.dc_ready)))
+                    });
+                    let mut use_extension = true;
+                    if let Some((viewer, dc_ready)) = live_pair {
+                        let already_open = dc_ready.load(Ordering::Acquire);
+                        let sent = if item.barrier {
+                            viewer.send_control_barrier(&item.live).await
                         } else {
-                            viewer.send_control_move(&body)
+                            viewer.send_control_move(&item.live)
                         };
-                        // Closed/saturated barrier: do not Extension-bypass.
-                    } else {
-                        let payload = serde_json::from_str(&inject).unwrap_or(json!({}));
-                        let node_arg = node;
-                        match run_non_idempotent_with_live_worker_client(
-                            &mut client,
+                        if sent {
+                            if !already_open {
+                                dc_ready.store(true, Ordering::Release);
+                            }
+                            use_extension = false;
+                        } else {
+                            // Once the WebRTC DataChannel has opened, never switch back
+                            // to relay Extension on saturation (reordering barrier).
+                            // While ICE is still connecting (!already_open) and JPEG stills
+                            // are live, fall back to relay inject_input (`DESK-12`).
+                            let err = if already_open {
+                                EnqueueError::BarrierBlocked
+                            } else {
+                                EnqueueError::Closed
+                            };
+                            use_extension = should_extension_fallback(already_open, &err);
+                        }
+                    }
+                    if use_extension {
+                        let payload = serde_json::from_str(&item.inject).unwrap_or(json!({}));
+                        let node_arg = item.node;
+                        match slot_run_non_idempotent(
+                            &client_slot,
                             &config_dir,
                             "sending input",
                             |current| {
@@ -1117,113 +1043,171 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         }
                     }
                 }
-                Cmd::Monitors { node, retry } => {
-                    diag_client(
-                        &config_dir,
-                        if retry { "retry" } else { "cmd" },
-                        Some("Monitors"),
-                        client.as_ref().map(|c| c.as_ref()),
-                        None,
-                    );
-                    match list_monitors_with_once_rebootstrap(
-                        &mut client,
-                        &node,
-                        |slot, force| {
-                            let config_dir = config_dir.clone();
-                            Box::pin(
-                                async move { ensure_worker_client(slot, &config_dir, force).await },
-                            )
-                        },
-                        |current, node| {
-                            Box::pin(async move { list_monitors(&current, &node).await })
-                        },
-                    )
-                    .await
-                    {
-                        Ok(MonitorsOutcome {
-                            monitors,
-                            reconnected,
-                        }) => {
-                            diag_client(
-                                &config_dir,
-                                "monitors_ok",
-                                Some("Monitors"),
-                                client.as_ref().map(|c| c.as_ref()),
-                                Some(reconnected),
-                            );
-                            if reconnected {
-                                shared.push(UiEvent::Notice(
-                                    "Reconnected after a closed relay session.".into(),
-                                ));
-                            }
-                            shared.push(UiEvent::Monitors(monitors));
-                        }
-                        Err(err) => {
-                            diag_client(
-                                &config_dir,
-                                "monitors_err",
-                                Some("Monitors"),
-                                client.as_ref().map(|c| c.as_ref()),
-                                None,
-                            );
-                            shared.push(UiEvent::Failed(err));
-                        }
-                    }
-                }
-                Cmd::Clipboard { node, text } => {
-                    let body = json!({"type": "clipboard", "text": text}).to_string();
-                    let viewer = live
-                        .as_ref()
-                        .and_then(|session| session.viewer.lock().ok())
-                        .and_then(|slot| slot.clone());
-                    let sent = match viewer {
-                        Some(viewer) => viewer.send_control_barrier(&body).await,
-                        None => false,
-                    };
-                    if !sent {
-                        shared.push(UiEvent::Failed(
-                            "Clipboard needs a live session. Reconnect desktop first.".into(),
-                        ));
-                        let _ = node;
-                    } else {
-                        shared.push(UiEvent::Notice("Clipboard sent to the machine.".into()));
-                    }
-                }
-                Cmd::Shot { node, path } => {
-                    let node_arg = node;
-                    let path_arg = path;
-                    match run_idempotent_with_once_rebootstrap(
-                        &mut client,
-                        &config_dir,
-                        |current| {
-                            let node = node_arg.clone();
-                            let path = path_arg.clone();
-                            Box::pin(async move { save_screenshot(&current, &node, &path).await })
-                        },
-                    )
-                    .await
-                    {
-                        Ok((saved, _)) => shared.push(UiEvent::Notice(format!("Saved {saved}"))),
-                        Err(err) => shared.push(UiEvent::Failed(err)),
-                    }
-                }
-                Cmd::Enroll {
-                    name,
-                    access,
-                    minutes,
-                } => match parse_access(&access) {
-                    Ok(policy) => {
-                        let ttl = minutes.clamp(1, 7 * 24 * 60) * 60;
-                        let name_arg = name.clone();
-                        match run_non_idempotent_with_live_worker_client(
-                            &mut client,
+            })
+        };
+
+        loop {
+            let Some(cmd) = rx.recv().await else {
+                break;
+            };
+            match cmd {
+                Cmd::Bootstrap => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        diag_client(
                             &config_dir,
-                            "creating enrollment token",
+                            "bootstrap_begin",
+                            Some("Bootstrap"),
+                            None,
+                            None,
+                        );
+                        let mut guard = client_slot.lock().await;
+                        match saved_client(&config_dir).await {
+                            Ok(Some((next, user))) => {
+                                diag_client(
+                                    &config_dir,
+                                    "bootstrap_ok",
+                                    Some("Bootstrap"),
+                                    Some(next.as_ref()),
+                                    None,
+                                );
+                                *guard = Some(next);
+                                drop(guard);
+                                shared.push(UiEvent::Ready { user: Some(user) });
+                                refresh_with_rebootstrap(&client_slot, &config_dir, &shared).await;
+                            }
+                            Ok(None) => {
+                                drop(guard);
+                                diag_client(
+                                    &config_dir,
+                                    "bootstrap_none",
+                                    Some("Bootstrap"),
+                                    None,
+                                    None,
+                                );
+                                shared.push(UiEvent::Ready { user: None });
+                            }
+                            Err(err) => {
+                                drop(guard);
+                                shared.push(UiEvent::Ready { user: None });
+                                shared.push(UiEvent::Failed(err));
+                            }
+                        }
+                    });
+                }
+                Cmd::Login {
+                    username,
+                    password,
+                    totp,
+                    relay,
+                    pin,
+                    trust,
+                } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let mut guard = client_slot.lock().await;
+                        match sign_in(
+                            &config_dir,
+                            &username,
+                            &password,
+                            &totp,
+                            &relay,
+                            &pin,
+                            &trust,
+                        )
+                        .await
+                        {
+                            Ok((next, user)) => {
+                                *guard = Some(next);
+                                drop(guard);
+                                shared.push(UiEvent::Ready {
+                                    user: Some(user.clone()),
+                                });
+                                shared.push(UiEvent::Notice(format!("Signed in as {user}")));
+                                refresh_with_rebootstrap(&client_slot, &config_dir, &shared).await;
+                            }
+                            Err(err) => {
+                                drop(guard);
+                                if super::model::asks_for_totp(&err) {
+                                    shared.push(UiEvent::TotpRequired(err));
+                                } else {
+                                    shared.push(UiEvent::Failed(err));
+                                }
+                            }
+                        }
+                    });
+                }
+                Cmd::Logout => {
+                    // Immediate local teardown — never blocked by slow RPCs.
+                    stop_live_holder(&live_holder, &shared);
+                    let to_close = pty_hub
+                        .lock()
+                        .map(|mut hub| hub.close_all())
+                        .unwrap_or_default();
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        for tx in to_close {
+                            let mut slot = Some(tx);
+                            close_pty(&mut slot).await;
+                        }
+                        {
+                            let mut guard = client_slot.lock().await;
+                            *guard = None;
+                        }
+                        if let Err(err) = crate::tray::sign_out(&config_dir).await {
+                            shared.push(UiEvent::Failed(err.to_string()));
+                        }
+                        shared.push(UiEvent::Ready { user: None });
+                        shared.push(UiEvent::Notice("Signed out".into()));
+                    });
+                }
+                Cmd::Refresh => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        refresh_with_rebootstrap(&client_slot, &config_dir, &shared).await;
+                    });
+                }
+                Cmd::PtyOpen {
+                    node,
+                    rows,
+                    cols,
+                    gen,
+                } => {
+                    // Register Opening slot synchronously so immediate PtyWrite commands
+                    // buffer instead of dropping while `open_pty` is in flight (`TERM-08`).
+                    if let Ok(mut hub) = pty_hub.lock() {
+                        hub.active_gen = gen;
+                        hub.sessions.insert(
+                            gen,
+                            PtyEntry::Opening {
+                                pending_writes: Vec::new(),
+                                pending_resize: None,
+                            },
+                        );
+                    }
+                    let client_slot = Arc::clone(&client_slot);
+                    let pty_hub = Arc::clone(&pty_hub);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let node_arg = node;
+                        match slot_run_non_idempotent(
+                            &client_slot,
+                            &config_dir,
+                            "opening terminal session",
                             |current| {
-                                let name = name_arg.clone();
+                                let node = node_arg.clone();
                                 Box::pin(async move {
                                     current
-                                        .create_enrollment_token(&name, policy, ttl, 1)
+                                        .open_pty(&node, None, None, rows, cols)
                                         .await
                                         .map_err(|err| err.to_string())
                                 })
@@ -1231,25 +1215,749 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         )
                         .await
                         {
-                            Ok(info) => {
-                                let command = enroll_command(&info.token, &name, &access);
-                                shared.push(UiEvent::Enrolled(format!(
-                                    "{command}\n\nToken: {}",
-                                    info.token
-                                )));
+                            Ok(session) => {
+                                let pending = pty_hub.lock().ok().and_then(|mut hub| {
+                                    match hub.sessions.get(&gen) {
+                                        Some(PtyEntry::Opening { .. }) => {
+                                            match hub.sessions.remove(&gen) {
+                                                Some(PtyEntry::Opening {
+                                                    pending_writes,
+                                                    pending_resize,
+                                                }) => Some((pending_writes, pending_resize)),
+                                                _ => None,
+                                            }
+                                        }
+                                        _ => None,
+                                    }
+                                });
+                                let Some((pending_writes, pending_resize)) = pending else {
+                                    let _ = session.close().await;
+                                    return;
+                                };
+                                let tx = spawn_pty(
+                                    session,
+                                    Arc::clone(&shared),
+                                    gen,
+                                    (rows, cols),
+                                );
+                                if let Some((r, c)) = pending_resize {
+                                    let _ = tx.send(PtyCmd::Resize(r, c));
+                                }
+                                for chunk in pending_writes {
+                                    let _ = tx.send(PtyCmd::Write(chunk));
+                                }
+                                if let Ok(mut hub) = pty_hub.lock() {
+                                    hub.sessions.insert(gen, PtyEntry::Live(tx));
+                                }
+                            }
+                            Err(err) => {
+                                if let Ok(mut hub) = pty_hub.lock() {
+                                    hub.sessions.remove(&gen);
+                                }
+                                shared.push(UiEvent::PtyFailed { gen, message: err });
+                                shared.push(UiEvent::PtyDone { gen });
+                            }
+                        }
+                    });
+                }
+                Cmd::PtySelect { gen } => {
+                    if let Ok(mut hub) = pty_hub.lock() {
+                        hub.active_gen = gen;
+                    }
+                }
+                Cmd::PtyCloseGen { gen } => {
+                    let removed = pty_hub.lock().ok().and_then(|mut hub| {
+                        if hub.active_gen == gen {
+                            hub.active_gen = 0;
+                        }
+                        match hub.sessions.remove(&gen) {
+                            Some(PtyEntry::Live(tx)) => Some(tx),
+                            _ => None,
+                        }
+                    });
+                    if let Some(tx) = removed {
+                        tokio::spawn(async move {
+                            let mut slot = Some(tx);
+                            close_pty(&mut slot).await;
+                        });
+                    }
+                }
+                Cmd::PtyWrite { data } => {
+                    let mut closed_gen = None;
+                    if let Ok(mut hub) = pty_hub.lock() {
+                        let gen = hub.active_gen;
+                        if let Some(entry) = hub.sessions.get_mut(&gen) {
+                            match entry {
+                                PtyEntry::Opening { pending_writes, .. } => {
+                                    if pending_writes.len() < 256 {
+                                        pending_writes.push(data);
+                                    }
+                                }
+                                PtyEntry::Live(tx) => {
+                                    if tx.send(PtyCmd::Write(data)).is_err() {
+                                        hub.sessions.remove(&gen);
+                                        if gen != 0 {
+                                            closed_gen = Some(gen);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(gen) = closed_gen {
+                        shared.push(UiEvent::PtyFailed {
+                            gen,
+                            message:
+                                "Shell session is no longer active; reopen shell to continue."
+                                    .into(),
+                        });
+                        shared.push(UiEvent::PtyDone { gen });
+                    }
+                }
+                Cmd::PtyResize { rows, cols } => {
+                    if let Ok(mut hub) = pty_hub.lock() {
+                        let gen = hub.active_gen;
+                        if let Some(entry) = hub.sessions.get_mut(&gen) {
+                            match entry {
+                                PtyEntry::Opening { pending_resize, .. } => {
+                                    *pending_resize = Some((rows, cols));
+                                }
+                                PtyEntry::Live(tx) => {
+                                    let _ = tx.send(PtyCmd::Resize(rows, cols));
+                                }
+                            }
+                        }
+                    }
+                }
+                Cmd::PtyProbe => {
+                    if let Ok(hub) = pty_hub.lock() {
+                        if let Some(PtyEntry::Live(tx)) = hub.sessions.get(&hub.active_gen) {
+                            let _ = tx.send(PtyCmd::Probe);
+                        }
+                    }
+                }
+                Cmd::PtyClose => {
+                    let removed = pty_hub.lock().ok().and_then(|mut hub| {
+                        let gen = hub.active_gen;
+                        hub.active_gen = 0;
+                        match hub.sessions.remove(&gen) {
+                            Some(PtyEntry::Live(tx)) => Some(tx),
+                            _ => None,
+                        }
+                    });
+                    if let Some(tx) = removed {
+                        tokio::spawn(async move {
+                            let mut slot = Some(tx);
+                            close_pty(&mut slot).await;
+                        });
+                    }
+                }
+                Cmd::List { node, path } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let node_arg = node;
+                        let path_arg = path.clone();
+                        match slot_run_idempotent(&client_slot, &config_dir, |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            Box::pin(async move {
+                                current
+                                    .list_dir(&node, &path)
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            })
+                        })
+                        .await
+                        {
+                            Ok((entries, _)) => shared.push(UiEvent::Dir { path, entries }),
+                            Err(err) => shared.push(UiEvent::Failed(err)),
+                        }
+                    });
+                }
+                Cmd::Read {
+                    node,
+                    path,
+                    size_hint,
+                } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let node_arg = node;
+                        let path_arg = path.clone();
+                        // Read up to 256 KiB + 1 byte so oversized files are always detected
+                        // even when `size_hint` was unavailable (`DESK-02`).
+                        let max_probe = (MAX_EDITABLE_FILE_BYTES + 1) as u32;
+                        match slot_run_idempotent(&client_slot, &config_dir, |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            Box::pin(async move {
+                                let total = match size_hint {
+                                    Some(sz) => Some(sz),
+                                    None => current.stat(&node, &path).await.ok().map(|s| s.size),
+                                };
+                                let bytes = current
+                                    .read_file(&node, &path, 0, max_probe)
+                                    .await
+                                    .map_err(|err| err.to_string())?;
+                                Ok((bytes, total))
+                            })
+                        })
+                        .await
+                        {
+                            Ok(((bytes, total_size), _)) => {
+                                let loaded = inspect_file_for_editor(path, &bytes, total_size);
+                                shared.push(UiEvent::File(loaded));
                             }
                             Err(err) => shared.push(UiEvent::Failed(err)),
                         }
+                    });
+                }
+                Cmd::Write { node, path, text } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let node_arg = node;
+                        let path_arg = path.clone();
+                        let text_arg = text.clone();
+                        match slot_run_non_idempotent(
+                            &client_slot,
+                            &config_dir,
+                            "saving file",
+                            |current| {
+                                let node = node_arg.clone();
+                                let path = path_arg.clone();
+                                let text = text_arg.clone();
+                                Box::pin(async move {
+                                    current
+                                        .write_file(&node, &path, text.as_bytes())
+                                        .await
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                let len = text.len() as u64;
+                                shared.push(UiEvent::Notice(format!("Saved {path}")));
+                                shared.push(UiEvent::File(LoadedFile {
+                                    path,
+                                    text,
+                                    read_only: false,
+                                    read_only_reason: None,
+                                    total_size: Some(len),
+                                }));
+                            }
+                            Err(err) => shared.push(UiEvent::Failed(err)),
+                        }
+                    });
+                }
+                Cmd::Upload {
+                    node,
+                    local_path,
+                    remote_path,
+                } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let parent = super::model::parent_path(&remote_path);
+                        let node_arg = node.clone();
+                        let local_arg = local_path.clone();
+                        let remote_arg = remote_path.clone();
+                        match slot_run_non_idempotent(
+                            &client_slot,
+                            &config_dir,
+                            "uploading file",
+                            |current| {
+                                let node = node_arg.clone();
+                                let local = local_arg.clone();
+                                let remote = remote_arg.clone();
+                                Box::pin(async move {
+                                    let file = std::fs::File::open(&local)
+                                        .map_err(|err| format!("open {}: {err}", local.display()))?;
+                                    current
+                                        .write_file_from(&node, &remote, file)
+                                        .await
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                shared.push(UiEvent::Notice(format!(
+                                    "Uploaded {remote_path} ({bytes} bytes)"
+                                )));
+                                let parent_arg = parent.clone();
+                                if let Ok((entries, _)) =
+                                    slot_run_idempotent(&client_slot, &config_dir, |current| {
+                                        let node = node.clone();
+                                        let parent = parent_arg.clone();
+                                        Box::pin(async move {
+                                            current
+                                                .list_dir(&node, &parent)
+                                                .await
+                                                .map_err(|err| err.to_string())
+                                        })
+                                    })
+                                    .await
+                                {
+                                    shared.push(UiEvent::Dir {
+                                        path: parent,
+                                        entries,
+                                    });
+                                }
+                            }
+                            Err(err) => shared.push(UiEvent::Failed(err)),
+                        }
+                    });
+                }
+                Cmd::Download {
+                    node,
+                    remote_path,
+                    local_path,
+                } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let node_arg = node;
+                        let remote_arg = remote_path.clone();
+                        let local_arg = local_path.clone();
+                        match slot_run_idempotent(&client_slot, &config_dir, |current| {
+                            let node = node_arg.clone();
+                            let remote = remote_arg.clone();
+                            let local = local_arg.clone();
+                            Box::pin(async move {
+                                if let Some(parent) = local.parent() {
+                                    if !parent.as_os_str().is_empty() {
+                                        std::fs::create_dir_all(parent)
+                                            .map_err(|err| err.to_string())?;
+                                    }
+                                }
+                                let file = std::fs::File::create(&local)
+                                    .map_err(|err| format!("create {}: {err}", local.display()))?;
+                                current
+                                    .read_file_to(&node, &remote, file)
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            })
+                        })
+                        .await
+                        {
+                            Ok((bytes, _)) => shared.push(UiEvent::Notice(format!(
+                                "Downloaded {} ({bytes} bytes)",
+                                local_path.display()
+                            ))),
+                            Err(err) => shared.push(UiEvent::Failed(err)),
+                        }
+                    });
+                }
+                Cmd::Mkdir { node, path } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let parent = super::model::parent_path(&path);
+                        let node_arg = node.clone();
+                        let path_arg = path;
+                        match slot_run_non_idempotent(
+                            &client_slot,
+                            &config_dir,
+                            "creating folder",
+                            |current| {
+                                let node = node_arg.clone();
+                                let path = path_arg.clone();
+                                Box::pin(async move {
+                                    current
+                                        .mkdir(&node, &path, true)
+                                        .await
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                let parent_arg = parent.clone();
+                                match slot_run_idempotent(&client_slot, &config_dir, |current| {
+                                    let node = node.clone();
+                                    let parent = parent_arg.clone();
+                                    Box::pin(async move {
+                                        current
+                                            .list_dir(&node, &parent)
+                                            .await
+                                            .map_err(|err| err.to_string())
+                                    })
+                                })
+                                .await
+                                {
+                                    Ok((entries, _)) => shared.push(UiEvent::Dir {
+                                        path: parent,
+                                        entries,
+                                    }),
+                                    Err(err) => shared.push(UiEvent::Failed(err)),
+                                }
+                            }
+                            Err(err) => shared.push(UiEvent::Failed(err)),
+                        }
+                    });
+                }
+                Cmd::Remove { node, path } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let parent = super::model::parent_path(&path);
+                        let node_arg = node.clone();
+                        let path_arg = path;
+                        match slot_run_non_idempotent(
+                            &client_slot,
+                            &config_dir,
+                            "removing path",
+                            |current| {
+                                let node = node_arg.clone();
+                                let path = path_arg.clone();
+                                Box::pin(async move {
+                                    current
+                                        .remove(&node, &path, false)
+                                        .await
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                let parent_arg = parent.clone();
+                                match slot_run_idempotent(&client_slot, &config_dir, |current| {
+                                    let node = node.clone();
+                                    let parent = parent_arg.clone();
+                                    Box::pin(async move {
+                                        current
+                                            .list_dir(&node, &parent)
+                                            .await
+                                            .map_err(|err| err.to_string())
+                                    })
+                                })
+                                .await
+                                {
+                                    Ok((entries, _)) => shared.push(UiEvent::Dir {
+                                        path: parent,
+                                        entries,
+                                    }),
+                                    Err(err) => shared.push(UiEvent::Failed(err)),
+                                }
+                            }
+                            Err(err) => shared.push(UiEvent::Failed(err)),
+                        }
+                    });
+                }
+                Cmd::Live {
+                    node,
+                    control,
+                    monitor,
+                    quality,
+                    scale,
+                    max_fps,
+                    retry,
+                } => {
+                    stop_live_holder(&live_holder, &shared);
+                    let live_gen = shared.current_live_gen();
+                    let client_slot = Arc::clone(&client_slot);
+                    let live_holder = Arc::clone(&live_holder);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    let clipboard_sync_enabled = Arc::clone(&clipboard_sync_enabled);
+                    tokio::spawn(async move {
+                        let current = match slot_ensure_client(&client_slot, &config_dir, false)
+                            .await
+                        {
+                            Ok(current) => current,
+                            Err(err) => {
+                                diag_client(&config_dir, "live_ensure_err", Some("Live"), None, None);
+                                if shared.current_live_gen() == live_gen {
+                                    shared.push(UiEvent::Failed(err));
+                                }
+                                return;
+                            }
+                        };
+                        if shared.current_live_gen() != live_gen {
+                            return;
+                        }
+                        diag_client(
+                            &config_dir,
+                            if retry { "retry" } else { "live_ensure_ok" },
+                            Some("Live"),
+                            Some(current.as_ref()),
+                            None,
+                        );
+                        shared.push(UiEvent::Link(if control {
+                            "connecting · control".into()
+                        } else {
+                            "connecting · view".into()
+                        }));
+                        let started = start_live_with_config(
+                            current,
+                            config_dir,
+                            node,
+                            control,
+                            monitor,
+                            quality,
+                            scale,
+                            max_fps,
+                            Arc::clone(&shared),
+                            live_gen,
+                            clipboard_sync_enabled,
+                        );
+                        if shared.current_live_gen() != live_gen {
+                            started.live.stop.store(true, Ordering::Relaxed);
+                            started.shots.abort();
+                            return;
+                        }
+                        if let Ok(mut slot) = live_holder.lock() {
+                            *slot = (Some(started.live), Some(started.shots));
+                        }
+                    });
+                }
+                Cmd::LiveStop => {
+                    stop_live_holder(&live_holder, &shared);
+                    shared.set_hud(LiveHud::default());
+                    shared.push(UiEvent::Link("relay".into()));
+                }
+                Cmd::ClipboardSync { enabled } => {
+                    clipboard_sync_enabled.store(enabled, Ordering::Relaxed);
+                }
+                Cmd::Input {
+                    node,
+                    live: body,
+                    inject,
+                    barrier,
+                } => {
+                    let kind = if barrier {
+                        ControlKind::Barrier
+                    } else {
+                        ControlKind::Move
+                    };
+                    if let Ok(mut q) = input_queue.lock() {
+                        let _ = q.enqueue(
+                            kind,
+                            QueuedInput {
+                                node,
+                                live: body,
+                                inject,
+                                barrier,
+                            },
+                        );
                     }
-                    Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-                },
+                    input_notify.notify_one();
+                }
+                Cmd::Monitors { node, retry } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        diag_client(
+                            &config_dir,
+                            if retry { "retry" } else { "cmd" },
+                            Some("Monitors"),
+                            None,
+                            None,
+                        );
+                        match slot_run_idempotent(&client_slot, &config_dir, |current| {
+                            let node = node.clone();
+                            Box::pin(async move { list_monitors(&current, &node).await })
+                        })
+                        .await
+                        {
+                            Ok((monitors, reconnected)) => {
+                                diag_client(
+                                    &config_dir,
+                                    "monitors_ok",
+                                    Some("Monitors"),
+                                    None,
+                                    Some(reconnected),
+                                );
+                                if reconnected {
+                                    shared.push(UiEvent::Notice(
+                                        "Reconnected after a closed relay session.".into(),
+                                    ));
+                                }
+                                shared.push(UiEvent::Monitors(monitors));
+                            }
+                            Err(err) => {
+                                diag_client(
+                                    &config_dir,
+                                    "monitors_err",
+                                    Some("Monitors"),
+                                    None,
+                                    None,
+                                );
+                                shared.push(UiEvent::Failed(err));
+                            }
+                        }
+                    });
+                }
+                Cmd::Clipboard { node, text } => {
+                    let live_holder = Arc::clone(&live_holder);
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let body = json!({"type": "clipboard", "text": text}).to_string();
+                        let viewer = live_holder.lock().ok().and_then(|slot| {
+                            slot.0
+                                .as_ref()
+                                .and_then(|session| session.viewer.lock().ok())
+                                .and_then(|v| v.clone())
+                        });
+                        let sent_rtc = match viewer {
+                            Some(viewer) => viewer.send_control_barrier(&body).await,
+                            None => false,
+                        };
+                        if sent_rtc {
+                            shared.push(UiEvent::Notice("Clipboard sent to the machine.".into()));
+                            return;
+                        }
+                        // Fallback to relay inject_input clipboard in JPEG mode (`DESK-18`).
+                        let payload = json!({"action": "clipboard", "text": text});
+                        match slot_run_non_idempotent(
+                            &client_slot,
+                            &config_dir,
+                            "sending clipboard",
+                            |current| {
+                                let node = node.clone();
+                                let payload = payload.clone();
+                                Box::pin(async move {
+                                    current
+                                        .call_op(
+                                            &node,
+                                            Op::Extension {
+                                                name: PHASE2_INJECT_INPUT.to_string(),
+                                                payload,
+                                            },
+                                        )
+                                        .await
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                        )
+                        .await
+                        {
+                            Ok(_) => shared
+                                .push(UiEvent::Notice("Clipboard sent to the machine.".into())),
+                            Err(err) => shared.push(UiEvent::Failed(format!(
+                                "Clipboard send failed: {err}"
+                            ))),
+                        }
+                    });
+                }
+                Cmd::Shot {
+                    node,
+                    path,
+                    monitor,
+                } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        let node_arg = node;
+                        let path_arg = path;
+                        match slot_run_idempotent(&client_slot, &config_dir, |current| {
+                            let node = node_arg.clone();
+                            let path = path_arg.clone();
+                            Box::pin(async move {
+                                save_screenshot(&current, &node, &path, monitor).await
+                            })
+                        })
+                        .await
+                        {
+                            Ok((saved, _)) => {
+                                shared.push(UiEvent::Notice(format!("Saved {saved}")))
+                            }
+                            Err(err) => shared.push(UiEvent::Failed(err)),
+                        }
+                    });
+                }
+                Cmd::Enroll {
+                    name,
+                    access,
+                    minutes,
+                } => {
+                    let client_slot = Arc::clone(&client_slot);
+                    let shared = Arc::clone(&shared);
+                    let config_dir = config_dir.clone();
+                    tokio::spawn(async move {
+                        match parse_access(&access) {
+                            Ok(policy) => {
+                                let ttl = minutes.clamp(1, 7 * 24 * 60) * 60;
+                                let name_arg = name.clone();
+                                match slot_run_non_idempotent(
+                                    &client_slot,
+                                    &config_dir,
+                                    "creating enrollment token",
+                                    |current| {
+                                        let name = name_arg.clone();
+                                        Box::pin(async move {
+                                            current
+                                                .create_enrollment_token(&name, policy, ttl, 1)
+                                                .await
+                                                .map_err(|err| err.to_string())
+                                        })
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(info) => {
+                                        let cfg = agentlink_core::config::load_file(&config_dir)
+                                            .unwrap_or_default();
+                                        let relay_url = cfg.relay.unwrap_or_default();
+                                        let pin = cfg.fingerprint.unwrap_or_default();
+                                        let trust = cfg.trust.unwrap_or_default();
+                                        let (unix, powershell) = enroll_commands(
+                                            &relay_url,
+                                            &pin,
+                                            &trust,
+                                            &info.token,
+                                            &name,
+                                            &access,
+                                        );
+                                        shared.push(UiEvent::Enrolled {
+                                            unix,
+                                            powershell,
+                                            token: info.token,
+                                        });
+                                    }
+                                    Err(err) => shared.push(UiEvent::Failed(err)),
+                                }
+                            }
+                            Err(err) => shared.push(UiEvent::Failed(err.to_string())),
+                        }
+                    });
+                }
             }
         }
-        // Await PTY close on this worker runtime only. Drop of PtySession
-        // never block_on (it only try_sends), so teardown cannot nest a
-        // runtime inside this one.
-        close_pty(&mut pty).await;
-        stop_live(&mut live, &mut shots);
+        // Teardown: close ordered input queue, stop live session, and close all PTYs.
+        input_closed.store(true, Ordering::Release);
+        if let Ok(mut q) = input_queue.lock() {
+            q.close();
+        }
+        input_notify.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(1), input_task).await;
+        let to_close = pty_hub
+            .lock()
+            .map(|mut hub| hub.close_all())
+            .unwrap_or_default();
+        for tx in to_close {
+            let mut slot = Some(tx);
+            close_pty(&mut slot).await;
+        }
+        stop_live_holder(&live_holder, &shared);
     });
 }
 
@@ -1304,8 +2012,63 @@ enum JpegSource {
     Injected(Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>),
 }
 
-fn start_live(
+fn build_ice_refresh_cb(
+    config_dir: std::path::PathBuf,
+    handle: tokio::runtime::Handle,
+) -> Arc<dyn Fn() -> Vec<Value> + Send + Sync> {
+    Arc::new(move || {
+        let cfg = agentlink_core::config::load_file(&config_dir).unwrap_or_default();
+        let env_fallback = || -> Vec<Value> {
+            let env_servers = turn_servers_from_env();
+            if env_servers.is_empty() {
+                return Vec::new();
+            }
+            agentlink_core::RelayIceConfig {
+                ice_servers: env_servers,
+                ttl_secs: 0,
+            }
+            .to_json_servers()
+        };
+        let Some(settings) = settings_of(&cfg) else {
+            return env_fallback();
+        };
+        let Ok(trust) = RelayTrust::parse(&settings.fingerprint, settings.trust.as_deref()) else {
+            return env_fallback();
+        };
+        let relay = settings.relay.clone();
+        let token = settings.token.clone();
+        let fetched = handle.block_on(async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_relay_ice_servers(&relay, &trust, &token),
+            )
+            .await
+        });
+        match fetched {
+            Ok(Ok(ice_cfg)) => {
+                let servers = ice_cfg.to_json_servers();
+                if servers.is_empty() {
+                    env_fallback()
+                } else {
+                    servers
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(error = %err, "relay /api/ice fetch failed; falling back to env/STUN");
+                env_fallback()
+            }
+            Err(_) => {
+                tracing::debug!("relay /api/ice fetch timed out; falling back to env/STUN");
+                env_fallback()
+            }
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_live_with_config(
     client: Arc<Client>,
+    config_dir: std::path::PathBuf,
     node: String,
     control: bool,
     monitor: u32,
@@ -1313,9 +2076,12 @@ fn start_live(
     scale: f32,
     max_fps_override: u32,
     shared: Arc<Shared>,
+    live_gen: u64,
+    clipboard_sync_enabled: Arc<AtomicBool>,
 ) -> Started {
     let handle = tokio::runtime::Handle::current();
-    start_live_from(
+    let ice_refresh = build_ice_refresh_cb(config_dir, handle.clone());
+    start_live_with_options(
         Arc::new(ClientSignal {
             client: Arc::clone(&client),
             handle,
@@ -1336,9 +2102,14 @@ fn start_live(
         Duration::from_millis(800),
         LiveSchedule::default(),
         Arc::new(|_| IceFault::None),
+        Some(ice_refresh),
+        live_gen,
+        clipboard_sync_enabled,
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 fn start_live_from(
     signal: Arc<dyn Signal>,
     jpeg: JpegSource,
@@ -1352,13 +2123,52 @@ fn start_live_from(
     schedule: LiveSchedule,
     ice_fault_for: Arc<dyn Fn(u32) -> IceFault + Send + Sync>,
 ) -> Started {
+    let live_gen = shared.current_live_gen();
+    start_live_with_options(
+        signal,
+        jpeg,
+        control,
+        monitor,
+        quality,
+        scale,
+        max_fps_override,
+        shared,
+        shot_interval,
+        schedule,
+        ice_fault_for,
+        None,
+        live_gen,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_live_with_options(
+    signal: Arc<dyn Signal>,
+    jpeg: JpegSource,
+    control: bool,
+    monitor: u32,
+    quality: u32,
+    scale: f32,
+    max_fps_override: u32,
+    shared: Arc<Shared>,
+    shot_interval: Duration,
+    schedule: LiveSchedule,
+    ice_fault_for: Arc<dyn Fn(u32) -> IceFault + Send + Sync>,
+    ice_refresh: Option<Arc<dyn Fn() -> Vec<Value> + Send + Sync>>,
+    live_gen: u64,
+    clipboard_sync_enabled: Arc<AtomicBool>,
+) -> Started {
     let stop = Arc::new(AtomicBool::new(false));
     let h264 = Arc::new(AtomicBool::new(false));
     let viewer = Arc::new(Mutex::new(None));
+    let dc_ready = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let thread_h264 = Arc::clone(&h264);
     let thread_viewer = Arc::clone(&viewer);
+    let thread_dc_ready = Arc::clone(&dc_ready);
     let thread_shared = Arc::clone(&shared);
+    let thread_clip_enabled = Arc::clone(&clipboard_sync_enabled);
     let (quality_fps, bitrate) = quality_offer(quality);
     let max_fps = if max_fps_override > 0 {
         max_fps_override.min(60)
@@ -1370,11 +2180,18 @@ fn start_live_from(
         .name("agentlink-desktop-view".into())
         .spawn(move || {
             const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+            let is_stale = |shared: &Shared, stop: &AtomicBool| -> bool {
+                stop.load(Ordering::Relaxed) || shared.current_live_gen() != live_gen
+            };
             let last_stage = Arc::new(Mutex::new("starting".to_string()));
             let on_stage: Arc<dyn Fn(&str) + Send + Sync> = {
                 let last_stage = Arc::clone(&last_stage);
                 let events = Arc::clone(&thread_shared);
+                let stop_check = Arc::clone(&thread_stop);
                 Arc::new(move |msg: &str| {
+                    if stop_check.load(Ordering::Relaxed) || events.current_live_gen() != live_gen {
+                        return;
+                    }
                     if let Ok(mut slot) = last_stage.lock() {
                         *slot = msg.to_string();
                     }
@@ -1397,7 +2214,7 @@ fn start_live_from(
             let mut last_soft: Option<String> = None;
 
             'live: loop {
-                if thread_stop.load(Ordering::Relaxed) {
+                if is_stale(&thread_shared, &thread_stop) {
                     break;
                 }
                 if offers_sent >= schedule.offer_budget || streak >= schedule.attempt_max {
@@ -1426,37 +2243,68 @@ fn start_live_from(
                     scale,
                     ice_fault,
                     on_stage: Some(Arc::clone(&on_stage)),
+                    ice_refresh: ice_refresh.clone(),
                     ..LiveOptions::default()
                 };
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 let connect_traced = Arc::clone(&traced);
+                let connect_stop = Arc::clone(&thread_stop);
+                let connect_shared = Arc::clone(&thread_shared);
                 let spawn_ok = std::thread::Builder::new()
                     .name("agentlink-desktop-connect".into())
                     .spawn(move || {
-                        let _ = tx.send(Viewer::connect(connect_traced, opts));
+                        let res = Viewer::connect(connect_traced, opts);
+                        if connect_stop.load(Ordering::Relaxed)
+                            || connect_shared.current_live_gen() != live_gen
+                        {
+                            if let Ok(v) = res {
+                                v.close();
+                            }
+                            return;
+                        }
+                        let _ = tx.send(res);
                     })
                     .is_ok();
+                // Interruptible wait: poll in 100ms slices so LiveStop or node switch
+                // cancels immediately instead of blocking 60s (`DESK-11`).
                 let connected = if !spawn_ok {
                     Err("failed to start WebRTC connect thread".into())
                 } else {
-                    match rx.recv_timeout(CONNECT_TIMEOUT) {
-                        Ok(result) => result,
-                        Err(_) => {
+                    let deadline = Instant::now() + CONNECT_TIMEOUT;
+                    loop {
+                        if is_stale(&thread_shared, &thread_stop) {
+                            break 'live;
+                        }
+                        let rem = deadline.saturating_duration_since(Instant::now());
+                        if rem.is_zero() {
                             let stage = last_stage
                                 .lock()
                                 .ok()
                                 .map(|slot| slot.clone())
                                 .unwrap_or_else(|| "unknown".into());
-                            Err(format!(
+                            break Err(format!(
                                 "WebRTC connect timed out after {}s during {stage}",
                                 CONNECT_TIMEOUT.as_secs()
-                            ))
+                            ));
+                        }
+                        match rx.recv_timeout(rem.min(Duration::from_millis(100))) {
+                            Ok(result) => break result,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                if is_stale(&thread_shared, &thread_stop) {
+                                    break 'live;
+                                }
+                                break Err("WebRTC connect thread terminated".into());
+                            }
                         }
                     }
                 };
                 let viewer = match connected {
                     Ok(viewer) => Arc::new(viewer),
                     Err(err) => {
+                        if is_stale(&thread_shared, &thread_stop) {
+                            return;
+                        }
                         if super::model::webrtc_connect_is_hard_reject(&err) {
                             thread_shared
                                 .set_handshake_terminal(format!("webrtc: failed ({err})"));
@@ -1475,7 +2323,9 @@ fn start_live_from(
                                 "webrtc: retry in {}s after connect failure (attempt {offers_sent}; JPEG stills remain)",
                                 delay.as_secs().max(1)
                             ));
-                            if !wait_interruptible(&thread_stop, delay) {
+                            if !wait_interruptible(&thread_stop, delay)
+                                || thread_shared.current_live_gen() != live_gen
+                            {
                                 break 'live;
                             }
                             continue;
@@ -1483,17 +2333,22 @@ fn start_live_from(
                         break 'live;
                     }
                 };
+                if is_stale(&thread_shared, &thread_stop) {
+                    viewer.close();
+                    return;
+                }
+                thread_dc_ready.store(false, Ordering::Release);
                 if let Ok(mut slot) = thread_viewer.lock() {
                     *slot = Some(Arc::clone(&viewer));
                 }
                 let info = viewer.info();
                 if agentlink_desktop::share_allowed(control, info.control) {
-                    spawn_session_clipboard(Arc::clone(&viewer), Arc::clone(&thread_stop));
+                    spawn_session_clipboard(
+                        Arc::clone(&viewer),
+                        Arc::clone(&thread_stop),
+                        Arc::clone(&thread_clip_enabled),
+                    );
                 }
-                // Handshake is independent of the painted media path. JPEG stills
-                // may still be on screen until the first decoded H.264 frame.
-                // Never publish kind=h264 / path=connecting here — that would
-                // overwrite an already-rendered jpeg · relay HUD.
                 let encoder = if info.encoder.is_empty() {
                     if info.hardware {
                         "h264_hw".into()
@@ -1517,12 +2372,14 @@ fn start_live_from(
                 let mut window_start = Instant::now();
                 let mut window_frames = 0u32;
                 let mut saw_frame = false;
+                let mut awaiting_idr = false;
+                let mut last_idr_req = Instant::now() - Duration::from_secs(5);
                 let mut last_recv = Instant::now();
                 let mut last_frame_at = Instant::now();
                 let mut last_decoded_at = Instant::now();
                 let mut soft: Option<String> = None;
                 let mut hard = false;
-                while !thread_stop.load(Ordering::Relaxed) {
+                while !is_stale(&thread_shared, &thread_stop) {
                     let Some(frame) = viewer.poll_frame(Duration::from_millis(50)) else {
                         if viewer.failed() {
                             if super::model::webrtc_loss_keeps_jpeg(saw_frame) {
@@ -1592,35 +2449,74 @@ fn start_live_from(
                     if saw_frame {
                         thread_shared.perf.note_recv_gap_us(gap_us);
                     }
+                    // After any decode error or skipped P-frame, drop orphaned P-frames
+                    // until an IDR arrives instead of feeding corrupted DPB refs (`DESK-14`).
+                    if awaiting_idr {
+                        if !frame.keyframe && !annex_b_has_idr(&frame.annex_b) {
+                            if last_idr_req.elapsed() >= Duration::from_secs(1) {
+                                viewer.request_keyframe();
+                                last_idr_req = Instant::now();
+                            }
+                            continue;
+                        }
+                        awaiting_idr = false;
+                    }
                     let decode_started = Instant::now();
-                    let decoded = decoder.decode(&frame.annex_b);
+                    let decoded = decoder.decode_into(&frame.annex_b, thread_shared.take_rgba_buf());
                     let decode_us = decode_started.elapsed().as_micros() as u64;
                     thread_shared.perf.note_decode_us(decode_us);
-                    // Drop backlog when decode overruns a 60fps budget.
-                    let frame = if decode_us > 16_000 {
-                        if let Some(newer) = viewer.drain_keep_latest() {
-                            let again_started = Instant::now();
-                            let again = decoder.decode(&newer.annex_b);
-                            thread_shared
-                                .perf
-                                .note_decode_us(again_started.elapsed().as_micros() as u64);
-                            again
-                        } else {
-                            decoded
+                    let mut final_outcome = decoded;
+                    if matches!(final_outcome, DecodeOutcome::Error) {
+                        awaiting_idr = true;
+                        if last_idr_req.elapsed() >= Duration::from_secs(1) {
+                            viewer.request_keyframe();
+                            last_idr_req = Instant::now();
                         }
-                    } else {
-                        decoded
-                    };
-                    if let Some((rgba, width, height)) = frame {
+                        continue;
+                    }
+                    // Drop backlog when decode overruns a 60fps budget, keeping only IDR
+                    // (or waiting for next IDR if intermediate P-frames were skipped).
+                    if decode_us > 16_000 {
+                        if let Some(newer) = viewer.drain_keep_latest() {
+                            if newer.keyframe || annex_b_has_idr(&newer.annex_b) {
+                                if let DecodeOutcome::Frame { rgba, .. } = final_outcome {
+                                    thread_shared.recycle_rgba(rgba);
+                                }
+                                let again_started = Instant::now();
+                                final_outcome = decoder
+                                    .decode_into(&newer.annex_b, thread_shared.take_rgba_buf());
+                                thread_shared
+                                    .perf
+                                    .note_decode_us(again_started.elapsed().as_micros() as u64);
+                                if matches!(final_outcome, DecodeOutcome::Error) {
+                                    awaiting_idr = true;
+                                    viewer.request_keyframe();
+                                    last_idr_req = Instant::now();
+                                    continue;
+                                }
+                            } else {
+                                awaiting_idr = true;
+                                viewer.request_keyframe();
+                                last_idr_req = Instant::now();
+                            }
+                        }
+                    }
+                    if let DecodeOutcome::Frame {
+                        rgba,
+                        width,
+                        height,
+                    } = final_outcome
+                    {
+                        if is_stale(&thread_shared, &thread_stop) {
+                            thread_shared.recycle_rgba(rgba);
+                            break;
+                        }
                         let first_h264 = !saw_frame;
                         saw_frame = true;
                         last_frame_at = Instant::now();
                         last_decoded_at = last_frame_at;
                         thread_h264.store(true, Ordering::Relaxed);
                         if first_h264 {
-                            // A live path was established; the next loss
-                            // starts a fresh retry streak, still limited by
-                            // the session offer budget.
                             streak = 0;
                             thread_shared.set_handshake_terminal("webrtc: receiving video");
                         }
@@ -1650,6 +2546,7 @@ fn start_live_from(
                                 bitmap_w: cursor.bitmap_w,
                                 bitmap_h: cursor.bitmap_h,
                                 bitmap_rgba: cursor.bitmap_rgba,
+                                rev: 0,
                             });
                         }
                         window_frames += 1;
@@ -1684,10 +2581,11 @@ fn start_live_from(
                     }
                 }
                 viewer.close();
+                thread_dc_ready.store(false, Ordering::Release);
                 if let Ok(mut slot) = thread_viewer.lock() {
                     *slot = None;
                 }
-                if hard || thread_stop.load(Ordering::Relaxed) {
+                if hard || is_stale(&thread_shared, &thread_stop) {
                     let _ = control;
                     return;
                 }
@@ -1703,7 +2601,9 @@ fn start_live_from(
                             },
                             last_soft.as_deref().unwrap_or("soft failure")
                         ));
-                        if !wait_interruptible(&thread_stop, delay) {
+                        if !wait_interruptible(&thread_stop, delay)
+                            || thread_shared.current_live_gen() != live_gen
+                        {
                             break 'live;
                         }
                         continue;
@@ -1712,17 +2612,19 @@ fn start_live_from(
                 break;
             }
 
-            if let Some(reason) = last_soft {
-                let terminal = if offers_sent > 1 {
-                    format!("{reason} (stopped after {offers_sent} attempts)")
-                } else {
-                    reason
-                };
-                thread_shared.set_handshake_terminal(terminal);
-                thread_shared.push(UiEvent::Notice(
-                    "WebRTC live video is not up. Showing JPEG over the relay.".into(),
-                ));
-                thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+            if !is_stale(&thread_shared, &thread_stop) {
+                if let Some(reason) = last_soft {
+                    let terminal = if offers_sent > 1 {
+                        format!("{reason} (stopped after {offers_sent} attempts)")
+                    } else {
+                        reason
+                    };
+                    thread_shared.set_handshake_terminal(terminal);
+                    thread_shared.push(UiEvent::Notice(
+                        "WebRTC live video is not up. Showing JPEG over the relay.".into(),
+                    ));
+                    thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                }
             }
             let _ = control;
         })
@@ -1735,7 +2637,7 @@ fn start_live_from(
         let mut still_times: Vec<Instant> = Vec::new();
         loop {
             tick.tick().await;
-            if shot_stop.load(Ordering::Relaxed) {
+            if shot_stop.load(Ordering::Relaxed) || shared.current_live_gen() != live_gen {
                 break;
             }
             if shot_h264.load(Ordering::Relaxed) {
@@ -1752,10 +2654,25 @@ fn start_live_from(
             };
             match grabbed {
                 Ok(bytes) => {
-                    if shot_h264.load(Ordering::Relaxed) {
+                    if shot_h264.load(Ordering::Relaxed)
+                        || shot_stop.load(Ordering::Relaxed)
+                        || shared.current_live_gen() != live_gen
+                    {
                         continue;
                     }
-                    if let Some((rgba, width, height)) = decode_image(&bytes) {
+                    // Decode JPEG off the Tokio async worker pool (`DESK-11`).
+                    let decoded = tokio::task::spawn_blocking(move || decode_image(&bytes))
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some((rgba, width, height)) = decoded {
+                        if shot_h264.load(Ordering::Relaxed)
+                            || shot_stop.load(Ordering::Relaxed)
+                            || shared.current_live_gen() != live_gen
+                        {
+                            shared.recycle_rgba(rgba);
+                            continue;
+                        }
                         shared.set_picture(rgba, width, height, "jpeg", "relay");
                         let now = Instant::now();
                         still_times.push(now);
@@ -1776,6 +2693,9 @@ fn start_live_from(
                     }
                 }
                 Err(err) => {
+                    if shot_stop.load(Ordering::Relaxed) || shared.current_live_gen() != live_gen {
+                        break;
+                    }
                     if super::model::webrtc_connect_is_hard_reject(&err) {
                         shared.push(UiEvent::Failed(err));
                         break;
@@ -1786,7 +2706,11 @@ fn start_live_from(
         }
     });
     Started {
-        live: Live { stop, viewer },
+        live: Live {
+            stop,
+            viewer,
+            dc_ready,
+        },
         shots,
     }
 }
@@ -1902,21 +2826,60 @@ fn parse_monitors(value: &Value) -> Vec<MonitorEntry> {
         .collect()
 }
 
-async fn save_screenshot(client: &Client, node: &str, path: &str) -> Result<String, String> {
-    let value = client
-        .call_op(
-            node,
-            Op::Extension {
-                name: PHASE2_SCREENSHOT.to_string(),
-                payload: json!({
-                    "target": "screen",
-                    "format": "png",
-                    "quality": 90
-                }),
-            },
-        )
-        .await
-        .map_err(|err| err.to_string())?;
+async fn save_screenshot(
+    client: &Client,
+    node: &str,
+    path: &str,
+    monitor: Option<u32>,
+) -> Result<String, String> {
+    let value = if let Some(mon) = monitor {
+        match client
+            .call_op(
+                node,
+                Op::Extension {
+                    name: PHASE2_SCREENSHOT.to_string(),
+                    payload: json!({
+                        "target": "monitor",
+                        "monitor": mon,
+                        "format": "png",
+                        "quality": 90
+                    }),
+                },
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => client
+                .call_op(
+                    node,
+                    Op::Extension {
+                        name: PHASE2_SCREENSHOT.to_string(),
+                        payload: json!({
+                            "target": "screen",
+                            "format": "png",
+                            "quality": 90
+                        }),
+                    },
+                )
+                .await
+                .map_err(|err| err.to_string())?,
+        }
+    } else {
+        client
+            .call_op(
+                node,
+                Op::Extension {
+                    name: PHASE2_SCREENSHOT.to_string(),
+                    payload: json!({
+                        "target": "screen",
+                        "format": "png",
+                        "quality": 90
+                    }),
+                },
+            )
+            .await
+            .map_err(|err| err.to_string())?
+    };
     let bytes =
         screenshot_bytes(&value).ok_or_else(|| "screenshot response has no image".to_string())?;
     if let Some(parent) = std::path::Path::new(path).parent() {
@@ -1928,15 +2891,36 @@ async fn save_screenshot(client: &Client, node: &str, path: &str) -> Result<Stri
     Ok(path.to_string())
 }
 
-fn spawn_session_clipboard(viewer: Arc<Viewer>, stop: Arc<AtomicBool>) {
+fn spawn_session_clipboard(
+    viewer: Arc<Viewer>,
+    stop: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+) {
     let _ = std::thread::Builder::new()
         .name("agentlink-clipboard-share".into())
         .spawn(move || {
-            let mut state = agentlink_desktop::ClipboardWatchState::new();
+            // Seed from current local clipboard on connect so pre-existing
+            // secrets (passwords/OTPs/SSH keys) are NEVER pushed (`DESK-18`).
+            let mut state = agentlink_desktop::ClipboardWatchState::seeded();
+            let mut was_enabled = enabled.load(Ordering::Relaxed);
             while !stop.load(Ordering::Relaxed) && !viewer.is_closed() {
                 std::thread::sleep(agentlink_desktop::CLIPBOARD_POLL_INTERVAL);
                 if stop.load(Ordering::Relaxed) || viewer.is_closed() {
                     break;
+                }
+                let is_enabled = enabled.load(Ordering::Relaxed);
+                if !is_enabled {
+                    // Drain any queued incoming clipboard while disabled so
+                    // toggling back on doesn't replay stale data.
+                    let _ = viewer.poll_clipboard();
+                    was_enabled = false;
+                    continue;
+                }
+                if !was_enabled {
+                    // Re-seed baseline whenever the user enables sync so items
+                    // copied while sync was off aren't retroactively pushed.
+                    state.seed_from_os();
+                    was_enabled = true;
                 }
                 if let Some(incoming) = viewer.poll_clipboard() {
                     if agentlink_desktop::write_clipboard(&incoming.text).is_ok() {
@@ -1947,7 +2931,10 @@ fn spawn_session_clipboard(viewer: Arc<Viewer>, stop: Arc<AtomicBool>) {
                     let body = agentlink_desktop::set_payload(&clip).to_string();
                     let mut sent = false;
                     for _ in 0..20 {
-                        if stop.load(Ordering::Relaxed) || viewer.is_closed() {
+                        if stop.load(Ordering::Relaxed)
+                            || viewer.is_closed()
+                            || !enabled.load(Ordering::Relaxed)
+                        {
                             break;
                         }
                         if viewer.send_control(&body) {
@@ -1962,20 +2949,6 @@ fn spawn_session_clipboard(viewer: Arc<Viewer>, stop: Arc<AtomicBool>) {
                 }
             }
         });
-}
-
-fn stop_live(live: &mut Option<Live>, shots: &mut Option<tokio::task::JoinHandle<()>>) {
-    if let Some(session) = live.take() {
-        session.stop.store(true, Ordering::Relaxed);
-        if let Ok(slot) = session.viewer.lock() {
-            if let Some(viewer) = slot.as_ref() {
-                viewer.close();
-            }
-        }
-    }
-    if let Some(task) = shots.take() {
-        task.abort();
-    }
 }
 
 fn screenshot_bytes(value: &Value) -> Option<Vec<u8>> {
@@ -2008,6 +2981,7 @@ const PTY_IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(300);
 const PTY_SILENT_WRITE_HEAL_DELAY: Duration = Duration::from_millis(450);
 const PTY_REBIND_COOLDOWN: Duration = Duration::from_secs(10);
 const PTY_MANUAL_PROBE_COOLDOWN: Duration = Duration::from_secs(2);
+const PTY_RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
 
 fn spawn_pty(
     mut session: PtySession,
@@ -2018,6 +2992,8 @@ fn spawn_pty(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut cur_size = (initial_size.0.max(1), initial_size.1.max(1));
+        let mut last_sent_size = cur_size;
+        let mut pending_resize_at: Option<tokio::time::Instant> = None;
         let mut last_sock_gen = session.socket_generation();
         let mut last_verified_at = Instant::now();
         let mut last_rebind_at: Option<Instant> = None;
@@ -2034,6 +3010,12 @@ fn spawn_pty(
             } else {
                 let heal_sleep = async {
                     match echo_heal_at {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                let resize_sleep = async {
+                    match pending_resize_at {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending::<()>().await,
                     }
@@ -2071,6 +3053,27 @@ fn spawn_pty(
                         }
                         continue;
                     }
+                    _ = resize_sleep => {
+                        pending_resize_at = None;
+                        if cur_size != last_sent_size {
+                            if let Err(err) = session.resize(cur_size.0, cur_size.1).await {
+                                if !session.is_client_alive()
+                                    || pty_error_means_session_dead(&err.to_string())
+                                {
+                                    shared.push(UiEvent::PtyFailed {
+                                        gen,
+                                        message: err.to_string(),
+                                    });
+                                    shared.push(UiEvent::PtyDone { gen });
+                                    break;
+                                }
+                            } else {
+                                last_sent_size = cur_size;
+                                last_verified_at = Instant::now();
+                            }
+                        }
+                        continue;
+                    }
                     _ = heal_sleep => {
                         echo_heal_at = None;
                         if last_rebind_at
@@ -2078,6 +3081,9 @@ fn spawn_pty(
                             .unwrap_or(true)
                         {
                             last_rebind_at = Some(Instant::now());
+                            // Re-announce the stream route without firing `probe_alive`
+                            // (`SIGWINCH`), which previously interrupted silent password
+                            // prompts (`sudo` / `stty -echo`) (`DESK-23`).
                             if let Err(err) = session.rebind_stream().await {
                                 shared.push(UiEvent::PtyFailed {
                                     gen,
@@ -2086,16 +3092,6 @@ fn spawn_pty(
                                 shared.push(UiEvent::PtyDone { gen });
                                 break;
                             }
-                            if let Err(err) = session.probe_alive(cur_size.0, cur_size.1).await {
-                                shared.push(UiEvent::PtyFailed {
-                                    gen,
-                                    message: err.to_string(),
-                                });
-                                shared.push(UiEvent::PtyDone { gen });
-                                break;
-                            }
-                            last_verified_at = Instant::now();
-                            last_probe_at = Some(Instant::now());
                         }
                         continue;
                     }
@@ -2164,21 +3160,25 @@ fn spawn_pty(
                         echo_heal_at = Some(tokio::time::Instant::now() + PTY_SILENT_WRITE_HEAL_DELAY);
                     }
                 }
-                Some(PtyCmd::Resize(rows, cols)) => {
-                    cur_size = (rows.max(1), cols.max(1));
-                    if let Err(err) = session.resize(cur_size.0, cur_size.1).await {
-                        if !session.is_client_alive()
-                            || pty_error_means_session_dead(&err.to_string())
-                        {
-                            shared.push(UiEvent::PtyFailed {
-                                gen,
-                                message: err.to_string(),
-                            });
-                            shared.push(UiEvent::PtyDone { gen });
-                            break;
+                Some(PtyCmd::Resize(mut rows, mut cols)) => {
+                    // Coalesce burst resize events during window drag and debounce
+                    // the wire RPC (`DESK-23`).
+                    loop {
+                        match rx.try_recv() {
+                            Ok(PtyCmd::Resize(r, c)) => {
+                                rows = r;
+                                cols = c;
+                            }
+                            Ok(other) => {
+                                buffered_cmd = Some(other);
+                                break;
+                            }
+                            Err(_) => break,
                         }
-                    } else {
-                        last_verified_at = Instant::now();
+                    }
+                    cur_size = (rows.max(1), cols.max(1));
+                    if cur_size != last_sent_size {
+                        pending_resize_at = Some(tokio::time::Instant::now() + PTY_RESIZE_DEBOUNCE);
                     }
                 }
                 Some(PtyCmd::Probe) => {
@@ -2235,30 +3235,8 @@ fn pty_error_means_session_dead(message: &str) -> bool {
         || lower.contains("replay slot")
 }
 
-async fn refresh(client: Option<&Arc<Client>>, shared: &Shared) {
-    let Some(client) = client else {
-        shared.push(UiEvent::Failed("Sign in first.".into()));
-        return;
-    };
-    match client.list_nodes().await {
-        Ok(mut nodes) => {
-            nodes.sort_by(|left, right| {
-                right
-                    .online
-                    .cmp(&left.online)
-                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            });
-            let pins = client.node_pin_warnings();
-            if !pins.is_empty() {
-                shared.push(UiEvent::Pins(pins));
-            }
-            shared.push(UiEvent::Nodes(nodes));
-        }
-        Err(err) => shared.push(UiEvent::Failed(err.to_string())),
-    }
-}
-
 /// Result of `Cmd::Monitors` after at most one transport rebootstrap.
+#[cfg(test)]
 #[derive(Debug)]
 struct MonitorsOutcome {
     monitors: Vec<MonitorEntry>,
@@ -2289,6 +3267,7 @@ fn replace_worker_client_slot<C>(
 /// Grant / owner / revoke denials stay immediate failures via
 /// [`super::model::session_needs_rebootstrap`]. The bootstrap closure runs at
 /// most twice (initial ensure + one force), never in a loop.
+#[cfg(test)]
 async fn list_monitors_with_once_rebootstrap<C, Ensure, List>(
     client: &mut Option<Arc<C>>,
     node: &str,
@@ -2330,61 +3309,7 @@ where
     }
 }
 
-/// Read-only idempotent operations (`List`, `Read`, `Shot`): rebuild a dead
-/// cached `Client` before sending AND retry once on transport closure.
-async fn run_idempotent_with_once_rebootstrap<T, OpFn>(
-    client: &mut Option<Arc<Client>>,
-    config_dir: &std::path::Path,
-    mut op: OpFn,
-) -> Result<(T, bool), String>
-where
-    OpFn: FnMut(
-        Arc<Client>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>,
-{
-    let current = ensure_worker_client(client, config_dir, false).await?;
-    match op(Arc::clone(&current)).await {
-        Ok(value) => Ok((value, false)),
-        Err(err) if super::model::session_needs_rebootstrap(&err) => {
-            let current = ensure_worker_client(client, config_dir, true).await?;
-            let value = op(current).await?;
-            Ok((value, true))
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// Non-idempotent / side-effecting operations (`PtyOpen`, `Write`, `Mkdir`,
-/// `Remove`, `Input` fallback, `Enroll`): rebuilds a dead cached `Client`
-/// *before* sending so pre-existing dead handles still recover transparently,
-/// but executes `op` **at most once** once dispatched on a live `Client`. If
-/// the transport drops before confirmation arrives, clears the dead handle for
-/// the next command and returns an explicit indeterminate-outcome error instead
-/// of silently replaying the side effect.
-async fn run_non_idempotent_with_live_worker_client<T, OpFn>(
-    client: &mut Option<Arc<Client>>,
-    config_dir: &std::path::Path,
-    action_label: &'static str,
-    op: OpFn,
-) -> Result<T, String>
-where
-    OpFn: FnOnce(
-        Arc<Client>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>,
-{
-    run_mutation_at_most_once_inner(
-        client,
-        action_label,
-        Client::is_alive,
-        |slot, force| {
-            let config_dir = config_dir.to_path_buf();
-            Box::pin(async move { ensure_worker_client(slot, &config_dir, force).await })
-        },
-        op,
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn run_mutation_at_most_once_inner<C, T, Ensure, OpFn>(
     client: &mut Option<Arc<C>>,
     action_label: &'static str,
@@ -3969,6 +4894,8 @@ mod worker_client_recovery_tests {
         );
 
         // 1. Open PTY #1, execute command, and exit cleanly (`exit`).
+        // Windows ConPTY `cmd.exe` requires `\r\n` (CR) to submit a command line.
+        const SHELL_ENTER: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\n" };
         cmd_tx
             .send(Cmd::PtyOpen {
                 node: box_id.clone(),
@@ -3978,10 +4905,10 @@ mod worker_client_recovery_tests {
             })
             .expect("pty open 1");
         tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut pty1_cmd = b"echo PTY1_MARKER && exit".to_vec();
+        pty1_cmd.extend_from_slice(SHELL_ENTER);
         cmd_tx
-            .send(Cmd::PtyWrite {
-                data: b"echo PTY1_MARKER && exit\n".to_vec(),
-            })
+            .send(Cmd::PtyWrite { data: pty1_cmd })
             .expect("pty write 1");
         let mut pty1_out = String::new();
         let mut pty1_done = false;
@@ -4075,10 +5002,10 @@ mod worker_client_recovery_tests {
             })
             .expect("send pty open 2");
         tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut pty2_cmd = b"echo PTY2_RECOVERED && exit".to_vec();
+        pty2_cmd.extend_from_slice(SHELL_ENTER);
         cmd_tx
-            .send(Cmd::PtyWrite {
-                data: b"echo PTY2_RECOVERED && exit\n".to_vec(),
-            })
+            .send(Cmd::PtyWrite { data: pty2_cmd })
             .expect("send pty write 2");
         let mut pty2_out = String::new();
         let until = std::time::Instant::now() + Duration::from_secs(10);
@@ -4890,5 +5817,37 @@ mod pty_fairness_tests {
         let (done, done_rx) = tokio::sync::oneshot::channel();
         let _ = cmd_tx.send(PtyCmd::Close(Some(done)));
         let _ = tokio::time::timeout(Duration::from_millis(750), done_rx).await;
+    }
+
+    #[test]
+    fn shared_cursor_defaults_visible_and_rgba_pool_recycles_desk_11() {
+        let shared = Shared::new();
+        assert!(
+            shared.cursor().visible,
+            "DeskCursor must default to visible=true so cursor is not hidden until first cursor message"
+        );
+
+        let mut hidden = DeskCursor::default();
+        hidden.visible = false;
+        hidden.x = 42;
+        shared.set_cursor(hidden);
+        assert!(!shared.cursor().visible);
+
+        shared.reset_cursor();
+        assert!(
+            shared.cursor().visible,
+            "reset_cursor on node switch must restore visible=true"
+        );
+
+        let g1 = shared.bump_live_gen();
+        let g2 = shared.bump_live_gen();
+        assert!(g2 > g1, "bump_live_gen must strictly increase");
+
+        let buf = vec![0u8; 4096];
+        let cap = buf.capacity();
+        shared.recycle_rgba(buf);
+        let recycled = shared.take_rgba_buf().expect("recycled buffer available");
+        assert!(recycled.is_empty());
+        assert_eq!(recycled.capacity(), cap);
     }
 }

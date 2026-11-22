@@ -85,13 +85,20 @@ pub fn hit_content(content: Rect, pos: Pos2) -> bool {
     content.width() > 0.0 && content.height() > 0.0 && content.contains(pos)
 }
 
-/// Zoom that shows the image at roughly 1 image pixel per egui point.
-pub fn native_zoom(image_size: Vec2, available: Vec2) -> f32 {
+/// Zoom that shows the image at 1 image pixel per physical screen pixel,
+/// accounting for HiDPI `pixels_per_point`.
+pub fn native_zoom_for_dpi(image_size: Vec2, available: Vec2, pixels_per_point: f32) -> f32 {
     let fitted = contain_size(image_size, available);
     if fitted.x <= 0.0 {
         return 1.0;
     }
-    (image_size.x / fitted.x).clamp(0.05, 8.0)
+    let ppp = pixels_per_point.max(0.5);
+    ((image_size.x / ppp) / fitted.x).clamp(0.05, 8.0)
+}
+
+/// Zoom that shows the image at roughly 1 image pixel per egui point (100% DPI).
+pub fn native_zoom(image_size: Vec2, available: Vec2) -> f32 {
+    native_zoom_for_dpi(image_size, available, 1.0)
 }
 
 #[cfg(test)]
@@ -194,6 +201,8 @@ mod tests {
     fn native_zoom_is_one_when_pane_matches_image() {
         let zoom = native_zoom(vec2(800.0, 600.0), vec2(800.0, 600.0));
         assert!((zoom - 1.0).abs() < 0.01);
+        let hidpi = native_zoom_for_dpi(vec2(1600.0, 1200.0), vec2(800.0, 600.0), 2.0);
+        assert!((hidpi - 1.0).abs() < 0.01, "2x DPI native zoom={hidpi}");
     }
 
     #[test]
