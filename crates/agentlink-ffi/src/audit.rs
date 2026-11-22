@@ -324,11 +324,16 @@ fn load_chain(root: &Path) -> ChainState {
         let mut parts = text.split_whitespace();
         let seq = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
         let prev = parts.next().unwrap_or("").to_string();
+        let prev = if seq == 0 && prev.is_empty() {
+            "0".repeat(64)
+        } else {
+            prev
+        };
         return ChainState { seq, prev };
     }
     ChainState {
         seq: 0,
-        prev: String::new(),
+        prev: "0".repeat(64),
     }
 }
 
@@ -412,11 +417,13 @@ mod tests {
         let chain =
             std::fs::read_to_string(dir.path().join("audit/logs").join(format!("{day}.jsonl")))
                 .unwrap();
-        let record: serde_json::Value =
-            serde_json::from_str(chain.lines().next().unwrap()).unwrap();
+        let first_line = chain.lines().next().unwrap();
+        let record: serde_json::Value = serde_json::from_str(first_line).unwrap();
         assert_eq!(record["seq"], 1);
         assert_eq!(record["op"], "exec");
         assert!(record["hash"].as_str().unwrap().len() > 8, "{record}");
+        let parsed: AuditRecord = serde_json::from_str(first_line).unwrap();
+        agentlink_core::audit::verify_chain(&[parsed]).unwrap();
         let state = std::fs::read_to_string(dir.path().join("audit/chain.state")).unwrap();
         assert!(state.starts_with("1 "), "{state}");
     }

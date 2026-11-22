@@ -663,11 +663,16 @@ fn load_chain(root: &Path) -> ChainState {
         let mut parts = text.split_whitespace();
         let seq = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let prev = parts.next().unwrap_or("").to_string();
+        let prev = if seq == 0 && prev.is_empty() {
+            "0".repeat(64)
+        } else {
+            prev
+        };
         return ChainState { seq, prev };
     }
     ChainState {
         seq: 0,
-        prev: String::new(),
+        prev: "0".repeat(64),
     }
 }
 

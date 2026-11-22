@@ -358,9 +358,27 @@ impl PtySession {
             node_id: self.node_id.clone(),
             cursors,
         };
+        let session_out = match seal_session_now(
+            &self.inner,
+            &self.node_id,
+            &self.client_id,
+            &session_env,
+        ) {
+            Ok(out) => out,
+            Err(Error::Protocol(msg))
+                if msg.contains("no e2e session") || msg.contains("counter exhausted") =>
+            {
+                if msg.contains("counter exhausted") {
+                    self.inner.e2e.forget(&self.node_id);
+                }
+                ensure_e2e(&self.inner, &self.node_id, &self.client_id).await?;
+                seal_session_now(&self.inner, &self.node_id, &self.client_id, &session_env)?
+            }
+            Err(err) => return Err(err),
+        };
         self.inner
             .tx
-            .send(ws::encode(&session_env)?)
+            .send(session_out)
             .await
             .map_err(|_| Error::Message("connection closed".into()))?;
         let out = match seal_now(&self.inner, &self.node_id, &self.client_id, &env) {
@@ -2112,17 +2130,37 @@ impl Client {
     }
 
     async fn protect(&self, env: &Envelope) -> Result<Envelope> {
-        let node_id = match env {
+        let (node_id, synthetic_id) = match env {
             Envelope::Invoke { node_id, .. }
             | Envelope::Cancel { node_id, .. }
-            | Envelope::Transfer { node_id, .. } => node_id.clone(),
+            | Envelope::Transfer { node_id, .. } => (node_id.clone(), None),
+            Envelope::Session { node_id, .. } => {
+                (node_id.clone(), Some(uuid::Uuid::new_v4().to_string()))
+            }
             _ => return Ok(env.clone()),
         };
         self.ensure_e2e(&node_id).await?;
         if let Some(id) = env.request_id() {
             self.inner.note_route(id, &node_id);
         }
-        match crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env) {
+        let seal_once = || match synthetic_id.as_deref() {
+            Some(req_id) => crate::e2e::seal_control_envelope(
+                &self.inner.e2e,
+                &node_id,
+                &node_id,
+                &self.client_id,
+                req_id,
+                env,
+            ),
+            None => crate::e2e::seal_envelope(
+                &self.inner.e2e,
+                &node_id,
+                &node_id,
+                &self.client_id,
+                env,
+            ),
+        };
+        match seal_once() {
             Err(Error::Protocol(msg))
                 if msg.contains("counter exhausted") || msg.contains("no e2e session") =>
             {
@@ -2130,7 +2168,7 @@ impl Client {
                     self.inner.e2e.forget(&node_id);
                 }
                 self.ensure_e2e(&node_id).await?;
-                crate::e2e::seal_envelope(&self.inner.e2e, &node_id, &node_id, &self.client_id, env)
+                seal_once()
             }
             other => other,
         }
@@ -2712,6 +2750,29 @@ fn seal_now(
         )));
     }
     let wrapped = crate::e2e::seal_envelope(&inner.e2e, node_id, node_id, client_id, env)?;
+    ws::encode(&wrapped)
+}
+
+fn seal_session_now(
+    inner: &ClientInner,
+    node_id: &str,
+    client_id: &str,
+    env: &Envelope,
+) -> Result<Outbound> {
+    if !inner.e2e.has(node_id) {
+        return Err(Error::Protocol(format!(
+            "no e2e session for {node_id}; refusing plaintext session fallback"
+        )));
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let wrapped = crate::e2e::seal_control_envelope(
+        &inner.e2e,
+        node_id,
+        node_id,
+        client_id,
+        &request_id,
+        env,
+    )?;
     ws::encode(&wrapped)
 }
 
@@ -3541,14 +3602,11 @@ async fn run_socket(
             _ = ws::run_writer(sink, sock_rx) => {}
         }
     });
-    for env in session_frames(inner) {
-        let Ok(out) = ws::encode(&env) else { continue };
-        if sock_tx.send(out).await.is_err() {
-            inner
-                .transport
-                .note_first(ClosureCategory::WsStreamEnd, None);
-            return SocketEnd::Gone;
-        }
+    if !send_sealed_session_frames(inner, &sock_tx).await {
+        inner
+            .transport
+            .note_first(ClosureCategory::WsStreamEnd, None);
+        return SocketEnd::Gone;
     }
     let mut resend_wait = std::pin::pin!(inner.resend.notified());
     let _ = resend_wait.as_mut().enable();
@@ -3561,6 +3619,12 @@ async fn run_socket(
                 resend_wait.set(inner.resend.notified());
                 let _ = resend_wait.as_mut().enable();
                 tokio::time::sleep(crate::resume::RECONNECT_FLOOR).await;
+                if !send_sealed_session_frames(inner, &sock_tx).await {
+                    inner
+                        .transport
+                        .note_first(ClosureCategory::WsStreamEnd, None);
+                    return SocketEnd::Gone;
+                }
                 resend_inflight(inner, &sock_tx).await;
             }
             outgoing = app_rx.recv() => {
@@ -3682,6 +3746,28 @@ fn session_frames(inner: &ClientInner) -> Vec<Envelope> {
             cursors,
         })
         .collect()
+}
+
+async fn send_sealed_session_frames(
+    inner: &Arc<ClientInner>,
+    sock_tx: &mpsc::Sender<Outbound>,
+) -> bool {
+    let client_id = inner.e2e.peer_id();
+    for env in session_frames(inner) {
+        let Envelope::Session { ref node_id, .. } = env else {
+            continue;
+        };
+        // Nodes and phones reject unsealed plaintext Session updates (SEC-01).
+        // Skip nodes without an active E2E session; `resend_inflight` will
+        // re-handshake and trigger a retry once the E2E session is ready.
+        let Ok(out) = seal_session_now(inner, node_id, client_id, &env) else {
+            continue;
+        };
+        if sock_tx.send(out).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 async fn resend_inflight(inner: &Arc<ClientInner>, sock_tx: &mpsc::Sender<Outbound>) {
@@ -4979,5 +5065,71 @@ mod session_maintain_tests {
             seal_now(&inner, node_ep.peer_id(), inner.e2e.peer_id(), &env).is_err(),
             "seal_now fell back to plaintext after e2e session reset!"
         );
+    }
+
+    #[tokio::test]
+    async fn sec01_send_sealed_session_frames_seals_cursors_and_refuses_plaintext() {
+        let client_ep = crate::e2e::Endpoint::new(crate::identity::Identity::generate());
+        let node_ep = crate::e2e::Endpoint::new(crate::identity::Identity::generate());
+        let (inner, _rx) = make_test_inner(client_ep);
+        inner.note_route("req-stream-1", node_ep.peer_id());
+        {
+            let mut cursors = inner.cursors.lock().unwrap();
+            for seq in 1..=4 {
+                let _ = cursors.push(Envelope::Chunk {
+                    request_id: "req-stream-1".into(),
+                    stream: "stdout".into(),
+                    data_b64: String::new(),
+                    seq,
+                });
+            }
+        }
+
+        // Without E2E, `send_sealed_session_frames` emits zero plaintext Session envelopes.
+        let (sock_tx, mut sock_rx) = mpsc::channel(8);
+        assert!(send_sealed_session_frames(&inner, &sock_tx).await);
+        assert!(
+            sock_rx.try_recv().is_err(),
+            "must never emit plaintext Envelope::Session without E2E"
+        );
+
+        // Once E2E is established, `send_sealed_session_frames` emits sealed `Envelope::E2e`
+        // carrying `Envelope::Session` with the acknowledged cursor.
+        let p = inner.e2e.client_hello_v2(node_ep.peer_id()).unwrap();
+        let (_, w) = node_ep.accept(crate::e2e::Endpoint::hello_bytes(&p)).unwrap();
+        inner.e2e.complete(p, &w).unwrap();
+
+        assert!(send_sealed_session_frames(&inner, &sock_tx).await);
+        let Outbound::Text(raw) = sock_rx.try_recv().expect("sealed session frame") else {
+            panic!("expected Outbound::Text");
+        };
+        assert!(!raw.contains("req-stream-1"), "cursor request_id leaked in plaintext");
+        let env: Envelope = serde_json::from_str(&raw).unwrap();
+        let Envelope::E2e {
+            request_id,
+            node_id,
+            client_id,
+            terminal,
+            body_b64,
+            ..
+        } = env
+        else {
+            panic!("expected Envelope::E2e, got {env:?}");
+        };
+        assert!(terminal);
+        let blob = crate::util::b64_decode(&body_b64).unwrap();
+        let (plain, _dir, peer) = node_ep
+            .open_routed(&client_id, &node_id, request_id.as_bytes(), &blob)
+            .unwrap();
+        assert_eq!(peer, inner.e2e.peer_id());
+        let decoded: Envelope = serde_json::from_slice(&plain).unwrap();
+        match decoded {
+            Envelope::Session { cursors, .. } => {
+                assert_eq!(cursors.len(), 1);
+                assert_eq!(cursors[0].request_id, "req-stream-1");
+                assert_eq!(cursors[0].seq, 4);
+            }
+            other => panic!("expected Envelope::Session, got {other:?}"),
+        }
     }
 }

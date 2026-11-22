@@ -2294,6 +2294,169 @@ mod tests {
         .await;
         assert!(!live.cancels.lock().unwrap().contains_key("fresh-unsealed"));
         assert!(live.sessions.existing("fresh-unsealed").is_none());
+        // Drain the rejection reply from step 3 before testing step 4.
+        while rx.try_recv().is_ok() {}
+
+        // 4. Plaintext Session must NOT trim victim_log, while owner's E2E-sealed
+        //    Session (via `seal_control_envelope`) trims acknowledged frames.
+        let issuer = Identity::generate();
+        let mut owners = BTreeSet::new();
+        owners.insert(issuer.public_hex().to_string());
+        agentlink_core::grant::save_owner_keys(dir.path(), &owners).unwrap();
+        *live.owner_keys.write().unwrap() = owners;
+        let alice_id = Identity::generate();
+        let alice_ep = Endpoint::new(alice_id.clone());
+        let pending = alice_ep.client_hello_v2(&node_id).unwrap();
+        let (_cid, welcome) = endpoint.accept(Endpoint::hello_bytes(&pending)).unwrap();
+        alice_ep.complete(pending, &welcome).unwrap();
+
+        let now = agentlink_core::util::unix_now();
+        let alice_req = "alice-stream-req".to_string();
+        let alice_log = live
+            .sessions
+            .begin(&alice_req, alice_id.public_hex(), "jti-alice-2", Some(now + 600))
+            .expect("alice log");
+        alice_log.push(Envelope::Chunk {
+            request_id: alice_req.clone(),
+            stream: "stdout".into(),
+            data_b64: util::b64_encode(b"chunk-1"),
+            seq: 0,
+        });
+        alice_log.push(Envelope::End {
+            request_id: alice_req.clone(),
+            exit_code: Some(0),
+            error: None,
+            seq: 0,
+        });
+        let cursor = agentlink_core::protocol::SessionCursor {
+            request_id: alice_req.clone(),
+            seq: 1,
+        };
+        handle_env(
+            Envelope::Session {
+                session_id: "plain-sess".into(),
+                node_id: node_id.clone(),
+                cursors: vec![cursor.clone()],
+            },
+            &tx,
+            &policy,
+            &config,
+            &host,
+            &io,
+            &transfer_host,
+            &tools,
+            &endpoint,
+            &audit_hub,
+            &live,
+        )
+        .await;
+        assert_eq!(
+            live.sessions.cursor(alice_id.public_hex(), &alice_req),
+            0,
+            "plaintext Session must be ignored"
+        );
+
+        let sealed_session = agentlink_core::e2e::seal_control_envelope(
+            &alice_ep,
+            &node_id,
+            &node_id,
+            alice_id.public_hex(),
+            "ctrl-phone-sess",
+            &Envelope::Session {
+                session_id: "sealed-sess".into(),
+                node_id: node_id.clone(),
+                cursors: vec![cursor],
+            },
+        )
+        .unwrap();
+        handle_env(
+            sealed_session,
+            &tx,
+            &policy,
+            &config,
+            &host,
+            &io,
+            &transfer_host,
+            &tools,
+            &endpoint,
+            &audit_hub,
+            &live,
+        )
+        .await;
+        assert_eq!(
+            live.sessions.cursor(alice_id.public_hex(), &alice_req),
+            1,
+            "sealed Session must record cursor=1 for owner"
+        );
+
+        // Replaying Alice's Invoke only emits frames with seq > 1 (seq=2 End).
+        let alice_grant = agentlink_core::grant::SignedGrant::sign(
+            &issuer,
+            alice_id.public_hex(),
+            &node_id,
+            NodePolicy::full(),
+            now - 10,
+            now + 600,
+            "jti-alice-2",
+        )
+        .unwrap();
+        let alice_replay = agentlink_core::e2e::seal_envelope(
+            &alice_ep,
+            &node_id,
+            &node_id,
+            alice_id.public_hex(),
+            &Envelope::Invoke {
+                request_id: alice_req.clone(),
+                node_id: node_id.clone(),
+                client_id: alice_id.public_hex().to_string(),
+                op: Op::SysInfo,
+                grant: None,
+                authz: Some(alice_grant),
+                device_id: None,
+                user: None,
+            },
+        )
+        .unwrap();
+        handle_env(
+            alice_replay,
+            &tx,
+            &policy,
+            &config,
+            &host,
+            &io,
+            &transfer_host,
+            &tools,
+            &endpoint,
+            &audit_hub,
+            &live,
+        )
+        .await;
+        let out = rx.try_recv().expect("trimmed replay frame");
+        let text = match out {
+            Outbound::Text(s) => s,
+            _ => panic!("expected text frame"),
+        };
+        let env: Envelope = serde_json::from_str(&text).unwrap();
+        match env {
+            Envelope::E2e {
+                body_b64,
+                request_id: rid,
+                ..
+            } => {
+                let bytes = util::b64_decode(&body_b64).unwrap();
+                let opened = alice_ep.open(&node_id, rid.as_bytes(), &bytes).unwrap();
+                let inner: Envelope = serde_json::from_slice(&opened).unwrap();
+                assert!(
+                    matches!(inner, Envelope::End { seq: 2, .. }),
+                    "expected trimmed replay to start at seq=2 End, got {inner:?}"
+                );
+            }
+            other => panic!("expected sealed replay frame, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "already-acknowledged seq<=1 frames must not be replayed"
+        );
     }
 
     #[tokio::test]

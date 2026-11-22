@@ -2396,9 +2396,18 @@ mod tests {
         let issuer = Identity::generate();
         let mut owners = BTreeSet::new();
         owners.insert(issuer.public_hex().to_string());
+        agentlink_core::grant::save_owner_keys(dir.path(), &owners).unwrap();
         *live.owner_keys.write().unwrap() = owners;
 
         let alice_id = Identity::generate();
+        let alice_ep = Endpoint::new(alice_id.clone());
+        let pending_a = alice_ep.client_hello_v2(&live.node_id).unwrap();
+        let (_, welcome_a) = live
+            .endpoint
+            .accept(Endpoint::hello_bytes(&pending_a))
+            .unwrap();
+        alice_ep.complete(pending_a, &welcome_a).unwrap();
+
         let bob_id = Identity::generate();
         let bob_ep = Endpoint::new(bob_id.clone());
         let pending_b = bob_ep.client_hello(&live.node_id).unwrap();
@@ -2604,6 +2613,169 @@ mod tests {
         )
         .await;
         assert!(!cancel_tok.is_cancelled(), "cross-peer Cancel cancelled Alice's op");
+
+        // 4. Plaintext Session and Bob's sealed Session MUST NOT trim Alice's replay log,
+        //    while Alice's E2E-sealed Session (via `seal_control_envelope`) DOES trim it.
+        let session_cursor = agentlink_core::protocol::SessionCursor {
+            request_id: req_id.clone(),
+            seq: 1,
+        };
+        handle_env(
+            Envelope::Session {
+                session_id: "sess-plain".into(),
+                node_id: live.node_id.clone(),
+                cursors: vec![session_cursor.clone()],
+            },
+            &tx,
+            &policy,
+            &live.cancels,
+            &live.pty,
+            &config,
+            &[],
+            &host,
+            &live,
+        )
+        .await;
+        assert_eq!(
+            live.sessions.cursor_for(alice_id.public_hex(), &req_id),
+            0,
+            "plaintext Session must not advance cursor"
+        );
+
+        let bob_session = agentlink_core::e2e::seal_control_envelope(
+            &bob_ep,
+            &live.node_id,
+            &live.node_id,
+            bob_id.public_hex(),
+            "ctrl-bob-sess",
+            &Envelope::Session {
+                session_id: "sess-bob".into(),
+                node_id: live.node_id.clone(),
+                cursors: vec![session_cursor.clone()],
+            },
+        )
+        .unwrap();
+        handle_env(
+            bob_session,
+            &tx,
+            &policy,
+            &live.cancels,
+            &live.pty,
+            &config,
+            &[],
+            &host,
+            &live,
+        )
+        .await;
+        assert_eq!(
+            live.sessions.cursor_for(alice_id.public_hex(), &req_id),
+            0,
+            "cross-peer sealed Session must not advance Alice's cursor"
+        );
+        assert_eq!(
+            live.sessions.cursor_for(bob_id.public_hex(), &req_id),
+            0,
+            "cross-peer sealed Session must not store cursor for unowned request"
+        );
+
+        let alice_session = agentlink_core::e2e::seal_control_envelope(
+            &alice_ep,
+            &live.node_id,
+            &live.node_id,
+            alice_id.public_hex(),
+            "ctrl-alice-sess",
+            &Envelope::Session {
+                session_id: "sess-alice".into(),
+                node_id: live.node_id.clone(),
+                cursors: vec![session_cursor],
+            },
+        )
+        .unwrap();
+        handle_env(
+            alice_session,
+            &tx,
+            &policy,
+            &live.cancels,
+            &live.pty,
+            &config,
+            &[],
+            &host,
+            &live,
+        )
+        .await;
+        assert_eq!(
+            live.sessions.cursor_for(alice_id.public_hex(), &req_id),
+            1,
+            "owner's sealed Session must advance replay cursor to seq=1"
+        );
+
+        // 5. When Alice replays her Invoke for `req_id`, only frames with seq > 1
+        //    (`Envelope::End { seq: 2 }`) are re-sent — seq=1 Chunk is trimmed!
+        let alice_grant = agentlink_core::grant::SignedGrant::sign(
+            &issuer,
+            alice_id.public_hex(),
+            &live.node_id,
+            NodePolicy::full(),
+            now - 10,
+            now + 600,
+            "jti-alice",
+        )
+        .unwrap();
+        let alice_replay = agentlink_core::e2e::seal_envelope(
+            &alice_ep,
+            &live.node_id,
+            &live.node_id,
+            alice_id.public_hex(),
+            &Envelope::Invoke {
+                request_id: req_id.clone(),
+                node_id: live.node_id.clone(),
+                client_id: alice_id.public_hex().to_string(),
+                op: Op::SysInfo,
+                grant: None,
+                authz: Some(alice_grant),
+                user: None,
+                device_id: None,
+            },
+        )
+        .unwrap();
+        handle_env(
+            alice_replay,
+            &tx,
+            &policy,
+            &live.cancels,
+            &live.pty,
+            &config,
+            &[],
+            &host,
+            &live,
+        )
+        .await;
+        let out = rx.try_recv().expect("trimmed replay frame");
+        let text = match out {
+            Outbound::Text(s) => s,
+            _ => panic!("expected Outbound::Text"),
+        };
+        let env: Envelope = serde_json::from_str(&text).unwrap();
+        match env {
+            Envelope::E2e {
+                body_b64,
+                request_id: rid,
+                ..
+            } => {
+                let bytes = agentlink_core::util::b64_decode(&body_b64).unwrap();
+                let opened = alice_ep.open(&live.node_id, rid.as_bytes(), &bytes).unwrap();
+                let inner: Envelope = serde_json::from_slice(&opened).unwrap();
+                assert!(
+                    matches!(inner, Envelope::End { seq: 2, .. }),
+                    "expected trimmed replay to start at seq=2 End, got {inner:?}"
+                );
+            }
+            other => panic!("expected sealed replay frame, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no already-acknowledged seq<=1 frames should be replayed"
+        );
     }
 
     #[test]

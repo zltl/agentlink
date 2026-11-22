@@ -118,6 +118,7 @@ pub(crate) fn open(
     bitrate: u32,
     monitor: u32,
     ice_servers: Vec<Value>,
+    ice_refresh: Option<Arc<dyn Fn() -> Vec<Value> + Send + Sync>>,
 ) -> Result<Arc<DesktopLive>, LinkError> {
     let signal = Arc::new(ClientSignal {
         client,
@@ -135,6 +136,7 @@ pub(crate) fn open(
             control: true,
             // Native pixels. The node clamps anything outside 0.25..=1.
             scale: 1.0,
+            ice_refresh,
             ..LiveOptions::default()
         },
     )

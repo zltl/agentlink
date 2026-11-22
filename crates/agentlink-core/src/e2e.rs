@@ -932,12 +932,30 @@ pub fn seal_envelope(
 ) -> Result<Envelope> {
     let request_id = env
         .request_id()
-        .ok_or_else(|| Error::Protocol("e2e envelope needs a request id".into()))?
-        .to_string();
+        .ok_or_else(|| Error::Protocol("e2e envelope needs a request id".into()))?;
+    seal_control_envelope(endpoint, peer, node_id, client_id, request_id, env)
+}
+
+/// Wrap a control envelope (such as [`Envelope::Session`], which carries no
+/// inner `request_id`) using an explicit outer `request_id` for relay routing
+/// and ChaCha20-Poly1305 associated data.
+pub fn seal_control_envelope(
+    endpoint: &Endpoint,
+    peer: &str,
+    node_id: &str,
+    client_id: &str,
+    request_id: &str,
+    env: &Envelope,
+) -> Result<Envelope> {
+    if request_id.is_empty() {
+        return Err(Error::Protocol(
+            "e2e control envelope needs a request id".into(),
+        ));
+    }
     let plain = serde_json::to_vec(env)?;
     let blob = endpoint.seal(peer, request_id.as_bytes(), &plain)?;
     Ok(Envelope::E2e {
-        request_id,
+        request_id: request_id.to_string(),
         node_id: node_id.to_string(),
         client_id: client_id.to_string(),
         class: coarse_class(env).to_string(),
@@ -1240,6 +1258,7 @@ pub fn envelope_terminal(env: &Envelope) -> bool {
         Envelope::Result { terminal, .. } => *terminal,
         Envelope::End { .. } => true,
         Envelope::Transfer { msg, terminal, .. } => *terminal || msg.is_terminal(),
+        Envelope::Session { .. } => true,
         _ => false,
     }
 }
@@ -1841,5 +1860,71 @@ mod tests {
         welcome.extend_from_slice(&node_sig);
         let err = client.complete(pending, &welcome).unwrap_err().to_string();
         assert!(err.contains("non-contributory"), "{err}");
+    }
+
+    #[test]
+    fn seal_control_envelope_roundtrips_session_cursor_update() {
+        let client = Endpoint::new(Identity::generate());
+        let node = Endpoint::new(Identity::generate());
+        let pending = client.client_hello_v2(node.peer_id()).unwrap();
+        let (_cid, welcome) = node.accept(Endpoint::hello_bytes(&pending)).unwrap();
+        client.complete(pending, &welcome).unwrap();
+
+        let session = Envelope::Session {
+            session_id: "sess-1".into(),
+            node_id: node.peer_id().to_string(),
+            cursors: vec![crate::protocol::SessionCursor {
+                request_id: "req-42".into(),
+                seq: 7,
+            }],
+        };
+        assert!(
+            seal_envelope(&client, node.peer_id(), node.peer_id(), client.peer_id(), &session)
+                .is_err(),
+            "seal_envelope still requires an inner request_id"
+        );
+        let wrapped = seal_control_envelope(
+            &client,
+            node.peer_id(),
+            node.peer_id(),
+            client.peer_id(),
+            "ctrl-req-1",
+            &session,
+        )
+        .unwrap();
+        let Envelope::E2e {
+            request_id,
+            node_id,
+            client_id,
+            class,
+            terminal,
+            body_b64,
+            ..
+        } = wrapped
+        else {
+            panic!("expected Envelope::E2e");
+        };
+        assert_eq!(request_id, "ctrl-req-1");
+        assert_eq!(class, "meta");
+        assert!(terminal);
+        let blob = crate::util::b64_decode(&body_b64).unwrap();
+        let (opened, _dir, peer) = node
+            .open_routed(&client_id, &node_id, request_id.as_bytes(), &blob)
+            .unwrap();
+        assert_eq!(peer, client.peer_id());
+        let inner: Envelope = serde_json::from_slice(&opened).unwrap();
+        match inner {
+            Envelope::Session {
+                session_id,
+                cursors,
+                ..
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(cursors.len(), 1);
+                assert_eq!(cursors[0].request_id, "req-42");
+                assert_eq!(cursors[0].seq, 7);
+            }
+            other => panic!("expected Session, got {other:?}"),
+        }
     }
 }

@@ -291,6 +291,31 @@ async fn post_api_ice_accepts_bearer_without_csrf_and_denies_zero_node_and_revok
         agentlink_core::rest_credential("wave1-turn-secret", username).unwrap()
     );
 
+    // 3b. Cross-crate verification: `agentlink_core::fetch_relay_ice_servers` over
+    //     pinned TLS against live `POST /api/ice` parses the exact Bearer response
+    //     (and does not short-circuit on relay-side `AGENTLINK_TURN_URLS` + `AGENTLINK_TURN_SECRET`).
+    let trust = agentlink_core::tls::RelayTrust::parse(&relay.fingerprint, None).unwrap();
+    let core_ice = agentlink_core::fetch_relay_ice_servers(
+        &relay_url,
+        &trust,
+        &alice_session.access_token,
+    )
+    .await
+    .expect("core fetch_relay_ice_servers against live TLS relay");
+    assert_eq!(core_ice.ttl_secs, 600);
+    let core_json = core_ice.to_json_servers();
+    let core_turn = core_json
+        .iter()
+        .find(|s| s.get("credential").is_some())
+        .expect("core_ice TURN entry with minted REST credentials");
+    let core_user = core_turn["username"].as_str().unwrap();
+    let core_cred = core_turn["credential"].as_str().unwrap();
+    assert!(core_user.ends_with(":user:alice"), "{core_user}");
+    assert_eq!(
+        core_cred,
+        agentlink_core::rest_credential("wave1-turn-secret", core_user).unwrap()
+    );
+
     // 4. Revoke Alice's device -> Bearer token is immediately rejected with 401!
     admin
         .revoke_device(&alice_session.device_id)

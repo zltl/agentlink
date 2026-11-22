@@ -673,11 +673,30 @@ async fn push_dir(
     transport: &str,
 ) -> Result<TransferStats> {
     let real = staged.real.clone();
+    let sandbox_root = if staged.publish {
+        Some(paths.roots.cache.clone())
+    } else {
+        paths::sandbox_root_for_guest(&paths.roots, &staged.guest)
+    };
     if !staged.publish {
-        return engine::serve_push_dir(&real, entries, link, transport).await;
+        return engine::serve_push_dir_confined(
+            sandbox_root.as_deref(),
+            &real,
+            entries,
+            link,
+            transport,
+        )
+        .await;
     }
     let (mut engine, hold) = hold_done(link);
-    let served = engine::serve_push_dir(&real, entries, &mut engine, transport).await;
+    let served = engine::serve_push_dir_confined(
+        sandbox_root.as_deref(),
+        &real,
+        entries,
+        &mut engine,
+        transport,
+    )
+    .await;
     drop(engine);
     publish_then_release(paths, staged, hold, served).await
 }
@@ -1175,6 +1194,35 @@ mod tests {
             "host.seals must be cleaned up when attach exits"
         );
         assert!(!host.sessions.lock().unwrap().contains_key("req-cleanup"));
+    }
+
+    #[tokio::test]
+    async fn push_dir_enforces_sandbox_confinement() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let host = test_host(dir.path(), NodePolicy::full());
+        let (_client_link, mut server_link) = Link::pair(8);
+        let escaped_staged = Staged {
+            real: outside.join("escape-dest"),
+            publish: false,
+            guest: "app:/files/sub".into(),
+        };
+        let err = push_dir(
+            host.paths.as_ref(),
+            &mut server_link,
+            &escaped_staged,
+            Vec::new(),
+            "relay",
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("sandbox") || msg.contains("escape") || msg.contains("outside"),
+            "expected sandbox rejection, got {err}"
+        );
+        assert!(!outside.join("escape-dest").exists());
     }
 }
 

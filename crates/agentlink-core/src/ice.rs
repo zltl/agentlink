@@ -993,7 +993,18 @@ pub async fn fetch_relay_ice_servers(
     access_token: &str,
 ) -> Result<RelayIceConfig> {
     let env_turn = turn_servers_from_env();
-    if !env_turn.is_empty() {
+    let has_static_creds = env_turn
+        .iter()
+        .any(|s| s.username.is_some() || s.credential.is_some());
+    let relay_rest_secret_set = std::env::var("AGENTLINK_TURN_SECRET")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    // Honor explicit client-side TURN overrides (with static credentials, or
+    // open TURN when no relay-side `AGENTLINK_TURN_SECRET` is present in the
+    // shared environment). When `AGENTLINK_TURN_SECRET` is set without static
+    // credentials, proceed to `POST /api/ice` so the relay mints short-lived
+    // REST credentials.
+    if !env_turn.is_empty() && (has_static_creds || !relay_rest_secret_set) {
         let mut servers = Vec::new();
         let stuns = stun_urls_ready_for_ice_async().await;
         if !stuns.is_empty() {

@@ -193,7 +193,7 @@ struct PinFile {
 pub struct MobileClient {
     handle: tokio::runtime::Handle,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
-    settings: RwLock<ClientSettings>,
+    settings: Arc<RwLock<ClientSettings>>,
     identity: ClientIdentity,
     client: Mutex<Option<Arc<Client>>>,
     connect_lock: Mutex<()>,
@@ -255,12 +255,12 @@ impl MobileClient {
         Ok(Self {
             handle,
             runtime: Mutex::new(Some(runtime)),
-            settings: RwLock::new(ClientSettings {
+            settings: Arc::new(RwLock::new(ClientSettings {
                 relay,
                 token,
                 fingerprint,
                 trust,
-            }),
+            })),
             identity,
             client: Mutex::new(None),
             connect_lock: Mutex::new(()),
@@ -988,16 +988,30 @@ impl MobileClient {
             .lock()
             .ok()
             .and_then(|guard| guard.clone());
+        let settings = self.current_settings()?;
         let ice_servers = match cached {
             Some(servers) => servers,
             None => {
-                let settings = self.current_settings()?;
+                let initial_settings = settings.clone();
                 drive(&self.handle, async move {
-                    Ok(crate::live::fetch_ice_servers(&settings).await)
+                    Ok(crate::live::fetch_ice_servers(&initial_settings).await)
                 })
                 .unwrap_or_default()
             }
         };
+        let refresh_handle = self.handle.clone();
+        let refresh_settings = Arc::clone(&self.settings);
+        let ice_refresh: Arc<dyn Fn() -> Vec<Value> + Send + Sync> = Arc::new(move || {
+            let Ok(settings) = refresh_settings.read().map(|guard| guard.clone()) else {
+                return Vec::new();
+            };
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            refresh_handle.spawn(async move {
+                let servers = crate::live::fetch_ice_servers(&settings).await;
+                let _ = tx.send(servers);
+            });
+            rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default()
+        });
         crate::live::open(
             client,
             self.handle.clone(),
@@ -1006,6 +1020,7 @@ impl MobileClient {
             bitrate,
             monitor,
             ice_servers,
+            Some(ice_refresh),
         )
     }
 }

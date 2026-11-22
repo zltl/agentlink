@@ -491,13 +491,17 @@ pub async fn on_transfer(
                         paths::ensure_path_stays_in_sandbox_at_sink(host.root.as_deref(), &path)?;
                     validate_push_dir_manifest(host.root.as_deref(), &path, &entries)?;
                     crate::ops::create_dir_all_confined(host.root.as_deref(), &path)?;
-                    if let Some(sandbox_root) = host.root.as_deref() {
+                    if host.root.is_some() {
                         ensure_no_symlink_tar_partials(&path)?;
-                        serve_push_dir_sandboxed(sandbox_root, &path, entries, &mut link, "relay")
-                            .await
-                    } else {
-                        engine::serve_push_dir(&path, entries, &mut link, "relay").await
                     }
+                    engine::serve_push_dir_confined(
+                        host.root.as_deref(),
+                        &path,
+                        entries,
+                        &mut link,
+                        "relay",
+                    )
+                    .await
                 }
                 .await;
                 finish(&host, &client_id, "push_dir", &dest, outcome, &mut link).await;
@@ -1099,125 +1103,6 @@ fn clean_rel_path(path: &Path) -> PathBuf {
         }
     }
     out
-}
-
-/// Run `engine::serve_push_dir` while holding back `TransferMsg::Done` until
-/// every unpacked symlink is verified canonically against `sandbox_root` (and
-/// scrubbing any escaping multi-hop symlink chain + masking modes `& 0o777`).
-async fn serve_push_dir_sandboxed(
-    sandbox_root: &Path,
-    dest: &Path,
-    entries: Vec<ManifestEntry>,
-    real_link: &mut Link,
-    transport: &str,
-) -> Result<TransferStats> {
-    let (mut inner_link, mut proxy) = Link::pair(64);
-    let mut held_done: Option<TransferMsg> = None;
-    let dest_buf = dest.to_path_buf();
-    let transport_s = transport.to_string();
-    let mut serve_fut = std::pin::pin!(async move {
-        engine::serve_push_dir(&dest_buf, entries, &mut inner_link, &transport_s).await
-    });
-    let serve_result = loop {
-        tokio::select! {
-            res = &mut serve_fut => break res,
-            from_client = real_link.inp.recv() => {
-                match from_client {
-                    Some(wire) => {
-                        if proxy.out.send(wire).await.is_err() {
-                            break serve_fut.await;
-                        }
-                    }
-                    None => {
-                        drop(proxy.out);
-                        break serve_fut.await;
-                    }
-                }
-            }
-            from_server = proxy.inp.recv() => {
-                match from_server {
-                    Some(Wire::Msg(done @ TransferMsg::Done { .. })) => {
-                        held_done = Some(done);
-                    }
-                    Some(wire) => {
-                        if real_link.out.send(wire).await.is_err() {
-                            break Err(Error::Message("connection closed".into()));
-                        }
-                    }
-                    None => {}
-                }
-            }
-        }
-    };
-    while let Ok(wire) = proxy.inp.try_recv() {
-        match wire {
-            Wire::Msg(done @ TransferMsg::Done { .. }) => held_done = Some(done),
-            other => {
-                let _ = real_link.out.send(other).await;
-            }
-        }
-    }
-    let stats = serve_result?;
-    verify_and_harden_unpacked_dir(sandbox_root, dest)?;
-    if let Some(done) = held_done {
-        real_link.send_msg(done).await?;
-    }
-    Ok(stats)
-}
-
-/// Verify every unpacked symlink stays inside `sandbox_root` (following chains),
-/// immediately scrub any escaping symlink, and strip special mode bits (`& 0o777`).
-fn verify_and_harden_unpacked_dir(sandbox_root: &Path, dir: &Path) -> Result<()> {
-    let mut escaped: Vec<PathBuf> = Vec::new();
-    walk_verify_and_mask(sandbox_root, dir, &mut escaped)?;
-    if !escaped.is_empty() {
-        return Err(Error::PermissionDenied(format!(
-            "pushed directory contained {} symlink(s) escaping sandbox",
-            escaped.len()
-        )));
-    }
-    Ok(())
-}
-
-fn walk_verify_and_mask(sandbox_root: &Path, dir: &Path, escaped: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)?;
-        if paths::is_link_entry(&meta) {
-            if paths::ensure_moved_symlinks_stay_inside(Some(sandbox_root), &path, &path).is_err() {
-                let _ = paths::remove_link_entry(&path, &meta);
-                escaped.push(path);
-            }
-        } else if meta.is_dir() {
-            mask_special_mode_bits(&path, &meta);
-            walk_verify_and_mask(sandbox_root, &path, escaped)?;
-        } else {
-            mask_special_mode_bits(&path, &meta);
-        }
-    }
-    Ok(())
-}
-
-fn mask_special_mode_bits(path: &Path, meta: &std::fs::Metadata) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        let clean = mode & 0o777;
-        if (mode & 0o7777) != clean {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(clean));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, meta);
-    }
 }
 
 /// Deliver a relay rejection to a transfer that is still waiting.
