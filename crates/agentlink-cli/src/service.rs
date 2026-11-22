@@ -1126,7 +1126,7 @@ fn render_windows_task(spec: &NodeSpec, job: TaskJob) -> Result<String> {
         TaskJob::Update => "",
     };
     Ok(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>{}</Description>
@@ -1241,17 +1241,18 @@ fn install_launchd_timer(binary: &Path, scope: Scope) -> Result<()> {
 }
 
 fn install_windows_timer(binary: &Path, scope: Scope) -> Result<()> {
+    let data_dir = default_data_dir(scope)?;
     let spec = NodeSpec {
-        binary: binary.to_path_buf(),
-        data_dir: default_data_dir(scope)?,
-        work_dir: work_dir(scope, &default_data_dir(scope)?),
+        binary: crate::preferred_gui_binary(binary),
+        work_dir: work_dir(scope, &data_dir),
+        data_dir,
         scope,
         run_as: None,
         headless: true,
     };
     let xml = render_windows_task(&spec, TaskJob::Update)?;
     let path = spec.data_dir.join("agentlink-update.task.xml");
-    write_text(&path, &xml)?;
+    write_utf16le_with_bom(&path, &xml)?;
     run_ok(
         "schtasks",
         &[
@@ -1934,6 +1935,30 @@ fn write_text(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Encode `contents` as UTF-16LE with a leading BOM (`0xFF 0xFE`).
+///
+/// Windows `schtasks /Create /XML` reads the file into a UTF-16 `BSTR` before
+/// handing it to Task Scheduler's MSXML parser, which rejects `encoding="UTF-8"`
+/// with `无法切换编码` ("switch from current encoding to specified encoding not
+/// supported") and mis-decodes BOM-less files under the system ANSI code page.
+fn encode_utf16le_with_bom(contents: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + contents.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in contents.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+fn write_utf16le_with_bom(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(path, encode_utf16le_with_bom(contents))
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 fn scope_name(scope: Scope) -> &'static str {
     match scope {
         Scope::User => "user",
@@ -2072,13 +2097,23 @@ mod tests {
         assert!(bin.contains("service run"));
         assert!(bin.contains("--data-dir"));
         let update = render_windows_task(&spec(Scope::User, true), TaskJob::Update).unwrap();
-        assert!(update.contains("encoding=\"UTF-8\""), "{update}");
-        assert!(!update.contains("UTF-16"), "{update}");
+        assert!(update.contains("encoding=\"UTF-16\""), "{update}");
+        assert!(!update.contains("encoding=\"UTF-8\""), "{update}");
         assert!(!update.contains("RestartOnFailure"), "{update}");
         assert!(update.contains("update --yes"));
         assert!(update.contains("ScheduleByDay"));
+        let encoded = encode_utf16le_with_bom(&update);
+        assert_eq!(&encoded[..2], &[0xFF, 0xFE]);
+        let decoded = String::from_utf16(
+            &encoded[2..]
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(decoded, update);
         let legacy = render_windows_task(&user, TaskJob::Node).unwrap();
-        assert!(legacy.contains("encoding=\"UTF-8\""), "{legacy}");
+        assert!(legacy.contains("encoding=\"UTF-16\""), "{legacy}");
         assert!(legacy.contains("RestartOnFailure"), "{legacy}");
         assert!(legacy.contains("InteractiveToken"));
         assert!(legacy.contains("node --data-dir"));
