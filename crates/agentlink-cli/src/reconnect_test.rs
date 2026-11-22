@@ -98,6 +98,22 @@ async fn flow() -> anyhow::Result<()> {
     wait_online(&admin, &node_task).await;
     let grant_jti = issue_test_grant(dir.path(), &node_dir, identity.public_hex())?;
 
+    let long_exec_cmd = if cfg!(windows) {
+        "ping -n 61 127.0.0.1 >nul & echo EXEC-OK"
+    } else {
+        "sleep 60; echo EXEC-OK"
+    };
+    let pty_beat_cmd = if cfg!(windows) {
+        "for /L %i in (1,1,1000) do @(echo p>>pty-heartbeat & ping -n 2 127.0.0.1 >nul)"
+    } else {
+        "while true; do printf p >> pty-heartbeat; sleep 0.2; done"
+    };
+    let long_mcp_cmd = if cfg!(windows) {
+        "ping -n 61 127.0.0.1 >nul & echo MCP-OK"
+    } else {
+        "sleep 60; echo MCP-OK"
+    };
+
     // Long enough that these cannot finish before the relay is dropped.
     let exec = tokio::spawn({
         let admin = admin_clone(&settings, &identity, dir.path()).await?;
@@ -105,7 +121,7 @@ async fn flow() -> anyhow::Result<()> {
             admin
                 .exec_collect(
                     "box",
-                    ExecRequest::shell("sleep 60; echo EXEC-OK", Some(Duration::from_secs(75))),
+                    ExecRequest::shell(long_exec_cmd, Some(Duration::from_secs(75))),
                     None,
                 )
                 .await
@@ -119,13 +135,7 @@ async fn flow() -> anyhow::Result<()> {
         let admin = admin_clone(&settings, &identity, dir.path()).await?;
         async move {
             let mut session = admin
-                .open_pty(
-                    "box",
-                    Some("while true; do printf p >> pty-heartbeat; sleep 0.2; done".into()),
-                    None,
-                    24,
-                    80,
-                )
+                .open_pty("box", Some(pty_beat_cmd.into()), None, 24, 80)
                 .await?;
             let mut buf = Vec::new();
             loop {
@@ -180,7 +190,7 @@ async fn flow() -> anyhow::Result<()> {
                         "name": "run_command",
                         "arguments": {
                             "node": "box",
-                            "command": "sleep 60; echo MCP-OK",
+                            "command": long_mcp_cmd,
                             "timeout_ms": 75000
                         }
                     }
@@ -224,8 +234,17 @@ async fn flow() -> anyhow::Result<()> {
             let partial = std::fs::metadata(root.join(".blob.bin.agentlink-partial"))
                 .map(|meta| meta.len())
                 .unwrap_or(0);
+            let final_len = std::fs::metadata(root.join("blob.bin"))
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            let xfer_done = transfer.is_finished();
+            let xfer_err = if xfer_done {
+                format!("{:?}", transfer.await)
+            } else {
+                "still-running".into()
+            };
             anyhow::bail!(
-                "setup incomplete; journal={} pty_heartbeat={} partial={partial} bytes",
+                "setup incomplete; journal={} pty_heartbeat={} partial={partial} final={final_len} xfer={xfer_err}",
                 journal.exists(),
                 file_len(&pty_beat)
             );
@@ -290,8 +309,9 @@ async fn flow() -> anyhow::Result<()> {
         !mcp_err.to_ascii_lowercase().contains("mcp-ok"),
         "old mcp command must not finish after the relay dropped: {mcp_err}"
     );
-    // stop_live_sessions cancels shells/media/grant RPCs, not WatchManager.
-    // The pre-drop poll must not be treated as success; a hang is allowed.
+    // stop_live_sessions closes watches as well as shells/procs/tunnels/media (`SEC-08`).
+    // The pre-drop poll must fail (e.g. cancelled / connection closed / not found: watch)
+    // and must never complete as a live event stream.
     match expect_stopped_within(watch, "watch", Duration::from_secs(5)).await {
         Ok(msg) => {
             anyhow::ensure!(
@@ -536,6 +556,7 @@ fn is_session_stop_error(msg: &str) -> bool {
         || lower.contains("transfer closed")
         || lower.contains("websocket")
         || lower.contains("pty session ended")
+        || lower.contains("not found: watch")
 }
 
 async fn admin_clone(
