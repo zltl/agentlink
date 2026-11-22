@@ -191,11 +191,6 @@ fn finalize_dest_path_in_sandbox(dest: &Path, sandbox_root: Option<&Path>) -> Re
     Ok(current)
 }
 
-#[cfg(test)]
-fn finalize_dest_path(dest: &Path) -> Result<PathBuf> {
-    finalize_dest_path_in_sandbox(dest, None)
-}
-
 /// Atomically install `partial` at `dest`, following a symlink destination only
 /// when it stays inside `sandbox_root`.
 ///
@@ -256,11 +251,6 @@ fn install_partial_at_dest_in_sandbox(
     Ok(())
 }
 
-#[cfg(test)]
-fn install_partial_at_dest(partial: &Path, dest: &Path) -> Result<()> {
-    install_partial_at_dest_in_sandbox(partial, dest, None)
-}
-
 fn is_exdev(err: &io::Error) -> bool {
     // Linux EXDEV is 18; keep a raw check for older Rust without CrossesDevices.
     err.raw_os_error() == Some(18)
@@ -303,7 +293,100 @@ fn journal_age(path: &Path) -> Option<Duration> {
 ///
 /// Clears when the journal is missing/corrupt, hash/size disagree, the partial
 /// blob is gone, or the journal is older than [`STALE_PARTIAL_MAX_AGE`].
+/// Private per-operation staging file (`0600` on Unix / private ACL on Windows)
+/// inside a private `0700` temporary directory. Automatically removed on drop.
+struct StagedTempFile {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl StagedTempFile {
+    fn new(prefix: &str, suffix: &str) -> Result<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix("agentlink-stage-")
+            .tempdir()
+            .map_err(Error::Io)?;
+        util::ensure_dir(dir.path())?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(prefix).suffix(suffix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o600));
+        }
+        let named = builder.tempfile_in(dir.path()).map_err(Error::Io)?;
+        let (_file, path) = named.keep().map_err(|e| Error::Io(e.error))?;
+        util::restrict_existing_file(&path)?;
+        Ok(Self { _dir: dir, path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Open a `.agentlink-partial` file for read/write without ever following a
+/// final-component symlink or reparse point, verifying sandbox confinement first.
+fn open_partial_rw(
+    partial: &Path,
+    sandbox_root: Option<&Path>,
+    create: bool,
+    truncate: bool,
+) -> Result<File> {
+    if let Some(root) = sandbox_root {
+        let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), partial)?;
+        if let Some(parent) = partial.parent() {
+            let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+        }
+    }
+    if let Ok(meta) = fs::symlink_metadata(partial) {
+        if crate::paths::is_link_entry(&meta) {
+            return Err(Error::PermissionDenied(format!(
+                "refusing to open symlink partial file: {}",
+                partial.display()
+            )));
+        }
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(create).truncate(truncate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT — do not follow a symlink/junction.
+        opts.custom_flags(0x0020_0000);
+    }
+    let file = opts.open(partial)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let meta = file.metadata()?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::PermissionDenied(format!(
+                "refusing to open reparse point partial file: {}",
+                partial.display()
+            )));
+        }
+    }
+    Ok(file)
+}
+
 fn take_resume_ranges(partial: &Path, journal_path: &Path, hash: &str, size: u64) -> Vec<ByteRange> {
+    if fs::symlink_metadata(partial)
+        .ok()
+        .is_some_and(|m| crate::paths::is_link_entry(&m))
+        || fs::symlink_metadata(journal_path)
+            .ok()
+            .is_some_and(|m| crate::paths::is_link_entry(&m))
+    {
+        clear_partial(partial, journal_path);
+        return Vec::new();
+    }
     let Some(journal) = load_journal(journal_path) else {
         if partial.exists() {
             let _ = fs::remove_file(partial);
@@ -371,10 +454,26 @@ fn save_journal(path: &Path, journal: &Journal) -> Result<()> {
     if let Some(parent) = path.parent() {
         util::create_dir_all_parent(parent)?;
     }
+    if fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|m| crate::paths::is_link_entry(&m))
+    {
+        return Err(Error::PermissionDenied(format!(
+            "refusing to write through symlink journal: {}",
+            path.display()
+        )));
+    }
     let text = serde_json::to_string(journal)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text)?;
-    fs::rename(&tmp, path)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("journal");
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", util::random_hex(8)));
+    {
+        let mut f = crate::paths::open_write_file(&tmp, true, true, true)?;
+        f.write_all(text.as_bytes())?;
+    }
+    util::replace_file(&tmp, path)?;
     Ok(())
 }
 
@@ -587,16 +686,20 @@ fn needed_entries(dest: &Path, entries: &[ManifestEntry]) -> Result<Vec<String>>
     let mut needed = Vec::new();
     for entry in entries {
         let path = safe_join(dest, &entry.rel)?;
-        if entry.dir {
-            if !path.is_dir() {
-                needed.push(entry.rel.clone());
-            }
-            continue;
+        if let Some(parent) = path.parent() {
+            ensure_unpacked_stays_inside(dest, parent)?;
         }
         if let Some(target) = &entry.symlink {
             match fs::read_link(&path) {
                 Ok(have) if have.to_string_lossy().replace('\\', "/") == *target => {}
                 _ => needed.push(entry.rel.clone()),
+            }
+            continue;
+        }
+        ensure_unpacked_stays_inside(dest, &path)?;
+        if entry.dir {
+            if !path.is_dir() {
+                needed.push(entry.rel.clone());
             }
             continue;
         }
@@ -653,7 +756,16 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf> {
 }
 
 /// `raw` is the symlink target as stored in the archive, relative to `link`.
-fn ensure_link_target_inside(root: &Path, link: &Path, raw: &Path) -> Result<()> {
+///
+/// Validates both lexically against `dest` AND canonically (expanding any
+/// already-extracted symlinks along the target path) against `dest` and
+/// `sandbox_root`, preventing multi-hop symlink chains from escaping.
+fn ensure_link_target_inside(
+    dest: &Path,
+    sandbox_root: Option<&Path>,
+    link: &Path,
+    raw: &Path,
+) -> Result<()> {
     if raw
         .components()
         .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
@@ -664,14 +776,20 @@ fn ensure_link_target_inside(root: &Path, link: &Path, raw: &Path) -> Result<()>
             raw.display()
         )));
     }
-    let parent = link.parent().unwrap_or(root);
-    let lexical = lexical_absolute(&parent.join(raw))?;
-    let root_lex = lexical_absolute(root)?;
+    let parent = link.parent().unwrap_or(dest);
+    let candidate = parent.join(raw);
+    let lexical = lexical_absolute(&candidate)?;
+    let root_lex = lexical_absolute(dest)?;
     if lexical != root_lex && !lexical.starts_with(&root_lex) {
         return Err(Error::PermissionDenied(format!(
             "symlink target escapes directory: {}",
             raw.display()
         )));
+    }
+    // Canonical / symlink-aware check against both unpack dest and sandbox root.
+    crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(dest), &candidate)?;
+    if let Some(root) = sandbox_root {
+        crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), &candidate)?;
     }
     Ok(())
 }
@@ -766,18 +884,26 @@ fn mode_mtime_of(path: &Path) -> (Option<u32>, Option<u64>) {
     (mode, mtime)
 }
 
-/// Apply Unix mode bits and/or mtime. Best-effort: errors are ignored so a
-/// transfer that wrote bytes still succeeds on a filesystem that rejects chmod.
+/// Apply Unix mode bits (masked with `0o777`, stripping setuid/setgid/sticky)
+/// and/or mtime. Best-effort: errors are ignored so a transfer that wrote bytes
+/// still succeeds on a filesystem that rejects chmod. Never follows symlinks.
 pub fn apply_mode_mtime(path: &Path, mode: Option<u32>, mtime_unix: Option<u64>) {
+    if fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|m| crate::paths::is_link_entry(&m))
+    {
+        return;
+    }
     if let Some(mode) = mode {
+        let safe_mode = mode & 0o777;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(safe_mode));
         }
         #[cfg(not(unix))]
         {
-            let _ = mode;
+            let _ = safe_mode;
         }
     }
     if let Some(secs) = mtime_unix {
@@ -818,7 +944,11 @@ pub fn write_tar(
     if let Some(parent) = tar_path.parent() {
         util::create_dir_all_parent(parent)?;
     }
-    let file = File::create(tar_path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(tar_path)?;
     let mut builder = tar::Builder::new(file);
     for entry in selected {
         let mut header = tar::Header::new_gnu();
@@ -874,10 +1004,23 @@ pub fn write_tar(
 }
 
 pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
+    unpack_tar_confined(tar_path, dest, None)
+}
+
+pub fn unpack_tar_confined(
+    tar_path: &Path,
+    dest: &Path,
+    sandbox_root: Option<&Path>,
+) -> Result<u32> {
+    let dest_checked = crate::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, dest)?;
+    let dest = dest_checked.as_path();
     util::create_dir_all_as_dir(dest)?;
+    let dest_checked = crate::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, dest)?;
+    let dest = dest_checked.as_path();
     let file = File::open(tar_path)?;
     let mut archive = tar::Archive::new(file);
     let mut files = 0u32;
+    let mut created_symlinks: Vec<PathBuf> = Vec::new();
     let entries = archive
         .entries()
         .map_err(|e| Error::Message(format!("tar: {e}")))?;
@@ -894,6 +1037,9 @@ pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
         }
         let out = safe_join(dest, &rel)?;
         ensure_unpacked_stays_inside(dest, &out)?;
+        if let Some(root) = sandbox_root {
+            let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), &out)?;
+        }
         let mode = entry.header().mode().ok();
         let mtime = entry.header().mtime().ok();
         let entry_type = entry.header().entry_type();
@@ -904,6 +1050,9 @@ pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
             if let Some(parent) = out.parent() {
                 util::create_dir_all_parent(parent)?;
                 ensure_unpacked_stays_inside(dest, parent)?;
+                if let Some(root) = sandbox_root {
+                    let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+                }
             }
             let target = entry
                 .link_name()
@@ -912,23 +1061,31 @@ pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
             // Re-normalize wire targets so an older peer's `C:///` or
             // trailing `/` is not written to disk as-is.
             let target = PathBuf::from(normalize_link_target_str(&target.to_string_lossy()));
-            // Absolute targets and `..` that leave dest would let chmod follow
-            // the new link onto a file outside the unpack root.
-            ensure_link_target_inside(dest, &out, &target)?;
+            // Verify both lexically and canonically against `dest` and `sandbox_root`.
+            if let Err(err) = ensure_link_target_inside(dest, sandbox_root, &out, &target) {
+                for sym in &created_symlinks {
+                    let _ = fs::remove_file(sym);
+                }
+                return Err(err);
+            }
             if out.symlink_metadata().is_ok() {
                 let _ = fs::remove_file(&out);
             }
             create_symlink(&target, &out)?;
+            created_symlinks.push(out.clone());
             // Do not chmod or utimens through the link.
             files += 1;
         } else if entry_type.is_file() || entry_type == tar::EntryType::Continuous {
             if let Some(parent) = out.parent() {
                 util::create_dir_all_parent(parent)?;
                 ensure_unpacked_stays_inside(dest, parent)?;
+                if let Some(root) = sandbox_root {
+                    let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+                }
             }
             if fs::symlink_metadata(&out)
                 .ok()
-                .is_some_and(|m| m.file_type().is_symlink())
+                .is_some_and(|m| crate::paths::is_link_entry(&m))
             {
                 fs::remove_file(&out)?;
             }
@@ -944,6 +1101,21 @@ pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
             )));
         }
     }
+    // Post-validate every extracted symlink once all archive entries exist on disk
+    // so reverse-order multi-hop symlink chains cannot escape `dest` or `sandbox_root`.
+    for sym in &created_symlinks {
+        let ok_dest = crate::paths::ensure_moved_symlinks_stay_inside(Some(dest), sym, sym);
+        let ok_root = match sandbox_root {
+            Some(root) => crate::paths::ensure_moved_symlinks_stay_inside(Some(root), sym, sym),
+            None => Ok(()),
+        };
+        if let Err(err) = ok_dest.and(ok_root) {
+            for created in &created_symlinks {
+                let _ = fs::remove_file(created);
+            }
+            return Err(err);
+        }
+    }
     Ok(files)
 }
 
@@ -955,8 +1127,13 @@ fn read_at(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).open(path)?;
+fn write_at_in_sandbox(
+    path: &Path,
+    offset: u64,
+    data: &[u8],
+    sandbox_root: Option<&Path>,
+) -> Result<()> {
+    let mut file = open_partial_rw(path, sandbox_root, false, false)?;
     // All-zero payload is a hole. Writing it would densify a sparse file
     // (agentlink cp of a 100MiB truncate turned 64KiB of real data into 100MiB
     // on disk). Punch / leave the gap instead — same as `rsync --sparse`
@@ -972,11 +1149,16 @@ fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<()> {
 }
 
 /// Mark `[offset, offset+len)` as present zeros without allocating or densifying.
-fn write_hole(path: &Path, offset: u64, len: u64) -> Result<()> {
+fn write_hole_in_sandbox(
+    path: &Path,
+    offset: u64,
+    len: u64,
+    sandbox_root: Option<&Path>,
+) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
-    let file = OpenOptions::new().write(true).open(path)?;
+    let file = open_partial_rw(path, sandbox_root, false, false)?;
     sparse::punch_hole(&file, offset, len)?;
     Ok(())
 }
@@ -1255,20 +1437,25 @@ async fn recv_blob_in_sandbox(
 ) -> Result<(u64, bool)> {
     if size > 0 {
         if let Some(parent) = partial.parent() {
+            if let Some(root) = sandbox_root {
+                let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+            }
             util::create_dir_all_parent(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .open(partial)?;
+        let file = open_partial_rw(partial, sandbox_root, true, false)?;
         // Mark sparse BEFORE extending so NTFS does not allocate the full logical size.
         sparse::prepare_sparse_len(&file, size)?;
     } else if !partial.exists() {
         if let Some(parent) = partial.parent() {
+            if let Some(root) = sandbox_root {
+                let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+            }
             util::create_dir_all_parent(parent)?;
         }
-        File::create(partial)?;
+        let _ = open_partial_rw(partial, sandbox_root, true, true)?;
+    } else {
+        // Verify existing partial is not a symlink even for zero-byte transfers.
+        let _ = open_partial_rw(partial, sandbox_root, false, false)?;
     }
     let mut payload = 0u64;
     let mut compressed = false;
@@ -1320,7 +1507,7 @@ async fn recv_blob_in_sandbox(
                         continue;
                     }
                     // Extend with zeros without densifying (no payload alloc).
-                    write_hole(partial, frame.offset, u64::from(frame.raw_len))?;
+                    write_hole_in_sandbox(partial, frame.offset, u64::from(frame.raw_len), sandbox_root)?;
                 } else {
                     if (frame.raw_len as usize) > frame::MAX_CHUNK {
                         persist_partial(journal_path, expect_hash, size, &have);
@@ -1351,7 +1538,7 @@ async fn recv_blob_in_sandbox(
                     if size == 0 {
                         continue;
                     }
-                    write_at(partial, frame.offset, &raw)?;
+                    write_at_in_sandbox(partial, frame.offset, &raw, sandbox_root)?;
                 }
                 have.push(ByteRange {
                     start: frame.offset,
@@ -1547,7 +1734,7 @@ async fn respond_as_source(
                 }
             },
             Wire::Msg(TransferMsg::Sigs { table }) => {
-                if size > 256 * 1024 * 1024 {
+                if size > delta::DELTA_MAX_SIZE {
                     link.send_msg(TransferMsg::PreferFull).await?;
                     continue;
                 }
@@ -1684,10 +1871,13 @@ pub async fn serve_push_confined(
         clear_partial(&partial, &journal_path);
         Vec::new()
     };
+    let dest_len = dest.metadata().map(|m| m.len()).unwrap_or(0);
     if have.is_empty()
         && dest.is_file()
         && size >= delta::DELTA_MIN_SIZE
-        && dest.metadata()?.len() >= delta::DELTA_MIN_SIZE
+        && size <= delta::DELTA_MAX_SIZE
+        && dest_len >= delta::DELTA_MIN_SIZE
+        && dest_len <= delta::DELTA_MAX_SIZE
     {
         let table = delta::signatures_file(dest, delta::DEFAULT_BLOCK)?;
         link.send_msg(TransferMsg::Sigs {
@@ -1701,16 +1891,33 @@ pub async fn serve_push_confined(
                 out_hash,
                 ops,
             }) => {
-                apply_copies(dest, &partial, out_size, &ops)?;
+                if out_size != size {
+                    return Err(Error::Protocol(format!(
+                        "delta plan out_size {out_size} does not match declared push size {size}"
+                    )));
+                }
+                apply_copies_in_sandbox(dest, &partial, out_size, &ops, sandbox_root)?;
                 let mut ranges = Vec::new();
                 let mut copy_bytes = 0u64;
                 for op in &ops {
                     if let PlanOp::Copy { new, len, .. } = op {
-                        ranges.push(ByteRange {
-                            start: *new,
-                            end: *new + *len,
-                        });
-                        copy_bytes += *len;
+                        let end = new
+                            .checked_add(*len)
+                            .ok_or_else(|| Error::Protocol("delta copy range overflow".into()))?;
+                        if end > out_size {
+                            return Err(Error::Protocol(
+                                "delta copy range exceeds declared output size".into(),
+                            ));
+                        }
+                        copy_bytes = copy_bytes
+                            .checked_add(*len)
+                            .ok_or_else(|| Error::Protocol("delta copy total overflow".into()))?;
+                        if copy_bytes > out_size {
+                            return Err(Error::Protocol(
+                                "delta copy total bytes exceed declared output size".into(),
+                            ));
+                        }
+                        ranges.push(ByteRange { start: *new, end });
                     }
                 }
                 save_journal(
@@ -1775,24 +1982,62 @@ pub async fn serve_push_confined(
     send_done(link, stats).await
 }
 
-fn apply_copies(old: &Path, partial: &Path, out_size: u64, ops: &[PlanOp]) -> Result<()> {
+const APPLY_COPIES_BUF_LEN: usize = 64 * 1024;
+
+fn apply_copies_in_sandbox(
+    old: &Path,
+    partial: &Path,
+    out_size: u64,
+    ops: &[PlanOp],
+    sandbox_root: Option<&Path>,
+) -> Result<()> {
     if let Some(parent) = partial.parent() {
+        if let Some(root) = sandbox_root {
+            let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
+        }
         util::create_dir_all_parent(parent)?;
     }
-    let mut out = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open(partial)?;
+    let mut out = open_partial_rw(partial, sandbox_root, true, true)?;
     sparse::prepare_sparse_len(&out, out_size)?;
-    let mut src = File::open(old)?;
+    let mut src = open_pullable_file(old)?;
+    let src_len = src.metadata()?.len();
+    let mut buf = [0u8; APPLY_COPIES_BUF_LEN];
+    let mut total_copied = 0u64;
     for op in ops {
         if let PlanOp::Copy { old: at, new, len } = op {
+            let src_end = at
+                .checked_add(*len)
+                .ok_or_else(|| Error::Protocol("delta copy source offset overflow".into()))?;
+            if src_end > src_len {
+                return Err(Error::Protocol(
+                    "delta copy source range exceeds existing file".into(),
+                ));
+            }
+            let dst_end = new
+                .checked_add(*len)
+                .ok_or_else(|| Error::Protocol("delta copy destination offset overflow".into()))?;
+            if dst_end > out_size {
+                return Err(Error::Protocol(
+                    "delta copy destination range exceeds output size".into(),
+                ));
+            }
+            total_copied = total_copied
+                .checked_add(*len)
+                .ok_or_else(|| Error::Protocol("delta copy total overflow".into()))?;
+            if total_copied > out_size {
+                return Err(Error::Protocol(
+                    "delta copy total bytes exceed output size".into(),
+                ));
+            }
             src.seek(SeekFrom::Start(*at))?;
-            let mut buf = vec![0u8; *len as usize];
-            src.read_exact(&mut buf)?;
             out.seek(SeekFrom::Start(*new))?;
-            out.write_all(&buf)?;
+            let mut remaining = *len;
+            while remaining > 0 {
+                let chunk = remaining.min(buf.len() as u64) as usize;
+                src.read_exact(&mut buf[..chunk])?;
+                out.write_all(&buf[..chunk])?;
+                remaining -= chunk as u64;
+            }
         }
     }
     Ok(())
@@ -1810,7 +2055,7 @@ pub async fn perform_pull(
     let (have_hash, sigs, have_ranges) = if local.is_file() {
         let hash = delta::hash_file(local).ok();
         let size = local.metadata().map(|m| m.len()).unwrap_or(0);
-        let sigs = if size >= delta::DELTA_MIN_SIZE {
+        let sigs = if size >= delta::DELTA_MIN_SIZE && size <= delta::DELTA_MAX_SIZE {
             delta::signatures_file(local, delta::DEFAULT_BLOCK).ok()
         } else {
             None
@@ -1913,19 +2158,35 @@ async fn receive_from_source(
         }) => {
             let (partial, journal) = partial_paths(local);
             if local.is_file() {
-                apply_copies(local, &partial, out_size, &ops)?;
+                apply_copies_in_sandbox(local, &partial, out_size, &ops, None)?;
+            } else if ops.iter().any(|op| matches!(op, PlanOp::Copy { .. })) {
+                return Err(Error::Protocol(
+                    "delta plan requested copies without an existing local file".into(),
+                ));
             }
-            let have: Vec<_> = ops
-                .iter()
-                .filter_map(|op| match op {
-                    PlanOp::Copy { new, len, .. } => Some(ByteRange {
-                        start: *new,
-                        end: *new + *len,
-                    }),
-                    PlanOp::Lit { .. } => None,
-                })
-                .collect();
-            let copy_bytes = have.iter().map(|r| r.len()).sum();
+            let mut have = Vec::new();
+            let mut copy_bytes = 0u64;
+            for op in &ops {
+                if let PlanOp::Copy { new, len, .. } = op {
+                    let end = new
+                        .checked_add(*len)
+                        .ok_or_else(|| Error::Protocol("delta copy range overflow".into()))?;
+                    if end > out_size {
+                        return Err(Error::Protocol(
+                            "delta copy range exceeds output size".into(),
+                        ));
+                    }
+                    copy_bytes = copy_bytes
+                        .checked_add(*len)
+                        .ok_or_else(|| Error::Protocol("delta copy total overflow".into()))?;
+                    if copy_bytes > out_size {
+                        return Err(Error::Protocol(
+                            "delta copy total bytes exceed output size".into(),
+                        ));
+                    }
+                    have.push(ByteRange { start: *new, end });
+                }
+            }
             let (payload, compressed) = recv_blob(
                 link, &partial, &journal, out_size, &out_hash, have, local, false, progress,
             )
@@ -2109,35 +2370,32 @@ pub async fn serve_pull(
     let opts = opts.clone().normalized();
     ensure_pullable_file(src)?;
     let meta_size = src.metadata()?.len();
-    // Keep a temp path alive when we materialize a size-0 virtual file for cp.
-    let mut zero_size_tmp: Option<PathBuf> = None;
+    // Keep a private temp file alive when we materialize a size-0 virtual file for cp.
+    let mut zero_size_tmp: Option<StagedTempFile> = None;
     let (src_buf, size, hash) = if meta_size == 0 {
         let data = read_zero_size_file(src, 0, None)?;
         if data.is_empty() {
             (src.to_path_buf(), 0u64, delta::hash_bytes(b""))
         } else {
-            let tmp = std::env::temp_dir().join(format!(
-                "agentlink-zero-size-{request_id}-{}.bin",
-                std::process::id()
-            ));
-            std::fs::write(&tmp, &data)?;
+            let staged = StagedTempFile::new("agentlink-zero-size-", ".bin")?;
+            {
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(staged.path())?;
+                f.write_all(&data)?;
+                f.flush()?;
+            }
             let hash = delta::hash_bytes(&data);
-            zero_size_tmp = Some(tmp.clone());
-            (tmp, data.len() as u64, hash)
+            let path = staged.path().to_path_buf();
+            zero_size_tmp = Some(staged);
+            (path, data.len() as u64, hash)
         }
     } else {
         (src.to_path_buf(), meta_size, delta::hash_file(src)?)
     };
     let src = src_buf.as_path();
-    struct RemoveOnDrop(Option<PathBuf>);
-    impl Drop for RemoveOnDrop {
-        fn drop(&mut self) {
-            if let Some(path) = self.0.take() {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-    let _keep_tmp = RemoveOnDrop(zero_size_tmp);
+    let _keep_tmp = zero_size_tmp;
     if have_hash.as_deref() == Some(hash.as_str()) {
         let stats = done_stats(size, 0, true, 1, 1, false, &opts.transport, 0, size);
         link.send_msg(TransferMsg::Accept {
@@ -2147,7 +2405,7 @@ pub async fn serve_pull(
         return send_done(link, stats).await;
     }
     if let Some(table) = sigs {
-        if size <= 256 * 1024 * 1024 && size >= delta::DELTA_MIN_SIZE {
+        if size <= delta::DELTA_MAX_SIZE && size >= delta::DELTA_MIN_SIZE {
             let mut data = Vec::new();
             File::open(src)?.read_to_end(&mut data)?;
             let plan: Plan = delta::plan(&data, &table);
@@ -2289,7 +2547,8 @@ pub async fn perform_push_dir(
             other => Err(Error::Protocol(format!("expected done, got {other:?}"))),
         };
     }
-    let tar_path = std::env::temp_dir().join(format!("agentlink-{request_id}.tar"));
+    let staged_tar = StagedTempFile::new("agentlink-", ".tar")?;
+    let tar_path = staged_tar.path().to_path_buf();
     write_tar(&tar_path, local, &entries, &needed)?;
     let size = tar_path.metadata()?.len();
     let hash = delta::hash_file(&tar_path)?;
@@ -2303,7 +2562,7 @@ pub async fn perform_push_dir(
         &tar_path, link, request_id, &hash, size, &opts, progress, true,
     )
     .await;
-    let _ = fs::remove_file(&tar_path);
+    drop(staged_tar);
     let mut stats = stats?;
     stats.logical_bytes = logical;
     stats.files = entries.iter().filter(|e| !e.dir).count() as u32;
@@ -2320,7 +2579,21 @@ pub async fn serve_push_dir(
     link: &mut Link,
     transport: &str,
 ) -> Result<TransferStats> {
+    serve_push_dir_confined(None, dest, entries, link, transport).await
+}
+
+pub async fn serve_push_dir_confined(
+    sandbox_root: Option<&Path>,
+    dest: &Path,
+    entries: Vec<ManifestEntry>,
+    link: &mut Link,
+    transport: &str,
+) -> Result<TransferStats> {
+    let dest_checked = crate::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, dest)?;
+    let dest = dest_checked.as_path();
     util::create_dir_all_as_dir(dest)?;
+    let dest_checked = crate::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, dest)?;
+    let dest = dest_checked.as_path();
     let needed = needed_entries(dest, &entries)?;
     let files = entries.iter().filter(|e| !e.dir).count() as u32;
     let files_skipped = files.saturating_sub(
@@ -2353,8 +2626,17 @@ pub async fn serve_push_dir(
         Wire::Msg(TransferMsg::Failed { message }) => return Err(Error::Message(message)),
         other => return Err(Error::Protocol(format!("expected tar blob, got {other:?}"))),
     };
-    let partial = dest.join(TAR_PARTIAL_NAME);
-    let journal = dest.join(".agentlink-tar.partial.json");
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let partial = dest.join(format!(".agentlink-tar.{nonce}.partial"));
+    let journal = dest.join(format!(".agentlink-tar.{nonce}.partial.json"));
+    let _partial_cleanup = PartialFile {
+        path: partial.clone(),
+        armed: true,
+    };
+    let _journal_cleanup = PartialFile {
+        path: journal.clone(),
+        armed: true,
+    };
     link.send_msg(TransferMsg::Accept {
         mode: AcceptMode::Full {
             missing: vec![ByteRange {
@@ -2364,7 +2646,7 @@ pub async fn serve_push_dir(
         },
     })
     .await?;
-    let (payload, compressed) = recv_blob(
+    let (payload, compressed) = recv_blob_in_sandbox(
         link,
         &partial,
         &journal,
@@ -2372,13 +2654,12 @@ pub async fn serve_push_dir(
         &hash,
         Vec::new(),
         dest,
+        sandbox_root,
         true,
         &None,
     )
     .await?;
-    let unpacked = unpack_tar(&partial, dest)?;
-    fs::remove_file(&partial).ok();
-    fs::remove_file(&journal).ok();
+    let unpacked = unpack_tar_confined(&partial, dest, sandbox_root)?;
     let logical = entries.iter().map(|e| e.size).sum();
     let stats = done_stats(
         logical,
@@ -2459,7 +2740,8 @@ pub async fn serve_pull_dir(
         .await?;
         return send_done(link, stats).await;
     }
-    let tar_path = std::env::temp_dir().join(format!("agentlink-{request_id}.tar"));
+    let staged_tar = StagedTempFile::new("agentlink-", ".tar")?;
+    let tar_path = staged_tar.path().to_path_buf();
     write_tar(&tar_path, src, &entries, &needed)?;
     let size = tar_path.metadata()?.len();
     let hash = delta::hash_file(&tar_path)?;
@@ -2474,7 +2756,6 @@ pub async fn serve_pull_dir(
             mode: AcceptMode::Full { missing },
         }) => missing,
         other => {
-            let _ = fs::remove_file(&tar_path);
             return Err(Error::Protocol(format!(
                 "expected range accept, got {other:?}"
             )));
@@ -2494,7 +2775,7 @@ pub async fn serve_pull_dir(
         size,
     )
     .await;
-    let _ = fs::remove_file(&tar_path);
+    drop(staged_tar);
     let pumped = pumped?;
     Ok(done_stats(
         logical,
@@ -2751,7 +3032,11 @@ fn decoded_chunk(bytes: &[u8]) -> Result<(u64, Vec<u8>, bool, u64)> {
 
 /// Write an upload at chunk offsets. Chunks may arrive out of order inside the
 /// window. The BLAKE3 check runs after `Commit`, streaming from the partial file.
-async fn recv_file_stream(link: &mut Link, partial: &Path) -> Result<(u64, u64, bool)> {
+async fn recv_file_stream(
+    link: &mut Link,
+    partial: &Path,
+    sandbox_root: Option<&Path>,
+) -> Result<(u64, u64, bool)> {
     let mut have: Vec<ByteRange> = Vec::new();
     let mut payload = 0u64;
     let mut compressed = false;
@@ -2762,7 +3047,7 @@ async fn recv_file_stream(link: &mut Link, partial: &Path) -> Result<(u64, u64, 
                 if is_zstd {
                     compressed = true;
                 }
-                write_at(partial, offset, &raw)?;
+                write_at_in_sandbox(partial, offset, &raw, sandbox_root)?;
                 payload += payload_len;
                 have.push(ByteRange {
                     start: offset,
@@ -2794,7 +3079,7 @@ async fn recv_file_stream(link: &mut Link, partial: &Path) -> Result<(u64, u64, 
                     delta::hash_bytes(b"")
                 } else {
                     {
-                        let file = OpenOptions::new().write(true).open(partial)?;
+                        let file = open_partial_rw(partial, sandbox_root, false, false)?;
                         sparse::ensure_sparse(&file)?;
                         file.set_len(size)?;
                     }
@@ -2872,15 +3157,20 @@ pub async fn serve_push_stream_confined(
     if dest.is_dir() {
         return Err(Error::Message(format!("{} is a directory", dest.display())));
     }
-    let (partial, journal) = partial_paths(dest);
-    if let Some(parent) = partial.parent() {
-        if let Some(root) = sandbox_root {
-            let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
-        }
-        util::create_dir_all_parent(parent)?;
+    let (_, journal) = partial_paths(dest);
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    if let Some(root) = sandbox_root {
+        let _ = crate::paths::ensure_path_stays_in_sandbox_at_sink(Some(root), parent)?;
     }
+    util::create_dir_all_parent(parent)?;
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let partial = parent.join(format!(".{name}.{nonce}.agentlink-partial"));
     let _ = fs::remove_file(&journal);
-    File::create(&partial)?;
+    let _ = open_partial_rw(&partial, sandbox_root, true, true)?;
     let mut cleanup = PartialFile {
         path: partial.clone(),
         armed: true,
@@ -2891,7 +3181,7 @@ pub async fn serve_push_stream_confined(
         },
     })
     .await?;
-    let (size, payload, compressed) = recv_file_stream(link, &partial).await?;
+    let (size, payload, compressed) = recv_file_stream(link, &partial, sandbox_root).await?;
     install_partial_at_dest_in_sandbox(&partial, dest, sandbox_root)?;
     let _ = fs::remove_file(&journal);
     cleanup.armed = false;
@@ -4383,5 +4673,205 @@ mod chunk_bounds_tests {
             len_on_disk <= 1024,
             "out-of-bounds hole extended partial file to {len_on_disk} > 1024"
         );
+    }
+}
+
+#[cfg(test)]
+mod security_hardening_tests {
+    use super::*;
+
+    fn create_file_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).unwrap();
+            true
+        }
+        #[cfg(windows)]
+        {
+            match std::os::windows::fs::symlink_file(target, link) {
+                Ok(()) => true,
+                Err(err) if err.raw_os_error() == Some(1314) => false,
+                Err(err) => panic!("symlink_file failed unexpectedly: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn sec04_unpack_tar_confined_blocks_multihop_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"top-secret").unwrap();
+        let sandbox = dir.path().join("sandbox");
+        let dest = sandbox.join("sub");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Pre-existing symlink inside sandbox pointing outside (or symlink created by tar).
+        let tar_path = dir.path().join("chain.tar");
+        {
+            let file = File::create(&tar_path).unwrap();
+            let mut builder = tar::Builder::new(file);
+            // Reverse-order chain: `a` points to `sub2/hop`, then `sub2/hop` points to `../../outside/secret.txt`.
+            let mut h1 = tar::Header::new_gnu();
+            h1.set_entry_type(tar::EntryType::Symlink);
+            h1.set_path("a").unwrap();
+            h1.set_link_name("sub2/hop").unwrap();
+            h1.set_size(0);
+            h1.set_mode(0o777);
+            h1.set_cksum();
+            builder.append(&h1, std::io::empty()).unwrap();
+
+            let mut h2 = tar::Header::new_gnu();
+            h2.set_entry_type(tar::EntryType::Symlink);
+            h2.set_path("sub2/hop").unwrap();
+            h2.set_link_name("../../../outside/secret.txt").unwrap();
+            h2.set_size(0);
+            h2.set_mode(0o777);
+            h2.set_cksum();
+            builder.append(&h2, std::io::empty()).unwrap();
+
+            builder.finish().unwrap();
+        }
+        let err = unpack_tar_confined(&tar_path, &dest, Some(&sandbox)).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes") || err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest.join("sub2/hop")).is_err(),
+            "escaping symlink must not remain on disk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sec04_apply_mode_mtime_masks_special_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bin");
+        std::fs::write(&file, b"elf").unwrap();
+        apply_mode_mtime(&file, 0o6755, 0);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o0755, "setuid/setgid/sticky bits must be masked off");
+    }
+
+    #[test]
+    fn sec04_open_partial_rw_refuses_symlink_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"untouched").unwrap();
+        let sandbox = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let (partial, _) = partial_paths(&sandbox.join("target.bin"));
+        if !create_file_symlink(&outside, &partial) {
+            return;
+        }
+        let err = open_partial_rw(&partial, Some(&sandbox), true, true).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink")
+                || err.to_string().contains("reparse")
+                || err.to_string().contains("escapes")
+                || err.to_string().contains("refusing"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn sec09_apply_copies_streams_bounded_and_rejects_overflow_or_oversized_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let basis = dir.path().join("basis.bin");
+        let payload: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&basis, &payload).unwrap();
+
+        // 1. Valid >64 KiB copy works via streaming loop.
+        let partial_ok = dir.path().join("ok.part");
+        apply_copies_in_sandbox(
+            &basis,
+            &partial_ok,
+            payload.len() as u64,
+            &[PlanOp::Copy {
+                old: 0,
+                new: 0,
+                len: payload.len() as u64,
+            }],
+            Some(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&partial_ok).unwrap(), payload);
+
+        // 2. Huge len > out_size fails immediately without OOM.
+        let partial_bad = dir.path().join("bad1.part");
+        let err = apply_copies_in_sandbox(
+            &basis,
+            &partial_bad,
+            1024,
+            &[PlanOp::Copy {
+                old: 0,
+                new: 0,
+                len: 1024 * 1024 * 1024,
+            }],
+            Some(dir.path()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        // 3. Arithmetic overflow in old + len or new + len fails cleanly.
+        let partial_ovf = dir.path().join("bad2.part");
+        assert!(apply_copies_in_sandbox(
+            &basis,
+            &partial_ovf,
+            1024,
+            &[PlanOp::Copy {
+                old: u64::MAX - 8,
+                new: 0,
+                len: 16,
+            }],
+            Some(dir.path()),
+        )
+        .is_err());
+
+        // 4. Total copied bytes across multiple ops exceeding out_size fails cleanly.
+        let partial_sum = dir.path().join("bad3.part");
+        let err = apply_copies_in_sandbox(
+            &basis,
+            &partial_sum,
+            100,
+            &[
+                PlanOp::Copy {
+                    old: 0,
+                    new: 0,
+                    len: 80,
+                },
+                PlanOp::Copy {
+                    old: 0,
+                    new: 20,
+                    len: 80,
+                },
+            ],
+            Some(dir.path()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceed"), "{err}");
+    }
+
+    #[test]
+    fn sec12_staged_temp_file_is_private_and_cleaned_up_on_drop() {
+        let staged = StagedTempFile::new("agentlink-", ".tar").unwrap();
+        let path = staged.path().to_path_buf();
+        let parent = path.parent().unwrap().to_path_buf();
+        assert!(path.exists());
+        assert_ne!(parent, std::env::temp_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+        drop(staged);
+        assert!(!path.exists());
+        assert!(!parent.exists());
     }
 }

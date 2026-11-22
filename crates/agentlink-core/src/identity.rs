@@ -39,7 +39,7 @@ impl Identity {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Err(Error::Message(format!(
-                "身份文件不存在，未重新生成：{}",
+                "identity file does not exist (not regenerated): {}",
                 path.display()
             )));
         }
@@ -102,15 +102,25 @@ impl Identity {
     }
 
     fn load_existing(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|err| Error::Message(format!("身份文件无法读取，未重新生成：{err}")))?;
-        let file: IdentityFile = serde_json::from_str(&text).map_err(|err| {
-            Error::Message(format!("身份文件已损坏或不是有效 JSON，未重新生成：{err}"))
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            Error::Message(format!(
+                "could not read identity file (not regenerated): {err}"
+            ))
         })?;
-        let bytes = hex::decode(file.secret_hex.trim())
-            .map_err(|err| Error::Message(format!("身份密钥无法解码，未重新生成：{err}")))?;
+        let file: IdentityFile = serde_json::from_str(&text).map_err(|err| {
+            Error::Message(format!(
+                "identity file is corrupt or not valid JSON (not regenerated): {err}"
+            ))
+        })?;
+        let bytes = hex::decode(file.secret_hex.trim()).map_err(|err| {
+            Error::Message(format!(
+                "identity secret key could not be decoded (not regenerated): {err}"
+            ))
+        })?;
         if bytes.len() != 32 {
-            return Err(Error::Message("身份密钥必须是 32 字节，未重新生成".into()));
+            return Err(Error::Message(
+                "identity secret key must be 32 bytes (not regenerated)".into(),
+            ));
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
@@ -118,7 +128,7 @@ impl Identity {
         let public_hex = hex::encode(signing.verifying_key().to_bytes());
         if public_hex != file.public_hex.trim() {
             return Err(Error::Message(
-                "身份文件已损坏：公钥与私钥不匹配，未重新生成。请检查或从备份恢复。".into(),
+                "identity file is corrupt: public key does not match secret key (not regenerated); inspect or restore from backup".into(),
             ));
         }
         Ok(Self {
@@ -303,7 +313,8 @@ mod tests {
             Ok(_) => panic!("expected a missing identity file to fail"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("不存在"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("not regenerated"), "{err}");
         assert!(!path.exists());
     }
 
@@ -334,8 +345,8 @@ mod tests {
             Ok(_) => panic!("damaged json must not load"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("未重新生成"), "{err}");
-        assert!(err.contains("损坏") || err.contains("JSON"), "{err}");
+        assert!(err.contains("not regenerated"), "{err}");
+        assert!(err.contains("corrupt") || err.contains("JSON"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
 
         std::fs::write(
@@ -350,8 +361,8 @@ mod tests {
             Ok(_) => panic!("mismatched identity must not load"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("未重新生成"), "{err}");
-        assert!(err.contains("不匹配"), "{err}");
+        assert!(err.contains("not regenerated"), "{err}");
+        assert!(err.contains("does not match"), "{err}");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("bbbbbbbb"),

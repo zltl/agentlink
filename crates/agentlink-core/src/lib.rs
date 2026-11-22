@@ -55,16 +55,21 @@ pub use client::{
     PtySession, PtyTestIo, PtyWriter,
 };
 pub use config::{
-    apply_relay_defaults, is_public_relay, load_settings, save_settings, ClientSettings,
-    FileConfig, DEFAULT_RELAY_TRUST,
+    apply_relay_defaults, is_public_relay, load_settings, load_settings_for_identity, save_file,
+    save_settings, ClientSettings, FileConfig, DEFAULT_RELAY_TRUST,
 };
 pub use error::{Error, Result};
 pub use extensions::{NodeExtension, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL};
-pub use grant::{resolve_e2e_policy, SignedGrant, OWNER_KEYS_FILE};
+pub use grant::{
+    format_grant_status, grant_matches_grantee, grant_status, resolve_e2e_policy, GrantStatus,
+    SignedGrant, OWNER_KEYS_FILE,
+};
 pub use ice::{
-    ice_attempts, is_default_stun_url, prepare_stun_urls, rewrite_ice_urls,
+    fetch_relay_ice_servers, ice_attempts, is_default_stun_url, parse_relay_ice_response,
+    prepare_stun_urls, prepare_stun_urls_async, relay_ice_endpoint, rewrite_ice_urls,
     stun_rewrite_mode_from_env, stun_rewrite_mode_from_value, stun_urls, stun_urls_from_env,
-    stun_urls_ready_for_ice, IceAttempt, StunRewriteMode, DEFAULT_STUN_URLS,
+    stun_urls_ready_for_ice, stun_urls_ready_for_ice_async, turn_servers_from_env, IceAttempt,
+    IceServerConfig, RelayIceConfig, StunRewriteMode, DEFAULT_STUN_URLS,
 };
 pub use identity::Identity;
 pub use invite::{decode_invite, encode_invite, parse_join_text, Invite, JoinText};

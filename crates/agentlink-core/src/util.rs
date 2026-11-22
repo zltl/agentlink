@@ -1,6 +1,8 @@
 //! Small helpers used by every crate.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -297,7 +299,6 @@ fn publish_exclusive_rename(tmp: &Path, dest: &Path) -> Result<bool> {
 }
 
 #[cfg(unix)]
-#[allow(dead_code)]
 fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
@@ -307,8 +308,7 @@ fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-#[cfg(not(unix))]
-#[allow(dead_code)]
+#[cfg(all(not(unix), not(windows)))]
 fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
@@ -316,11 +316,7 @@ fn open_new_secret(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(not(windows))]
 fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let mut file = open_new_secret(path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -494,13 +490,14 @@ fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         lpSecurityDescriptor: sd,
         bInheritHandle: 0,
     };
+    // CREATE_NEW (1) fails closed if a pre-planted file/symlink exists at the temp path.
     let handle = unsafe {
         windows_sys::Win32::Storage::FileSystem::CreateFileW(
             wide.as_ptr(),
             0x4000_0000,
             0,
             &sa,
-            2,
+            1,
             0x80,
             std::ptr::null_mut(),
         )
@@ -956,5 +953,27 @@ mod tests {
         }
         assert!(!seen_empty.load(Ordering::Relaxed), "dest appeared empty");
         assert_eq!(std::fs::read(&path).unwrap(), payload);
+    }
+
+    #[test]
+    fn sec12_write_private_bytes_fails_closed_when_target_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("preplanted.tmp");
+        std::fs::write(&existing, b"keep").unwrap();
+        assert!(
+            write_private_bytes(&existing, b"overwrite").is_err(),
+            "write_private_bytes must use create_new and refuse pre-existing paths"
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+
+        let fresh = dir.path().join("fresh.tmp");
+        write_private_bytes(&fresh, b"secret-data").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"secret-data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

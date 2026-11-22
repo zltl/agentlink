@@ -1391,24 +1391,63 @@ pub fn looks_like_path_or_glob(query: &str) -> bool {
         || query.starts_with('~')
 }
 
-/// Resolve a user-supplied name or id against a node list.
+/// Resolve a user-supplied name, full id, or unique >=8-char hex id prefix
+/// against a node list.
+///
+/// Precedence:
+/// 1. Exact node id (then case-insensitive exact id).
+/// 2. Exact case-sensitive node name.
+/// 3. Case-insensitive node name.
+/// 4. Unique case-insensitive hex id prefix of at least 8 hex characters.
 pub fn resolve_node<'a>(nodes: &'a [NodeInfo], query: &str) -> crate::error::Result<&'a NodeInfo> {
     if let Some(node) = nodes.iter().find(|n| n.id == query) {
         return Ok(node);
     }
-    let matches: Vec<_> = nodes.iter().filter(|n| n.name == query).collect();
-    match matches.len() {
-        1 => Ok(matches[0]),
-        0 => {
-            let hint = if looks_like_path_or_glob(query) {
-                " (looks like a path or glob; put the machine name first — see `agentlink nodes`)"
-            } else {
-                ""
-            };
-            Err(crate::error::Error::NotFound(format!("node '{query}'{hint}")))
+    let trimmed = query.trim();
+    if !trimmed.is_empty() {
+        let id_ci: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.id.eq_ignore_ascii_case(trimmed))
+            .collect();
+        match id_ci.len() {
+            1 => return Ok(id_ci[0]),
+            n if n > 1 => return Err(crate::error::Error::Ambiguous(query.to_string())),
+            _ => {}
         }
-        _ => Err(crate::error::Error::Ambiguous(query.to_string())),
     }
+    let exact_name: Vec<_> = nodes.iter().filter(|n| n.name == query).collect();
+    match exact_name.len() {
+        1 => return Ok(exact_name[0]),
+        n if n > 1 => return Err(crate::error::Error::Ambiguous(query.to_string())),
+        _ => {}
+    }
+    let ci_name: Vec<_> = nodes
+        .iter()
+        .filter(|n| n.name.eq_ignore_ascii_case(query))
+        .collect();
+    match ci_name.len() {
+        1 => return Ok(ci_name[0]),
+        n if n > 1 => return Err(crate::error::Error::Ambiguous(query.to_string())),
+        _ => {}
+    }
+    if trimmed.len() >= 8 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let prefix = trimmed.to_ascii_lowercase();
+        let prefix_matches: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.id.to_ascii_lowercase().starts_with(&prefix))
+            .collect();
+        match prefix_matches.len() {
+            1 => return Ok(prefix_matches[0]),
+            n if n > 1 => return Err(crate::error::Error::Ambiguous(query.to_string())),
+            _ => {}
+        }
+    }
+    let hint = if looks_like_path_or_glob(query) {
+        " (looks like a path or glob; put the machine name first — see `agentlink nodes`)"
+    } else {
+        ""
+    };
+    Err(crate::error::Error::NotFound(format!("node '{query}'{hint}")))
 }
 
 #[cfg(test)]
@@ -1440,6 +1479,65 @@ mod tests {
         let plain_msg = plain.to_string();
         assert!(plain_msg.contains("no-such-box"), "{plain_msg}");
         assert!(!plain_msg.contains("path or glob"), "{plain_msg}");
+    }
+
+    #[test]
+    fn ux06_resolve_node_supports_case_insensitive_name_and_unique_hex_prefix() {
+        let node = |id: &str, name: &str| NodeInfo {
+            id: id.into(),
+            name: name.into(),
+            hostname: name.into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            version: "0.1.0".into(),
+            online: true,
+            policy: NodePolicy::exec(),
+            effective: NodePolicy::exec(),
+            owner: String::new(),
+            relation: String::new(),
+            access: String::new(),
+            has_display: None,
+        };
+        let a_id = "abcdef0111111111111111111111111111111111111111111111111111111111";
+        let b_id = "abcdef0122222222222222222222222222222222222222222222222222222222";
+        let c_id = "99887766554433221100aabbccddeeff99887766554433221100aabbccddeeff";
+        let nodes = vec![
+            node(a_id, "AlphaBox"),
+            node(b_id, "beta-box"),
+            node(c_id, "Gamma"),
+        ];
+
+        // Exact ID wins.
+        assert_eq!(resolve_node(&nodes, a_id).unwrap().name, "AlphaBox");
+        // Case-insensitive exact ID works.
+        assert_eq!(
+            resolve_node(&nodes, &c_id.to_ascii_uppercase()).unwrap().name,
+            "Gamma"
+        );
+        // Case-insensitive name works.
+        assert_eq!(resolve_node(&nodes, "alphabox").unwrap().id, a_id);
+        assert_eq!(resolve_node(&nodes, "BETA-BOX").unwrap().id, b_id);
+        // Unique >=8-char hex prefix works (case-insensitive).
+        assert_eq!(resolve_node(&nodes, "99887766").unwrap().id, c_id);
+        assert_eq!(resolve_node(&nodes, "ABCDEF011").unwrap().id, a_id);
+        // Ambiguous >=8-char hex prefix returns Ambiguous.
+        assert!(matches!(
+            resolve_node(&nodes, "abcdef01"),
+            Err(crate::error::Error::Ambiguous(_))
+        ));
+        // Prefix shorter than 8 chars does NOT match.
+        assert!(matches!(
+            resolve_node(&nodes, "9988776"),
+            Err(crate::error::Error::NotFound(_))
+        ));
+        // Exact case-sensitive name wins over case-insensitive collision.
+        let dup_case = vec![node(a_id, "Box"), node(b_id, "box")];
+        assert_eq!(resolve_node(&dup_case, "Box").unwrap().id, a_id);
+        assert_eq!(resolve_node(&dup_case, "box").unwrap().id, b_id);
+        assert!(matches!(
+            resolve_node(&dup_case, "BOX"),
+            Err(crate::error::Error::Ambiguous(_))
+        ));
     }
 
     #[test]

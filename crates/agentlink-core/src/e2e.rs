@@ -28,9 +28,22 @@ use crate::identity::{self, Identity};
 use crate::protocol::{Envelope, Op, TransferMsg};
 
 const INFO: &[u8] = b"agentlink-e2e-v1";
+/// Trailing capability tag on v2 hello (132 bytes) and v2 welcome (100 bytes)
+/// that cryptographically negotiates [`frame_aad_v2`] via the Ed25519
+/// handshake transcript while keeping 128-byte v1 handshakes interoperable
+/// with older nodes during rolling upgrades.
+const HELLO_V2_MAGIC: [u8; 4] = *b"FV2\x01";
 const REPLAY_WINDOW_BITS: u64 = 4096;
 const REPLAY_WORDS: usize = (REPLAY_WINDOW_BITS as usize) / 64;
 const MAX_SESSION_COUNTER: u64 = u64::MAX - 1;
+
+fn zeroize_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    std::hint::black_box(buf);
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
 
 struct ReplayWindow {
     max_seen: Option<u64>,
@@ -99,9 +112,13 @@ impl ReplayWindow {
 }
 
 /// Keys for one direction pair after a finished handshake.
+///
+/// Both [`ChaCha20Poly1305`] instances implement `ZeroizeOnDrop`; `Drop` also
+/// scrubs ephemeral metadata buffers.
 pub struct Direction {
-    encrypt: [u8; 32],
-    decrypt: [u8; 32],
+    encrypt: ChaCha20Poly1305,
+    decrypt: ChaCha20Poly1305,
+    frame_aad_v2: bool,
     send_n: AtomicU64,
     seen: Mutex<ReplayWindow>,
     epoch: Instant,
@@ -111,18 +128,37 @@ pub struct Direction {
     cached_welcome: Option<Vec<u8>>,
 }
 
+impl Drop for Direction {
+    fn drop(&mut self) {
+        if let Some(eph) = self.client_eph.as_mut() {
+            zeroize_bytes(eph);
+        }
+        if let Some(welcome) = self.cached_welcome.as_mut() {
+            zeroize_bytes(welcome);
+        }
+        // `self.encrypt` and `self.decrypt` are `ChaCha20Poly1305`, whose
+        // `Drop` calls `zeroize::Zeroize` on the 32-byte key material.
+    }
+}
+
 impl Direction {
     fn new(
-        encrypt: [u8; 32],
-        decrypt: [u8; 32],
+        mut encrypt_key: [u8; 32],
+        mut decrypt_key: [u8; 32],
+        frame_aad_v2: bool,
         epoch: Instant,
         now_ms: u64,
         client_eph: Option<[u8; 32]>,
         cached_welcome: Option<Vec<u8>>,
     ) -> Self {
+        let encrypt = ChaCha20Poly1305::new((&encrypt_key).into());
+        let decrypt = ChaCha20Poly1305::new((&decrypt_key).into());
+        zeroize_bytes(&mut encrypt_key);
+        zeroize_bytes(&mut decrypt_key);
         Self {
             encrypt,
             decrypt,
+            frame_aad_v2,
             send_n: AtomicU64::new(1),
             seen: Mutex::new(ReplayWindow::default()),
             epoch,
@@ -131,6 +167,10 @@ impl Direction {
             client_eph,
             cached_welcome,
         }
+    }
+
+    pub fn uses_frame_aad_v2(&self) -> bool {
+        self.frame_aad_v2
     }
 
     fn touch(&self) {
@@ -175,12 +215,47 @@ impl Direction {
         Ok(plain)
     }
 
+    fn aad_for_frame(&self, frame: &[u8], decoded: &crate::frame::DataFrame) -> Result<Vec<u8>> {
+        if self.frame_aad_v2 {
+            let (version, kind, non_e2e_flags, offset, raw_len, request_id) =
+                crate::frame::header_fields(frame)?;
+            Ok(frame_aad_v2(
+                version,
+                kind,
+                non_e2e_flags,
+                offset,
+                raw_len,
+                &request_id,
+            ))
+        } else {
+            Ok(frame_aad(&decoded.request_id, decoded.offset))
+        }
+    }
+
     /// Encrypt a binary file frame's payload with this session.
     pub fn seal_frame(&self, frame: &[u8]) -> Result<Vec<u8>> {
         let decoded = crate::frame::decode(frame)?;
-        let aad = frame_aad(&decoded.request_id, decoded.offset);
+        let aad = self.aad_for_frame(frame, &decoded)?;
         let sealed = self.seal(&aad, &decoded.payload)?;
         crate::frame::replace_payload(frame, &sealed, true)
+    }
+
+    /// Decrypt a binary file frame's payload with this session.
+    pub fn open_frame(&self, frame: &[u8]) -> Result<Vec<u8>> {
+        if !crate::frame::is_e2e(frame) {
+            return Err(Error::Protocol(
+                "file frame is not end-to-end; plaintext file bytes are refused".into(),
+            ));
+        }
+        let decoded = crate::frame::decode(frame)?;
+        let aad = self.aad_for_frame(frame, &decoded)?;
+        let plain = self.open_one(&aad, &decoded.payload)?;
+        if decoded.hole && !plain.is_empty() {
+            return Err(Error::Protocol(
+                "hole frame must have empty payload".into(),
+            ));
+        }
+        crate::frame::replace_payload(frame, &plain, false)
     }
 }
 
@@ -189,6 +264,7 @@ pub struct PendingHello {
     secret: EphemeralSecret,
     node_id: String,
     hello: Vec<u8>,
+    frame_aad_v2: bool,
 }
 
 /// How many handshakes to keep per peer ed25519 id.
@@ -201,20 +277,46 @@ const MAX_STAGED_PER_PEER: usize = 4;
 const MAX_RETIRED_PER_PEER: usize = 64;
 pub const MAX_TRACKED_PEERS: usize = 1024;
 pub const IDLE_PEER_TTL_MS: u64 = 15 * 60 * 1000;
+/// Separate bounded LRU for unverified `E2eHello` handshakes so spoofed hellos
+/// can never fill `MAX_TRACKED_PEERS` and lock out legitimate controllers.
+pub const MAX_STAGED_PEERS: usize = 64;
+pub const STAGED_PEER_TTL_MS: u64 = 30 * 1000;
 const MAX_PRUNED_RETIRED_HELLOS: usize = 4096;
 
 type DirectionRing = VecDeque<Arc<Direction>>;
+
+struct StagedSession {
+    direction: Arc<Direction>,
+    created_ms: u64,
+}
+
+#[derive(Default)]
+struct StagedPeerEntry {
+    sessions: VecDeque<StagedSession>,
+}
+
+impl StagedPeerEntry {
+    fn prune_expired(&mut self, now_ms: u64) {
+        self.sessions
+            .retain(|s| now_ms.saturating_sub(s.created_ms) < STAGED_PEER_TTL_MS);
+    }
+
+    fn push(&mut self, direction: Arc<Direction>, now_ms: u64) {
+        self.sessions.push_back(StagedSession {
+            direction,
+            created_ms: now_ms,
+        });
+        while self.sessions.len() > MAX_STAGED_PER_PEER {
+            let _ = self.sessions.pop_front();
+        }
+    }
+}
 
 #[derive(Default)]
 struct PeerEntry {
     /// Sessions proven live (locally completed via `complete`, or acceptor
     /// sessions that decrypted at least one authenticated AEAD frame).
     verified: DirectionRing,
-    /// Accepted handshakes awaiting their first valid AEAD frame. Replayed
-    /// historical `E2eHello` frames without the destroyed client ephemeral
-    /// secret can never pass AEAD authentication, so they never leave `staged`
-    /// and can never evict any `verified` active session.
-    staged: DirectionRing,
     retired_order: VecDeque<[u8; 32]>,
     retired_set: HashSet<[u8; 32]>,
 }
@@ -234,7 +336,6 @@ impl PeerEntry {
     fn newest_activity_ms(&self) -> u64 {
         self.verified
             .iter()
-            .chain(self.staged.iter())
             .map(|dir| dir.last_active_ms.load(Ordering::Relaxed))
             .max()
             .unwrap_or(0)
@@ -257,18 +358,16 @@ impl PeerEntry {
             }
         }
     }
-
-    fn push_staged(&mut self, direction: Arc<Direction>) {
-        self.staged.push_back(direction);
-        while self.staged.len() > MAX_STAGED_PER_PEER {
-            let _ = self.staged.pop_front();
-        }
-    }
 }
 
 #[derive(Default)]
 struct EndpointState {
+    /// Verified active peers only (capped at `MAX_TRACKED_PEERS`).
     peers: HashMap<String, PeerEntry>,
+    /// Unverified staged handshakes isolated in a separate bounded LRU
+    /// (`MAX_STAGED_PEERS` slots, `STAGED_PEER_TTL_MS` TTL).
+    staged: HashMap<String, StagedPeerEntry>,
+    staged_lru: VecDeque<String>,
     pruned_retired_order: VecDeque<[u8; 32]>,
     pruned_retired_set: HashSet<[u8; 32]>,
 }
@@ -289,11 +388,45 @@ impl EndpointState {
         for eph in entry.retired_order {
             self.retire_pruned_eph(eph);
         }
-        for dir in entry.verified.into_iter().chain(entry.staged) {
+        for dir in entry.verified {
             if let Some(eph) = dir.client_eph {
                 self.retire_pruned_eph(eph);
             }
         }
+    }
+
+    fn prune_expired_staged(&mut self, now_ms: u64) {
+        let mut empty = Vec::new();
+        for (peer, entry) in self.staged.iter_mut() {
+            entry.prune_expired(now_ms);
+            if entry.sessions.is_empty() {
+                empty.push(peer.clone());
+            }
+        }
+        for key in empty {
+            self.staged.remove(&key);
+            self.staged_lru.retain(|k| k != &key);
+        }
+    }
+
+    fn push_staged(&mut self, peer: String, direction: Arc<Direction>, now_ms: u64) {
+        self.prune_expired_staged(now_ms);
+        if let Some(entry) = self.staged.get_mut(&peer) {
+            entry.push(direction, now_ms);
+            self.staged_lru.retain(|k| k != &peer);
+            self.staged_lru.push_back(peer);
+            return;
+        }
+        while self.staged.len() >= MAX_STAGED_PEERS {
+            let Some(oldest) = self.staged_lru.pop_front() else {
+                break;
+            };
+            self.staged.remove(&oldest);
+        }
+        let mut entry = StagedPeerEntry::default();
+        entry.push(direction, now_ms);
+        self.staged.insert(peer.clone(), entry);
+        self.staged_lru.push_back(peer);
     }
 
     fn prune_idle_peers(&mut self, now_ms: u64, idle_ttl_ms: u64) {
@@ -343,9 +476,24 @@ impl Endpoint {
     }
 
     pub fn has(&self, peer: &str) -> bool {
+        let now_ms = self.now_ms();
         self.state
             .lock()
-            .map(|state| state.peers.contains_key(peer))
+            .map(|state| {
+                state.peers.contains_key(peer)
+                    || state.staged.get(peer).is_some_and(|s| {
+                        s.sessions
+                            .iter()
+                            .any(|item| now_ms.saturating_sub(item.created_ms) < STAGED_PEER_TTL_MS)
+                    })
+            })
+            .unwrap_or(false)
+    }
+
+    /// True when the newest active session for `peer` negotiated `frame_aad_v2`.
+    pub fn peer_uses_frame_aad_v2(&self, peer: &str) -> bool {
+        self.direction(peer)
+            .map(|d| d.uses_frame_aad_v2())
             .unwrap_or(false)
     }
 
@@ -354,6 +502,14 @@ impl Endpoint {
         if let Ok(mut state) = self.state.lock() {
             if let Some(removed) = state.peers.remove(peer) {
                 state.retire_peer_entry(removed);
+            }
+            if let Some(staged) = state.staged.remove(peer) {
+                state.staged_lru.retain(|k| k != peer);
+                for item in staged.sessions {
+                    if let Some(eph) = item.direction.client_eph {
+                        state.retire_pruned_eph(eph);
+                    }
+                }
             }
         }
     }
@@ -371,6 +527,28 @@ impl Endpoint {
             secret,
             node_id: node_id.to_string(),
             hello,
+            frame_aad_v2: false,
+        })
+    }
+
+    /// Client hello that cryptographically negotiates `frame_aad_v2` (binding
+    /// binary frame header fields `version`, `kind`, non-E2E `flags`, `offset`,
+    /// `raw_len`, and `request_id` into ChaCha20-Poly1305 AAD).
+    pub fn client_hello_v2(&self, node_id: &str) -> Result<PendingHello> {
+        let secret = EphemeralSecret::random_from_rng(OsRng);
+        let public = PublicKey::from(&secret);
+        let eph = public.to_bytes();
+        let message = sign_message_v2("client", &eph, node_id, &self.identity)?;
+        let mut hello = Vec::with_capacity(32 + 32 + 64 + HELLO_V2_MAGIC.len());
+        hello.extend_from_slice(&eph);
+        hello.extend_from_slice(&identity::public_bytes(self.identity.public_hex())?);
+        hello.extend_from_slice(&message);
+        hello.extend_from_slice(&HELLO_V2_MAGIC);
+        Ok(PendingHello {
+            secret,
+            node_id: node_id.to_string(),
+            hello,
+            frame_aad_v2: true,
         })
     }
 
@@ -378,34 +556,57 @@ impl Endpoint {
         &pending.hello
     }
 
-    /// Node side. Verifies the client, stores the session under the client id,
-    /// and returns the welcome message to send back.
+    /// Node side. Verifies the client, stores the staged session under the
+    /// client id in the bounded staged LRU, and returns the welcome message.
+    /// Accepts both 128-byte v1 hellos (older clients) and 132-byte v2 hellos
+    /// negotiating `frame_aad_v2`.
     pub fn accept(&self, hello: &[u8]) -> Result<(String, Vec<u8>)> {
-        if hello.len() != 128 {
-            return Err(Error::Protocol("e2e hello has the wrong length".into()));
-        }
+        let frame_aad_v2 = match hello.len() {
+            128 => false,
+            132 if hello[128..132] == HELLO_V2_MAGIC => true,
+            _ => return Err(Error::Protocol("e2e hello has the wrong length".into())),
+        };
         let mut client_eph = [0u8; 32];
         client_eph.copy_from_slice(&hello[..32]);
         let mut client_pk = [0u8; 32];
         client_pk.copy_from_slice(&hello[32..64]);
         let sig = &hello[64..128];
         let client_id = hex::encode(client_pk);
-        let signed = transcript("client", &client_eph, self.identity.public_hex());
+        let signed = if frame_aad_v2 {
+            transcript_v2("client", &client_eph, self.identity.public_hex())
+        } else {
+            transcript("client", &client_eph, self.identity.public_hex())
+        };
         identity::verify_message(&client_id, signed.as_bytes(), &hex::encode(sig))?;
 
         let secret = EphemeralSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         let node_eph = public.to_bytes();
         let shared = secret.diffie_hellman(&PublicKey::from(client_eph));
+        if !shared.was_contributory() {
+            return Err(Error::Protocol(
+                "non-contributory x25519 peer public key".into(),
+            ));
+        }
         let (c2n, n2c) = derive(shared.as_bytes(), &client_eph, &node_eph);
-        let message = sign_raw("node", &client_eph, &node_eph, &client_id, &self.identity)?;
-        let mut welcome = Vec::with_capacity(32 + 64);
+        let message = if frame_aad_v2 {
+            sign_raw_v2("node", &client_eph, &node_eph, &client_id, &self.identity)?
+        } else {
+            sign_raw("node", &client_eph, &node_eph, &client_id, &self.identity)?
+        };
+        let mut welcome = Vec::with_capacity(
+            32 + 64 + if frame_aad_v2 { HELLO_V2_MAGIC.len() } else { 0 },
+        );
         welcome.extend_from_slice(&node_eph);
         welcome.extend_from_slice(&message);
+        if frame_aad_v2 {
+            welcome.extend_from_slice(&HELLO_V2_MAGIC);
+        }
         let now_ms = self.now_ms();
         let candidate = Arc::new(Direction::new(
             n2c,
             c2n,
+            frame_aad_v2,
             self.epoch,
             now_ms,
             Some(client_eph),
@@ -416,6 +617,7 @@ impl Endpoint {
             .state
             .lock()
             .map_err(|_| Error::Message("e2e session lock poisoned".into()))?;
+        state.prune_expired_staged(now_ms);
         if state.pruned_retired_set.contains(&client_eph) {
             return Err(Error::Protocol("replayed e2e hello".into()));
         }
@@ -428,20 +630,6 @@ impl Endpoint {
             {
                 return Err(Error::Protocol("replayed e2e hello".into()));
             }
-            if let Some(existing) = peer_entry
-                .staged
-                .iter()
-                .find(|dir| dir.client_eph == Some(client_eph))
-                .cloned()
-            {
-                if !existing.received_any.load(Ordering::Acquire) {
-                    if let Some(cached) = &existing.cached_welcome {
-                        existing.touch();
-                        return Ok((client_id, cached.clone()));
-                    }
-                }
-                return Err(Error::Protocol("replayed e2e hello".into()));
-            }
         } else if state.peers.len() >= MAX_TRACKED_PEERS {
             state.prune_idle_peers(now_ms, IDLE_PEER_TTL_MS);
             if state.peers.len() >= MAX_TRACKED_PEERS {
@@ -450,30 +638,64 @@ impl Endpoint {
                 )));
             }
         }
-        state
-            .peers
-            .entry(client_id.clone())
-            .or_default()
-            .push_staged(candidate);
+        if let Some(staged_entry) = state.staged.get(&client_id) {
+            if let Some(existing) = staged_entry
+                .sessions
+                .iter()
+                .find(|s| s.direction.client_eph == Some(client_eph))
+            {
+                if !existing.direction.received_any.load(Ordering::Acquire) {
+                    if let Some(cached) = &existing.direction.cached_welcome {
+                        // Do NOT refresh TTL or touch activity on unauthenticated replays.
+                        return Ok((client_id, cached.clone()));
+                    }
+                }
+                return Err(Error::Protocol("replayed e2e hello".into()));
+            }
+        }
+        state.push_staged(client_id.clone(), candidate, now_ms);
         Ok((client_id, welcome))
     }
 
     pub fn complete(&self, pending: PendingHello, welcome: &[u8]) -> Result<()> {
-        if welcome.len() != 96 {
+        let expect_len = if pending.frame_aad_v2 { 100 } else { 96 };
+        if welcome.len() != expect_len {
             return Err(Error::Protocol("e2e welcome has the wrong length".into()));
+        }
+        if pending.frame_aad_v2 && welcome[96..100] != HELLO_V2_MAGIC {
+            return Err(Error::Protocol(
+                "e2e welcome missing frame_aad_v2 capability tag".into(),
+            ));
         }
         let mut node_eph = [0u8; 32];
         node_eph.copy_from_slice(&welcome[..32]);
         let sig = &welcome[32..96];
         let client_eph = PublicKey::from(&pending.secret).to_bytes();
-        let signed = transcript_node(&client_eph, &node_eph, self.identity.public_hex());
+        let signed = if pending.frame_aad_v2 {
+            transcript_node_v2(&client_eph, &node_eph, self.identity.public_hex())
+        } else {
+            transcript_node(&client_eph, &node_eph, self.identity.public_hex())
+        };
         identity::verify_message(&pending.node_id, signed.as_bytes(), &hex::encode(sig))?;
         let shared = pending.secret.diffie_hellman(&PublicKey::from(node_eph));
+        if !shared.was_contributory() {
+            return Err(Error::Protocol(
+                "non-contributory x25519 peer public key".into(),
+            ));
+        }
         let (c2n, n2c) = derive(shared.as_bytes(), &client_eph, &node_eph);
         let now_ms = self.now_ms();
         self.insert_verified_with_now(
             &pending.node_id,
-            Direction::new(c2n, n2c, self.epoch, now_ms, Some(client_eph), None),
+            Direction::new(
+                c2n,
+                n2c,
+                pending.frame_aad_v2,
+                self.epoch,
+                now_ms,
+                Some(client_eph),
+                None,
+            ),
             now_ms,
         )?;
         Ok(())
@@ -508,7 +730,7 @@ impl Endpoint {
         for keys in staged.iter().rev() {
             match keys.open_one(aad, blob) {
                 Ok(plain) => {
-                    self.promote_staged(peer, keys);
+                    self.promote_staged(peer, keys)?;
                     return Ok((plain, Arc::clone(keys)));
                 }
                 Err(err) => last_err = err,
@@ -556,26 +778,56 @@ impl Endpoint {
                 "file frame is not end-to-end; plaintext file bytes are refused".into(),
             ));
         }
-        let decoded = crate::frame::decode(frame)?;
-        let aad = frame_aad(&decoded.request_id, decoded.offset);
-        let plain = self.open(peer, &aad, &decoded.payload)?;
-        crate::frame::replace_payload(frame, &plain, false)
+        // Fail fast on malformed headers / oversized hole frames before trying keys.
+        let _ = crate::frame::decode(frame)?;
+        let (verified, staged) = self.sessions_for(peer)?;
+        let mut last_err = Error::Protocol(format!("no e2e session for {peer}"));
+        for keys in verified.iter().rev() {
+            match keys.open_frame(frame) {
+                Ok(opened) => return Ok(opened),
+                Err(err) => last_err = err,
+            }
+        }
+        for keys in staged.iter().rev() {
+            match keys.open_frame(frame) {
+                Ok(opened) => {
+                    self.promote_staged(peer, keys)?;
+                    return Ok(opened);
+                }
+                Err(err) => last_err = err,
+            }
+        }
+        Err(last_err)
     }
 
-    fn promote_staged(&self, peer: &str, matched: &Arc<Direction>) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        let Some(entry) = state.peers.get_mut(peer) else {
-            return;
-        };
-        if let Some(pos) = entry
-            .staged
-            .iter()
-            .position(|cand| Arc::ptr_eq(cand, matched))
-        {
-            let _ = entry.staged.remove(pos);
+    fn promote_staged(&self, peer: &str, matched: &Arc<Direction>) -> Result<()> {
+        let now_ms = self.now_ms();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Message("e2e session lock poisoned".into()))?;
+        if let Some(staged_entry) = state.staged.get_mut(peer) {
+            if let Some(pos) = staged_entry
+                .sessions
+                .iter()
+                .position(|cand| Arc::ptr_eq(&cand.direction, matched))
+            {
+                let _ = staged_entry.sessions.remove(pos);
+            }
+            if staged_entry.sessions.is_empty() {
+                state.staged.remove(peer);
+                state.staged_lru.retain(|k| k != peer);
+            }
         }
+        if !state.peers.contains_key(peer) && state.peers.len() >= MAX_TRACKED_PEERS {
+            state.prune_idle_peers(now_ms, IDLE_PEER_TTL_MS);
+            if state.peers.len() >= MAX_TRACKED_PEERS {
+                return Err(Error::Protocol(format!(
+                    "e2e peer table at capacity ({MAX_TRACKED_PEERS} active peers)"
+                )));
+            }
+        }
+        let entry = state.peers.entry(peer.to_string()).or_default();
         if !entry
             .verified
             .iter()
@@ -583,6 +835,7 @@ impl Endpoint {
         {
             entry.push_verified(Arc::clone(matched));
         }
+        Ok(())
     }
 
     fn insert_verified_with_now(&self, peer: &str, direction: Direction, now_ms: u64) -> Result<()> {
@@ -617,21 +870,50 @@ impl Endpoint {
     }
 
     fn sessions_for(&self, peer: &str) -> Result<(DirectionRing, DirectionRing)> {
+        let now_ms = self.now_ms();
         let guard = self
             .state
             .lock()
             .map_err(|_| Error::Message("e2e session lock poisoned".into()))?;
-        let entry = guard
+        let verified = guard
             .peers
             .get(peer)
-            .ok_or_else(|| Error::Protocol(format!("no e2e session for {peer}")))?;
-        Ok((entry.verified.clone(), entry.staged.clone()))
+            .map(|e| e.verified.clone())
+            .unwrap_or_default();
+        let staged: DirectionRing = guard
+            .staged
+            .get(peer)
+            .map(|e| {
+                e.sessions
+                    .iter()
+                    .filter(|s| now_ms.saturating_sub(s.created_ms) < STAGED_PEER_TTL_MS)
+                    .map(|s| Arc::clone(&s.direction))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if verified.is_empty() && staged.is_empty() {
+            return Err(Error::Protocol(format!("no e2e session for {peer}")));
+        }
+        Ok((verified, staged))
     }
 
     pub fn peer_ids(&self) -> Vec<String> {
+        let now_ms = self.now_ms();
         self.state
             .lock()
-            .map(|state| state.peers.keys().cloned().collect())
+            .map(|state| {
+                let mut set: HashSet<String> = state.peers.keys().cloned().collect();
+                for (peer, entry) in &state.staged {
+                    if entry
+                        .sessions
+                        .iter()
+                        .any(|s| now_ms.saturating_sub(s.created_ms) < STAGED_PEER_TTL_MS)
+                    {
+                        set.insert(peer.clone());
+                    }
+                }
+                set.into_iter().collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -731,8 +1013,31 @@ fn frame_aad(request_id: &str, offset: u64) -> Vec<u8> {
     aad
 }
 
+fn frame_aad_v2(
+    version: u8,
+    kind: u8,
+    non_e2e_flags: u16,
+    offset: u64,
+    raw_len: u32,
+    request_id: &str,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(8 + 1 + 1 + 2 + 8 + 4 + request_id.len());
+    aad.extend_from_slice(b"frame-v2");
+    aad.push(version);
+    aad.push(kind);
+    aad.extend_from_slice(&non_e2e_flags.to_le_bytes());
+    aad.extend_from_slice(&offset.to_le_bytes());
+    aad.extend_from_slice(&raw_len.to_le_bytes());
+    aad.extend_from_slice(request_id.as_bytes());
+    aad
+}
+
 fn transcript(role: &str, eph: &[u8], other: &str) -> String {
     format!("{INFO:?}|{role}|{}|{other}", hex::encode(eph))
+}
+
+fn transcript_v2(role: &str, eph: &[u8], other: &str) -> String {
+    format!("{INFO:?}|v2|frame-aad-v2|{role}|{}|{other}", hex::encode(eph))
 }
 
 fn transcript_node(client_eph: &[u8], node_eph: &[u8], client_id: &str) -> String {
@@ -743,8 +1048,21 @@ fn transcript_node(client_eph: &[u8], node_eph: &[u8], client_id: &str) -> Strin
     )
 }
 
+fn transcript_node_v2(client_eph: &[u8], node_eph: &[u8], client_id: &str) -> String {
+    format!(
+        "{INFO:?}|v2|frame-aad-v2|node|{}|{}|{client_id}",
+        hex::encode(client_eph),
+        hex::encode(node_eph)
+    )
+}
+
 fn sign_message(role: &str, eph: &[u8], other: &str, identity: &Identity) -> Result<Vec<u8>> {
     let text = transcript(role, eph, other);
+    decode_sig(&identity.sign_message(text.as_bytes()))
+}
+
+fn sign_message_v2(role: &str, eph: &[u8], other: &str, identity: &Identity) -> Result<Vec<u8>> {
+    let text = transcript_v2(role, eph, other);
     decode_sig(&identity.sign_message(text.as_bytes()))
 }
 
@@ -757,6 +1075,18 @@ fn sign_raw(
 ) -> Result<Vec<u8>> {
     let _ = role;
     let text = transcript_node(client_eph, node_eph, client_id);
+    decode_sig(&identity.sign_message(text.as_bytes()))
+}
+
+fn sign_raw_v2(
+    role: &str,
+    client_eph: &[u8],
+    node_eph: &[u8],
+    client_id: &str,
+    identity: &Identity,
+) -> Result<Vec<u8>> {
+    let _ = role;
+    let text = transcript_node_v2(client_eph, node_eph, client_id);
     decode_sig(&identity.sign_message(text.as_bytes()))
 }
 
@@ -780,11 +1110,11 @@ fn derive(shared: &[u8], client_eph: &[u8], node_eph: &[u8]) -> ([u8; 32], [u8; 
     let mut n2c = [0u8; 32];
     c2n.copy_from_slice(&okm[..32]);
     n2c.copy_from_slice(&okm[32..]);
+    zeroize_bytes(&mut okm);
     (c2n, n2c)
 }
 
-fn aead_seal(key: &[u8; 32], n: u64, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(key.into());
+fn aead_seal(cipher: &ChaCha20Poly1305, n: u64, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
     let nonce_bytes = nonce(n);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
@@ -796,12 +1126,11 @@ fn aead_seal(key: &[u8; 32], n: u64, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>
     Ok(out)
 }
 
-fn aead_open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<(u64, Vec<u8>)> {
+fn aead_open(cipher: &ChaCha20Poly1305, aad: &[u8], blob: &[u8]) -> Result<(u64, Vec<u8>)> {
     if blob.len() < 8 + 16 {
         return Err(Error::Protocol("e2e blob is short".into()));
     }
     let n = u64::from_le_bytes(blob[..8].try_into().unwrap());
-    let cipher = ChaCha20Poly1305::new(key.into());
     let nonce_bytes = nonce(n);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plain = cipher
@@ -1198,8 +1527,11 @@ mod tests {
         let p0 = active.client_hello(node.peer_id()).unwrap();
         let (_, w0) = node.accept(Endpoint::hello_bytes(&p0)).unwrap();
         active.complete(p0, &w0).unwrap();
+        // Send one authenticated frame so `active` promotes from staged LRU to verified `peers`.
+        let init_ct = active.seal(node.peer_id(), b"init", b"hi").unwrap();
+        assert_eq!(node.open(active.peer_id(), b"init", &init_ct).unwrap(), b"hi");
 
-        // Fill remaining MAX_TRACKED_PEERS - 1 slots with synthetic peers.
+        // Fill remaining MAX_TRACKED_PEERS - 1 slots with synthetic verified peers.
         {
             let mut state = node.state.lock().unwrap();
             for i in 1..MAX_TRACKED_PEERS {
@@ -1207,6 +1539,7 @@ mod tests {
                 pe.push_verified(Arc::new(Direction::new(
                     [1u8; 32],
                     [2u8; 32],
+                    true,
                     node.epoch,
                     1_000_000,
                     Some([i as u8; 32]),
@@ -1216,12 +1549,12 @@ mod tests {
             }
             // Mark active peer fresh too.
             let active_pe = state.peers.get(active.peer_id()).unwrap();
-            for dir in active_pe.verified.iter().chain(active_pe.staged.iter()) {
+            for dir in active_pe.verified.iter() {
                 dir.last_active_ms.store(1_000_000, Ordering::SeqCst);
             }
         }
 
-        // When all 1024 peers are active within IDLE_PEER_TTL_MS, a 1025th peer is refused
+        // When all 1024 verified peers are active within IDLE_PEER_TTL_MS, a 1025th peer is refused
         // rather than evicting any active session.
         let newcomer = Endpoint::new(Identity::generate());
         let p_new = newcomer.client_hello(node.peer_id()).unwrap();
@@ -1327,5 +1660,186 @@ mod tests {
             b"live-2",
             "replayed ancient E2eHellos evicted an active verified session!"
         );
+    }
+
+    #[test]
+    fn sec07_frame_aad_v2_authenticates_header_fields_and_keeps_v1_interop() {
+        let client = Endpoint::new(Identity::generate());
+        let node = Endpoint::new(Identity::generate());
+        let pending = client.client_hello_v2(node.peer_id()).unwrap();
+        assert_eq!(Endpoint::hello_bytes(&pending).len(), 132);
+        let (_, welcome) = node.accept(Endpoint::hello_bytes(&pending)).unwrap();
+        assert_eq!(welcome.len(), 100);
+        client.complete(pending, &welcome).unwrap();
+        assert!(client.peer_uses_frame_aad_v2(node.peer_id()));
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let frame = crate::frame::DataFrame {
+            request_id: id.clone(),
+            offset: 4096,
+            raw_len: 16,
+            compressed: false,
+            hole: false,
+            tar: false,
+            payload: b"FILEBYTES-secret".to_vec(),
+        };
+        let raw = crate::frame::encode(&frame).unwrap();
+
+        // Tampering with kind (KIND_DATA -> KIND_TAR) must fail AEAD!
+        let mut tampered_kind = client.seal_frame(node.peer_id(), &raw).unwrap();
+        tampered_kind[1] = crate::frame::KIND_TAR;
+        assert!(node.open_frame(client.peer_id(), &tampered_kind).is_err());
+
+        // Tampering with FLAG_ZSTD must fail AEAD!
+        let mut tampered_zstd = client.seal_frame(node.peer_id(), &raw).unwrap();
+        let flags = u16::from_le_bytes([tampered_zstd[2], tampered_zstd[3]]) | crate::frame::FLAG_ZSTD;
+        tampered_zstd[2..4].copy_from_slice(&flags.to_le_bytes());
+        assert!(node.open_frame(client.peer_id(), &tampered_zstd).is_err());
+
+        // Tampering with FLAG_HOLE must fail AEAD!
+        let mut tampered_hole = client.seal_frame(node.peer_id(), &raw).unwrap();
+        let flags = u16::from_le_bytes([tampered_hole[2], tampered_hole[3]]) | crate::frame::FLAG_HOLE;
+        tampered_hole[2..4].copy_from_slice(&flags.to_le_bytes());
+        assert!(node.open_frame(client.peer_id(), &tampered_hole).is_err());
+
+        // Tampering with raw_len on a legitimate hole frame must fail AEAD!
+        let hole_frame = crate::frame::DataFrame {
+            request_id: id.clone(),
+            offset: 0,
+            raw_len: 4096,
+            compressed: false,
+            hole: true,
+            tar: false,
+            payload: Vec::new(),
+        };
+        let raw_hole = crate::frame::encode(&hole_frame).unwrap();
+        let mut tampered_raw_len = client.seal_frame(node.peer_id(), &raw_hole).unwrap();
+        tampered_raw_len[28..32].copy_from_slice(&(65536u32).to_le_bytes());
+        assert!(node.open_frame(client.peer_id(), &tampered_raw_len).is_err());
+
+        // Oversized FLAG_HOLE raw_len (> FILE_MAX_HOLE) is rejected outright!
+        let mut huge_hole = client.seal_frame(node.peer_id(), &raw_hole).unwrap();
+        huge_hole[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(node.open_frame(client.peer_id(), &huge_hole).is_err());
+
+        // Untampered v2 hole and data frames open cleanly!
+        let good_hole = client.seal_frame(node.peer_id(), &raw_hole).unwrap();
+        let opened_hole = node.open_frame(client.peer_id(), &good_hole).unwrap();
+        let decoded_hole = crate::frame::decode(&opened_hole).unwrap();
+        assert!(decoded_hole.hole);
+        assert_eq!(decoded_hole.raw_len, 4096);
+        assert!(decoded_hole.payload.is_empty());
+
+        let good_data = client.seal_frame(node.peer_id(), &raw).unwrap();
+        let opened_data = node.open_frame(client.peer_id(), &good_data).unwrap();
+        assert_eq!(crate::frame::decode(&opened_data).unwrap().payload, b"FILEBYTES-secret");
+
+        // Downgrade attempt: a v1 96-byte welcome cannot complete a v2 pending hello!
+        let pending_v2 = client.client_hello_v2(node.peer_id()).unwrap();
+        let fake_v1_welcome = vec![0u8; 96];
+        assert!(client.complete(pending_v2, &fake_v1_welcome).is_err());
+
+        // Rolling upgrade interop: a v1 client (128-byte hello) still connects to the same upgraded node.
+        let legacy_client = Endpoint::new(Identity::generate());
+        let p_v1 = legacy_client.client_hello(node.peer_id()).unwrap();
+        assert_eq!(Endpoint::hello_bytes(&p_v1).len(), 128);
+        let (_, w_v1) = node.accept(Endpoint::hello_bytes(&p_v1)).unwrap();
+        assert_eq!(w_v1.len(), 96);
+        legacy_client.complete(p_v1, &w_v1).unwrap();
+        assert!(!legacy_client.peer_uses_frame_aad_v2(node.peer_id()));
+        let legacy_sealed = legacy_client.seal_frame(node.peer_id(), &raw).unwrap();
+        let legacy_opened = node.open_frame(legacy_client.peer_id(), &legacy_sealed).unwrap();
+        assert_eq!(crate::frame::decode(&legacy_opened).unwrap().payload, b"FILEBYTES-secret");
+    }
+
+    #[test]
+    fn sec11_spoofed_hello_flood_isolated_in_staged_lru_and_replay_does_not_refresh_ttl() {
+        let node = Endpoint::new(Identity::generate());
+
+        // Blast 1,200 spoofed random-identity E2eHello handshakes (exceeding MAX_TRACKED_PEERS = 1024).
+        // None send a valid AEAD frame, so they stay isolated in the 64-slot staged LRU.
+        for _ in 0..(MAX_TRACKED_PEERS + 176) {
+            let spoof = Endpoint::new(Identity::generate());
+            let p = spoof.client_hello_v2(node.peer_id()).unwrap();
+            let _ = node.accept(Endpoint::hello_bytes(&p)).unwrap();
+        }
+        {
+            let state = node.state.lock().unwrap();
+            assert_eq!(state.peers.len(), 0, "unverified staged hellos must never fill verified peers");
+            assert!(
+                state.staged.len() <= MAX_STAGED_PEERS,
+                "staged LRU grew past {MAX_STAGED_PEERS}: {}",
+                state.staged.len()
+            );
+        }
+
+        // A legitimate controller MUST still be accepted and promoted cleanly!
+        let legit = Endpoint::new(Identity::generate());
+        let p_legit = legit.client_hello_v2(node.peer_id()).unwrap();
+        let (_, w_legit) = node.accept(Endpoint::hello_bytes(&p_legit)).unwrap();
+        legit.complete(p_legit, &w_legit).unwrap();
+        let ct = legit.seal(node.peer_id(), b"ok", b"hello-legit").unwrap();
+        assert_eq!(node.open(legit.peer_id(), b"ok", &ct).unwrap(), b"hello-legit");
+
+        // Replaying an unused staged E2eHello must NOT refresh its created_ms / TTL.
+        let peer_ttl = Endpoint::new(Identity::generate());
+        let p_ttl = peer_ttl.client_hello_v2(node.peer_id()).unwrap();
+        let h_ttl = Endpoint::hello_bytes(&p_ttl).to_vec();
+        let (_, w1) = node.accept(&h_ttl).unwrap();
+        let initial_created = {
+            let mut state = node.state.lock().unwrap();
+            let entry = state.staged.get_mut(peer_ttl.peer_id()).unwrap();
+            entry.sessions[0].created_ms = 5;
+            entry.sessions[0].created_ms
+        };
+        let (_, w2) = node.accept(&h_ttl).unwrap();
+        assert_eq!(w1, w2);
+        {
+            let state = node.state.lock().unwrap();
+            let entry = state.staged.get(peer_ttl.peer_id()).unwrap();
+            assert_eq!(
+                entry.sessions[0].created_ms, initial_created,
+                "unauthenticated E2eHello replay must not refresh staged TTL"
+            );
+        }
+        // Once past STAGED_PEER_TTL_MS, pruning evicts the stale staged entry.
+        {
+            let mut state = node.state.lock().unwrap();
+            state.prune_expired_staged(initial_created + STAGED_PEER_TTL_MS + 1);
+            assert!(!state.staged.contains_key(peer_ttl.peer_id()));
+        }
+    }
+
+    #[test]
+    fn sec20_non_contributory_x25519_key_is_rejected() {
+        let client_id = Identity::generate();
+        let node = Endpoint::new(Identity::generate());
+        // Low-order all-zero X25519 public key produces all-zero shared secret!
+        let bad_eph = [0u8; 32];
+        let sig = sign_message("client", &bad_eph, node.peer_id(), &client_id).unwrap();
+        let mut hello = Vec::with_capacity(128);
+        hello.extend_from_slice(&bad_eph);
+        hello.extend_from_slice(&identity::public_bytes(client_id.public_hex()).unwrap());
+        hello.extend_from_slice(&sig);
+        let err = node.accept(&hello).unwrap_err().to_string();
+        assert!(err.contains("non-contributory"), "{err}");
+
+        // Same check on client side (`complete`) with low-order node_eph:
+        let client = Endpoint::new(client_id);
+        let pending = client.client_hello(node.peer_id()).unwrap();
+        let client_eph = PublicKey::from(&pending.secret).to_bytes();
+        let node_sig = sign_raw(
+            "node",
+            &client_eph,
+            &bad_eph,
+            client.peer_id(),
+            node.identity(),
+        )
+        .unwrap();
+        let mut welcome = Vec::with_capacity(96);
+        welcome.extend_from_slice(&bad_eph);
+        welcome.extend_from_slice(&node_sig);
+        let err = client.complete(pending, &welcome).unwrap_err().to_string();
+        assert!(err.contains("non-contributory"), "{err}");
     }
 }

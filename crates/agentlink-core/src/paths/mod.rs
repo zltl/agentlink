@@ -341,6 +341,12 @@ pub(crate) fn resolve_sandboxed(
                         }
                         missing_depth = 1;
                     }
+                    Err(err) if !entered_root => {
+                        let _ = err;
+                        return Err(Error::PermissionDenied(format!(
+                            "path escapes sandbox: {user_label}"
+                        )));
+                    }
                     Err(err) => return Err(err.into()),
                 }
             }
@@ -813,7 +819,14 @@ mod tests {
     #[test]
     fn resolve_path_keeps_unix_root() {
         let resolved = resolve_path(None, "/").unwrap();
+        #[cfg(unix)]
         assert_eq!(resolved, PathBuf::from("/"));
+        #[cfg(windows)]
+        assert!(
+            resolved.is_absolute() && resolved.parent().is_none(),
+            "expected drive root on Windows, got {}",
+            resolved.display()
+        );
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub const PHYSICAL_ON_LINK_PREF: u16 = 65535;
 pub const OVERLAY_ON_LINK_PREF: u16 = 49151;
 /// Host address that is not on-link to any local prefix (e.g. other private NIC).
 pub const OFF_LINK_HOST_PREF: u16 = 32767;
+/// Virtual bridge (Docker/WSL/Hyper-V/libvirt/CNI/Podman) or link-local (`169.254/16`, `fe80::/10`).
+/// Always ranked below physical LAN, overlay VPN, and off-link routable hosts, but still above srflx/relay.
+pub const VIRTUAL_BRIDGE_HOST_PREF: u16 = 16383;
 /// Short wait so multiple host pairs can succeed before nomination.
 pub const HOST_ACCEPTANCE_MIN_WAIT: Duration = Duration::from_millis(250);
 
@@ -56,20 +59,30 @@ pub fn on_link(ip: IpAddr, prefix: &IfacePrefix) -> bool {
 
 /// Local preference for a remote host IP given real local prefixes.
 ///
-/// Order: physical on-link > overlay on-link (incl. `100.64/10`) > off-link host.
-/// Overlay on-link is still host P2P — never treated as failure.
+/// Order: physical on-link > overlay/VPN on-link (incl. `100.64/10`, Wintun/Clash/Mihomo/WARP)
+/// > off-link host > virtual bridge (Docker/WSL/Hyper-V/libvirt/CNI/Podman) and link-local
+/// (`169.254/16`, `fe80::/10`).
 ///
 /// Callers with an **empty** prefix list must not rewrite candidates: without
 /// real iface data every host would look "off-link" and get hashed down. See
 /// [`rewrite_candidate_line`].
 pub fn host_local_pref(ip: IpAddr, prefixes: &[IfacePrefix]) -> u16 {
+    if is_link_local_addr(ip) {
+        return unique_in_band(VIRTUAL_BRIDGE_HOST_PREF, ip);
+    }
     let mut saw_physical = false;
     let mut saw_overlay = false;
+    let mut saw_virtual = false;
     for prefix in prefixes {
         if !on_link(ip, prefix) {
             continue;
         }
-        if prefix.overlay {
+        if is_virtual_bridge_iface_name(&prefix.name) || is_link_local_addr(prefix.addr) {
+            saw_virtual = true;
+        } else if prefix.overlay
+            || is_overlay_addr(prefix.addr)
+            || is_overlay_iface_name(&prefix.name)
+        {
             saw_overlay = true;
         } else {
             saw_physical = true;
@@ -79,6 +92,8 @@ pub fn host_local_pref(ip: IpAddr, prefixes: &[IfacePrefix]) -> u16 {
         unique_in_band(PHYSICAL_ON_LINK_PREF, ip)
     } else if saw_overlay {
         unique_in_band(OVERLAY_ON_LINK_PREF, ip)
+    } else if saw_virtual {
+        unique_in_band(VIRTUAL_BRIDGE_HOST_PREF, ip)
     } else {
         unique_in_band(OFF_LINK_HOST_PREF, ip)
     }
@@ -99,6 +114,29 @@ pub fn host_priority(local_pref: u16, component: u16) -> Option<u32> {
     )
 }
 
+/// True for IPv4 link-local (`169.254.0.0/16`) or IPv6 link-local (`fe80::/10`).
+pub fn is_link_local_addr(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Interface-name heuristics for local container / VM / hypervisor virtual bridges
+/// (Docker, libvirt, CNI, Podman, Windows Hyper-V / WSL `vEthernet`).
+pub fn is_virtual_bridge_iface_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("docker")
+        || n.starts_with("br-")
+        || n.starts_with("virbr")
+        || n.starts_with("cni")
+        || n.starts_with("podman")
+        || n.starts_with("veth")
+        || n.starts_with("vboxnet")
+        || n.starts_with("vmnet")
+        || n.contains("vethernet")
+}
+
 /// Classify a local address as overlay/VPN (still valid P2P).
 pub fn is_overlay_addr(ip: IpAddr) -> bool {
     match ip {
@@ -107,7 +145,8 @@ pub fn is_overlay_addr(ip: IpAddr) -> bool {
     }
 }
 
-/// Interface-name heuristics for tunnels (Tailscale, WireGuard, utun, etc.).
+/// Interface-name heuristics for tunnels and VPN/proxy adapters (Tailscale,
+/// WireGuard, utun, Wintun, Clash, Mihomo, Cloudflare WARP, etc.).
 pub fn is_overlay_iface_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with("tailscale")
@@ -118,6 +157,10 @@ pub fn is_overlay_iface_name(name: &str) -> bool {
         || n.starts_with("zt")
         || n.contains("wireguard")
         || n.contains("tailscale")
+        || n.contains("wintun")
+        || n.contains("clash")
+        || n.contains("mihomo")
+        || n.contains("warp")
 }
 
 /// Enumerate local unicast prefixes from the OS (real netmasks via `if-addrs`).
@@ -151,7 +194,10 @@ pub fn list_local_prefixes() -> Vec<IfacePrefix> {
             }
         };
         out.push(IfacePrefix {
-            overlay: is_overlay_addr(addr) || is_overlay_iface_name(&iface.name),
+            overlay: is_overlay_addr(addr)
+                || is_overlay_iface_name(&iface.name)
+                || is_virtual_bridge_iface_name(&iface.name)
+                || is_link_local_addr(addr),
             addr,
             prefix_len,
             name: iface.name,
@@ -210,16 +256,21 @@ pub fn rewrite_candidate_line(line: &str, prefixes: &[IfacePrefix]) -> String {
     }
 }
 
-/// Rewrite every `a=candidate:` host line in an SDP body.
+/// Rewrite every `a=candidate:` host line in an SDP body, preserving original
+/// `\r\n` (RFC 4566) or `\n` line endings.
 pub fn rewrite_sdp_remote_hosts(sdp: &str, prefixes: &[IfacePrefix]) -> String {
     if prefixes.is_empty() {
         return sdp.to_string();
     }
     let mut out = String::with_capacity(sdp.len() + 32);
-    for (i, line) in sdp.lines().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
+    for segment in sdp.split_inclusive('\n') {
+        let (line, eol) = if let Some(stripped) = segment.strip_suffix("\r\n") {
+            (stripped, "\r\n")
+        } else if let Some(stripped) = segment.strip_suffix('\n') {
+            (stripped, "\n")
+        } else {
+            (segment, "")
+        };
         if line
             .trim_start()
             .to_ascii_lowercase()
@@ -229,9 +280,7 @@ pub fn rewrite_sdp_remote_hosts(sdp: &str, prefixes: &[IfacePrefix]) -> String {
         } else {
             out.push_str(line);
         }
-    }
-    if sdp.ends_with('\n') {
-        out.push('\n');
+        out.push_str(eol);
     }
     out
 }
@@ -580,5 +629,76 @@ mod tests {
     fn host_acceptance_wait_is_nonzero_vs_rtc_ice_default() {
         assert!(HOST_ACCEPTANCE_MIN_WAIT > Duration::from_secs(0));
         assert!(HOST_ACCEPTANCE_MIN_WAIT <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn desk24_virtual_bridges_vpn_adapters_and_link_local_are_downranked() {
+        for bridge in [
+            "docker0",
+            "br-1a2b3c4d",
+            "virbr0",
+            "cni0",
+            "podman0",
+            "vEthernet (WSL)",
+            "vEthernet (Default Switch)",
+        ] {
+            assert!(is_virtual_bridge_iface_name(bridge), "expected virtual bridge: {bridge}");
+        }
+        for vpn in ["wintun", "Clash", "MihomoMeta", "CloudflareWARP"] {
+            assert!(is_overlay_iface_name(vpn), "expected overlay/VPN: {vpn}");
+        }
+        assert!(is_link_local_addr(IpAddr::V4(Ipv4Addr::new(169, 254, 10, 5))));
+        assert!(is_link_local_addr(IpAddr::V6(
+            "fe80::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(!is_link_local_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))));
+
+        let prefixes = vec![
+            pref(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 8)), 24, "eth0", false),
+            pref(IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)), 16, "docker0", false),
+            pref(IpAddr::V4(Ipv4Addr::new(192, 168, 122, 1)), 24, "virbr0", false),
+            pref(IpAddr::V4(Ipv4Addr::new(172, 24, 0, 1)), 20, "vEthernet (WSL)", false),
+            pref(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 24, "wintun", false),
+            pref(
+                IpAddr::V6("fe80::1".parse::<Ipv6Addr>().unwrap()),
+                64,
+                "eth0",
+                false,
+            ),
+        ];
+
+        let lan = host_local_pref(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), &prefixes);
+        let wintun = host_local_pref(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), &prefixes);
+        let docker = host_local_pref(IpAddr::V4(Ipv4Addr::new(172, 17, 0, 2)), &prefixes);
+        let wsl = host_local_pref(IpAddr::V4(Ipv4Addr::new(172, 24, 0, 5)), &prefixes);
+        let apipa = host_local_pref(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2)), &prefixes);
+        let ll6 = host_local_pref(IpAddr::V6("fe80::2".parse::<Ipv6Addr>().unwrap()), &prefixes);
+
+        assert!(lan > wintun, "{lan} > {wintun}");
+        assert!(wintun > docker, "{wintun} > {docker}");
+        assert!(wintun > wsl, "{wintun} > {wsl}");
+        assert!(wintun > apipa, "{wintun} > {apipa}");
+        assert!(wintun > ll6, "{wintun} > {ll6}");
+        // Virtual bridge / link-local still stay valid host candidates above srflx.
+        let srflx = (1u32 << 24) * 100 + (1u32 << 8) * u32::from(DEFAULT_LOCAL_PREFERENCE) + 255;
+        assert!(host_priority(docker, 1).unwrap() > srflx);
+    }
+
+    #[test]
+    fn strm03_rewrite_sdp_preserves_crlf_line_endings() {
+        let prefixes = vec![pref(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 8)),
+            24,
+            "eth0",
+            false,
+        )];
+        let sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\na=candidate:1 1 udp 2130706431 192.168.1.12 54444 typ host\r\na=candidate:2 1 udp 100 203.0.113.1 1 typ srflx\r\n";
+        let out = rewrite_sdp_remote_hosts(sdp, &prefixes);
+        assert!(out.ends_with("\r\n"), "must preserve trailing CRLF");
+        for seg in out.split_inclusive('\n') {
+            assert!(seg.ends_with("\r\n"), "lost CRLF in segment: {seg:?}");
+        }
+        assert!(out.contains("192.168.1.12"));
+        assert!(!out.contains("2130706431"));
     }
 }
