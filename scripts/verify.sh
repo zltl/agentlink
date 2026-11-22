@@ -47,9 +47,15 @@ skip_step() {
   skipped=$((skipped + 1))
 }
 
-# 1. Shell script syntax checks
-run_step "Shell syntax check (sh -n)" \
-  sh -n install.sh scripts/smoke.sh scripts/check-release-matrix.sh scripts/generate-signing-key.sh scripts/verify.sh
+# 1. Shell script syntax checks (POSIX /bin/sh vs bash)
+run_step "POSIX shell syntax check (sh -n)" \
+  sh -n install.sh scripts/check-release-matrix.sh scripts/generate-signing-key.sh scripts/verify.sh
+if command -v bash >/dev/null 2>&1; then
+  run_step "Bash syntax check (bash -n scripts/smoke.sh)" \
+    bash -n scripts/smoke.sh
+else
+  skip_step "Bash syntax check (bash -n scripts/smoke.sh)" "bash not found on PATH"
+fi
 
 # 2. PowerShell syntax check for install.ps1 (if pwsh or powershell is available)
 ps_bin=""

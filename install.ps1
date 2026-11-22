@@ -127,7 +127,7 @@ function Test-AgentlinkLoopbackHttp([System.Uri]$Uri) {
     return ($hostName -eq "127.0.0.1" -or $hostName -eq "::1" -or $hostName -eq "localhost")
 }
 
-function Assert-AgentlinkDownloadUrl([string]$Url) {
+function Assert-AgentlinkDownloadUrl([string]$Url, [bool]$AllowLoopbackHttp = $true) {
     $uri = $null
     if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$uri)) {
         throw "invalid download URL: $Url"
@@ -138,7 +138,7 @@ function Assert-AgentlinkDownloadUrl([string]$Url) {
     if ($uri.Scheme -eq "https") {
         return
     }
-    if (Test-AgentlinkLoopbackHttp $uri) {
+    if ($AllowLoopbackHttp -and (Test-AgentlinkLoopbackHttp $uri)) {
         return
     }
     if ($uri.Scheme -eq "http" -and $allowHttp) {
@@ -150,9 +150,16 @@ function Assert-AgentlinkDownloadUrl([string]$Url) {
 
 function Invoke-AgentlinkHttp([string]$Url, [string]$DestPath, [string]$AcceptHeader) {
     $current = $Url
+    $initialUri = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$initialUri)) {
+        throw "invalid download URL: $Url"
+    }
+    # Only allow loopback http:// when the caller initially targeted loopback http://
+    # (prevents an https:// host/mirror from redirecting to http://127.0.0.1/...).
+    $initialIsLoopbackHttp = Test-AgentlinkLoopbackHttp $initialUri
     $maxRedirects = 5
     for ($hop = 0; $hop -le $maxRedirects; $hop++) {
-        Assert-AgentlinkDownloadUrl $current
+        Assert-AgentlinkDownloadUrl -Url $current -AllowLoopbackHttp:($initialIsLoopbackHttp)
         $req = [System.Net.HttpWebRequest]([System.Net.WebRequest]::Create($current))
         $req.Method = "GET"
         $req.UserAgent = "agentlink-install"
@@ -451,7 +458,7 @@ try {
         Save-AgentlinkFile "$base/SHA256SUMS.minisig" $sig
         $embedded = "untrusted comment: minisign public key`nRWTCrF4TYAywjeqH2h25khhV1Ska9eBdU0l2FdPvtYp0b7emGttpZmcx"
         $pubkey = if ($env:AGENTLINK_UPDATE_PUBKEY) { $env:AGENTLINK_UPDATE_PUBKEY } else { $embedded }
-        if (Test-Path $pubkey) {
+        if (-not $pubkey.Contains("`n") -and -not $pubkey.Contains("`r") -and (Test-Path -LiteralPath $pubkey)) {
             $pubfile = $pubkey
         } else {
             $pubfile = Join-Path $tmp "minisign.pub"

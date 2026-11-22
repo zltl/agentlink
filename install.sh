@@ -300,7 +300,12 @@ lookup_checksum() {
 }
 
 tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
+tmp_install=""
+cleanup() {
+    [ -n "$tmp_install" ] && rm -f "$tmp_install"
+    rm -rf "$tmpdir"
+}
+trap cleanup EXIT
 
 sums_downloaded=0
 if [ -z "$VERSION" ]; then
@@ -442,8 +447,13 @@ fi
 
 mkdir -p "$PREFIX"
 install_bin="${PREFIX}/agentlink"
-cp "${tmpdir}/agentlink" "$install_bin"
-chmod 755 "$install_bin"
+# Stage beside the destination and atomically rename to avoid ETXTBSY when
+# upgrading over a running binary on Linux.
+tmp_install="${install_bin}.tmp.$$"
+cp "${tmpdir}/agentlink" "$tmp_install"
+chmod 755 "$tmp_install"
+mv -f "$tmp_install" "$install_bin"
+tmp_install=""
 
 case ":$PATH:" in
     *":${PREFIX}:"*) ;;
