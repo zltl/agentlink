@@ -1,15 +1,15 @@
 //! Bulk transfers and the direct QUIC accept loop.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use agentlink_core::e2e::{self, Direction, Endpoint};
 use agentlink_core::engine::{self, Link, Wire, XferOpts};
 use agentlink_core::frame;
-use agentlink_core::p2p::{self, QuicPeer};
-use agentlink_core::protocol::{Envelope, TransferMsg, TransferStats};
+use agentlink_core::p2p::QuicPeer;
+use agentlink_core::protocol::{Envelope, ManifestEntry, TransferMsg, TransferStats};
 use agentlink_core::ws::{self, Outbound};
 use agentlink_core::{paths, Error, NodePolicy, Result};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,6 +20,284 @@ use uuid::Uuid;
 use crate::audit;
 use crate::pipeline::AuditService;
 
+const MAX_WAITING_STREAMS: usize = 128;
+const WAITING_STREAM_TTL: Duration = Duration::from_secs(30);
+
+pub type TunnelGrantHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+struct TunnelSession {
+    #[allow(dead_code)]
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
+    cancel: CancellationToken,
+}
+
+struct WaitingStream {
+    stream: TcpStream,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
+    bind_request_id: String,
+    created_at: Instant,
+}
+
+#[derive(Default)]
+pub struct TunnelRegistry {
+    sessions: Mutex<HashMap<String, TunnelSession>>,
+    waiting: Mutex<HashMap<String, WaitingStream>>,
+    grant_active: RwLock<Option<TunnelGrantHook>>,
+}
+
+impl TunnelRegistry {
+    pub fn set_grant_active(&self, hook: Option<TunnelGrantHook>) {
+        if let Ok(mut slot) = self.grant_active.write() {
+            *slot = hook;
+        }
+    }
+
+    fn grant_hook(&self) -> Option<TunnelGrantHook> {
+        self.grant_active
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn check_grant(&self, grant_jti: &str, grant_exp_unix: Option<i64>) -> Result<()> {
+        if let Some(exp) = grant_exp_unix {
+            if agentlink_core::util::unix_now() >= exp {
+                return Err(Error::Auth("grant expired".into()));
+            }
+        }
+        if let Some(hook) = self.grant_hook() {
+            let jti = grant_jti.trim();
+            if jti.is_empty() {
+                return Err(Error::Auth("grant is required".into()));
+            }
+            if !hook(jti) {
+                return Err(Error::Auth("grant was revoked".into()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn register(
+        &self,
+        request_id: &str,
+        owner_peer: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
+    ) -> Result<CancellationToken> {
+        self.check_grant(grant_jti, grant_exp_unix)?;
+        let token = CancellationToken::new();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Error::Message("tunnel registry poisoned".into()))?;
+        sessions.insert(
+            request_id.to_string(),
+            TunnelSession {
+                owner_peer: owner_peer.to_string(),
+                grant_jti: grant_jti.trim().to_string(),
+                grant_exp_unix,
+                cancel: token.clone(),
+            },
+        );
+        Ok(token)
+    }
+
+    pub fn unregister(&self, request_id: &str) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            if let Some(session) = sessions.remove(request_id) {
+                session.cancel.cancel();
+            }
+        }
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.retain(|_, item| item.bind_request_id != request_id);
+        }
+    }
+
+    pub fn insert_waiting(
+        &self,
+        token: String,
+        stream: TcpStream,
+        owner_peer: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
+        bind_request_id: &str,
+    ) -> Result<()> {
+        let now = Instant::now();
+        let mut map = self
+            .waiting
+            .lock()
+            .map_err(|_| Error::Message("tunnel wait poisoned".into()))?;
+        map.retain(|_, item| now.saturating_duration_since(item.created_at) < WAITING_STREAM_TTL);
+        if map.len() >= MAX_WAITING_STREAMS {
+            return Err(Error::Message(format!(
+                "too many pending tunnel connections (limit {MAX_WAITING_STREAMS})"
+            )));
+        }
+        map.insert(
+            token,
+            WaitingStream {
+                stream,
+                owner_peer: owner_peer.to_string(),
+                grant_jti: grant_jti.trim().to_string(),
+                grant_exp_unix,
+                bind_request_id: bind_request_id.to_string(),
+                created_at: now,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn take_waiting(&self, token: &str, peer: &str) -> Result<TcpStream> {
+        let now = Instant::now();
+        let entry = {
+            let mut map = self
+                .waiting
+                .lock()
+                .map_err(|_| Error::Message("tunnel wait poisoned".into()))?;
+            map.retain(|_, item| {
+                now.saturating_duration_since(item.created_at) < WAITING_STREAM_TTL
+            });
+            let Some(existing) = map.get(token) else {
+                return Err(Error::Message(format!("unknown tunnel token {token}")));
+            };
+            if existing.owner_peer != peer {
+                return Err(Error::Message(format!("unknown tunnel token {token}")));
+            }
+            map.remove(token)
+        };
+        let Some(entry) = entry else {
+            return Err(Error::Message(format!("unknown tunnel token {token}")));
+        };
+        self.check_grant(&entry.grant_jti, entry.grant_exp_unix)?;
+        Ok(entry.stream)
+    }
+
+    pub fn close_all(&self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            for (_, session) in sessions.drain() {
+                session.cancel.cancel();
+            }
+        }
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.clear();
+        }
+    }
+
+    pub fn close_inactive(&self, revoked: &BTreeSet<String>) -> usize {
+        let hook = self.grant_hook();
+        let now_unix = agentlink_core::util::unix_now();
+        let now_inst = Instant::now();
+        let mut closed = 0usize;
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.retain(|_, session| {
+                let inactive = tunnel_grant_inactive(
+                    &session.grant_jti,
+                    session.grant_exp_unix,
+                    revoked,
+                    hook.as_deref(),
+                    now_unix,
+                );
+                if inactive {
+                    session.cancel.cancel();
+                    closed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.retain(|_, item| {
+                now_inst.saturating_duration_since(item.created_at) < WAITING_STREAM_TTL
+                    && !tunnel_grant_inactive(
+                        &item.grant_jti,
+                        item.grant_exp_unix,
+                        revoked,
+                        hook.as_deref(),
+                        now_unix,
+                    )
+            });
+        }
+        closed
+    }
+
+    pub fn close_expired(&self) -> usize {
+        let now_unix = agentlink_core::util::unix_now();
+        let now_inst = Instant::now();
+        let mut closed = 0usize;
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.retain(|_, session| {
+                if session.grant_exp_unix.is_some_and(|exp| now_unix >= exp) {
+                    session.cancel.cancel();
+                    closed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.retain(|_, item| {
+                now_inst.saturating_duration_since(item.created_at) < WAITING_STREAM_TTL
+                    && !item.grant_exp_unix.is_some_and(|exp| now_unix >= exp)
+            });
+        }
+        closed
+    }
+
+    #[cfg(test)]
+    pub fn active_count(&self) -> usize {
+        self.sessions.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn waiting_count(&self) -> usize {
+        self.waiting.lock().map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+fn tunnel_grant_inactive(
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
+    revoked: &BTreeSet<String>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    now_unix: i64,
+) -> bool {
+    if grant_exp_unix.is_some_and(|exp| now_unix >= exp) {
+        return true;
+    }
+    let jti = grant_jti.trim();
+    if !jti.is_empty()
+        && revoked
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(jti))
+    {
+        return true;
+    }
+    if let Some(hook) = hook {
+        if jti.is_empty() || !hook(jti) {
+            return true;
+        }
+    }
+    false
+}
+
+struct TunnelGuard {
+    registry: Arc<TunnelRegistry>,
+    request_id: String,
+}
+
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        self.registry.unregister(&self.request_id);
+    }
+}
+
+#[allow(dead_code)]
 pub struct DirectReply {
     pub public_key: String,
     pub cert_fp: String,
@@ -42,10 +320,13 @@ const SESSION_WIRE_BOUND: usize = 256;
 pub struct TransferHost {
     pub sessions: Arc<Mutex<HashMap<String, mpsc::Sender<Wire>>>>,
     pub direct_wait: Arc<Mutex<HashMap<String, oneshot::Sender<DirectReply>>>>,
+    #[allow(dead_code)]
     pub allowed: Arc<Mutex<HashMap<String, Instant>>>,
+    #[allow(dead_code)]
     pub quic: Option<Arc<QuicPeer>>,
     pub tx: mpsc::Sender<Outbound>,
     pub policy: Arc<RwLock<NodePolicy>>,
+    #[allow(dead_code)]
     pub max_policy: NodePolicy,
     pub root: Option<PathBuf>,
     pub e2e: Endpoint,
@@ -53,8 +334,10 @@ pub struct TransferHost {
     pub seals: Arc<Mutex<HashMap<String, SealTarget>>>,
     pub pending: Arc<Mutex<HashMap<String, oneshot::Sender<Envelope>>>>,
     pub audit: Arc<AuditService>,
+    pub tunnels: Arc<TunnelRegistry>,
 }
 
+#[allow(dead_code)]
 pub fn spawn_accept(
     peer: Arc<QuicPeer>,
     allowed: Arc<Mutex<HashMap<String, Instant>>>,
@@ -64,38 +347,10 @@ pub fn spawn_accept(
     audit: Arc<AuditService>,
     shutdown: CancellationToken,
 ) {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                accepted = peer.accept_one(&allowed) => {
-                    match accepted {
-                        Ok(link) => {
-                            let policy = policy.clone();
-                            let max_policy = max_policy;
-                            let root = root.clone();
-                            let audit = audit.clone();
-                            tokio::spawn(async move {
-                                if let Err(err) = serve_quic(link, &policy, max_policy, root.as_deref(), &audit).await {
-                                    tracing::debug!(error = %err, "direct transfer ended");
-                                }
-                            });
-                        }
-                        Err(Error::Timeout) => {}
-                        Err(Error::Auth(_)) => {}
-                        Err(err) => {
-                            tracing::debug!(error = %err, "quic accept ended");
-                            if shutdown.is_cancelled() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let _ = (peer, allowed, policy, max_policy, root, audit, shutdown);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn on_transfer(
     host: Arc<TransferHost>,
     request_id: String,
@@ -104,13 +359,31 @@ pub async fn on_transfer(
     msg: TransferMsg,
     session: Option<std::sync::Arc<Direction>>,
     policy: Option<NodePolicy>,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
 ) {
+    let effective_peer = if peer.is_empty() {
+        client_id.clone()
+    } else {
+        peer.clone()
+    };
     if let Some(tx) = host
         .sessions
         .lock()
         .ok()
         .and_then(|map| map.get(&request_id).cloned())
     {
+        // Only the peer that opened this transfer session may feed control messages.
+        let owner_matches = host
+            .seals
+            .lock()
+            .ok()
+            .and_then(|seals| seals.get(&request_id).map(|s| s.peer == effective_peer))
+            .unwrap_or(false);
+        if !owner_matches {
+            tracing::warn!(%request_id, "ignoring cross-peer transfer message for existing session");
+            return;
+        }
         if tx.try_send(Wire::Msg(msg)).is_err() {
             if let Ok(mut map) = host.sessions.lock() {
                 map.remove(&request_id);
@@ -122,11 +395,7 @@ pub async fn on_transfer(
         seals.insert(
             request_id.clone(),
             SealTarget {
-                peer: if peer.is_empty() {
-                    client_id.clone()
-                } else {
-                    peer
-                },
+                peer: effective_peer.clone(),
                 node_id: host.node_id.clone(),
                 client_id: client_id.clone(),
                 session,
@@ -150,6 +419,13 @@ pub async fn on_transfer(
                 let outcome = async {
                     ensure(&host, policy, true)?;
                     let dest = paths::resolve_lexical(host.root.as_deref(), &path)?;
+                    let dest =
+                        paths::ensure_path_stays_in_sandbox_at_sink(host.root.as_deref(), &dest)?;
+                    ensure_no_symlink_partial(host.root.as_deref(), &dest)?;
+                    if let Some(parent) = dest.parent() {
+                        crate::ops::create_dir_all_confined(host.root.as_deref(), parent)?;
+                    }
+                    let safe_mode = mode.map(|m| m & 0o777);
                     engine::serve_push_confined(
                         host.root.as_deref(),
                         &dest,
@@ -161,7 +437,7 @@ pub async fn on_transfer(
                         resume,
                         &mut link,
                         "relay",
-                        mode,
+                        safe_mode,
                         mtime_unix,
                     )
                     .await
@@ -211,7 +487,17 @@ pub async fn on_transfer(
                 let outcome = async {
                     ensure(&host, policy, true)?;
                     let path = paths::resolve_lexical(host.root.as_deref(), &dest)?;
-                    engine::serve_push_dir(&path, entries, &mut link, "relay").await
+                    let path =
+                        paths::ensure_path_stays_in_sandbox_at_sink(host.root.as_deref(), &path)?;
+                    validate_push_dir_manifest(host.root.as_deref(), &path, &entries)?;
+                    crate::ops::create_dir_all_confined(host.root.as_deref(), &path)?;
+                    if let Some(sandbox_root) = host.root.as_deref() {
+                        ensure_no_symlink_tar_partials(&path)?;
+                        serve_push_dir_sandboxed(sandbox_root, &path, entries, &mut link, "relay")
+                            .await
+                    } else {
+                        engine::serve_push_dir(&path, entries, &mut link, "relay").await
+                    }
                 }
                 .await;
                 finish(&host, &client_id, "push_dir", &dest, outcome, &mut link).await;
@@ -246,7 +532,19 @@ pub async fn on_transfer(
                         )));
                     }
                     let dest = paths::resolve_lexical(host.root.as_deref(), &path)?;
-                    engine::serve_push_stream_confined(host.root.as_deref(), &dest, &mut link, "relay").await
+                    let dest =
+                        paths::ensure_path_stays_in_sandbox_at_sink(host.root.as_deref(), &dest)?;
+                    ensure_no_symlink_partial(host.root.as_deref(), &dest)?;
+                    if let Some(parent) = dest.parent() {
+                        crate::ops::create_dir_all_confined(host.root.as_deref(), parent)?;
+                    }
+                    engine::serve_push_stream_confined(
+                        host.root.as_deref(),
+                        &dest,
+                        &mut link,
+                        "relay",
+                    )
+                    .await
                 }
                 .await;
                 finish(&host, &client_id, "push_stream", &path, outcome, &mut link).await;
@@ -343,67 +641,150 @@ pub async fn on_transfer(
             });
         }
 
-        TransferMsg::TunnelDial { host: remote_host, port: remote_port } => {
-            let mut link = attach(&host, &request_id, &reply_node);
+        TransferMsg::TunnelDial {
+            host: remote_host,
+            port: remote_port,
+        } => {
+            let link = attach(&host, &request_id, &reply_node);
             let req = request_id.clone();
             tokio::spawn(async move {
                 let detail = format!("{remote_host}:{remote_port}");
                 let outcome = async {
                     ensure_exec(&host, policy)?;
+                    let cancel = host.tunnels.register(
+                        &req,
+                        &effective_peer,
+                        &grant_jti,
+                        grant_exp_unix,
+                    )?;
+                    let _guard = TunnelGuard {
+                        registry: host.tunnels.clone(),
+                        request_id: req.clone(),
+                    };
                     let addr = format!("{remote_host}:{remote_port}");
-                    let stream = TcpStream::connect(&addr).await.map_err(|err| {
-                        Error::Message(format!("tunnel dial {addr}: {err}"))
-                    })?;
+                    let stream = tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::Auth("tunnel closed by grant lifecycle".into())),
+                        conn = TcpStream::connect(&addr) => conn.map_err(|err| {
+                            Error::Message(format!("tunnel dial {addr}: {err}"))
+                        })?,
+                    };
                     link.send_msg(TransferMsg::TunnelReady).await?;
-                    agentlink_core::tunnel::pump(stream, link, &req).await?;
-                    Ok::<(), Error>(())
+                    tokio::select! {
+                        _ = cancel.cancelled() => Ok::<(), Error>(()),
+                        res = agentlink_core::tunnel::pump(stream, link, &req) => res,
+                    }
                 }
                 .await;
                 if let Err(err) = outcome {
                     note_transfer(
-                        &host, &client_id, "tunnel_dial", &detail, false, Some(&err.to_string()), None,
-                        &host.node_id, &detail, "", "", "tunnel",
+                        &host,
+                        &client_id,
+                        "tunnel_dial",
+                        &detail,
+                        false,
+                        Some(&err.to_string()),
+                        None,
+                        &host.node_id,
+                        &detail,
+                        "",
+                        "",
+                        "tunnel",
                     );
                 } else {
                     note_transfer(
-                        &host, &client_id, "tunnel_dial", &detail, true, None, None,
-                        &host.node_id, &detail, "", "", "tunnel",
+                        &host,
+                        &client_id,
+                        "tunnel_dial",
+                        &detail,
+                        true,
+                        None,
+                        None,
+                        &host.node_id,
+                        &detail,
+                        "",
+                        "",
+                        "tunnel",
                     );
                 }
             });
         }
         TransferMsg::TunnelBind { port } => {
             let mut control = attach(&host, &request_id, &reply_node);
+            let req = request_id.clone();
             tokio::spawn(async move {
-                if let Err(err) = run_tunnel_bind(&host, policy, port, &mut control, &client_id).await {
+                if let Err(err) = run_tunnel_bind(
+                    &host,
+                    policy,
+                    port,
+                    &mut control,
+                    &client_id,
+                    &req,
+                    &effective_peer,
+                    &grant_jti,
+                    grant_exp_unix,
+                )
+                .await
+                {
                     let _ = control
                         .send_msg(TransferMsg::Failed {
                             message: err.to_string(),
                         })
                         .await;
                     note_transfer(
-                        &host, &client_id, "tunnel_bind", &format!("127.0.0.1:{port}"), false,
-                        Some(&err.to_string()), None, &host.node_id, "", "", "", "tunnel",
+                        &host,
+                        &client_id,
+                        "tunnel_bind",
+                        &format!("127.0.0.1:{port}"),
+                        false,
+                        Some(&err.to_string()),
+                        None,
+                        &host.node_id,
+                        "",
+                        "",
+                        "",
+                        "tunnel",
                     );
                 }
             });
         }
         TransferMsg::TunnelAccept { token } => {
-            let mut link = attach(&host, &request_id, &reply_node);
+            let link = attach(&host, &request_id, &reply_node);
             let req = request_id.clone();
             tokio::spawn(async move {
                 let outcome = async {
                     ensure_exec(&host, policy)?;
-                    let stream = take_waiting_stream(&token)?;
+                    let cancel = host.tunnels.register(
+                        &req,
+                        &effective_peer,
+                        &grant_jti,
+                        grant_exp_unix,
+                    )?;
+                    let _guard = TunnelGuard {
+                        registry: host.tunnels.clone(),
+                        request_id: req.clone(),
+                    };
+                    let stream = host.tunnels.take_waiting(&token, &effective_peer)?;
                     link.send_msg(TransferMsg::TunnelReady).await?;
-                    agentlink_core::tunnel::pump(stream, link, &req).await?;
-                    Ok::<(), Error>(())
+                    tokio::select! {
+                        _ = cancel.cancelled() => Ok::<(), Error>(()),
+                        res = agentlink_core::tunnel::pump(stream, link, &req) => res,
+                    }
                 }
                 .await;
                 if let Err(err) = outcome {
                     note_transfer(
-                        &host, &client_id, "tunnel_accept", &token, false, Some(&err.to_string()), None,
-                        &host.node_id, &token, "", "", "tunnel",
+                        &host,
+                        &client_id,
+                        "tunnel_accept",
+                        &token,
+                        false,
+                        Some(&err.to_string()),
+                        None,
+                        &host.node_id,
+                        &token,
+                        "",
+                        "",
+                        "tunnel",
                     );
                 }
             });
@@ -413,21 +794,6 @@ pub async fn on_transfer(
             tracing::debug!(?other, "transfer message had no session");
         }
     }
-}
-
-
-
-fn waiting_streams() -> &'static Mutex<HashMap<String, TcpStream>> {
-    static MAP: OnceLock<Mutex<HashMap<String, TcpStream>>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn take_waiting_stream(token: &str) -> Result<TcpStream> {
-    waiting_streams()
-        .lock()
-        .map_err(|_| Error::Message("tunnel wait poisoned".into()))?
-        .remove(token)
-        .ok_or_else(|| Error::Message(format!("unknown tunnel token {token}")))
 }
 
 fn ensure_exec(host: &TransferHost, policy: Option<NodePolicy>) -> Result<()> {
@@ -444,14 +810,26 @@ fn ensure_exec(host: &TransferHost, policy: Option<NodePolicy>) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tunnel_bind(
     host: &Arc<TransferHost>,
     policy: Option<NodePolicy>,
     port: u16,
     control: &mut Link,
     client_id: &str,
+    request_id: &str,
+    owner_peer: &str,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
 ) -> Result<()> {
     ensure_exec(host, policy)?;
+    let cancel = host
+        .tunnels
+        .register(request_id, owner_peer, grant_jti, grant_exp_unix)?;
+    let _guard = TunnelGuard {
+        registry: host.tunnels.clone(),
+        request_id: request_id.to_string(),
+    };
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|err| Error::Message(format!("tunnel bind 127.0.0.1:{port}: {err}")))?;
@@ -474,26 +852,372 @@ async fn run_tunnel_bind(
         "tunnel",
     );
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .map_err(|err| Error::Message(format!("tunnel accept: {err}")))?;
-        let token = Uuid::new_v4().to_string();
-        waiting_streams()
-            .lock()
-            .map_err(|_| Error::Message("tunnel wait poisoned".into()))?
-            .insert(token.clone(), stream);
-        if control
-            .send_msg(TransferMsg::TunnelIncoming {
-                token: token.clone(),
-            })
-            .await
-            .is_err()
-        {
-            break;
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            ctrl = control.recv() => {
+                match ctrl {
+                    Ok(Wire::Msg(TransferMsg::Failed { .. })) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted
+                    .map_err(|err| Error::Message(format!("tunnel accept: {err}")))?;
+                let token = Uuid::new_v4().to_string();
+                if let Err(err) = host.tunnels.insert_waiting(
+                    token.clone(),
+                    stream,
+                    owner_peer,
+                    grant_jti,
+                    grant_exp_unix,
+                    request_id,
+                ) {
+                    tracing::warn!(error = %err, "dropping incoming tunnel connection");
+                    continue;
+                }
+                if control
+                    .send_msg(TransferMsg::TunnelIncoming {
+                        token: token.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Refuse pre-existing symlink partial/journal files inside a sandboxed write
+/// destination (blocks SEC-04 `.x.agentlink-partial -> hop/../../../../outside`
+/// symlink planting even before `serve_push_confined` opens the partial path).
+fn ensure_no_symlink_partial(root: Option<&Path>, dest: &Path) -> Result<()> {
+    if root.is_none() {
+        return Ok(());
+    }
+    let (partial, journal) = engine::partial_paths(dest);
+    for candidate in [partial, journal] {
+        if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+            if paths::is_link_entry(&meta) {
+                return Err(Error::PermissionDenied(format!(
+                    "refusing to write through symlink partial file: {}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_symlink_tar_partials(dest: &Path) -> Result<()> {
+    for name in [".agentlink-tar.partial", ".agentlink-tar.partial.json"] {
+        let candidate = dest.join(name);
+        if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+            if paths::is_link_entry(&meta) {
+                return Err(Error::PermissionDenied(format!(
+                    "refusing to write through symlink tar partial: {}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate `PushDir` manifest entries (including multi-hop symlink chains)
+/// against `sandbox_root` before accepting the tar payload.
+fn validate_push_dir_manifest(
+    sandbox_root: Option<&Path>,
+    dest: &Path,
+    entries: &[ManifestEntry],
+) -> Result<()> {
+    let mut symlink_map: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for entry in entries {
+        if entry.rel.is_empty() || entry.rel.contains('\0') {
+            return Err(Error::PermissionDenied("invalid manifest path".into()));
+        }
+        let rel = Path::new(&entry.rel);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            return Err(Error::PermissionDenied(format!(
+                "manifest path escapes directory: {}",
+                entry.rel
+            )));
+        }
+        if let Some(target) = &entry.symlink {
+            let t = Path::new(target);
+            if t.is_absolute()
+                || t.components()
+                    .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+            {
+                return Err(Error::PermissionDenied(format!(
+                    "symlink target escapes directory: {target}"
+                )));
+            }
+            let norm_rel = clean_rel_path(rel);
+            symlink_map.insert(norm_rel, t.to_path_buf());
+        }
+    }
+    let Some(root) = sandbox_root else {
+        return Ok(());
+    };
+    let root_c = paths::strip_verbatim_prefix(&std::fs::canonicalize(root)?);
+    let dest_base = paths::ensure_path_stays_in_sandbox_at_sink(Some(root), dest)?;
+    for (link_rel, raw_target) in &symlink_map {
+        // Resolve component-by-component without prematurely collapsing `sym/..`,
+        // matching kernel symlink traversal (`namei`) so chained symlinks like
+        // `d1/d2/d3/hop -> ../../..` + `d1/d2/d3/x -> hop/../../../../outside`
+        // are caught before accepting the tar payload.
+        let mut cur: Vec<std::ffi::OsString> = link_rel
+            .parent()
+            .map(|p| {
+                p.components()
+                    .filter_map(|c| match c {
+                        Component::Normal(s) => Some(s.to_os_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut queue: VecDeque<Component<'_>> = raw_target.components().collect();
+        let mut owned_targets: Vec<PathBuf> = Vec::new();
+        let mut queue_tokens: VecDeque<ManifestPathTok> = queue
+            .drain(..)
+            .map(ManifestPathTok::from_component)
+            .collect();
+        let mut hops = 0usize;
+        while let Some(tok) = queue_tokens.pop_front() {
+            match tok {
+                ManifestPathTok::RootOrPrefix => {
+                    return Err(Error::PermissionDenied(format!(
+                        "manifest symlink escapes sandbox: {} -> {}",
+                        link_rel.display(),
+                        raw_target.display()
+                    )));
+                }
+                ManifestPathTok::CurDir => {}
+                ManifestPathTok::ParentDir => {
+                    if cur.pop().is_none() {
+                        return Err(Error::PermissionDenied(format!(
+                            "manifest symlink escapes sandbox: {} -> {}",
+                            link_rel.display(),
+                            raw_target.display()
+                        )));
+                    }
+                }
+                ManifestPathTok::Normal(name) => {
+                    cur.push(name);
+                    let probe: PathBuf = cur.iter().collect();
+                    if let Some(next_target) = symlink_map.get(&probe) {
+                        hops += 1;
+                        if hops > paths::MAX_SYMLINK_HOPS {
+                            return Err(Error::PermissionDenied(format!(
+                                "too many symlink hops in manifest: {}",
+                                link_rel.display()
+                            )));
+                        }
+                        cur.pop();
+                        let next_toks: Vec<ManifestPathTok> = next_target
+                            .components()
+                            .map(ManifestPathTok::from_component)
+                            .collect();
+                        for t in next_toks.into_iter().rev() {
+                            queue_tokens.push_front(t);
+                        }
+                        continue;
+                    }
+                    let disk_path = dest_base.join(&probe);
+                    if let Ok(meta) = std::fs::symlink_metadata(&disk_path) {
+                        if paths::is_link_entry(&meta) {
+                            hops += 1;
+                            if hops > paths::MAX_SYMLINK_HOPS {
+                                return Err(Error::PermissionDenied(format!(
+                                    "too many symlink hops in manifest: {}",
+                                    link_rel.display()
+                                )));
+                            }
+                            let disk_target = std::fs::read_link(&disk_path)?;
+                            owned_targets.push(disk_target);
+                            let last = owned_targets.last().expect("pushed");
+                            cur.pop();
+                            let next_toks: Vec<ManifestPathTok> = last
+                                .components()
+                                .map(ManifestPathTok::from_component)
+                                .collect();
+                            for t in next_toks.into_iter().rev() {
+                                queue_tokens.push_front(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let final_rel: PathBuf = cur.iter().collect();
+        let final_path = dest_base.join(&final_rel);
+        if !paths::is_inside_root(&root_c, &final_path)
+            || !paths::is_inside_root(&dest_base, &final_path)
+        {
+            return Err(Error::PermissionDenied(format!(
+                "manifest symlink escapes sandbox: {} -> {}",
+                link_rel.display(),
+                raw_target.display()
+            )));
+        }
+        paths::ensure_path_stays_in_sandbox_at_sink(Some(root), &final_path)?;
+    }
+    Ok(())
+}
+
+enum ManifestPathTok {
+    RootOrPrefix,
+    CurDir,
+    ParentDir,
+    Normal(std::ffi::OsString),
+}
+
+impl ManifestPathTok {
+    fn from_component(comp: Component<'_>) -> Self {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => Self::RootOrPrefix,
+            Component::CurDir => Self::CurDir,
+            Component::ParentDir => Self::ParentDir,
+            Component::Normal(s) => Self::Normal(s.to_os_string()),
+        }
+    }
+}
+
+fn clean_rel_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        if let Component::Normal(c) = comp {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Run `engine::serve_push_dir` while holding back `TransferMsg::Done` until
+/// every unpacked symlink is verified canonically against `sandbox_root` (and
+/// scrubbing any escaping multi-hop symlink chain + masking modes `& 0o777`).
+async fn serve_push_dir_sandboxed(
+    sandbox_root: &Path,
+    dest: &Path,
+    entries: Vec<ManifestEntry>,
+    real_link: &mut Link,
+    transport: &str,
+) -> Result<TransferStats> {
+    let (mut inner_link, mut proxy) = Link::pair(64);
+    let mut held_done: Option<TransferMsg> = None;
+    let dest_buf = dest.to_path_buf();
+    let transport_s = transport.to_string();
+    let mut serve_fut = std::pin::pin!(async move {
+        engine::serve_push_dir(&dest_buf, entries, &mut inner_link, &transport_s).await
+    });
+    let serve_result = loop {
+        tokio::select! {
+            res = &mut serve_fut => break res,
+            from_client = real_link.inp.recv() => {
+                match from_client {
+                    Some(wire) => {
+                        if proxy.out.send(wire).await.is_err() {
+                            break serve_fut.await;
+                        }
+                    }
+                    None => {
+                        drop(proxy.out);
+                        break serve_fut.await;
+                    }
+                }
+            }
+            from_server = proxy.inp.recv() => {
+                match from_server {
+                    Some(Wire::Msg(done @ TransferMsg::Done { .. })) => {
+                        held_done = Some(done);
+                    }
+                    Some(wire) => {
+                        if real_link.out.send(wire).await.is_err() {
+                            break Err(Error::Message("connection closed".into()));
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    };
+    while let Ok(wire) = proxy.inp.try_recv() {
+        match wire {
+            Wire::Msg(done @ TransferMsg::Done { .. }) => held_done = Some(done),
+            other => {
+                let _ = real_link.out.send(other).await;
+            }
+        }
+    }
+    let stats = serve_result?;
+    verify_and_harden_unpacked_dir(sandbox_root, dest)?;
+    if let Some(done) = held_done {
+        real_link.send_msg(done).await?;
+    }
+    Ok(stats)
+}
+
+/// Verify every unpacked symlink stays inside `sandbox_root` (following chains),
+/// immediately scrub any escaping symlink, and strip special mode bits (`& 0o777`).
+fn verify_and_harden_unpacked_dir(sandbox_root: &Path, dir: &Path) -> Result<()> {
+    let mut escaped: Vec<PathBuf> = Vec::new();
+    walk_verify_and_mask(sandbox_root, dir, &mut escaped)?;
+    if !escaped.is_empty() {
+        return Err(Error::PermissionDenied(format!(
+            "pushed directory contained {} symlink(s) escaping sandbox",
+            escaped.len()
+        )));
+    }
+    Ok(())
+}
+
+fn walk_verify_and_mask(sandbox_root: &Path, dir: &Path, escaped: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if paths::is_link_entry(&meta) {
+            if paths::ensure_moved_symlinks_stay_inside(Some(sandbox_root), &path, &path).is_err() {
+                let _ = paths::remove_link_entry(&path, &meta);
+                escaped.push(path);
+            }
+        } else if meta.is_dir() {
+            mask_special_mode_bits(&path, &meta);
+            walk_verify_and_mask(sandbox_root, &path, escaped)?;
+        } else {
+            mask_special_mode_bits(&path, &meta);
+        }
+    }
+    Ok(())
+}
+
+fn mask_special_mode_bits(path: &Path, meta: &std::fs::Metadata) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        let clean = mode & 0o777;
+        if (mode & 0o7777) != clean {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(clean));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, meta);
+    }
 }
 
 /// Deliver a relay rejection to a transfer that is still waiting.
@@ -877,11 +1601,8 @@ async fn peer_copy(
     }
     let _direct = direct;
     let request_id = Uuid::new_v4().to_string();
-    // Node-to-node bytes stay sealed. If the peer handshake fails, the copy
-    // still uses the relay, and each frame is sealed to that peer.
-    if let Err(err) = ensure_peer(host, dst_node).await {
-        tracing::warn!(error = %err, peer = %dst_node, "peer e2e unavailable; using relay cleartext");
-    }
+    // Node-to-node bytes stay sealed. Fail closed if the peer handshake fails.
+    ensure_peer(host, dst_node).await?;
     if let Ok(mut seals) = host.seals.lock() {
         seals.insert(
             request_id.clone(),
@@ -950,8 +1671,9 @@ fn copy_tree(root: Option<&Path>, src: &Path, dest: &Path) -> Result<(u64, u32)>
 
 
 
+#[allow(dead_code)]
 async fn serve_quic(
-    mut link: Link,
+    link: Link,
     policy: &RwLock<NodePolicy>,
     max_policy: NodePolicy,
     root: Option<&Path>,
@@ -964,6 +1686,7 @@ async fn serve_quic(
     ))
 }
 
+#[allow(dead_code)]
 fn audit_result(audit: &AuditService, op: &str, detail: &str, result: &Result<TransferStats>) {
     let (ok, error) = match result {
         Ok(_) => (true, None),
@@ -1138,6 +1861,7 @@ mod tests {
             )]))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             audit: crate::pipeline::AuditService::open_quiet(dir.path(), "node", "node"),
+            tunnels: Arc::new(TunnelRegistry::default()),
         };
         std::mem::forget(dir);
 
@@ -1227,6 +1951,7 @@ mod tests {
             seals: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             audit: crate::pipeline::AuditService::open_quiet(dir.path(), "node", "node"),
+            tunnels: Arc::new(TunnelRegistry::default()),
         };
         (host, dir)
     }
@@ -1254,5 +1979,120 @@ mod tests {
         // A provided policy still does not read the poisoned lock.
         ensure(&host, Some(NodePolicy::full()), false).unwrap();
         ensure_exec(&host, Some(NodePolicy::full())).unwrap();
+    }
+
+    #[test]
+    fn push_dir_manifest_rejects_multi_hop_symlink_chain_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        let dest = sandbox.join("up");
+        std::fs::create_dir_all(&dest).unwrap();
+        let entries = vec![
+            ManifestEntry {
+                rel: "d1/d2/d3/hop".into(),
+                size: 0,
+                hash: String::new(),
+                dir: false,
+                symlink: Some("../../..".into()),
+            },
+            ManifestEntry {
+                rel: "d1/d2/d3/.x.agentlink-partial".into(),
+                size: 0,
+                hash: String::new(),
+                dir: false,
+                symlink: Some("hop/../../../../outside/target".into()),
+            },
+        ];
+        let err = validate_push_dir_manifest(Some(&sandbox), &dest, &entries)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_refuses_preexisting_symlink_partial_file_under_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let dest = sandbox.join("x");
+        let (partial, _) = engine::partial_paths(&dest);
+        std::os::unix::fs::symlink(outside.join("target"), &partial).unwrap();
+        let err = ensure_no_symlink_partial(Some(&sandbox), &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tunnel_registry_enforces_peer_ownership_revoke_and_bind_drop() {
+        let reg = Arc::new(TunnelRegistry::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (c_res, a_res) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let _client = c_res.unwrap();
+        let (server_stream, _) = a_res.unwrap();
+
+        reg.insert_waiting(
+            "tok-1".into(),
+            server_stream,
+            "alice",
+            "jti-t1",
+            None,
+            "bind-1",
+        )
+        .unwrap();
+        assert_eq!(reg.waiting_count(), 1);
+        // Bob cannot steal Alice's waiting stream.
+        assert!(reg.take_waiting("tok-1", "bob").is_err());
+        assert_eq!(reg.waiting_count(), 1);
+        // Revoking Alice's grant drops the waiting stream and cancels the tunnel.
+        let tok = reg.register("dial-1", "alice", "jti-t1", None).unwrap();
+        assert!(!tok.is_cancelled());
+        let mut revoked = BTreeSet::new();
+        revoked.insert("jti-t1".into());
+        assert_eq!(reg.close_inactive(&revoked), 1);
+        assert!(tok.is_cancelled());
+        assert_eq!(reg.waiting_count(), 0);
+        assert_eq!(reg.active_count(), 0);
+
+        // Dropping control link immediately terminates `run_tunnel_bind` and frees the port.
+        let (host, _dir) = host_with_policy(NodePolicy::full());
+        let host = Arc::new(host);
+        let (mut ctrl_server, mut ctrl_client) = Link::pair(8);
+        let host_bg = host.clone();
+        let bind_task = tokio::spawn(async move {
+            run_tunnel_bind(
+                &host_bg,
+                Some(NodePolicy::full()),
+                0,
+                &mut ctrl_server,
+                "alice",
+                "req-bind",
+                "alice",
+                "jti-b1",
+                None,
+            )
+            .await
+        });
+        let bound_port = match tokio::time::timeout(Duration::from_secs(3), ctrl_client.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Wire::Msg(TransferMsg::TunnelBound { port }) => port,
+            other => panic!("expected TunnelBound, got {other:?}"),
+        };
+        assert!(bound_port > 0);
+        assert_eq!(host.tunnels.active_count(), 1);
+        drop(ctrl_client);
+        let res = tokio::time::timeout(Duration::from_secs(3), bind_task)
+            .await
+            .expect("run_tunnel_bind must exit when control drops")
+            .expect("join");
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(host.tunnels.active_count(), 0);
     }
 }

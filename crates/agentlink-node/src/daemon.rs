@@ -1,19 +1,20 @@
 //! Outbound connection loop.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use agentlink_core::confirm::ConfirmPolicy;
+use agentlink_core::confirm::{ConfirmPolicy, ConfirmRule};
 use agentlink_core::e2e::Endpoint;
 use agentlink_core::p2p::QuicPeer;
-use agentlink_core::protocol::{Envelope, Role, PROTOCOL_VERSION};
+use agentlink_core::protocol::{Envelope, Op, Role, TransferMsg, PROTOCOL_VERSION};
 use agentlink_core::sandbox::CommandPolicy;
 use agentlink_core::tls;
 use agentlink_core::ws::{self, Incoming, Outbound};
 use agentlink_core::{Error, Identity, NodeExtension, NodePolicy, Result};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -30,9 +31,9 @@ use tokio_util::sync::CancellationToken;
 use crate::audit;
 use crate::ops::{dispatch, OpContext, Responder};
 use crate::pty_session::PtyManager;
-use crate::resume::{ReplayLog, Sessions, SocketSlot};
+use crate::resume::{ReplayLog, ReplayOwner, Sessions, SocketSlot};
 use crate::status::{self, LinkState};
-use crate::transfer::{self, TransferHost};
+use crate::transfer::{self, TransferHost, TunnelRegistry};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -125,13 +126,11 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
             "owner keys loaded; remote control needs a grant signed by one of them"
         );
     }
-    let revoked_jtis = agentlink_core::grant::refresh_revoked_jtis(
-        &config.data_dir,
-        &std::collections::BTreeSet::new(),
-    );
-    if !revoked_jtis.is_empty() {
+    let revoked_cache = Arc::new(RevokedJtiCache::new(config.data_dir.clone()));
+    let revoked_initial = revoked_cache.current();
+    if !revoked_initial.is_empty() {
         tracing::info!(
-            jtis = revoked_jtis.len(),
+            jtis = revoked_initial.len(),
             "revoked grant jtis loaded; matching grants are rejected"
         );
     }
@@ -142,57 +141,31 @@ pub async fn run(mut config: NodeConfig, shutdown: CancellationToken) -> Result<
         service: service.clone(),
         data_dir: config.data_dir.clone(),
         owner_keys: RwLock::new(owner_keys),
-        revoked_jtis: RwLock::new(revoked_jtis),
+        revoked_cache,
         commands: load_commands(&config.data_dir),
         confirm: load_confirm(&config.data_dir),
         pending: Arc::new(Mutex::new(HashMap::new())),
         approvals: Arc::new(Mutex::new(HashMap::new())),
         procs: ProcManager::new(),
         watches: WatchManager::default(),
+        tunnels: Arc::new(TunnelRegistry::default()),
         socket: Arc::new(SocketSlot::default()),
         sessions: Arc::new(Sessions::default()),
         pty: PtyManager::default(),
         cancels: Arc::new(Mutex::new(HashMap::new())),
-        grant_sessions: Mutex::new(HashMap::new()),
+        grant_sessions: Arc::new(Mutex::new(HashMap::new())),
         extensions: config.extensions.clone(),
     });
-    {
-        let dir = live.data_dir.clone();
-        live.pty.set_grant_active(Some(std::sync::Arc::new(move |jti: &str| {
-            match agentlink_core::grant::load_revoked_jtis(&dir) {
-                Ok(revoked) => !revoked
-                    .iter()
-                    .any(|item| item.trim().eq_ignore_ascii_case(jti.trim())),
-                Err(_) => false,
-            }
-        })));
-    }
+    wire_grant_hooks(&live);
     pipeline::spawn_recorder(service.clone(), config.capture.clone());
 
     // `--max-access` is this machine's ceiling. A grant cannot raise it,
     // and a relay policy update cannot either.
     let policy = Arc::new(RwLock::new(config.max_policy));
     let allowed = Arc::new(Mutex::new(HashMap::new()));
-    let relay_udp = agentlink_core::p2p::relay_addr_from_url(&config.relay_url).ok();
-    let quic = match QuicPeer::bind(&identity, relay_udp) {
-        Ok(peer) => {
-            let peer = Arc::new(peer);
-            transfer::spawn_accept(
-                peer.clone(),
-                allowed.clone(),
-                policy.clone(),
-                config.max_policy,
-                config.root.clone(),
-                service.clone(),
-                shutdown.clone(),
-            );
-            Some(peer)
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "direct path unavailable");
-            None
-        }
-    };
+    // Direct offers are disabled (SEC-19 / DESK-24): do not bind or spawn the
+    // dormant unauthenticated `0.0.0.0:0` QUIC listener.
+    let quic: Option<Arc<QuicPeer>> = None;
 
     let mut backoff = agentlink_core::resume::Backoff::new();
     let mut fast = false;
@@ -278,6 +251,180 @@ fn persist_config(config: &NodeConfig) {
     }
 }
 
+struct CancelEntry {
+    token: CancellationToken,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
+}
+
+struct GrantSessionEntry {
+    request_id: String,
+    token: CancellationToken,
+    grant_exp_unix: Option<i64>,
+}
+
+struct CachedRevoked {
+    jtis: BTreeSet<String>,
+    mtime: Option<SystemTime>,
+    len: Option<u64>,
+    last_check: Instant,
+}
+
+/// Cached view of `revoked-grants.json` backed by an `RwLock`, file metadata
+/// (`mtime` + `len`), and an optional `notify` watcher. Avoids per-keystroke
+/// disk reads and preserves the last-known-good set across transient Windows
+/// replace-lock errors so live shells are never killed by a transient read error.
+struct RevokedJtiCache {
+    data_dir: PathBuf,
+    state: RwLock<CachedRevoked>,
+    dirty: Arc<AtomicBool>,
+    _watcher: Option<RecommendedWatcher>,
+}
+
+impl RevokedJtiCache {
+    const CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+    fn new(data_dir: PathBuf) -> Self {
+        let path = data_dir.join(agentlink_core::grant::REVOKED_GRANTS_FILE);
+        let (mtime, len) = file_sig(&path);
+        let initial =
+            agentlink_core::grant::refresh_revoked_jtis(&data_dir, &BTreeSet::new());
+        let dirty = Arc::new(AtomicBool::new(false));
+        let dirty_cb = dirty.clone();
+        let watcher = notify::recommended_watcher(
+            move |res: std::result::Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let relevant = event.paths.is_empty()
+                        || event.paths.iter().any(|p| {
+                            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                                n.eq_ignore_ascii_case(agentlink_core::grant::REVOKED_GRANTS_FILE)
+                                    || n.contains("revoked-grants")
+                            })
+                        });
+                    if relevant {
+                        dirty_cb.store(true, Ordering::Release);
+                    }
+                }
+            },
+        )
+        .ok()
+        .and_then(|mut w| {
+            w.watch(&data_dir, RecursiveMode::NonRecursive).ok()?;
+            Some(w)
+        });
+        Self {
+            data_dir,
+            state: RwLock::new(CachedRevoked {
+                jtis: initial,
+                mtime,
+                len,
+                last_check: Instant::now(),
+            }),
+            dirty,
+            _watcher: watcher,
+        }
+    }
+
+    fn current(&self) -> BTreeSet<String> {
+        self.refresh(false)
+    }
+
+    fn current_forced(&self) -> BTreeSet<String> {
+        self.refresh(true)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    fn is_active(&self, jti: &str) -> bool {
+        let jti = jti.trim();
+        if jti.is_empty() {
+            return false;
+        }
+        if !self.dirty.load(Ordering::Acquire) {
+            if let Ok(guard) = self.state.read() {
+                if guard.last_check.elapsed() < Self::CHECK_INTERVAL {
+                    return !guard
+                        .jtis
+                        .iter()
+                        .any(|item| item.trim().eq_ignore_ascii_case(jti));
+                }
+            }
+        }
+        let revoked = self.refresh(false);
+        !revoked
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(jti))
+    }
+
+    fn refresh(&self, force: bool) -> BTreeSet<String> {
+        let was_dirty = self.dirty.swap(false, Ordering::AcqRel);
+        if !force && !was_dirty {
+            if let Ok(guard) = self.state.read() {
+                if guard.last_check.elapsed() < Self::CHECK_INTERVAL {
+                    return guard.jtis.clone();
+                }
+            }
+        }
+        let path = self
+            .data_dir
+            .join(agentlink_core::grant::REVOKED_GRANTS_FILE);
+        let (mtime, len) = file_sig(&path);
+        if !force && !was_dirty {
+            if let Ok(guard) = self.state.read() {
+                if guard.mtime == mtime && guard.len == len {
+                    let snapshot = guard.jtis.clone();
+                    drop(guard);
+                    if let Ok(mut w) = self.state.write() {
+                        w.last_check = Instant::now();
+                    }
+                    return snapshot;
+                }
+            }
+        }
+        match agentlink_core::grant::load_revoked_jtis(&self.data_dir) {
+            Ok(fresh) => {
+                if let Ok(mut w) = self.state.write() {
+                    w.jtis = fresh.clone();
+                    w.mtime = mtime;
+                    w.len = len;
+                    w.last_check = Instant::now();
+                }
+                fresh
+            }
+            Err(_) => {
+                // Transient Windows replace lock or partial write: keep last-good
+                // set and mark dirty so the next check retries without killing
+                // live shells.
+                self.dirty.store(true, Ordering::Release);
+                self.state
+                    .read()
+                    .map(|g| g.jtis.clone())
+                    .unwrap_or_default()
+            }
+        }
+    }
+}
+
+fn file_sig(path: &Path) -> (Option<SystemTime>, Option<u64>) {
+    match std::fs::metadata(path) {
+        Ok(meta) => (meta.modified().ok(), Some(meta.len())),
+        Err(_) => (None, None),
+    }
+}
+
+fn wire_grant_hooks(live: &Live) {
+    let cache = live.revoked_cache.clone();
+    let hook: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+        Arc::new(move |jti: &str| cache.is_active(jti));
+    live.pty.set_grant_active(Some(hook.clone()));
+    live.procs.set_grant_active(Some(hook.clone()));
+    live.watches.set_grant_active(Some(hook.clone()));
+    live.tunnels.set_grant_active(Some(hook));
+}
+
 struct Live {
     endpoint: Endpoint,
     node_id: String,
@@ -288,29 +435,30 @@ struct Live {
     data_dir: PathBuf,
     /// Local issuer keys. Remote control is denied until one of these keys
     /// has signed a grant for the end-to-end peer. Relay stamps are not read.
-    owner_keys: RwLock<std::collections::BTreeSet<String>>,
-    /// Last good revoked-jti deny-list, reloaded from the data dir before each
-    /// authz decision so `grant revoke --data-dir` applies without a restart.
-    revoked_jtis: RwLock<std::collections::BTreeSet<String>>,
+    owner_keys: RwLock<BTreeSet<String>>,
+    /// Cached revoked-jti deny-list with mtime + filesystem watcher.
+    revoked_cache: Arc<RevokedJtiCache>,
     commands: CommandPolicy,
     confirm: ConfirmPolicy,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Envelope>>>>,
     approvals: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     procs: ProcManager,
     watches: WatchManager,
+    tunnels: Arc<TunnelRegistry>,
     socket: Arc<SocketSlot>,
     sessions: Arc<Sessions>,
     pty: PtyManager,
-    cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    /// jti -> in-flight request ids. A local revoke closes these.
-    grant_sessions: Mutex<HashMap<String, Vec<(String, CancellationToken)>>>,
+    cancels: Arc<Mutex<HashMap<String, CancelEntry>>>,
+    /// jti -> in-flight request entries. Pruned on completion and cancelled on
+    /// local revoke or expiry.
+    grant_sessions: Arc<Mutex<HashMap<String, Vec<GrantSessionEntry>>>>,
     extensions: Vec<Arc<dyn NodeExtension>>,
 }
 
 impl Live {
     /// Reload `owner-keys.json` and update the cache. Falls back to the last
     /// good set when the file is unreadable.
-    fn current_owner_keys(&self) -> std::collections::BTreeSet<String> {
+    fn current_owner_keys(&self) -> BTreeSet<String> {
         let cached = self
             .owner_keys
             .read()
@@ -323,19 +471,58 @@ impl Live {
         fresh
     }
 
-    /// Reload `revoked-grants.json` and update the cache. Falls back to the
-    /// last good set when the file is unreadable.
-    fn current_revoked_jtis(&self) -> std::collections::BTreeSet<String> {
-        let cached = self
-            .revoked_jtis
-            .read()
-            .map(|jtis| jtis.clone())
-            .unwrap_or_default();
-        let fresh = agentlink_core::grant::refresh_revoked_jtis(&self.data_dir, &cached);
-        if let Ok(mut guard) = self.revoked_jtis.write() {
-            *guard = fresh.clone();
+    /// Return the cached revoked-jti set, refreshing on mtime/watcher changes
+    /// while preserving last-good entries on transient lock errors.
+    fn current_revoked_jtis(&self) -> BTreeSet<String> {
+        self.revoked_cache.current()
+    }
+}
+
+struct ApprovalGuard {
+    approvals: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    approval_id: String,
+}
+
+impl Drop for ApprovalGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.approvals.lock() {
+            map.remove(&self.approval_id);
         }
-        fresh
+    }
+}
+
+struct GrantSessionGuard {
+    grant_sessions: Arc<Mutex<HashMap<String, Vec<GrantSessionEntry>>>>,
+    jti: Option<String>,
+    request_id: String,
+}
+
+impl Drop for GrantSessionGuard {
+    fn drop(&mut self) {
+        let Some(ref jti) = self.jti else {
+            return;
+        };
+        if let Ok(mut map) = self.grant_sessions.lock() {
+            if let Some(entries) = map.get_mut(jti) {
+                entries.retain(|entry| entry.request_id != self.request_id);
+                if entries.is_empty() {
+                    map.remove(jti);
+                }
+            }
+        }
+    }
+}
+
+struct CancelGuard {
+    cancels: Arc<Mutex<HashMap<String, CancelEntry>>>,
+    request_id: String,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.cancels.lock() {
+            map.remove(&self.request_id);
+        }
     }
 }
 
@@ -623,6 +810,7 @@ async fn connect_once(
         seals: Arc::new(Mutex::new(HashMap::new())),
         pending: live.pending.clone(),
         audit: live.service.clone(),
+        tunnels: live.tunnels.clone(),
     });
 
     let end = loop {
@@ -712,18 +900,21 @@ fn schedule_idle_cleanup(live: Arc<Live>, generation: u64) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_env(
     env: Envelope,
     tx: &mpsc::Sender<Outbound>,
     policy: &Arc<RwLock<NodePolicy>>,
-    cancels: &Arc<Mutex<HashMap<String, CancellationToken>>>,
+    cancels: &Arc<Mutex<HashMap<String, CancelEntry>>>,
     pty: &PtyManager,
     config: &NodeConfig,
     extensions: &[Arc<dyn NodeExtension>],
     host: &Arc<TransferHost>,
     live: &Arc<Live>,
 ) {
-    sweep_revoked_sessions(live);
+    if live.revoked_cache.is_dirty() {
+        enforce_live_grants(live, false);
+    }
     if let Envelope::E2eWelcome { request_id, .. } = &env {
         if let Some(waiter) = live
             .pending
@@ -879,31 +1070,60 @@ async fn handle_env(
             tracing::info!(access = effective.preset_name(), "policy updated");
         }
         Envelope::Session { cursors, .. } => {
+            // SEC-01: Only accept session cursor updates from an authenticated
+            // E2E peer, bound to that peer's own requests with live grants.
+            let Some(seal_ref) = seal.as_ref() else {
+                tracing::debug!("ignoring unsealed plaintext Session cursor update");
+                return;
+            };
             let pairs: Vec<(String, u64)> = cursors
                 .into_iter()
                 .map(|cursor| (cursor.request_id, cursor.seq))
                 .collect();
-            live.sessions.note_cursors(&pairs);
+            let revoked = live.current_revoked_jtis();
+            let now = agentlink_core::util::unix_now();
+            live.sessions
+                .note_cursors_for(&seal_ref.peer, &pairs, &revoked, now);
         }
         Envelope::Cancel { request_id, .. } => {
+            // SEC-01 / SEC-08: Reject unsealed Cancel and verify owner + live
+            // grant before cancelling an op or aborting portal ScreenCast pickers.
+            let Some(seal_ref) = seal.as_ref() else {
+                tracing::warn!(%request_id, "ignoring unsealed plaintext Cancel");
+                return;
+            };
+            let revoked = live.current_revoked_jtis();
+            let now = agentlink_core::util::unix_now();
             let known = if let Ok(map) = cancels.lock() {
-                if let Some(token) = map.get(&request_id) {
-                    token.cancel();
-                    true
+                if let Some(entry) = map.get(&request_id) {
+                    let owner_ok = entry.owner_peer == seal_ref.peer;
+                    let expired = entry.grant_exp_unix.is_some_and(|exp| now >= exp);
+                    let jti = entry.grant_jti.trim();
+                    let is_revoked = !jti.is_empty()
+                        && revoked
+                            .iter()
+                            .any(|item| item.trim().eq_ignore_ascii_case(jti));
+                    if owner_ok && !expired && !is_revoked {
+                        entry.token.cancel();
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
             } else {
                 false
             };
-            tracing::info!(
-                %request_id,
-                known,
-                "received Cancel; aborting the op and closing any live portal ScreenCast handles"
-            );
-            // Capture waits on a current-thread desktop runtime, so the
-            // CancellationToken alone will not Close the official picker.
-            agentlink_desktop::abort_live_portal_pickers();
+            if known {
+                tracing::info!(
+                    %request_id,
+                    "received authenticated Cancel; aborting op and closing live portal ScreenCast handles"
+                );
+                agentlink_desktop::abort_live_portal_pickers();
+            } else {
+                tracing::debug!(%request_id, "ignoring Cancel with no matching owner entry");
+            }
         }
         Envelope::Invoke {
             request_id,
@@ -915,79 +1135,98 @@ async fn handle_env(
             device_id,
             ..
         } => {
-            if let Some(log) = live.sessions.existing(&request_id) {
-                replay_log(&log, live.sessions.cursor(&request_id), seal.as_ref(), tx).await;
-                return;
-            }
-            let Some(log) = live.sessions.begin(&request_id) else {
-                return;
-            };
-            live.service.touch();
-            if matches!(
-                op,
-                agentlink_core::protocol::Op::Extension { ref name, .. }
-                    if name == "screenshot" || name == "inject_input"
-            ) {
-                // JPEG fallback stays on this invoke. An agent session seals it.
-                // WebRTC picture bytes are DTLS-SRTP and are a different path.
-                live.service.touch_gui();
-            }
-            let token = CancellationToken::new();
-            if let Ok(mut map) = cancels.lock() {
-                map.insert(request_id.clone(), token.clone());
-            }
-            let extra = Arc::new(Mutex::new(pipeline::AuditExtra::default()));
-            let resp = Responder {
-                socket: live.socket.clone(),
-                request_id: request_id.clone(),
-                seal: seal.clone(),
-                extra,
-                log,
-            };
-            // The deny-list is a file on this machine. A remote revoke, even
-            // inside a sealed session, would let a controller edit that list.
-            if let agentlink_core::protocol::Op::RevokeGrant { .. } = &op {
-                let _ = resp
-                    .err("grant list is local to this node; revoke on the node host")
-                    .await;
-                if let Ok(mut map) = cancels.lock() {
-                    map.remove(&request_id);
-                }
-                return;
-            }
+            // SEC-01: Reject unsealed plaintext Invoke BEFORE touching
+            // `sessions.existing()`, `sessions.begin()`, or `cancels`.
             let Some(seal_ref) = seal.as_ref() else {
-                let _ = resp
-                    .err("control requires an end-to-end session; plaintext relay invokes are disabled")
-                    .await;
-                if let Ok(mut map) = cancels.lock() {
-                    map.remove(&request_id);
-                }
-                return;
-            };
-            // The peer is the key that opened the sealed body, not the
-            // client_id the relay wrote on the outer envelope.
-            let grantee = seal_ref.peer.clone();
-            let _relay_says = (&client_id, relay_admin, relay_grant);
-            let ceiling = policy.read().ok().map(|g| *g);
-            let Some(ceiling) = ceiling else {
                 let deny = Envelope::result_err(
-                    request_id.clone(),
-                    "node policy is unavailable",
+                    request_id,
+                    "control requires an end-to-end session; plaintext relay invokes are disabled",
                 );
                 if let Ok(out) = ws::encode(&deny) {
                     let _ = tx.send(out).await;
                 }
                 return;
             };
+            // The deny-list is a file on this machine. A remote revoke, even
+            // inside a sealed session, would let a controller edit that list.
+            if let Op::RevokeGrant { .. } = &op {
+                send_sealed_err(
+                    seal_ref,
+                    request_id,
+                    "grant list is local to this node; revoke on the node host",
+                    tx,
+                )
+                .await;
+                return;
+            }
+            // The peer is the key that opened the sealed body, not the
+            // client_id the relay wrote on the outer envelope.
+            let grantee = seal_ref.peer.clone();
+            let _relay_says = (&client_id, relay_admin, relay_grant);
+            let ceiling = policy.read().ok().map(|g| *g);
+            let Some(ceiling) = ceiling else {
+                send_sealed_err(seal_ref, request_id, "node policy is unavailable", tx).await;
+                return;
+            };
+            let now = agentlink_core::util::unix_now();
             let owner_keys = live.current_owner_keys();
             let revoked_jtis = live.current_revoked_jtis();
+            // SEC-01: Check replay BEFORE starting a new session, but ONLY
+            // after verifying `seal.is_some()`, `seal.peer == owner_peer`, and
+            // live grant validity (both stored grant and current authz).
+            if let Some(log) = live.sessions.existing(&request_id) {
+                if !log.owner().is_valid_for(&grantee, &revoked_jtis, now) {
+                    tracing::warn!(
+                        %request_id,
+                        peer = %grantee,
+                        "replay log access rejected: owner mismatch or inactive grant"
+                    );
+                    send_sealed_err(
+                        seal_ref,
+                        request_id,
+                        "replay denied: peer mismatch or grant inactive",
+                        tx,
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(err) = agentlink_core::grant::resolve_e2e_policy(
+                    &owner_keys,
+                    &revoked_jtis,
+                    authz.as_ref(),
+                    &live.node_id,
+                    &grantee,
+                    now,
+                    ceiling,
+                    false,
+                    None,
+                    grant,
+                ) {
+                    tracing::warn!(
+                        error = %err,
+                        %request_id,
+                        peer = %grantee,
+                        "replay log authz rejected"
+                    );
+                    send_sealed_err(seal_ref, request_id, err.to_string(), tx).await;
+                    return;
+                }
+                replay_log(
+                    &log,
+                    live.sessions.cursor_for(&grantee, &request_id),
+                    seal_ref,
+                    tx,
+                )
+                .await;
+                return;
+            }
             let policy_now = match agentlink_core::grant::resolve_e2e_policy(
                 &owner_keys,
                 &revoked_jtis,
                 authz.as_ref(),
                 &live.node_id,
                 &grantee,
-                agentlink_core::util::unix_now(),
+                now,
                 ceiling,
                 false,
                 None,
@@ -1001,47 +1240,70 @@ async fn handle_env(
                         node_id = %live.node_id,
                         "e2e authz rejected"
                     );
-                    let deny = Envelope::result_err(request_id.clone(), err.to_string());
-                    if let Ok(out) = ws::encode(&deny) {
-                        let _ = tx.send(out).await;
-                    }
+                    send_sealed_err(seal_ref, request_id, err.to_string(), tx).await;
                     return;
                 }
             };
-            if let Some(jti) = authz.as_ref().map(|grant| grant.jti.clone()) {
-                if let Ok(mut sessions) = live.grant_sessions.lock() {
-                    sessions
-                        .entry(jti)
-                        .or_default()
-                        .push((request_id.clone(), token.clone()));
-                }
-            }
-            let confirm_category = live.confirm.matching(&op).map(|rule| rule.category.clone());
-            let root = config.root.clone();
-            let audit_path = config.data_dir.join("audit.log");
-            let pty = pty.clone();
-            let extensions = extensions.to_vec();
-            let cancels = cancels.clone();
-            let commands = live.commands.clone();
-            let procs = live.procs.clone();
-            let watches = live.watches.clone();
-            let node_name = live.node_name.clone();
-            let node_id = live.node_id.clone();
-            let audit = live.service.clone();
-            let peer_id = grantee.clone();
             let grant_jti = authz.as_ref().map(|g| g.jti.clone());
             let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
-            let confirm_wait = confirm_category.map(|category| {
+            let owner = ReplayOwner {
+                owner_peer: grantee.clone(),
+                grant_jti: grant_jti.clone().unwrap_or_default(),
+                grant_exp_unix,
+            };
+            let Some(log) = live.sessions.begin_for(&request_id, owner) else {
+                return;
+            };
+            live.service.touch();
+            if matches!(
+                op,
+                Op::Extension { ref name, .. }
+                    if name == "screenshot" || name == "inject_input"
+            ) {
+                // JPEG fallback stays on this invoke. An agent session seals it.
+                // WebRTC picture bytes are DTLS-SRTP and are a different path.
+                live.service.touch_gui();
+            }
+            let token = CancellationToken::new();
+            if let Ok(mut map) = cancels.lock() {
+                map.insert(
+                    request_id.clone(),
+                    CancelEntry {
+                        token: token.clone(),
+                        owner_peer: grantee.clone(),
+                        grant_jti: grant_jti.clone().unwrap_or_default(),
+                        grant_exp_unix,
+                    },
+                );
+            }
+            if let Some(ref jti) = grant_jti {
+                if let Ok(mut sessions) = live.grant_sessions.lock() {
+                    sessions
+                        .entry(jti.clone())
+                        .or_default()
+                        .push(GrantSessionEntry {
+                            request_id: request_id.clone(),
+                            token: token.clone(),
+                            grant_exp_unix,
+                        });
+                }
+            }
+            let extra = Arc::new(Mutex::new(pipeline::AuditExtra::default()));
+            let resp = Responder {
+                socket: live.socket.clone(),
+                request_id: request_id.clone(),
+                seal: Some(seal_ref.clone()),
+                extra,
+                log,
+            };
+            let confirm_hit = confirm_match_op(&live.confirm, &op, config.root.as_deref());
+            let confirm_wait = confirm_hit.map(|(category, raw_summary)| {
                 let approval_id = Uuid::new_v4().to_string();
                 let (wait_tx, wait_rx) = oneshot::channel();
                 if let Ok(mut map) = live.approvals.lock() {
                     map.insert(approval_id.clone(), wait_tx);
                 }
-                let summary = live
-                    .service
-                    .policy()
-                    .redact
-                    .apply(&agentlink_core::confirm::ConfirmPolicy::summary(&op));
+                let summary = live.service.policy().redact.apply(&raw_summary);
                 let expires = agentlink_core::util::unix_now() + live.confirm.timeout_secs as i64;
                 let note = Envelope::ApprovalRequest {
                     request_id: request_id.clone(),
@@ -1055,16 +1317,70 @@ async fn handle_env(
                 let timeout_secs = live.confirm.timeout_secs.max(1);
                 (approval_id, note, wait_rx, timeout_secs)
             });
+
+            // DESK-20: Pre-enqueue PtyInput / PtyResize synchronously in wire
+            // arrival order into the bounded per-session channel when no
+            // approval wait is pending, so concurrent `tokio::spawn` scheduling
+            // can never scramble keystrokes or resizes.
+            let pre_enqueued_pty = if confirm_wait.is_none() && policy_now.allows(&op).is_ok() {
+                match &op {
+                    Op::PtyInput {
+                        session_id,
+                        data_b64,
+                    } => agentlink_core::util::b64_decode(data_b64)
+                        .ok()
+                        .and_then(|bytes| pty.enqueue_write(session_id, bytes, &grantee).ok()),
+                    Op::PtyResize {
+                        session_id,
+                        rows,
+                        cols,
+                    } => pty.enqueue_resize(session_id, *rows, *cols, &grantee).ok(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let root = config.root.clone();
+            let audit_path = config.data_dir.join("audit.log");
+            let pty = pty.clone();
+            let extensions = extensions.to_vec();
+            let cancels = cancels.clone();
+            let grant_sessions = live.grant_sessions.clone();
+            let approvals_map = live.approvals.clone();
+            let commands = live.commands.clone();
+            let procs = live.procs.clone();
+            let watches = live.watches.clone();
+            let node_name = live.node_name.clone();
+            let node_id = live.node_id.clone();
+            let audit = live.service.clone();
+            let peer_id = grantee;
             let tx = tx.clone();
             tokio::spawn(async move {
+                let _cancel_guard = CancelGuard {
+                    cancels,
+                    request_id: request_id.clone(),
+                };
+                let _grant_guard = GrantSessionGuard {
+                    grant_sessions,
+                    jti: grant_jti.clone(),
+                    request_id: request_id.clone(),
+                };
                 if let Some((approval_id, note, wait_rx, timeout_secs)) = confirm_wait {
+                    let _approval_guard = ApprovalGuard {
+                        approvals: approvals_map,
+                        approval_id: approval_id.clone(),
+                    };
                     if let Ok(out) = ws::encode(&note) {
                         let _ = tx.send(out).await;
                     }
-                    let timeout =
-                        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), wait_rx)
-                            .await;
-                    let allowed = matches!(timeout, Ok(Ok(true)));
+                    let allowed = tokio::select! {
+                        _ = token.cancelled() => false,
+                        res = tokio::time::timeout(
+                            std::time::Duration::from_secs(timeout_secs),
+                            wait_rx,
+                        ) => matches!(res, Ok(Ok(true))),
+                    };
                     if !allowed {
                         let _ = resp.err("approval denied or timed out").await;
                         audit.submit(audit::event_for(
@@ -1077,9 +1393,6 @@ async fn handle_env(
                             Some("denied or timed out".into()),
                             Duration::ZERO,
                         ));
-                        if let Ok(mut map) = cancels.lock() {
-                            map.remove(&request_id);
-                        }
                         return;
                     }
                 }
@@ -1105,12 +1418,10 @@ async fn handle_env(
                         peer_id: &peer_id,
                         grant_jti: grant_jti.as_deref(),
                         grant_exp_unix,
+                        pty_ticket: pre_enqueued_pty,
                     },
                 )
                 .await;
-                if let Ok(mut map) = cancels.lock() {
-                    map.remove(&request_id);
-                }
             });
         }
         Envelope::Result {
@@ -1172,14 +1483,151 @@ async fn handle_env(
                             node_id = %live.node_id,
                             "e2e transfer authz rejected"
                         );
-                        let deny = Envelope::result_err(request_id, err.to_string());
-                        if let Ok(out) = ws::encode(&deny) {
-                            let _ = tx.send(out).await;
-                        }
+                        send_sealed_err(seal_ref, request_id, err.to_string(), tx).await;
                         return;
                     }
                 }
             };
+            let grant_jti = authz
+                .as_ref()
+                .map(|g| g.jti.clone())
+                .unwrap_or_default();
+            let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
+
+            // SEC-10: Evaluate `confirm.toml` uniformly on Transfer writes
+            // (`Push`, `PushStream`, `PushDir`) before starting the transfer.
+            let is_existing_session = host
+                .sessions
+                .lock()
+                .ok()
+                .is_some_and(|map| map.contains_key(&request_id));
+            let confirm_hit = if is_existing_session {
+                None
+            } else {
+                confirm_match_transfer(&live.confirm, &msg, config.root.as_deref())
+            };
+            if let Some((category, raw_summary)) = confirm_hit {
+                let approval_id = Uuid::new_v4().to_string();
+                let (wait_tx, wait_rx) = oneshot::channel();
+                if let Ok(mut map) = live.approvals.lock() {
+                    map.insert(approval_id.clone(), wait_tx);
+                }
+                let summary = live.service.policy().redact.apply(&raw_summary);
+                let timeout_secs = live.confirm.timeout_secs.max(1);
+                let expires = agentlink_core::util::unix_now() + timeout_secs as i64;
+                let note = Envelope::ApprovalRequest {
+                    request_id: request_id.clone(),
+                    approval_id: approval_id.clone(),
+                    node_id: live.node_id.clone(),
+                    client_id: client_id.clone(),
+                    category,
+                    summary,
+                    expires_unix: expires,
+                };
+                let token = CancellationToken::new();
+                if let Ok(mut map) = cancels.lock() {
+                    map.insert(
+                        request_id.clone(),
+                        CancelEntry {
+                            token: token.clone(),
+                            owner_peer: grantee.clone(),
+                            grant_jti: grant_jti.clone(),
+                            grant_exp_unix,
+                        },
+                    );
+                }
+                let tracked_jti = (!grant_jti.is_empty()).then(|| grant_jti.clone());
+                if let Some(ref jti) = tracked_jti {
+                    if let Ok(mut sessions) = live.grant_sessions.lock() {
+                        sessions
+                            .entry(jti.clone())
+                            .or_default()
+                            .push(GrantSessionEntry {
+                                request_id: request_id.clone(),
+                                token: token.clone(),
+                                grant_exp_unix,
+                            });
+                    }
+                }
+                let approvals_map = live.approvals.clone();
+                let cancels_bg = cancels.clone();
+                let grant_sessions = live.grant_sessions.clone();
+                let audit = live.service.clone();
+                let host_bg = host.clone();
+                let tx_bg = tx.clone();
+                let seal_owned = seal_ref.clone();
+                tokio::spawn(async move {
+                    let _cancel_guard = CancelGuard {
+                        cancels: cancels_bg,
+                        request_id: request_id.clone(),
+                    };
+                    let _grant_guard = GrantSessionGuard {
+                        grant_sessions,
+                        jti: tracked_jti,
+                        request_id: request_id.clone(),
+                    };
+                    let _approval_guard = ApprovalGuard {
+                        approvals: approvals_map,
+                        approval_id: approval_id.clone(),
+                    };
+                    if let Ok(out) = ws::encode(&note) {
+                        let _ = tx_bg.send(out).await;
+                    }
+                    let allowed = tokio::select! {
+                        _ = token.cancelled() => false,
+                        res = tokio::time::timeout(
+                            std::time::Duration::from_secs(timeout_secs),
+                            wait_rx,
+                        ) => matches!(res, Ok(Ok(true))),
+                    };
+                    if !allowed {
+                        let failed = Envelope::Transfer {
+                            request_id: request_id.clone(),
+                            node_id: seal_owned.node_id.clone(),
+                            client_id: client_id.clone(),
+                            terminal: true,
+                            msg: TransferMsg::Failed {
+                                message: "approval denied or timed out".into(),
+                            },
+                            authz: None,
+                        };
+                        if let Ok(wrapped) = agentlink_core::e2e::seal_envelope_session(
+                            &seal_owned.session,
+                            &seal_owned.node_id,
+                            &client_id,
+                            &failed,
+                        ) {
+                            if let Ok(out) = ws::encode(&wrapped) {
+                                let _ = tx_bg.send(out).await;
+                            }
+                        }
+                        audit.submit(audit::event_for(
+                            "approval",
+                            "approval",
+                            &client_id,
+                            &approval_id,
+                            serde_json::json!({"detail": approval_id, "allow": false}),
+                            false,
+                            Some("denied or timed out".into()),
+                            Duration::ZERO,
+                        ));
+                        return;
+                    }
+                    transfer::on_transfer(
+                        host_bg,
+                        request_id,
+                        client_id,
+                        grantee,
+                        msg,
+                        session,
+                        policy_now,
+                        grant_jti,
+                        grant_exp_unix,
+                    )
+                    .await;
+                });
+                return;
+            }
             transfer::on_transfer(
                 host.clone(),
                 request_id,
@@ -1188,6 +1636,8 @@ async fn handle_env(
                 msg,
                 session,
                 policy_now,
+                grant_jti,
+                grant_exp_unix,
             )
             .await;
         }
@@ -1196,6 +1646,27 @@ async fn handle_env(
         other => {
             tracing::debug!(?other, "ignoring envelope");
         }
+    }
+}
+
+async fn send_sealed_err(
+    seal: &crate::ops::ResponseSeal,
+    request_id: String,
+    message: impl Into<String>,
+    tx: &mpsc::Sender<Outbound>,
+) {
+    let deny = Envelope::result_err(request_id, message);
+    let encoded = match agentlink_core::e2e::seal_envelope_session(
+        &seal.session,
+        &seal.node_id,
+        &seal.peer,
+        &deny,
+    ) {
+        Ok(wrapped) => ws::encode(&wrapped),
+        Err(_) => return,
+    };
+    if let Ok(out) = encoded {
+        let _ = tx.send(out).await;
     }
 }
 
@@ -1208,81 +1679,99 @@ fn spawn_grant_watch(live: Arc<Live>, generation: u64) {
             if live.socket.generation() != generation {
                 break;
             }
-            enforce_live_grants(&live);
+            enforce_live_grants(&live, true);
         }
     });
 }
 
 fn stop_live_sessions(live: &Live) {
     live.pty.close_all();
+    live.procs.close_all();
+    live.watches.close_all();
+    live.tunnels.close_all();
     let _ = agentlink_desktop::close_all_streams(&live.extensions);
     if let Ok(mut sessions) = live.grant_sessions.lock() {
         for (_jti, inflight) in sessions.drain() {
-            for (_request_id, token) in inflight {
-                token.cancel();
+            for entry in inflight {
+                entry.token.cancel();
             }
         }
     }
 }
 
-/// Walk live WebRTC/PTY sessions by the grant metadata they stored at
-/// creation. This is not keyed off the inflight RPC index, so a session
-/// that is inserted after a jti is dropped from `grant_sessions` is still
-/// closed, and a disconnect with no further inbound frames still tears
-/// media down on the independent watcher.
-fn enforce_live_grants(live: &Live) {
-    let revoked = live.current_revoked_jtis();
+/// Walk live WebRTC/PTY/Proc/Watch/Tunnel sessions by the grant metadata they
+/// stored at creation. This is not keyed off the inflight RPC index, so a
+/// session inserted after a jti is dropped from `grant_sessions` is still
+/// closed, and a disconnect with no further inbound frames still tears down
+/// every grant-scoped resource on the independent watcher.
+fn enforce_live_grants(live: &Live, force_refresh: bool) {
+    let revoked = if force_refresh {
+        live.revoked_cache.current_forced()
+    } else {
+        live.current_revoked_jtis()
+    };
+    let now = agentlink_core::util::unix_now();
     live.pty.close_inactive(&revoked);
     live.pty.close_expired();
+    live.procs.close_inactive(&revoked);
+    live.procs.close_expired();
+    live.watches.close_inactive(&revoked);
+    live.watches.close_expired();
+    live.tunnels.close_inactive(&revoked);
+    live.tunnels.close_expired();
+    live.sessions.drop_inactive(&revoked, now);
     let _ = agentlink_desktop::close_inactive_streams(&live.extensions);
     let _ = agentlink_desktop::close_expired_streams(&live.extensions);
     if let Ok(mut sessions) = live.grant_sessions.lock() {
         sessions.retain(|jti, inflight| {
-            let dead = revoked
+            let jti_revoked = revoked
                 .iter()
                 .any(|item| item.trim().eq_ignore_ascii_case(jti.trim()));
-            if !dead {
-                return true;
+            if jti_revoked {
+                for entry in inflight.drain(..) {
+                    entry.token.cancel();
+                }
+                return false;
             }
-            for (_request_id, token) in inflight.drain(..) {
-                token.cancel();
-            }
-            false
+            inflight.retain(|entry| {
+                let expired = entry.grant_exp_unix.is_some_and(|exp| now >= exp);
+                if expired {
+                    entry.token.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+            !inflight.is_empty()
         });
     }
 }
 
-fn sweep_revoked_sessions(live: &Live) {
-    enforce_live_grants(live);
-}
-
+/// Replay retained frames for an authenticated E2E session. Plaintext replay
+/// is intentionally impossible by construction (`seal` is non-optional).
 async fn replay_log(
     log: &ReplayLog,
     cursor: u64,
-    seal: Option<&crate::ops::ResponseSeal>,
+    seal: &crate::ops::ResponseSeal,
     tx: &mpsc::Sender<Outbound>,
 ) {
     for env in log.snapshot() {
         if env.seq() != 0 && env.seq() <= cursor {
             continue;
         }
-        let encoded = if let Some(seal) = seal {
-            match agentlink_core::e2e::seal_envelope_session(
-                &seal.session,
-                &seal.node_id,
-                &seal.peer,
-                &env,
-            ) {
-                Ok(wrapped) => ws::encode(&wrapped),
-                Err(err) => {
-                    tracing::debug!(error = %err, "replay seal failed");
-                    continue;
-                }
+        let wrapped = match agentlink_core::e2e::seal_envelope_session(
+            &seal.session,
+            &seal.node_id,
+            &seal.peer,
+            &env,
+        ) {
+            Ok(wrapped) => wrapped,
+            Err(err) => {
+                tracing::debug!(error = %err, "replay seal failed");
+                continue;
             }
-        } else {
-            ws::encode(&env)
         };
-        if let Ok(out) = encoded {
+        if let Ok(out) = ws::encode(&wrapped) {
             if tx.send(out).await.is_err() {
                 break;
             }
@@ -1290,12 +1779,165 @@ async fn replay_log(
     }
 }
 
-fn cancel_all(cancels: &Mutex<HashMap<String, CancellationToken>>) {
+fn cancel_all(cancels: &Mutex<HashMap<String, CancelEntry>>) {
     if let Ok(map) = cancels.lock() {
-        for token in map.values() {
-            token.cancel();
+        for entry in map.values() {
+            entry.token.cancel();
         }
     }
+}
+
+/// Normalize a path lexically (resolving `.` and `..` and standardizing slashes)
+/// against optional sandbox `root` so `confirm.toml` `outside = "/work"` cannot
+/// be bypassed with `/work/../etc/passwd`.
+fn normalize_confirm_path(root: Option<&Path>, raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let resolved = agentlink_core::paths::resolve_lexical(root, trimmed)
+        .unwrap_or_else(|_| PathBuf::from(trimmed));
+    let mut clean = PathBuf::new();
+    for comp in resolved.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                clean.pop();
+            }
+            other => clean.push(other),
+        }
+    }
+    agentlink_core::paths::normalize_path_text(&clean.to_string_lossy())
+}
+
+fn confirm_path_inside(root: Option<&Path>, prefix: &str, path: &str) -> bool {
+    let norm_prefix = normalize_confirm_path(root, prefix)
+        .trim_end_matches('/')
+        .to_string();
+    let norm_path = normalize_confirm_path(root, path);
+    if norm_prefix.is_empty() || norm_path.is_empty() {
+        return false;
+    }
+    if cfg!(windows) {
+        norm_path.eq_ignore_ascii_case(&norm_prefix)
+            || norm_path
+                .to_ascii_lowercase()
+                .starts_with(&format!("{}/", norm_prefix.to_ascii_lowercase()))
+    } else {
+        norm_path == norm_prefix || norm_path.starts_with(&format!("{norm_prefix}/"))
+    }
+}
+
+/// Evaluate `confirm.toml` on an `Op`, covering `Replace`, `EditLines`,
+/// `ApplyPatch`, both `Rename` endpoints, and normalized `outside` paths in
+/// addition to `ConfirmPolicy::matching`.
+fn confirm_match_op(
+    policy: &ConfirmPolicy,
+    op: &Op,
+    root: Option<&Path>,
+) -> Option<(String, String)> {
+    if matches!(op, Op::RevokeGrant { .. }) {
+        return None;
+    }
+    if let Some(rule) = policy.matching(op) {
+        return Some((rule.category.clone(), ConfirmPolicy::summary(op)));
+    }
+    let summary = match op {
+        Op::Replace { path, .. } => format!("replace {path}"),
+        Op::EditLines { path, .. } => format!("edit_lines {path}"),
+        Op::ApplyPatch { root: patch_root, .. } => format!("apply_patch {patch_root}"),
+        _ => ConfirmPolicy::summary(op),
+    };
+    let paths_for_op: Vec<&str> = match op {
+        Op::WriteFile { path, .. }
+        | Op::Mkdir { path, .. }
+        | Op::Remove { path, .. }
+        | Op::Replace { path, .. }
+        | Op::EditLines { path, .. } => vec![path.as_str()],
+        Op::ApplyPatch { root: patch_root, .. } => vec![patch_root.as_str()],
+        Op::Rename { from, to } => vec![from.as_str(), to.as_str()],
+        Op::Exec { cwd: Some(c), .. } | Op::BgStart { cwd: Some(c), .. } => vec![c.as_str()],
+        _ => Vec::new(),
+    };
+    let is_write = matches!(
+        op,
+        Op::WriteFile { .. }
+            | Op::Mkdir { .. }
+            | Op::Rename { .. }
+            | Op::Replace { .. }
+            | Op::EditLines { .. }
+            | Op::ApplyPatch { .. }
+    );
+    let is_remove = matches!(op, Op::Remove { .. });
+    let is_recursive_remove = matches!(op, Op::Remove { recursive: true, .. });
+    for rule in &policy.rules {
+        let cat = rule.category.to_ascii_lowercase();
+        let cat_ok = cat == "any"
+            || (is_write && cat == "write")
+            || (is_remove && (cat == "remove" || cat == "delete"));
+        if !cat_ok {
+            continue;
+        }
+        if rule.recursive && !is_recursive_remove {
+            continue;
+        }
+        if let Some(prefix) = &rule.outside {
+            if paths_for_op.is_empty()
+                || paths_for_op
+                    .iter()
+                    .all(|p| confirm_path_inside(root, prefix, p))
+            {
+                continue;
+            }
+        }
+        if rule.pattern.is_empty() || agentlink_core::sandbox::glob_match(&rule.pattern, &summary) {
+            return Some((rule.category.clone(), summary));
+        }
+    }
+    None
+}
+
+/// Evaluate `confirm.toml` on write-mutating `Envelope::Transfer` messages
+/// (`Push`, `PushStream`, `PushDir`, and `PeerCopy`).
+fn confirm_match_transfer(
+    policy: &ConfirmPolicy,
+    msg: &TransferMsg,
+    root: Option<&Path>,
+) -> Option<(String, String)> {
+    let (summary, target_path) = match msg {
+        TransferMsg::Push { path, .. } => (format!("push {path}"), path.as_str()),
+        TransferMsg::PushStream { path, .. } => (format!("push_stream {path}"), path.as_str()),
+        TransferMsg::PushDir { dest, .. } => (format!("push_dir {dest}"), dest.as_str()),
+        TransferMsg::PeerCopy { dst_path, .. } => (format!("peer_copy {dst_path}"), dst_path.as_str()),
+        _ => return None,
+    };
+    for rule in &policy.rules {
+        if transfer_rule_matches(rule, &summary, target_path, root) {
+            return Some((rule.category.clone(), summary));
+        }
+    }
+    None
+}
+
+fn transfer_rule_matches(
+    rule: &ConfirmRule,
+    summary: &str,
+    target_path: &str,
+    root: Option<&Path>,
+) -> bool {
+    let cat = rule.category.to_ascii_lowercase();
+    if !matches!(cat.as_str(), "any" | "write" | "transfer") {
+        return false;
+    }
+    if rule.recursive {
+        return false;
+    }
+    if let Some(prefix) = &rule.outside {
+        if target_path.is_empty() || confirm_path_inside(root, prefix, target_path) {
+            return false;
+        }
+    }
+    rule.pattern.is_empty() || agentlink_core::sandbox::glob_match(&rule.pattern, summary)
 }
 
 async fn next_env<S>(stream: &mut S) -> Result<Envelope>
@@ -1563,31 +2205,22 @@ mod tests {
             service: AuditService::open_quiet(dir, identity.node_id(), "box"),
             data_dir: dir.to_path_buf(),
             owner_keys: RwLock::new(Default::default()),
-            revoked_jtis: RwLock::new(Default::default()),
+            revoked_cache: Arc::new(RevokedJtiCache::new(dir.to_path_buf())),
             commands: CommandPolicy::baseline(),
             confirm: ConfirmPolicy::baseline(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(Mutex::new(HashMap::new())),
             procs: ProcManager::new(),
             watches: WatchManager::default(),
+            tunnels: Arc::new(TunnelRegistry::default()),
             socket: Arc::new(SocketSlot::default()),
             sessions: Arc::new(Sessions::default()),
             pty: PtyManager::default(),
             cancels: Arc::new(Mutex::new(HashMap::new())),
-            grant_sessions: Mutex::new(HashMap::new()),
+            grant_sessions: Arc::new(Mutex::new(HashMap::new())),
             extensions,
         });
-        {
-            let dir = live.data_dir.clone();
-            live.pty.set_grant_active(Some(Arc::new(move |jti: &str| {
-                match agentlink_core::grant::load_revoked_jtis(&dir) {
-                    Ok(revoked) => !revoked
-                        .iter()
-                        .any(|item| item.trim().eq_ignore_ascii_case(jti.trim())),
-                    Err(_) => false,
-                }
-            })));
-        }
+        wire_grant_hooks(&live);
         live
     }
 
@@ -1754,5 +2387,377 @@ mod tests {
             }
         }
         let _ = live.pty.close_all();
+    }
+
+    #[tokio::test]
+    async fn plaintext_and_cross_peer_replay_oracle_and_cancel_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = test_live(dir.path(), Vec::new());
+        let issuer = Identity::generate();
+        let mut owners = BTreeSet::new();
+        owners.insert(issuer.public_hex().to_string());
+        *live.owner_keys.write().unwrap() = owners;
+
+        let alice_id = Identity::generate();
+        let bob_id = Identity::generate();
+        let bob_ep = Endpoint::new(bob_id.clone());
+        let pending_b = bob_ep.client_hello(&live.node_id).unwrap();
+        let (_, welcome_b) = live
+            .endpoint
+            .accept(Endpoint::hello_bytes(&pending_b))
+            .unwrap();
+        bob_ep.complete(pending_b, &welcome_b).unwrap();
+
+        // Seed a retained replay log containing sensitive E2E output owned by Alice.
+        let req_id = Uuid::new_v4().to_string();
+        let now = agentlink_core::util::unix_now();
+        let log = live
+            .sessions
+            .begin_for(
+                &req_id,
+                ReplayOwner {
+                    owner_peer: alice_id.public_hex().to_string(),
+                    grant_jti: "jti-alice".into(),
+                    grant_exp_unix: Some(now + 600),
+                },
+            )
+            .expect("begin_for");
+        log.push(Envelope::Chunk {
+            request_id: req_id.clone(),
+            stream: "stdout".into(),
+            data_b64: agentlink_core::util::b64_encode(b"TOP_SECRET_E2E_STDOUT"),
+            seq: 0,
+        });
+        log.push(Envelope::End {
+            request_id: req_id.clone(),
+            exit_code: Some(0),
+            error: None,
+            seq: 0,
+        });
+
+        let cancel_tok = CancellationToken::new();
+        live.cancels.lock().unwrap().insert(
+            req_id.clone(),
+            CancelEntry {
+                token: cancel_tok.clone(),
+                owner_peer: alice_id.public_hex().to_string(),
+                grant_jti: "jti-alice".into(),
+                grant_exp_unix: Some(now + 600),
+            },
+        );
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let policy = Arc::new(RwLock::new(NodePolicy::full()));
+        let config = NodeConfig {
+            relay_url: "wss://127.0.0.1:7443".into(),
+            fingerprint: String::new(),
+            trust: None,
+            data_dir: dir.path().to_path_buf(),
+            name: "box".into(),
+            pairing_token: None,
+            root: None,
+            max_policy: NodePolicy::full(),
+            version: "test".into(),
+            extensions: Vec::new(),
+            policy_hook: None,
+            capture: None,
+        };
+        let host = Arc::new(TransferHost {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            direct_wait: Arc::new(Mutex::new(HashMap::new())),
+            allowed: Arc::new(Mutex::new(HashMap::new())),
+            quic: None,
+            tx: tx.clone(),
+            policy: policy.clone(),
+            max_policy: NodePolicy::full(),
+            root: None,
+            e2e: live.endpoint.clone(),
+            node_id: live.node_id.clone(),
+            seals: Arc::new(Mutex::new(HashMap::new())),
+            pending: live.pending.clone(),
+            audit: live.service.clone(),
+            tunnels: live.tunnels.clone(),
+        });
+
+        // 1. Plaintext Invoke replay-log oracle attack MUST NOT leak any frame.
+        let spoofed_plain = Envelope::Invoke {
+            request_id: req_id.clone(),
+            node_id: live.node_id.clone(),
+            client_id: alice_id.public_hex().to_string(),
+            op: Op::SysInfo,
+            grant: None,
+            authz: None,
+            user: None,
+            device_id: None,
+        };
+        handle_env(
+            spoofed_plain,
+            &tx,
+            &policy,
+            &live.cancels,
+            &live.pty,
+            &config,
+            &[],
+            &host,
+            &live,
+        )
+        .await;
+        let out = rx.try_recv().expect("error reply");
+        let text = match out {
+            Outbound::Text(s) => s,
+            _ => panic!("expected Outbound::Text"),
+        };
+        assert!(!text.contains("TOP_SECRET_E2E_STDOUT"), "plaintext oracle leaked replay: {text}");
+        assert!(text.contains("end-to-end"), "expected plaintext rejection, got {text}");
+        assert!(rx.try_recv().is_err(), "no extra frames should be replayed");
+
+        // 2. Cross-peer sealed Invoke (Bob replaying Alice's request_id) MUST fail.
+        let bob_inner = Envelope::Invoke {
+            request_id: req_id.clone(),
+            node_id: live.node_id.clone(),
+            client_id: bob_id.public_hex().to_string(),
+            op: Op::SysInfo,
+            grant: None,
+            authz: None,
+            user: None,
+            device_id: None,
+        };
+        let bob_sealed = agentlink_core::e2e::seal_envelope(
+            &bob_ep,
+            &live.node_id,
+            &live.node_id,
+            bob_id.public_hex(),
+            &bob_inner,
+        )
+        .unwrap();
+        handle_env(
+            bob_sealed,
+            &tx,
+            &policy,
+            &live.cancels,
+            &live.pty,
+            &config,
+            &[],
+            &host,
+            &live,
+        )
+        .await;
+        let out = rx.try_recv().expect("sealed deny");
+        let text = match out {
+            Outbound::Text(s) => s,
+            _ => panic!("expected Outbound::Text"),
+        };
+        let env: Envelope = serde_json::from_str(&text).unwrap();
+        match env {
+            Envelope::E2e { body_b64, request_id: rid, .. } => {
+                let bytes = agentlink_core::util::b64_decode(&body_b64).unwrap();
+                let opened = bob_ep.open(&live.node_id, rid.as_bytes(), &bytes).unwrap();
+                let inner: Envelope = serde_json::from_slice(&opened).unwrap();
+                assert!(
+                    matches!(inner, Envelope::Result { ok: false, .. }),
+                    "cross-peer replay must return error, got {inner:?}"
+                );
+            }
+            other => panic!("expected sealed error envelope, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "cross-peer replay must not emit log frames");
+
+        // 3. Plaintext Cancel and Bob's sealed Cancel MUST NOT cancel Alice's op.
+        handle_env(
+            Envelope::Cancel {
+                request_id: req_id.clone(),
+                node_id: live.node_id.clone(),
+            },
+            &tx,
+            &policy,
+            &live.cancels,
+            &live.pty,
+            &config,
+            &[],
+            &host,
+            &live,
+        )
+        .await;
+        assert!(!cancel_tok.is_cancelled(), "plaintext Cancel cancelled Alice's op");
+
+        let bob_cancel = agentlink_core::e2e::seal_envelope(
+            &bob_ep,
+            &live.node_id,
+            &live.node_id,
+            bob_id.public_hex(),
+            &Envelope::Cancel {
+                request_id: req_id.clone(),
+                node_id: live.node_id.clone(),
+            },
+        )
+        .unwrap();
+        handle_env(
+            bob_cancel,
+            &tx,
+            &policy,
+            &live.cancels,
+            &live.pty,
+            &config,
+            &[],
+            &host,
+            &live,
+        )
+        .await;
+        assert!(!cancel_tok.is_cancelled(), "cross-peer Cancel cancelled Alice's op");
+    }
+
+    #[test]
+    fn confirm_policy_covers_transfers_edits_and_normalized_outside_paths() {
+        let policy = ConfirmPolicy {
+            timeout_secs: 10,
+            rules: vec![ConfirmRule {
+                category: "write".into(),
+                pattern: String::new(),
+                outside: Some("/work".into()),
+                recursive: false,
+            }],
+        };
+        // Traversal outside `/work` MUST trigger confirmation!
+        let traversal_push = TransferMsg::Push {
+            path: "/work/../etc/cron.d/pwn".into(),
+            size: 10,
+            hash: String::new(),
+            chunk_size: 4096,
+            compress: agentlink_core::protocol::CompressPref::Auto,
+            resume: false,
+            mode: None,
+            mtime_unix: None,
+        };
+        assert!(confirm_match_transfer(&policy, &traversal_push, None).is_some());
+
+        let inside_push = TransferMsg::Push {
+            path: "/work/sub/ok.txt".into(),
+            size: 10,
+            hash: String::new(),
+            chunk_size: 4096,
+            compress: agentlink_core::protocol::CompressPref::Auto,
+            resume: false,
+            mode: None,
+            mtime_unix: None,
+        };
+        assert!(confirm_match_transfer(&policy, &inside_push, None).is_none());
+
+        let push_stream = TransferMsg::PushStream {
+            path: "/etc/hosts".into(),
+            chunk_size: 4096,
+            window: 4,
+            compress: agentlink_core::protocol::CompressPref::Auto,
+        };
+        assert!(confirm_match_transfer(&policy, &push_stream, None).is_some());
+
+        let push_dir = TransferMsg::PushDir {
+            dest: "/etc/app".into(),
+            manifest_hash: String::new(),
+            entries: Vec::new(),
+            chunk_size: 4096,
+            compress: agentlink_core::protocol::CompressPref::Auto,
+        };
+        assert!(confirm_match_transfer(&policy, &push_dir, None).is_some());
+
+        // Replace / EditLines / ApplyPatch / Rename.from outside `/work` MUST trigger!
+        assert!(confirm_match_op(
+            &policy,
+            &Op::Replace {
+                path: "/work/../etc/shadow".into(),
+                old: "a".into(),
+                new: "b".into(),
+                replace_all: false,
+            },
+            None,
+        )
+        .is_some());
+        assert!(confirm_match_op(
+            &policy,
+            &Op::EditLines {
+                path: "/etc/hosts".into(),
+                start_line: 1,
+                end_line: 1,
+                content: "x".into(),
+            },
+            None,
+        )
+        .is_some());
+        assert!(confirm_match_op(
+            &policy,
+            &Op::ApplyPatch {
+                root: "/etc".into(),
+                patch: String::new(),
+            },
+            None,
+        )
+        .is_some());
+        assert!(confirm_match_op(
+            &policy,
+            &Op::Rename {
+                from: "/etc/passwd".into(),
+                to: "/work/copied".into(),
+            },
+            None,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn revoked_cache_retains_last_good_set_on_transient_corrupt_or_locked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = BTreeSet::new();
+        initial.insert("jti-revoked".into());
+        agentlink_core::grant::save_revoked_jtis(dir.path(), &initial).unwrap();
+
+        let cache = RevokedJtiCache::new(dir.path().to_path_buf());
+        assert!(!cache.is_active("jti-revoked"));
+        assert!(cache.is_active("jti-good"));
+
+        // Simulate transient partial write / lock error by writing corrupt JSON.
+        std::fs::write(
+            dir.path().join(agentlink_core::grant::REVOKED_GRANTS_FILE),
+            b"{partial-write",
+        )
+        .unwrap();
+        let _ = cache.current_forced();
+        // Good grant MUST stay active (never kill live shells on transient error!),
+        // and previously revoked grant MUST stay revoked.
+        assert!(cache.is_active("jti-good"));
+        assert!(!cache.is_active("jti-revoked"));
+    }
+
+    #[test]
+    fn approval_and_grant_session_guards_clean_up_entries_on_drop() {
+        let approvals: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        approvals.lock().unwrap().insert("ap-1".into(), tx);
+        {
+            let _guard = ApprovalGuard {
+                approvals: approvals.clone(),
+                approval_id: "ap-1".into(),
+            };
+            assert_eq!(approvals.lock().unwrap().len(), 1);
+        }
+        assert!(approvals.lock().unwrap().is_empty());
+
+        let gs: Arc<Mutex<HashMap<String, Vec<GrantSessionEntry>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        gs.lock().unwrap().entry("jti-1".into()).or_default().push(
+            GrantSessionEntry {
+                request_id: "req-1".into(),
+                token: CancellationToken::new(),
+                grant_exp_unix: None,
+            },
+        );
+        {
+            let _guard = GrantSessionGuard {
+                grant_sessions: gs.clone(),
+                jti: Some("jti-1".into()),
+                request_id: "req-1".into(),
+            };
+            assert_eq!(gs.lock().unwrap().len(), 1);
+        }
+        assert!(gs.lock().unwrap().is_empty());
     }
 }

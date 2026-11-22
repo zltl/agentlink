@@ -3,8 +3,9 @@
 //! The node keeps a `notify` watcher and a bounded event buffer. The CLI
 //! polls in a loop so events appear as a stream. MCP calls the same poll.
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::util;
@@ -64,20 +65,46 @@ impl EventBuf {
     }
 }
 
+pub type WatchGrantHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 struct Watch {
     events: Arc<Mutex<EventBuf>>,
     notify: Arc<Notify>,
     last_used: Instant,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
     _watcher: RecommendedWatcher,
 }
 
 #[derive(Clone, Default)]
 pub struct WatchManager {
     inner: Arc<Mutex<Vec<(String, Watch)>>>,
+    grant_active: Arc<RwLock<Option<WatchGrantHook>>>,
 }
 
 impl WatchManager {
-    pub fn start(&self, path: &Path, recursive: bool) -> Result<Value> {
+    pub fn set_grant_active(&self, hook: Option<WatchGrantHook>) {
+        if let Ok(mut slot) = self.grant_active.write() {
+            *slot = hook;
+        }
+    }
+
+    fn grant_hook(&self) -> Option<WatchGrantHook> {
+        self.grant_active
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub fn start(
+        &self,
+        path: &Path,
+        recursive: bool,
+        owner_peer: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
+    ) -> Result<Value> {
         self.reap();
         {
             let guard = self.lock()?;
@@ -87,7 +114,7 @@ impl WatchManager {
                 )));
             }
         }
-        let id = util::random_hex(4);
+        let id = util::random_hex(16);
         // macOS reports FSEvents under the canonical path. A tempfile lives in
         // `/var/folders`, which is a symlink to `/private/var/folders`, so a
         // prefix check against the path the caller passed drops every event.
@@ -141,15 +168,17 @@ impl WatchManager {
                 .watch(&root, RecursiveMode::NonRecursive)
                 .map_err(|err| Error::Message(format!("watch {}: {err}", root.display())))?;
         }
-        self.lock()?.push((
-            id.clone(),
-            Watch {
-                events,
-                notify,
-                last_used: Instant::now(),
-                _watcher: watcher,
-            },
-        ));
+        let watch = Watch {
+            events,
+            notify,
+            last_used: Instant::now(),
+            owner_peer: owner_peer.to_string(),
+            grant_jti: grant_jti.trim().to_string(),
+            grant_exp_unix,
+            _watcher: watcher,
+        };
+        require_watch_access(&watch, owner_peer, self.grant_hook().as_deref())?;
+        self.lock()?.push((id.clone(), watch));
         Ok(json!({
             "watch_id": id,
             "path": root.display().to_string(),
@@ -158,24 +187,31 @@ impl WatchManager {
         }))
     }
 
-    pub async fn poll(&self, id: &str, cursor: u64, timeout_ms: u64, limit: u32) -> Result<Value> {
+    pub async fn poll(
+        &self,
+        id: &str,
+        peer: &str,
+        cursor: u64,
+        timeout_ms: u64,
+        limit: u32,
+    ) -> Result<Value> {
         let timeout_ms = timeout_ms.min(MAX_TIMEOUT_MS);
         let limit = if limit == 0 { 50 } else { limit.min(MAX_LIMIT) };
-        let notify = self.notify_of(id)?;
+        let notify = self.notify_of(id, peer)?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            if let Some(batch) = self.drain(id, cursor, limit, false)? {
+            if let Some(batch) = self.drain(id, peer, cursor, limit, false)? {
                 return Ok(batch);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return self
-                    .drain(id, cursor, limit, true)?
+                    .drain(id, peer, cursor, limit, true)?
                     .ok_or_else(|| Error::NotFound(format!("watch {id}")));
             }
             tokio::select! {
                 _ = tokio::time::sleep(left) => {
-                    return self.drain(id, cursor, limit, true)?.ok_or_else(|| {
+                    return self.drain(id, peer, cursor, limit, true)?.ok_or_else(|| {
                         Error::NotFound(format!("watch {id}"))
                     });
                 }
@@ -184,21 +220,98 @@ impl WatchManager {
         }
     }
 
-    pub fn stop(&self, id: &str) -> Result<Value> {
+    pub fn stop(&self, id: &str, peer: &str) -> Result<Value> {
         let mut guard = self.lock()?;
-        let before = guard.len();
-        guard.retain(|(watch_id, _)| watch_id != id);
-        if guard.len() == before {
+        let pos = guard.iter().position(|(watch_id, _)| watch_id == id);
+        let Some(idx) = pos else {
+            return Err(Error::NotFound(format!("watch {id}")));
+        };
+        if guard[idx].1.owner_peer != peer {
             return Err(Error::NotFound(format!("watch {id}")));
         }
+        let (_, removed) = guard.remove(idx);
+        removed.notify.notify_waiters();
         Ok(json!({"watch_id": id, "stopped": true}))
     }
 
-    fn drain(&self, id: &str, cursor: u64, limit: u32, allow_empty: bool) -> Result<Option<Value>> {
+    pub fn close_all(&self) {
+        let removed: Vec<(String, Watch)> = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+        for (_, watch) in removed {
+            watch.notify.notify_waiters();
+        }
+    }
+
+    pub fn close_inactive(&self, revoked: &BTreeSet<String>) -> usize {
+        let hook = self.grant_hook();
+        let now = agentlink_core::util::unix_now();
+        let mut dropped = Vec::new();
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let mut kept = Vec::with_capacity(guard.len());
+            for (id, watch) in guard.drain(..) {
+                if watch_inactive(&watch, revoked, hook.as_deref(), now) {
+                    dropped.push(watch);
+                } else {
+                    kept.push((id, watch));
+                }
+            }
+            *guard = kept;
+        }
+        let n = dropped.len();
+        for watch in dropped {
+            watch.notify.notify_waiters();
+        }
+        n
+    }
+
+    pub fn close_expired(&self) -> usize {
+        let now = agentlink_core::util::unix_now();
+        let mut dropped = Vec::new();
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let mut kept = Vec::with_capacity(guard.len());
+            for (id, watch) in guard.drain(..) {
+                if watch.grant_exp_unix.is_some_and(|exp| now >= exp) {
+                    dropped.push(watch);
+                } else {
+                    kept.push((id, watch));
+                }
+            }
+            *guard = kept;
+        }
+        let n = dropped.len();
+        for watch in dropped {
+            watch.notify.notify_waiters();
+        }
+        n
+    }
+
+    fn drain(
+        &self,
+        id: &str,
+        peer: &str,
+        cursor: u64,
+        limit: u32,
+        allow_empty: bool,
+    ) -> Result<Option<Value>> {
+        let hook = self.grant_hook();
         let mut guard = self.lock()?;
         let Some(watch) = guard.iter_mut().find(|(watch_id, _)| watch_id == id) else {
             return Err(Error::NotFound(format!("watch {id}")));
         };
+        require_watch_access(&watch.1, peer, hook.as_deref())?;
         watch.1.last_used = Instant::now();
         let buf = watch
             .1
@@ -236,13 +349,15 @@ impl WatchManager {
         })))
     }
 
-    fn notify_of(&self, id: &str) -> Result<Arc<Notify>> {
+    fn notify_of(&self, id: &str, peer: &str) -> Result<Arc<Notify>> {
+        let hook = self.grant_hook();
         let guard = self.lock()?;
-        guard
+        let (_, watch) = guard
             .iter()
             .find(|(watch_id, _)| watch_id == id)
-            .map(|(_, watch)| watch.notify.clone())
-            .ok_or_else(|| Error::NotFound(format!("watch {id}")))
+            .ok_or_else(|| Error::NotFound(format!("watch {id}")))?;
+        require_watch_access(watch, peer, hook.as_deref())?;
+        Ok(watch.notify.clone())
     }
 
     fn reap(&self) {
@@ -256,6 +371,56 @@ impl WatchManager {
             .lock()
             .map_err(|_| Error::Message("watch map poisoned".into()))
     }
+}
+
+fn require_watch_access(
+    watch: &Watch,
+    peer: &str,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+) -> Result<()> {
+    if watch.owner_peer != peer {
+        return Err(Error::NotFound("watch not found for this peer".into()));
+    }
+    if let Some(exp) = watch.grant_exp_unix {
+        if agentlink_core::util::unix_now() >= exp {
+            return Err(Error::Auth("grant expired".into()));
+        }
+    }
+    if let Some(hook) = hook {
+        let jti = watch.grant_jti.trim();
+        if jti.is_empty() {
+            return Err(Error::Auth("grant is required".into()));
+        }
+        if !hook(jti) {
+            return Err(Error::Auth("grant was revoked".into()));
+        }
+    }
+    Ok(())
+}
+
+fn watch_inactive(
+    watch: &Watch,
+    revoked: &BTreeSet<String>,
+    hook: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    now: i64,
+) -> bool {
+    if watch.grant_exp_unix.is_some_and(|exp| now >= exp) {
+        return true;
+    }
+    let jti = watch.grant_jti.trim();
+    if !jti.is_empty()
+        && revoked
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(jti))
+    {
+        return true;
+    }
+    if let Some(hook) = hook {
+        if jti.is_empty() || !hook(jti) {
+            return true;
+        }
+    }
+    false
 }
 
 fn kind_name(kind: &EventKind) -> &'static str {
@@ -381,8 +546,12 @@ mod tests {
     async fn watch_sees_a_created_file() {
         let dir = tempfile::tempdir().unwrap();
         let watches = WatchManager::default();
-        let started = watches.start(dir.path(), true).unwrap();
+        let started = watches.start(dir.path(), true, "alice", "jti-w1", None).unwrap();
         let id = started["watch_id"].as_str().unwrap().to_string();
+        assert_eq!(id.len(), 32, "watch_id should be 128-bit hex");
+        // Cross-peer poll and stop must be refused.
+        assert!(watches.poll(&id, "bob", 0, 100, 10).await.is_err());
+        assert!(watches.stop(&id, "bob").is_err());
         // FSEvents registers the stream after `watch` returns. A create in
         // that window is dropped, so wait until the stream is live.
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -392,7 +561,7 @@ mod tests {
         let mut saw = false;
         let mut cursor = 0u64;
         while Instant::now() < deadline {
-            let batch = watches.poll(&id, cursor, 500, 20).await.unwrap();
+            let batch = watches.poll(&id, "alice", cursor, 500, 20).await.unwrap();
             cursor = batch["cursor"].as_u64().unwrap_or(cursor);
             let events = batch["events"].as_array().unwrap();
             if events.iter().any(|event| {
@@ -407,7 +576,29 @@ mod tests {
             }
         }
         assert!(saw, "no create/modify event for created.txt");
-        watches.stop(&id).unwrap();
+        watches.stop(&id, "alice").unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_tears_down_on_revoke_and_wakes_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let watches = WatchManager::default();
+        let started = watches.start(dir.path(), false, "alice", "jti-rev", None).unwrap();
+        let id = started["watch_id"].as_str().unwrap().to_string();
+        let watches_bg = watches.clone();
+        let id_bg = id.clone();
+        let poll_task = tokio::spawn(async move {
+            watches_bg.poll(&id_bg, "alice", 0, 10_000, 10).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut revoked = BTreeSet::new();
+        revoked.insert("jti-rev".into());
+        assert_eq!(watches.close_inactive(&revoked), 1);
+        let res = tokio::time::timeout(Duration::from_secs(2), poll_task)
+            .await
+            .expect("poll must wake on revoke")
+            .expect("join");
+        assert!(res.is_err(), "poll after revoke must fail: {res:?}");
     }
 
     #[cfg(unix)]
@@ -421,7 +612,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
         let watches = WatchManager::default();
-        let started = match watches.start(dir.path(), true) {
+        let started = match watches.start(dir.path(), true, "alice", "jti-r", None) {
             Ok(value) => value,
             Err(err) => {
                 let _ = std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755));
@@ -444,7 +635,7 @@ mod tests {
                 "skipped={skipped:?}"
             );
         }
-        watches.stop(started["watch_id"].as_str().unwrap()).unwrap();
+        watches.stop(started["watch_id"].as_str().unwrap(), "alice").unwrap();
     }
 
     #[test]

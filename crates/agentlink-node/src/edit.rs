@@ -4,10 +4,13 @@
 //! the same directory, are flushed, and then replace the destination.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use agentlink_core::paths::{resolve_lexical, resolve_path};
+use agentlink_core::paths::{
+    ensure_path_stays_in_sandbox_at_sink, is_inside_root, is_link_entry, resolve_path,
+    strip_verbatim_prefix,
+};
 use agentlink_core::{Error, Result};
 use serde_json::{json, Value};
 
@@ -93,16 +96,34 @@ fn replace_blocking(
             full.display()
         )));
     }
+    let replacements = if replace_all { count } else { 1 };
+    let projected_len = if new.len() >= old.len() {
+        let delta = new.len() - old.len();
+        delta
+            .checked_mul(replacements)
+            .and_then(|growth| before.len().checked_add(growth))
+    } else {
+        let shrink = (old.len() - new.len()).saturating_mul(replacements);
+        Some(before.len().saturating_sub(shrink))
+    };
+    match projected_len {
+        Some(len) if len <= MAX_FILE => {}
+        _ => {
+            return Err(Error::Message(format!(
+                "replacement output would exceed {MAX_FILE} bytes"
+            )));
+        }
+    }
     let after = if replace_all {
         before.replace(old, new)
     } else {
         before.replacen(old, new, 1)
     };
-    atomic_write(&full, after.as_bytes())?;
+    atomic_write_confined(sandbox, &full, after.as_bytes())?;
     let display = full.display().to_string();
     let edit = EditAudit::from_texts(vec![(display.clone(), before.as_str(), after.as_str())]);
     Ok((
-        json!({"path": display, "replacements": if replace_all { count } else { 1 }}),
+        json!({"path": display, "replacements": replacements}),
         edit,
     ))
 }
@@ -161,7 +182,12 @@ fn edit_lines_blocking(
     }
     doc.lines.splice(start_idx..end_idx, replacement.drain(..));
     let after = render_doc(&doc);
-    atomic_write(&full, after.as_bytes())?;
+    if after.len() > MAX_FILE {
+        return Err(Error::Message(format!(
+            "edited file would exceed {MAX_FILE} bytes"
+        )));
+    }
+    atomic_write_confined(sandbox, &full, after.as_bytes())?;
     let display = full.display().to_string();
     let edit = EditAudit::from_texts(vec![(display.clone(), before.as_str(), after.as_str())]);
     Ok((
@@ -250,19 +276,22 @@ fn apply_patch_blocking(
         });
     }
     for item in &mut planned {
+        if item.after.len() > MAX_FILE {
+            return Err(Error::Message(format!(
+                "patched {} would exceed {MAX_FILE} bytes",
+                item.path.display()
+            )));
+        }
         if item.action == "delete" {
-            if item.path.exists() {
-                fs::remove_file(&item.path)?;
+            let checked = ensure_path_stays_in_sandbox_at_sink(sandbox, &item.path)?;
+            if fs::symlink_metadata(&checked).is_ok() {
+                fs::remove_file(&checked)?;
             }
         } else {
             if let Some(parent) = item.path.parent() {
-                if !parent.exists() {
-                    let parent_text = parent.to_string_lossy().to_string();
-                    let dir = resolve_lexical(sandbox, &parent_text)?;
-                    agentlink_core::util::create_dir_all_parent(&dir)?;
-                }
+                crate::ops::create_dir_all_confined(sandbox, parent)?;
             }
-            atomic_write(&item.path, item.after.as_bytes())?;
+            atomic_write_confined(sandbox, &item.path, item.after.as_bytes())?;
         }
         item.display = item.path.display().to_string();
     }
@@ -428,20 +457,65 @@ fn safe_relative(raw: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Walk `base.join(rel)` verifying every existing ancestor component against
+/// `sandbox` rather than falling back to `resolve_lexical` on missing parents.
 fn resolve_joined(sandbox: Option<&Path>, base: &Path, rel: &Path) -> Result<PathBuf> {
-    let joined = base.join(rel);
-    if joined.exists() {
-        resolve_path(sandbox, &joined.to_string_lossy())
-    } else if let Some(parent) = joined.parent() {
-        if parent.exists() {
-            resolve_path(sandbox, &joined.to_string_lossy())
-        } else {
-            let parent_resolved = resolve_lexical(sandbox, &parent.to_string_lossy())?;
-            Ok(parent_resolved.join(joined.file_name().unwrap_or_default()))
-        }
-    } else {
-        resolve_path(sandbox, &joined.to_string_lossy())
+    let Some(root) = sandbox else {
+        return Ok(base.join(rel));
+    };
+    let root_c = strip_verbatim_prefix(
+        &fs::canonicalize(root).map_err(|e| Error::Message(format!("sandbox root: {e}")))?,
+    );
+    let mut cur = strip_verbatim_prefix(&fs::canonicalize(base)?);
+    if !is_inside_root(&root_c, &cur) {
+        return Err(Error::PermissionDenied(format!(
+            "path escapes sandbox: {}",
+            base.display()
+        )));
     }
+    let mut missing = false;
+    for comp in rel.components() {
+        let Component::Normal(name) = comp else {
+            return Err(Error::PermissionDenied(format!(
+                "patch path escapes sandbox: {}",
+                rel.display()
+            )));
+        };
+        cur.push(name);
+        if missing {
+            continue;
+        }
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if is_link_entry(&meta) => {
+                // Verify the symlink resolves inside the sandbox (even if dangling).
+                cur = ensure_path_stays_in_sandbox_at_sink(Some(root), &cur)?;
+                if fs::symlink_metadata(&cur).is_err() {
+                    missing = true;
+                }
+            }
+            Ok(_) => {
+                let canon = strip_verbatim_prefix(&fs::canonicalize(&cur)?);
+                if !is_inside_root(&root_c, &canon) {
+                    return Err(Error::PermissionDenied(format!(
+                        "path escapes sandbox: {}",
+                        cur.display()
+                    )));
+                }
+                cur = canon;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing = true;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    if !is_inside_root(&root_c, &cur) {
+        return Err(Error::PermissionDenied(format!(
+            "path escapes sandbox: {}",
+            cur.display()
+        )));
+    }
+    Ok(cur)
 }
 
 struct Doc {
@@ -490,7 +564,16 @@ fn render_doc(doc: &Doc) -> String {
 }
 
 fn read_text(path: &Path) -> Result<String> {
-    let bytes = fs::read(path)?;
+    let meta = fs::metadata(path)?;
+    if meta.len() > MAX_FILE as u64 {
+        return Err(Error::Message(format!(
+            "{} is larger than {MAX_FILE} bytes",
+            path.display()
+        )));
+    }
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity((meta.len() as usize).min(MAX_FILE));
+    file.take((MAX_FILE as u64) + 1).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FILE {
         return Err(Error::Message(format!(
             "{} is larger than {MAX_FILE} bytes",
@@ -508,22 +591,41 @@ fn tip_enotdir(path: &Path, err: Error) -> Error {
     }
 }
 
-pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
-    let parent = match path.parent() {
+pub(crate) fn atomic_write_confined(
+    sandbox: Option<&Path>,
+    path: &Path,
+    data: &[u8],
+) -> Result<()> {
+    let checked = ensure_path_stays_in_sandbox_at_sink(sandbox, path)?;
+    let parent = match checked.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    agentlink_core::util::create_dir_all_parent(parent)?;
+    crate::ops::create_dir_all_confined(sandbox, parent)?;
+    if let Some(root) = sandbox {
+        let root_c = strip_verbatim_prefix(
+            &fs::canonicalize(root).map_err(|e| Error::Message(format!("sandbox root: {e}")))?,
+        );
+        let parent_c = strip_verbatim_prefix(&fs::canonicalize(parent)?);
+        if !is_inside_root(&root_c, &parent_c) {
+            return Err(Error::PermissionDenied(format!(
+                "path escapes sandbox: {}",
+                checked.display()
+            )));
+        }
+    }
     let mut tmp = tempfile::Builder::new()
         .prefix(".agentlink-")
         .tempfile_in(parent)?;
     tmp.write_all(data)?;
     tmp.as_file().sync_all().ok();
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = tmp.as_file().set_permissions(meta.permissions());
+    if let Ok(meta) = fs::symlink_metadata(&checked) {
+        if !is_link_entry(&meta) {
+            let _ = tmp.as_file().set_permissions(meta.permissions());
+        }
     }
-    tmp.persist(path)
-        .map_err(|err| Error::Message(format!("atomic write {}: {}", path.display(), err.error)))?;
+    tmp.persist(&checked)
+        .map_err(|err| Error::Message(format!("atomic write {}: {}", checked.display(), err.error)))?;
     Ok(())
 }
 
@@ -641,5 +743,54 @@ mod tests {
 
         let err = apply_patch_blocking(None, &root, escape).unwrap_err();
         assert!(err.to_string().contains("escapes"), "{err}");
+    }
+
+    #[test]
+    fn read_text_rejects_oversized_file_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("sparse.txt");
+        let file = fs::File::create(&huge).unwrap();
+        // 1 GiB sparse file — checking metadata.len() refuses instantly without OOM.
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        drop(file);
+        let err = read_text(&huge).unwrap_err().to_string();
+        assert!(err.contains("larger than"), "{err}");
+    }
+
+    #[test]
+    fn replace_all_rejects_expansion_exceeding_max_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("expand.txt");
+        // 100 KiB of 'a' * 100 byte replacement = ~10 MiB > MAX_FILE (8 MiB).
+        fs::write(&file, "a".repeat(100 * 1024)).unwrap();
+        let big = "x".repeat(100);
+        let err = replace_blocking(None, &file.display().to_string(), "a", &big, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceed"), "{err}");
+        // File must stay untouched.
+        assert_eq!(fs::metadata(&file).unwrap().len(), 100 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_rejects_missing_parent_through_escaping_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&sandbox).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, sandbox.join("esc")).unwrap();
+        let patch = "\
+--- /dev/null
++++ b/esc/missing_dir/pwned.txt
+@@ -0,0 +1 @@
++evil
+";
+        let err = apply_patch_blocking(Some(&sandbox), ".", patch)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes"), "{err}");
+        assert!(!outside.join("missing_dir").exists());
     }
 }
