@@ -34,6 +34,8 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
     private var fg = DEFAULT_FG
     private var bg = DEFAULT_BG
     private var bold = false
+    private var inverse = false
+    private var underline = false
     private var wrap = true
     private var pendingWrap = false
     private var savedRow = 0
@@ -101,7 +103,7 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
                 col++
                 continue
             }
-            out.append(grid.ch[row][col])
+            out.appendCodePoint(grid.cp[row][col])
             grid.marks[row][col]?.let { out.append(it) }
             col += if (width <= 0) 1 else width
         }
@@ -114,7 +116,24 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
 
     fun boldAt(row: Int, col: Int): Boolean = inGrid(row, col) && grid.bold[row][col]
 
-    fun charAt(row: Int, col: Int): Char = if (inGrid(row, col)) grid.ch[row][col] else ' '
+    fun inverseAt(row: Int, col: Int): Boolean = inGrid(row, col) && grid.inverse[row][col]
+
+    fun underlineAt(row: Int, col: Int): Boolean = inGrid(row, col) && grid.underline[row][col]
+
+    fun codePointAt(row: Int, col: Int): Int = if (inGrid(row, col)) grid.cp[row][col] else ' '.code
+
+    fun charAt(row: Int, col: Int): Char {
+        val cp = codePointAt(row, col)
+        return if (cp in 0..0xFFFF) cp.toChar() else '?'
+    }
+
+    fun cellText(row: Int, col: Int): String {
+        if (!inGrid(row, col)) return " "
+        val cp = grid.cp[row][col]
+        val marks = grid.marks[row][col]
+        val base = if (cp in 0..0xFFFF) cp.toChar().toString() else String(Character.toChars(cp))
+        return if (marks.isNullOrEmpty()) base else base + marks
+    }
 
     fun widthAt(row: Int, col: Int): Int = if (inGrid(row, col)) grid.width[row][col].toInt() else 1
 
@@ -164,12 +183,12 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
     }
 
     private fun putChar(cp: Int, @Suppress("UNUSED_PARAMETER") replies: ArrayList<Byte>) {
-        val width = CellWidth.of(cp)
+        val scalar = if (cp in 0x20..0x10FFFF && cp !in 0xD800..0xDFFF) cp else 0xFFFD
+        val width = CellWidth.of(scalar)
         if (width == 0) {
-            attachCombining(cp)
+            attachCombining(scalar)
             return
         }
-        val ch = if (cp in 0x20..0xFFFF) cp.toChar() else '?'
         if (pendingWrap && wrap) {
             pendingWrap = false
             carriageReturn()
@@ -188,17 +207,21 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
         if (width == 2 && cursorCol + 1 < cols) {
             clearClusterAt(cursorRow, cursorCol + 1)
         }
-        grid.ch[cursorRow][cursorCol] = ch
+        grid.cp[cursorRow][cursorCol] = scalar
         grid.fg[cursorRow][cursorCol] = fg
         grid.bg[cursorRow][cursorCol] = bg
         grid.bold[cursorRow][cursorCol] = bold
+        grid.inverse[cursorRow][cursorCol] = inverse
+        grid.underline[cursorRow][cursorCol] = underline
         grid.width[cursorRow][cursorCol] = width.toByte()
         grid.marks[cursorRow][cursorCol] = null
         if (width == 2 && cursorCol + 1 < cols) {
-            grid.ch[cursorRow][cursorCol + 1] = ' '
+            grid.cp[cursorRow][cursorCol + 1] = ' '.code
             grid.fg[cursorRow][cursorCol + 1] = fg
             grid.bg[cursorRow][cursorCol + 1] = bg
             grid.bold[cursorRow][cursorCol + 1] = bold
+            grid.inverse[cursorRow][cursorCol + 1] = inverse
+            grid.underline[cursorRow][cursorCol + 1] = underline
             grid.width[cursorRow][cursorCol + 1] = 0
             grid.marks[cursorRow][cursorCol + 1] = null
         }
@@ -212,11 +235,11 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
     }
 
     private fun attachCombining(cp: Int) {
-        if (cp !in 0x20..0xFFFF) return
-        val mark = cp.toChar().toString()
+        if (cp !in 0x20..0x10FFFF || cp in 0xD800..0xDFFF) return
+        val mark = if (cp <= 0xFFFF) cp.toChar().toString() else String(Character.toChars(cp))
         val base = baseCellForCombining() ?: return
         val existing = grid.marks[base.first][base.second] ?: ""
-        if (existing.length < 8) {
+        if (existing.length < 16) {
             grid.marks[base.first][base.second] = existing + mark
         }
     }
@@ -247,10 +270,12 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
         }
         val width = grid.width[row][start].toInt().coerceAtLeast(1)
         for (c in start until (start + width).coerceAtMost(cols)) {
-            grid.ch[row][c] = ' '
+            grid.cp[row][c] = ' '.code
             grid.fg[row][c] = fg
             grid.bg[row][c] = bg
             grid.bold[row][c] = false
+            grid.inverse[row][c] = false
+            grid.underline[row][c] = false
             grid.width[row][c] = 1
             grid.marks[row][c] = null
         }
@@ -449,16 +474,18 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
             val start = if (row == r0) c0 else 0
             val end = if (row == r1) c1 else cols - 1
             for (col in start..end) {
-                grid.ch[row][col] = ' '
+                grid.cp[row][col] = ' '.code
                 grid.fg[row][col] = fg
                 grid.bg[row][col] = bg
                 grid.bold[row][col] = false
+                grid.inverse[row][col] = false
+                grid.underline[row][col] = false
                 grid.width[row][col] = 1
                 grid.marks[row][col] = null
             }
             if (start > 0 && grid.width[row][start - 1].toInt() == 2) {
                 // A wide character lost its spacer; drop the dangling start.
-                grid.ch[row][start - 1] = ' '
+                grid.cp[row][start - 1] = ' '.code
                 grid.width[row][start - 1] = 1
                 grid.marks[row][start - 1] = null
             }
@@ -475,7 +502,11 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
             when (val value = params[i]) {
                 0 -> resetSgr()
                 1 -> bold = true
+                4 -> underline = true
+                7 -> inverse = true
                 22 -> bold = false
+                24 -> underline = false
+                27 -> inverse = false
                 39 -> fg = DEFAULT_FG
                 49 -> bg = DEFAULT_BG
                 in 30..37 -> fg = value - 30
@@ -484,8 +515,13 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
                 in 100..107 -> bg = value - 100 + 8
                 38, 48 -> {
                     if (i + 2 < count && params[i + 1] == 5) {
-                        if (value == 38) fg = params[i + 2] else bg = params[i + 2]
+                        val color = params[i + 2].coerceIn(0, 255)
+                        if (value == 38) fg = color else bg = color
                         i += 2
+                    } else if (i + 4 < count && params[i + 1] == 2) {
+                        val color = packRgb(params[i + 2], params[i + 3], params[i + 4])
+                        if (value == 38) fg = color else bg = color
+                        i += 4
                     }
                 }
             }
@@ -497,6 +533,8 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
         fg = DEFAULT_FG
         bg = DEFAULT_BG
         bold = false
+        inverse = false
+        underline = false
     }
 
     private fun reset() {
@@ -649,34 +687,40 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
     private enum class State { Ground, Escape, Csi, Osc, OscEsc }
 
     private class Grid(rows: Int, cols: Int) {
-        var ch: Array<CharArray> = Array(rows) { CharArray(cols) { ' ' } }
+        var cp: Array<IntArray> = Array(rows) { IntArray(cols) { ' '.code } }
         var fg: Array<IntArray> = Array(rows) { IntArray(cols) { DEFAULT_FG } }
         var bg: Array<IntArray> = Array(rows) { IntArray(cols) { DEFAULT_BG } }
         var bold: Array<BooleanArray> = Array(rows) { BooleanArray(cols) }
+        var inverse: Array<BooleanArray> = Array(rows) { BooleanArray(cols) }
+        var underline: Array<BooleanArray> = Array(rows) { BooleanArray(cols) }
         var width: Array<ByteArray> = Array(rows) { ByteArray(cols) { 1 } }
         var marks: Array<Array<String?>> = Array(rows) { arrayOfNulls(cols) }
 
         fun resize(rows: Int, cols: Int) {
-            val nextCh = Array(rows) { r -> CharArray(cols) { c -> if (r < ch.size && c < ch[r].size) ch[r][c] else ' ' } }
+            val nextCp = Array(rows) { r -> IntArray(cols) { c -> if (r < cp.size && c < cp[r].size) cp[r][c] else ' '.code } }
             val nextFg = Array(rows) { r -> IntArray(cols) { c -> if (r < fg.size && c < fg[r].size) fg[r][c] else DEFAULT_FG } }
             val nextBg = Array(rows) { r -> IntArray(cols) { c -> if (r < bg.size && c < bg[r].size) bg[r][c] else DEFAULT_BG } }
             val nextBold = Array(rows) { r -> BooleanArray(cols) { c -> r < bold.size && c < bold[r].size && bold[r][c] } }
+            val nextInv = Array(rows) { r -> BooleanArray(cols) { c -> r < inverse.size && c < inverse[r].size && inverse[r][c] } }
+            val nextUl = Array(rows) { r -> BooleanArray(cols) { c -> r < underline.size && c < underline[r].size && underline[r][c] } }
             val nextWidth = Array(rows) { r -> ByteArray(cols) { c -> if (r < width.size && c < width[r].size) width[r][c] else 1 } }
             val nextMarks = Array(rows) { r -> Array(cols) { c -> if (r < marks.size && c < marks[r].size) marks[r][c] else null } }
-            ch = nextCh
+            cp = nextCp
             fg = nextFg
             bg = nextBg
             bold = nextBold
+            inverse = nextInv
+            underline = nextUl
             width = nextWidth
             marks = nextMarks
             repairWideAtEdge()
         }
 
         fun repairWideAtEdge() {
-            for (row in ch.indices) {
-                val last = ch[row].lastIndex
+            for (row in cp.indices) {
+                val last = cp[row].lastIndex
                 if (last >= 0 && width[row][last].toInt() == 2) {
-                    ch[row][last] = ' '
+                    cp[row][last] = ' '.code
                     width[row][last] = 1
                     marks[row][last] = null
                 }
@@ -684,61 +728,75 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
         }
 
         fun clear() {
-            for (row in ch.indices) {
-                ch[row].fill(' ')
+            for (row in cp.indices) {
+                cp[row].fill(' '.code)
                 fg[row].fill(DEFAULT_FG)
                 bg[row].fill(DEFAULT_BG)
                 bold[row].fill(false)
+                inverse[row].fill(false)
+                underline[row].fill(false)
                 width[row].fill(1)
                 marks[row].fill(null)
             }
         }
 
         fun scrollUp(top: Int, bottom: Int) {
-            if (top !in ch.indices || bottom !in ch.indices || top > bottom) return
-            val savedCh = ch[top]
+            if (top !in cp.indices || bottom !in cp.indices || top > bottom) return
+            val savedCp = cp[top]
             val savedFg = fg[top]
             val savedBg = bg[top]
             val savedBold = bold[top]
+            val savedInv = inverse[top]
+            val savedUl = underline[top]
             val savedWidth = width[top]
             val savedMarks = marks[top]
             for (row in top until bottom) {
-                ch[row] = ch[row + 1]
+                cp[row] = cp[row + 1]
                 fg[row] = fg[row + 1]
                 bg[row] = bg[row + 1]
                 bold[row] = bold[row + 1]
+                inverse[row] = inverse[row + 1]
+                underline[row] = underline[row + 1]
                 width[row] = width[row + 1]
                 marks[row] = marks[row + 1]
             }
-            ch[bottom] = savedCh
+            cp[bottom] = savedCp
             fg[bottom] = savedFg
             bg[bottom] = savedBg
             bold[bottom] = savedBold
+            inverse[bottom] = savedInv
+            underline[bottom] = savedUl
             width[bottom] = savedWidth
             marks[bottom] = savedMarks
             blank(bottom)
         }
 
         fun scrollDown(top: Int, bottom: Int) {
-            if (top !in ch.indices || bottom !in ch.indices || top > bottom) return
-            val savedCh = ch[bottom]
+            if (top !in cp.indices || bottom !in cp.indices || top > bottom) return
+            val savedCp = cp[bottom]
             val savedFg = fg[bottom]
             val savedBg = bg[bottom]
             val savedBold = bold[bottom]
+            val savedInv = inverse[bottom]
+            val savedUl = underline[bottom]
             val savedWidth = width[bottom]
             val savedMarks = marks[bottom]
             for (row in bottom downTo top + 1) {
-                ch[row] = ch[row - 1]
+                cp[row] = cp[row - 1]
                 fg[row] = fg[row - 1]
                 bg[row] = bg[row - 1]
                 bold[row] = bold[row - 1]
+                inverse[row] = inverse[row - 1]
+                underline[row] = underline[row - 1]
                 width[row] = width[row - 1]
                 marks[row] = marks[row - 1]
             }
-            ch[top] = savedCh
+            cp[top] = savedCp
             fg[top] = savedFg
             bg[top] = savedBg
             bold[top] = savedBold
+            inverse[top] = savedInv
+            underline[top] = savedUl
             width[top] = savedWidth
             marks[top] = savedMarks
             blank(top)
@@ -753,47 +811,53 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
         }
 
         fun deleteChars(row: Int, col: Int, count: Int) {
-            if (row !in ch.indices) return
-            var start = col.coerceIn(0, ch[row].lastIndex)
+            if (row !in cp.indices) return
+            var start = col.coerceIn(0, cp[row].lastIndex)
             if (width[row][start].toInt() == 0 && start > 0) start--
             val n = count.coerceAtLeast(0)
-            val line = ch[row]
+            val line = cp[row]
             for (c in start until line.size) {
                 val src = c + n
-                line[c] = if (src < line.size) line[src] else ' '
+                line[c] = if (src < line.size) line[src] else ' '.code
                 fg[row][c] = if (src < line.size) fg[row][src] else DEFAULT_FG
                 bg[row][c] = if (src < line.size) bg[row][src] else DEFAULT_BG
                 bold[row][c] = src < line.size && bold[row][src]
+                inverse[row][c] = src < line.size && inverse[row][src]
+                underline[row][c] = src < line.size && underline[row][src]
                 width[row][c] = if (src < line.size) width[row][src] else 1
                 marks[row][c] = if (src < line.size) marks[row][src] else null
             }
             repairWideAtEdge()
             if (start > 0 && width[row][start].toInt() == 0) {
-                ch[row][start - 1] = ' '
+                cp[row][start - 1] = ' '.code
                 width[row][start - 1] = 1
                 marks[row][start - 1] = null
             }
         }
 
         fun insertChars(row: Int, col: Int, count: Int) {
-            if (row !in ch.indices) return
-            val start = col.coerceIn(0, ch[row].size)
+            if (row !in cp.indices) return
+            val start = col.coerceIn(0, cp[row].size)
             val n = count.coerceAtLeast(0)
-            val line = ch[row]
+            val line = cp[row]
             for (c in line.lastIndex downTo start) {
                 val src = c - n
-                line[c] = if (src >= start) line[src] else ' '
+                line[c] = if (src >= start) line[src] else ' '.code
                 fg[row][c] = if (src >= start) fg[row][src] else DEFAULT_FG
                 bg[row][c] = if (src >= start) bg[row][src] else DEFAULT_BG
                 bold[row][c] = src >= start && bold[row][src]
+                inverse[row][c] = src >= start && inverse[row][src]
+                underline[row][c] = src >= start && underline[row][src]
                 width[row][c] = if (src >= start) width[row][src] else 1
                 marks[row][c] = if (src >= start) marks[row][src] else null
             }
             for (c in start until (start + n).coerceAtMost(line.size)) {
-                line[c] = ' '
+                line[c] = ' '.code
                 fg[row][c] = DEFAULT_FG
                 bg[row][c] = DEFAULT_BG
                 bold[row][c] = false
+                inverse[row][c] = false
+                underline[row][c] = false
                 width[row][c] = 1
                 marks[row][c] = null
             }
@@ -801,30 +865,34 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
         }
 
         fun eraseChars(row: Int, col: Int, count: Int) {
-            if (row !in ch.indices) return
+            if (row !in cp.indices) return
             var start = col.coerceAtLeast(0)
-            if (start < ch[row].size && width[row][start].toInt() == 0 && start > 0) start--
-            val end = (start + count).coerceAtMost(ch[row].size)
+            if (start < cp[row].size && width[row][start].toInt() == 0 && start > 0) start--
+            val end = (start + count).coerceAtMost(cp[row].size)
             for (c in start until end) {
-                ch[row][c] = ' '
+                cp[row][c] = ' '.code
                 fg[row][c] = DEFAULT_FG
                 bg[row][c] = DEFAULT_BG
                 bold[row][c] = false
+                inverse[row][c] = false
+                underline[row][c] = false
                 width[row][c] = 1
                 marks[row][c] = null
             }
-            if (end < ch[row].size && width[row][end].toInt() == 0) {
-                ch[row][end] = ' '
+            if (end < cp[row].size && width[row][end].toInt() == 0) {
+                cp[row][end] = ' '.code
                 width[row][end] = 1
                 marks[row][end] = null
             }
         }
 
         private fun blank(row: Int) {
-            ch[row] = CharArray(ch[row].size) { ' ' }
+            cp[row] = IntArray(cp[row].size) { ' '.code }
             fg[row] = IntArray(fg[row].size) { DEFAULT_FG }
             bg[row] = IntArray(bg[row].size) { DEFAULT_BG }
             bold[row] = BooleanArray(bold[row].size)
+            inverse[row] = BooleanArray(inverse[row].size)
+            underline[row] = BooleanArray(underline[row].size)
             width[row] = ByteArray(width[row].size) { 1 }
             marks[row] = arrayOfNulls(marks[row].size)
         }
@@ -833,7 +901,15 @@ class TerminalScreen(rows: Int = 24, cols: Int = 80) {
     companion object {
         const val DEFAULT_FG = 7
         const val DEFAULT_BG = 0
+        const val TRUECOLOR_FLAG = 0x0100_0000
         private const val SCROLLBACK = 500
+
+        fun isTrueColor(color: Int): Boolean = (color and TRUECOLOR_FLAG) != 0
+
+        fun packRgb(r: Int, g: Int, b: Int): Int {
+            return TRUECOLOR_FLAG or
+                ((r.coerceIn(0, 255) shl 16) or (g.coerceIn(0, 255) shl 8) or b.coerceIn(0, 255))
+        }
     }
 }
 
@@ -875,11 +951,23 @@ fun ptySequence(key: PtyKey, applicationCursor: Boolean): ByteArray {
     }
 }
 
-/** Ctrl+letter becomes the corresponding C0 byte. Other text is sent as UTF-8. */
-fun ptyText(text: String, ctrl: Boolean): ByteArray {
-    if (ctrl && text.length == 1) {
+/** Ctrl+letter becomes the corresponding C0 byte. Alt prefixes ESC. Other text is sent as UTF-8. */
+fun ptyText(text: String, ctrl: Boolean, alt: Boolean = false): ByteArray {
+    val payload = if (ctrl && text.length == 1) {
         val ch = text[0].lowercaseChar()
-        if (ch in 'a'..'z') return byteArrayOf((ch.code - 96).toByte())
+        when (ch) {
+            in 'a'..'z' -> byteArrayOf((ch.code - 96).toByte())
+            '@', ' ' -> byteArrayOf(0x00)
+            '[' -> byteArrayOf(0x1b)
+            '\\' -> byteArrayOf(0x1c)
+            ']' -> byteArrayOf(0x1d)
+            '^' -> byteArrayOf(0x1e)
+            '_' -> byteArrayOf(0x1f)
+            '?' -> byteArrayOf(0x7f)
+            else -> text.encodeToByteArray()
+        }
+    } else {
+        text.encodeToByteArray()
     }
-    return text.encodeToByteArray()
+    return if (alt && payload.isNotEmpty()) byteArrayOf(0x1b) + payload else payload
 }

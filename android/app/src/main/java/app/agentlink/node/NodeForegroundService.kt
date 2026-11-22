@@ -51,21 +51,26 @@ object NodeRuntime {
 
 class NodeForegroundService : Service() {
     private var host: AndroidHost? = null
+    private var shells: ShellSessions? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
+        if (intent == null || intent.action == ACTION_STOP) {
             stopNode()
             return START_NOT_STICKY
         }
         val projection = projectionExtra(intent)
-        val resultCode = intent?.getIntExtra(EXTRA_RESULT, 0) ?: 0
-        val type = if (projection != null && resultCode == android.app.Activity.RESULT_OK) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        val resultCode = intent.getIntExtra(EXTRA_RESULT, 0)
+        val baseType = if (Build.VERSION.SDK_INT >= 34) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
         } else {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        }
+        val type = if (projection != null && resultCode == android.app.Activity.RESULT_OK) {
+            baseType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        } else {
+            baseType
         }
         ServiceCompat.startForeground(this, NOTIFICATION_ID, notification("Connecting"), type)
         if (projection != null && resultCode == android.app.Activity.RESULT_OK) {
@@ -75,7 +80,12 @@ class NodeForegroundService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        return START_STICKY
+        return START_NOT_STICKY
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        NodeRuntime.status.value = "{\"state\":\"stopped\",\"detail\":\"foreground service timed out by Android\"}"
+        stopNode()
     }
 
     override fun onDestroy() {
@@ -84,7 +94,8 @@ class NodeForegroundService : Service() {
     }
 
     private fun startNode(): Boolean {
-        val setup = ConsentStore(this).load()
+        val consentStore = ConsentStore(this)
+        val setup = consentStore.load()
         if (setup == null || !setup.choices.appStorage) {
             NodeRuntime.status.value = "{\"state\":\"fatal\",\"detail\":\"app storage was not allowed\"}"
             return false
@@ -98,9 +109,10 @@ class NodeForegroundService : Service() {
         val ceiling = ceilingOf(setup.choices)
         val dataDir = File(noBackupFilesDir, "node")
         val filesDir = File(filesDir, "shared")
-        val cacheDir = cacheDir
+        val nodeCacheDir = File(cacheDir, "node-cache")
         dataDir.mkdirs()
         filesDir.mkdirs()
+        nodeCacheDir.mkdirs()
         val audit = File(dataDir, "audit.log")
         val now = Instant.now().toString()
         appendAudit(audit, auditRecord(now, "consent", "node start", true, null, null))
@@ -110,27 +122,35 @@ class NodeForegroundService : Service() {
         } else {
             ""
         }
+        val shellSessions = ShellSessions()
+        shells = shellSessions
+        var tokenCleared = false
         host = AndroidHost(
             context = this,
             saf = SafStore(this),
-            shells = ShellSessions(),
+            shells = shellSessions,
             capture = NodeRuntime.capture,
             allowShizuku = setup.choices.shizuku,
             allowRoot = setup.choices.root,
-            onStatus = { json ->
+            statusCallback = { json ->
                 NodeRuntime.status.value = json
                 val state = app.agentlink.model.jsonField(json, "state") ?: "node"
                 val detail = app.agentlink.model.jsonField(json, "detail").orEmpty()
+                if (!tokenCleared && state == "online") {
+                    tokenCleared = true
+                    consentStore.clearToken()
+                }
                 val manager = getSystemService(NotificationManager::class.java)
                 manager.notify(NOTIFICATION_ID, notification("$state: $detail"))
             },
+            stageCacheDir = nodeCacheDir,
         )
         val options = NodeOptions(
             relayUrl = resolved.relay,
             fingerprint = resolved.fingerprint,
             dataDir = dataDir.absolutePath,
             filesDir = filesDir.absolutePath,
-            cacheDir = cacheDir.absolutePath,
+            cacheDir = nodeCacheDir.absolutePath,
             storageDir = storage,
             name = resolved.name.ifBlank { setup.name.ifBlank { Build.MODEL ?: "android" } },
             pairingToken = resolved.token,
@@ -150,6 +170,9 @@ class NodeForegroundService : Service() {
             NodeRuntime.bind(node)
             true
         } catch (err: Exception) {
+            shellSessions.closeAll()
+            shells = null
+            host = null
             val detail = jsonString(err.message ?: "start failed")
             NodeRuntime.status.value = "{\"state\":\"fatal\",\"detail\":$detail}"
             false
@@ -157,11 +180,19 @@ class NodeForegroundService : Service() {
     }
 
     private fun stopNode() {
-        NodeRuntime.current()?.stop()
-        NodeRuntime.current()?.close()
+        val activeNode = NodeRuntime.current()
+        val activeShells = shells
         NodeRuntime.clear()
         NodeRuntime.capture.release()
+        shells = null
         host = null
+        if (activeNode != null || activeShells != null) {
+            kotlin.concurrent.thread(name = "agentlink-node-stop", isDaemon = true) {
+                runCatching { activeShells?.closeAll() }
+                runCatching { activeNode?.stop() }
+                runCatching { activeNode?.close() }
+            }
+        }
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -208,8 +239,7 @@ class NodeForegroundService : Service() {
         }
 
         fun stop(context: Context) {
-            val intent = Intent(context, NodeForegroundService::class.java).setAction(ACTION_STOP)
-            context.startService(intent)
+            context.stopService(Intent(context, NodeForegroundService::class.java))
         }
     }
 }

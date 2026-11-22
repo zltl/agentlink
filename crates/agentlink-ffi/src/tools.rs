@@ -6,13 +6,13 @@
 //! relay reconnect. A watch is scanned when the client polls, which does not
 //! need an inotify backend. Background commands run in the app sandbox shell.
 
-use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentlink_core::process;
@@ -59,6 +59,11 @@ impl ToolState {
     pub fn shutdown(&self) {
         self.procs.kill_all();
         self.watches.clear();
+    }
+
+    pub fn close_inactive(&self, revoked: &BTreeSet<String>, now_unix: i64, fail_closed: bool) {
+        self.procs.close_inactive(revoked, now_unix, fail_closed);
+        self.watches.close_inactive(revoked, now_unix, fail_closed);
     }
 }
 
@@ -132,8 +137,19 @@ pub async fn apply_patch(roots: Roots, root: String, patch: String) -> Result<Va
         .map_err(|err| Error::Message(format!("patch task: {err}")))?
 }
 
-pub fn watch_start(state: &ToolState, roots: &Roots, path: &str, recursive: bool) -> Result<Value> {
-    state.watches.start(roots, path, recursive)
+pub async fn watch_start(
+    state: &ToolState,
+    roots: &Roots,
+    path: &str,
+    recursive: bool,
+    owner_peer: &str,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
+) -> Result<Value> {
+    state
+        .watches
+        .start(roots, path, recursive, owner_peer, grant_jti, grant_exp_unix)
+        .await
 }
 
 pub async fn watch_poll(
@@ -142,12 +158,16 @@ pub async fn watch_poll(
     cursor: u64,
     timeout_ms: u64,
     limit: u32,
+    peer: &str,
 ) -> Result<Value> {
-    state.watches.poll(id, cursor, timeout_ms, limit).await
+    state
+        .watches
+        .poll(id, cursor, timeout_ms, limit, peer)
+        .await
 }
 
-pub fn watch_stop(state: &ToolState, id: &str) -> Result<Value> {
-    state.watches.stop(id)
+pub fn watch_stop(state: &ToolState, id: &str, peer: &str) -> Result<Value> {
+    state.watches.stop(id, peer)
 }
 
 
@@ -166,7 +186,7 @@ fn decode_stdin_b64(b64: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub fn bg_start(
+pub async fn bg_start(
     state: &ToolState,
     roots: &Roots,
     program: &str,
@@ -175,18 +195,42 @@ pub fn bg_start(
     env: &[(String, String)],
     shell: bool,
     stdin_b64: Option<&str>,
+    owner_peer: &str,
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
 ) -> Result<Value> {
     let stdin = match stdin_b64 {
         Some(b64) => Some(decode_stdin_b64(b64)?),
         None => None,
     };
-    state
-        .procs
-        .start(roots, program, args, cwd, env, shell, stdin.as_deref())
+    let procs = state.procs.clone();
+    let roots = roots.clone();
+    let program = program.to_string();
+    let args = args.to_vec();
+    let cwd = cwd.map(str::to_string);
+    let env = env.to_vec();
+    let owner_peer = owner_peer.to_string();
+    let grant_jti = grant_jti.to_string();
+    tokio::task::spawn_blocking(move || {
+        procs.start(
+            &roots,
+            &program,
+            &args,
+            cwd.as_deref(),
+            &env,
+            shell,
+            stdin.as_deref(),
+            &owner_peer,
+            &grant_jti,
+            grant_exp_unix,
+        )
+    })
+    .await
+    .map_err(|err| Error::Message(format!("bg_start task: {err}")))?
 }
 
-pub fn bg_list(state: &ToolState) -> Result<Value> {
-    state.procs.list()
+pub fn bg_list(state: &ToolState, peer: &str) -> Result<Value> {
+    state.procs.list(peer)
 }
 
 pub fn bg_output(
@@ -195,18 +239,24 @@ pub fn bg_output(
     stdout_cursor: u64,
     stderr_cursor: u64,
     max_bytes: u32,
+    peer: &str,
 ) -> Result<Value> {
     state
         .procs
-        .output(id, stdout_cursor, stderr_cursor, max_bytes)
+        .output(id, stdout_cursor, stderr_cursor, max_bytes, peer)
 }
 
-pub fn bg_status(state: &ToolState, id: &str) -> Result<Value> {
-    state.procs.status(id)
+pub fn bg_status(state: &ToolState, id: &str, peer: &str) -> Result<Value> {
+    state.procs.status(id, peer)
 }
 
-pub fn bg_kill(state: &ToolState, id: &str) -> Result<Value> {
-    state.procs.kill(id)
+pub async fn bg_kill(state: &ToolState, id: &str, peer: &str) -> Result<Value> {
+    let procs = state.procs.clone();
+    let id = id.to_string();
+    let peer = peer.to_string();
+    tokio::task::spawn_blocking(move || procs.kill(&id, &peer))
+        .await
+        .map_err(|err| Error::Message(format!("bg_kill task: {err}")))?
 }
 
 pub async fn system_info() -> Result<Value> {
@@ -226,6 +276,33 @@ fn locate(roots: &Roots, guest: &str, write: bool) -> Result<Located> {
         real,
         guest: guest.trim().replace('\\', "/"),
     })
+}
+
+fn locate_no_follow(roots: &Roots, guest: &str, write: bool) -> Result<Located> {
+    let (target, _) = paths::classify_entry_with_root(roots, guest, write, false)?;
+    let real = match target {
+        paths::GuestTarget::Real(path) => path,
+        _ => {
+            return Err(Error::Message(format!(
+                "{guest} is not a writable filesystem path"
+            )))
+        }
+    };
+    Ok(Located {
+        real,
+        guest: guest.trim().replace('\\', "/"),
+    })
+}
+
+fn ensure_not_symlink(path: &Path) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if agentlink_core::paths::is_link_entry(&meta) {
+            return Err(Error::PermissionDenied(
+                "refusing to write through a symbolic link".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn guest_of(root_guest: &str, root_real: &Path, path: &Path) -> String {
@@ -467,7 +544,9 @@ fn replace_blocking(
     if old.len() > MAX_TEXT || new.len() > MAX_TEXT {
         return Err(Error::Message("replacement text exceeds 1 MiB".into()));
     }
-    let located = locate(roots, path, true)?;
+    let sandbox_root = paths::sandbox_root_for_guest(roots, path);
+    let located = locate_no_follow(roots, path, true)?;
+    ensure_not_symlink(&located.real)?;
     let before = read_text(&located.real)?;
     let count = before.matches(old).count();
     if count == 0 {
@@ -487,7 +566,7 @@ fn replace_blocking(
     } else {
         before.replacen(old, new, 1)
     };
-    atomic_write(&located.real, after.as_bytes())?;
+    atomic_write(sandbox_root.as_deref(), &located.real, after.as_bytes())?;
     Ok(json!({
         "path": located.guest,
         "replacements": if replace_all { count } else { 1 },
@@ -512,7 +591,9 @@ fn edit_lines_blocking(
             "end line {end_line} is before start line {start_line}"
         )));
     }
-    let located = locate(roots, path, true)?;
+    let sandbox_root = paths::sandbox_root_for_guest(roots, path);
+    let located = locate_no_follow(roots, path, true)?;
+    ensure_not_symlink(&located.real)?;
     let before = if located.real.exists() {
         read_text(&located.real)?
     } else if start_line == 1 {
@@ -544,7 +625,7 @@ fn edit_lines_blocking(
     if trailing || content.ends_with('\n') {
         after.push('\n');
     }
-    atomic_write(&located.real, after.as_bytes())?;
+    atomic_write(sandbox_root.as_deref(), &located.real, after.as_bytes())?;
     Ok(json!({
         "path": located.guest,
         "start_line": start_line,
@@ -559,6 +640,7 @@ fn apply_patch_blocking(roots: &Roots, root: &str, patch: &str) -> Result<Value>
     if patch.trim().is_empty() {
         return Err(Error::Message("patch is empty".into()));
     }
+    let sandbox_root = paths::sandbox_root_for_guest(roots, root);
     let located = locate(roots, root, true)?;
     if !located.real.is_dir() {
         return Err(Error::Message(format!(
@@ -576,10 +658,14 @@ fn apply_patch_blocking(roots: &Roots, root: &str, patch: &str) -> Result<Value>
             .ok_or_else(|| Error::Message("patch section has no path".into()))?;
         let rel = safe_relative(&target)?;
         let full = located.real.join(&rel);
-        paths::ensure_inside(roots, &full)?;
-        let exists = full.is_file();
+        let confined = agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(
+            sandbox_root.as_deref(),
+            &full,
+        )?;
+        ensure_not_symlink(&confined)?;
+        let exists = confined.is_file();
         let before = if exists {
-            read_text(&full)?
+            read_text(&confined)?
         } else {
             String::new()
         };
@@ -603,19 +689,21 @@ fn apply_patch_blocking(roots: &Roots, root: &str, patch: &str) -> Result<Value>
         } else {
             "update"
         };
-        planned.push((full, rel, after, action));
+        planned.push((confined, rel, after, action));
     }
     let mut files = Vec::new();
     for (full, rel, after, action) in planned {
         if action == "delete" {
-            if full.exists() {
-                fs::remove_file(&full)?;
+            let checked = agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(
+                sandbox_root.as_deref(),
+                &full,
+            )?;
+            ensure_not_symlink(&checked)?;
+            if checked.exists() {
+                fs::remove_file(&checked)?;
             }
         } else {
-            if let Some(parent) = full.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            atomic_write(&full, after.as_bytes())?;
+            atomic_write(sandbox_root.as_deref(), &full, after.as_bytes())?;
         }
         files.push(json!({
             "path": guest_of(&located.guest, &located.real, &full),
@@ -711,18 +799,47 @@ fn read_text(path: &Path) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| Error::Message(format!("{} is not utf-8", path.display())))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("agentlink-tmp");
+fn open_new_nofollow(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut file = File::create(&tmp)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(0x0020_0000);
+    }
+    opts.open(path)
+}
+
+fn atomic_write(sandbox_root: Option<&Path>, path: &Path, bytes: &[u8]) -> Result<()> {
+    let target = agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, path)?;
+    ensure_not_symlink(&target)?;
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, parent)?;
+        fs::create_dir_all(parent)?;
+        agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, parent)?;
+    }
+    let tmp = parent.join(format!(".agentlink-tmp-{}", util::random_hex(12)));
+    let write_res = (|| -> Result<()> {
+        let mut file = open_new_nofollow(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all().ok();
+        drop(file);
+        let checked =
+            agentlink_core::paths::ensure_path_stays_in_sandbox_at_sink(sandbox_root, &target)?;
+        ensure_not_symlink(&checked)?;
+        agentlink_core::paths::rename_within_sandbox(sandbox_root, &tmp, &checked)?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    write_res
 }
 
 fn split_lines(text: &str) -> Vec<String> {
@@ -909,7 +1026,11 @@ impl Default for WatchHub {
 
 struct Watch {
     root: PathBuf,
+    root_guest: String,
     recursive: bool,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
     snapshot: HashMap<PathBuf, Snap>,
     events: VecDeque<Stored>,
     next_seq: u64,
@@ -929,8 +1050,40 @@ struct Stored {
     unix_ms: i64,
 }
 
+fn grant_entry_inactive(
+    grant_jti: &str,
+    grant_exp_unix: Option<i64>,
+    revoked: &BTreeSet<String>,
+    now_unix: i64,
+    fail_closed: bool,
+) -> bool {
+    if grant_exp_unix.is_some_and(|exp| now_unix >= exp) {
+        return true;
+    }
+    if fail_closed {
+        return true;
+    }
+    let jti = grant_jti.trim();
+    !jti.is_empty()
+        && revoked
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(jti))
+}
+
 impl WatchHub {
-    fn start(&self, roots: &Roots, path: &str, recursive: bool) -> Result<Value> {
+    async fn start(
+        &self,
+        roots: &Roots,
+        path: &str,
+        recursive: bool,
+        owner_peer: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
+    ) -> Result<Value> {
+        let owner_peer = owner_peer.trim().to_string();
+        if owner_peer.is_empty() {
+            return Err(Error::Auth("watch owner is required".into()));
+        }
         let located = locate(roots, path, false)?;
         if !located.real.is_dir() {
             return Err(Error::Message(format!(
@@ -938,6 +1091,21 @@ impl WatchHub {
                 located.guest
             )));
         }
+        {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| Error::Message("watch map poisoned".into()))?;
+            if guard.len() >= MAX_WATCHES {
+                return Err(Error::Message(format!(
+                    "this node already has {MAX_WATCHES} watches"
+                )));
+            }
+        }
+        let root_for_scan = located.real.clone();
+        let snapshot = tokio::task::spawn_blocking(move || scan_dir(&root_for_scan, recursive))
+            .await
+            .map_err(|err| Error::Message(format!("watch scan task: {err}")))?;
         let mut guard = self
             .inner
             .lock()
@@ -951,9 +1119,13 @@ impl WatchHub {
         guard.insert(
             id.clone(),
             Watch {
-                snapshot: scan_dir(&located.real, recursive),
+                snapshot,
                 root: located.real,
+                root_guest: located.guest.clone(),
                 recursive,
+                owner_peer,
+                grant_jti: grant_jti.trim().to_string(),
+                grant_exp_unix,
                 events: VecDeque::new(),
                 next_seq: 1,
             },
@@ -965,32 +1137,43 @@ impl WatchHub {
         }))
     }
 
-    async fn poll(&self, id: &str, cursor: u64, timeout_ms: u64, limit: u32) -> Result<Value> {
+    async fn poll(
+        &self,
+        id: &str,
+        cursor: u64,
+        timeout_ms: u64,
+        limit: u32,
+        peer: &str,
+    ) -> Result<Value> {
         let timeout_ms = timeout_ms.min(30_000);
         let limit = if limit == 0 { 50 } else { limit.min(200) };
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            self.refresh(id)?;
-            if let Some(batch) = self.drain(id, cursor, limit, false)? {
+            self.refresh(id, peer).await?;
+            if let Some(batch) = self.drain(id, cursor, limit, false, peer)? {
                 return Ok(batch);
             }
             if Instant::now() >= deadline {
                 return self
-                    .drain(id, cursor, limit, true)?
+                    .drain(id, cursor, limit, true, peer)?
                     .ok_or_else(|| Error::NotFound(format!("watch {id}")));
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
     }
 
-    fn stop(&self, id: &str) -> Result<Value> {
+    fn stop(&self, id: &str, peer: &str) -> Result<Value> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| Error::Message("watch map poisoned".into()))?;
-        if guard.remove(id).is_none() {
+        let Some(existing) = guard.get(id) else {
+            return Err(Error::NotFound(format!("watch {id}")));
+        };
+        if existing.owner_peer != peer {
             return Err(Error::NotFound(format!("watch {id}")));
         }
+        guard.remove(id);
         Ok(json!({"watch_id": id, "stopped": true}))
     }
 
@@ -1000,34 +1183,69 @@ impl WatchHub {
         }
     }
 
-    fn refresh(&self, id: &str) -> Result<()> {
+    fn close_inactive(&self, revoked: &BTreeSet<String>, now_unix: i64, fail_closed: bool) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.retain(|_, watch| {
+                !grant_entry_inactive(
+                    &watch.grant_jti,
+                    watch.grant_exp_unix,
+                    revoked,
+                    now_unix,
+                    fail_closed,
+                )
+            });
+        }
+    }
+
+    async fn refresh(&self, id: &str, peer: &str) -> Result<()> {
+        let (root, recursive) = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| Error::Message("watch map poisoned".into()))?;
+            let watch = guard
+                .get(id)
+                .filter(|w| w.owner_peer == peer)
+                .ok_or_else(|| Error::NotFound(format!("watch {id}")))?;
+            if watch
+                .grant_exp_unix
+                .is_some_and(|exp| util::unix_now() >= exp)
+            {
+                return Err(Error::Auth("grant expired".into()));
+            }
+            (watch.root.clone(), watch.recursive)
+        };
+        let next = tokio::task::spawn_blocking(move || scan_dir(&root, recursive))
+            .await
+            .map_err(|err| Error::Message(format!("watch scan task: {err}")))?;
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| Error::Message("watch map poisoned".into()))?;
         let watch = guard
             .get_mut(id)
+            .filter(|w| w.owner_peer == peer)
             .ok_or_else(|| Error::NotFound(format!("watch {id}")))?;
-        let next = scan_dir(&watch.root, watch.recursive);
         let mut created = Vec::new();
         let mut modified = Vec::new();
         let mut removed = Vec::new();
         for (path, snap) in &next {
+            let guest_path = guest_of(&watch.root_guest, &watch.root, path);
             match watch.snapshot.get(path) {
-                None => created.push(path.display().to_string()),
+                None => created.push(guest_path),
                 Some(old)
                     if old.len != snap.len
                         || old.modified != snap.modified
                         || old.is_dir != snap.is_dir =>
                 {
-                    modified.push(path.display().to_string());
+                    modified.push(guest_path);
                 }
                 _ => {}
             }
         }
         for path in watch.snapshot.keys() {
             if !next.contains_key(path) {
-                removed.push(path.display().to_string());
+                removed.push(guest_of(&watch.root_guest, &watch.root, path));
             }
         }
         watch.snapshot = next;
@@ -1037,13 +1255,21 @@ impl WatchHub {
         Ok(())
     }
 
-    fn drain(&self, id: &str, cursor: u64, limit: u32, allow_empty: bool) -> Result<Option<Value>> {
+    fn drain(
+        &self,
+        id: &str,
+        cursor: u64,
+        limit: u32,
+        allow_empty: bool,
+        peer: &str,
+    ) -> Result<Option<Value>> {
         let guard = self
             .inner
             .lock()
             .map_err(|_| Error::Message("watch map poisoned".into()))?;
         let watch = guard
             .get(id)
+            .filter(|w| w.owner_peer == peer)
             .ok_or_else(|| Error::NotFound(format!("watch {id}")))?;
         let oldest = watch
             .events
@@ -1145,16 +1371,26 @@ impl Default for ProcHub {
     }
 }
 
+struct ProcChildState {
+    child: Option<Child>,
+    exited: bool,
+    kill_requested: bool,
+}
+
 struct ProcSlot {
     id: String,
     pid: u32,
     command: String,
     cwd: String,
+    owner_peer: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
     running: AtomicBool,
     exit_code: Mutex<Option<i32>>,
     stdout: Arc<Mutex<OutBuf>>,
     stderr: Arc<Mutex<OutBuf>>,
-    child: Mutex<Option<Child>>,
+    state: Mutex<ProcChildState>,
+    signal_cvar: Condvar,
     started_unix_ms: i64,
 }
 
@@ -1217,7 +1453,14 @@ impl ProcHub {
         env: &[(String, String)],
         shell: bool,
         stdin: Option<&[u8]>,
+        owner_peer: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
     ) -> Result<Value> {
+        let owner_peer = owner_peer.trim();
+        if owner_peer.is_empty() {
+            return Err(Error::Auth("process owner is required".into()));
+        }
         if program.is_empty() {
             return Err(Error::Message("command is empty".into()));
         }
@@ -1236,10 +1479,11 @@ impl ProcHub {
             (program.to_string(), args.to_vec())
         };
         {
-            let guard = self
+            let mut guard = self
                 .inner
                 .lock()
                 .map_err(|_| Error::Message("process map poisoned".into()))?;
+            evict_exited_slots(&mut guard);
             if guard.len() >= MAX_PROCS {
                 return Err(Error::Message(format!(
                     "this node already has {MAX_PROCS} background processes"
@@ -1247,6 +1491,11 @@ impl ProcHub {
             }
         }
         let mut cmd = process::hidden(&argv0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         cmd.args(&argv)
             .current_dir(&dir)
             .stdin(if stdin.is_some() {
@@ -1261,7 +1510,6 @@ impl ProcHub {
         }
         let mut child = cmd.spawn().map_err(|err| spawn_error(&argv0, err))?;
         if let Some(bytes) = stdin {
-            use std::io::Write;
             let mut child_stdin = child
                 .stdin
                 .take()
@@ -1286,6 +1534,9 @@ impl ProcHub {
             pid,
             command,
             cwd: dir.display().to_string(),
+            owner_peer: owner_peer.to_string(),
+            grant_jti: grant_jti.trim().to_string(),
+            grant_exp_unix,
             running: AtomicBool::new(true),
             exit_code: Mutex::new(None),
             stdout: Arc::new(Mutex::new(OutBuf {
@@ -1296,7 +1547,12 @@ impl ProcHub {
                 data: Vec::new(),
                 start: 0,
             })),
-            child: Mutex::new(Some(child)),
+            state: Mutex::new(ProcChildState {
+                child: Some(child),
+                exited: false,
+                kill_requested: false,
+            }),
+            signal_cvar: Condvar::new(),
             started_unix_ms: now_ms(),
         });
         if let Some(pipe) = stdout {
@@ -1309,34 +1565,29 @@ impl ProcHub {
         std::thread::Builder::new()
             .name("agentlink-bg".into())
             .spawn(move || {
-                let code = waited
-                    .child
-                    .lock()
-                    .ok()
-                    .and_then(|mut child| child.as_mut().and_then(|child| child.wait().ok()))
-                    .map(|status| status.code().unwrap_or(-1))
-                    .unwrap_or(-1);
-                if let Ok(mut slot) = waited.exit_code.lock() {
-                    *slot = Some(code);
-                }
-                waited.running.store(false, Ordering::SeqCst);
+                reap_loop(&waited);
             })
             .map_err(|err| Error::Message(format!("process thread: {err}")))?;
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| Error::Message("process map poisoned".into()))?;
+        evict_exited_slots(&mut guard);
         let body = describe(&slot);
         guard.insert(id, slot);
         Ok(body)
     }
 
-    fn list(&self) -> Result<Value> {
+    fn list(&self, peer: &str) -> Result<Value> {
         let guard = self
             .inner
             .lock()
             .map_err(|_| Error::Message("process map poisoned".into()))?;
-        let mut processes: Vec<_> = guard.values().map(|slot| describe(slot)).collect();
+        let mut processes: Vec<_> = guard
+            .values()
+            .filter(|slot| slot.owner_peer == peer)
+            .map(|slot| describe(slot))
+            .collect();
         processes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         Ok(json!({"processes": processes}))
     }
@@ -1347,19 +1598,14 @@ impl ProcHub {
         stdout_cursor: u64,
         stderr_cursor: u64,
         max_bytes: u32,
+        peer: &str,
     ) -> Result<Value> {
         let max = if max_bytes == 0 {
             65_536
         } else {
             (max_bytes as usize).min(OUTPUT_CAP)
         };
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Message("process map poisoned".into()))?;
-        let slot = guard
-            .get(id)
-            .ok_or_else(|| Error::NotFound(format!("background process {id}")))?;
+        let slot = self.owned_slot(id, peer)?;
         let (stdout_next, stdout, stdout_gap) = slot
             .stdout
             .lock()
@@ -1383,49 +1629,185 @@ impl ProcHub {
         }))
     }
 
-    fn status(&self, id: &str) -> Result<Value> {
+    fn status(&self, id: &str, peer: &str) -> Result<Value> {
+        let slot = self.owned_slot(id, peer)?;
+        Ok(describe(&slot))
+    }
+
+    fn kill(&self, id: &str, peer: &str) -> Result<Value> {
+        let slot = self.owned_slot(id, peer)?;
+        terminate_slot(&slot);
+        Ok(describe(&slot))
+    }
+
+    fn close_inactive(&self, revoked: &BTreeSet<String>, now_unix: i64, fail_closed: bool) {
+        let victims: Vec<Arc<ProcSlot>> = {
+            let Ok(mut guard) = self.inner.lock() else {
+                return;
+            };
+            let ids: Vec<String> = guard
+                .iter()
+                .filter(|(_, slot)| {
+                    grant_entry_inactive(
+                        &slot.grant_jti,
+                        slot.grant_exp_unix,
+                        revoked,
+                        now_unix,
+                        fail_closed,
+                    )
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| guard.remove(&id))
+                .collect()
+        };
+        for slot in victims {
+            terminate_slot(&slot);
+        }
+    }
+
+    fn kill_all(&self) {
+        let slots: Vec<Arc<ProcSlot>> = match self.inner.lock() {
+            Ok(mut guard) => guard.drain().map(|(_, slot)| slot).collect(),
+            Err(poison) => poison
+                .into_inner()
+                .drain()
+                .map(|(_, slot)| slot)
+                .collect(),
+        };
+        for slot in slots {
+            terminate_slot(&slot);
+        }
+    }
+
+    fn owned_slot(&self, id: &str, peer: &str) -> Result<Arc<ProcSlot>> {
         let guard = self
             .inner
             .lock()
             .map_err(|_| Error::Message("process map poisoned".into()))?;
-        let slot = guard
+        guard
             .get(id)
-            .ok_or_else(|| Error::NotFound(format!("background process {id}")))?;
-        Ok(describe(slot))
+            .filter(|slot| slot.owner_peer == peer)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("background process {id}")))
     }
+}
 
-    fn kill(&self, id: &str) -> Result<Value> {
-        let slot = {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|_| Error::Message("process map poisoned".into()))?;
-            guard
-                .get(id)
-                .cloned()
-                .ok_or_else(|| Error::NotFound(format!("background process {id}")))?
-        };
-        if let Ok(mut child) = slot.child.lock() {
-            if let Some(child) = child.as_mut() {
-                child.kill().ok();
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while slot.running.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Ok(describe(&slot))
+fn evict_exited_slots(map: &mut HashMap<String, Arc<ProcSlot>>) {
+    if map.len() < MAX_PROCS {
+        return;
     }
+    let mut exited: Vec<(i64, String)> = map
+        .iter()
+        .filter(|(_, slot)| !slot.running.load(Ordering::SeqCst))
+        .map(|(id, slot)| (slot.started_unix_ms, id.clone()))
+        .collect();
+    exited.sort_by_key(|(started, _)| *started);
+    for (_, id) in exited {
+        map.remove(&id);
+        if map.len() < MAX_PROCS {
+            break;
+        }
+    }
+}
 
-    fn kill_all(&self) {
-        if let Ok(guard) = self.inner.lock() {
-            for slot in guard.values() {
-                if let Ok(mut child) = slot.child.lock() {
-                    if let Some(child) = child.as_mut() {
-                        child.kill().ok();
-                    }
+fn reap_loop(slot: &ProcSlot) {
+    let mut guard = match slot.state.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    loop {
+        if guard.exited {
+            return;
+        }
+        let waited = guard.child.as_mut().map(|child| child.try_wait());
+        match waited {
+            Some(Ok(Some(status))) => {
+                let code = status.code().unwrap_or(-1);
+                guard.child = None;
+                guard.exited = true;
+                if let Ok(mut exit_slot) = slot.exit_code.lock() {
+                    *exit_slot = Some(code);
                 }
+                slot.running.store(false, Ordering::SeqCst);
+                slot.signal_cvar.notify_all();
+                return;
             }
+            Some(Err(_)) | None => {
+                guard.child = None;
+                guard.exited = true;
+                if let Ok(mut exit_slot) = slot.exit_code.lock() {
+                    *exit_slot = Some(-1);
+                }
+                slot.running.store(false, Ordering::SeqCst);
+                slot.signal_cvar.notify_all();
+                return;
+            }
+            Some(Ok(None)) => {}
+        }
+        let (next_guard, _) = match slot
+            .signal_cvar
+            .wait_timeout(guard, Duration::from_millis(20))
+        {
+            Ok(pair) => pair,
+            Err(poison) => poison.into_inner(),
+        };
+        guard = next_guard;
+    }
+}
+
+fn terminate_slot(slot: &ProcSlot) {
+    let mut guard = match slot.state.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    if guard.exited {
+        return;
+    }
+    guard.kill_requested = true;
+    #[cfg(unix)]
+    unsafe {
+        // Hold `slot.state` while signaling so the wait loop cannot reap and
+        // allow PID reuse before `kill` runs.
+        libc::kill(-(slot.pid as libc::pid_t), libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    if let Some(child) = guard.child.as_mut() {
+        let _ = child.kill();
+    }
+    slot.signal_cvar.notify_all();
+
+    let grace_deadline = Instant::now() + Duration::from_millis(300);
+    while !guard.exited {
+        let Some(rem) = grace_deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let (next, _) = match slot.signal_cvar.wait_timeout(guard, rem) {
+            Ok(pair) => pair,
+            Err(poison) => poison.into_inner(),
+        };
+        guard = next;
+    }
+    if !guard.exited {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(slot.pid as libc::pid_t), libc::SIGKILL);
+        }
+        if let Some(child) = guard.child.as_mut() {
+            let _ = child.kill();
+        }
+        slot.signal_cvar.notify_all();
+        let hard_deadline = Instant::now() + Duration::from_secs(2);
+        while !guard.exited {
+            let Some(rem) = hard_deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (next, _) = match slot.signal_cvar.wait_timeout(guard, rem) {
+                Ok(pair) => pair,
+                Err(poison) => poison.into_inner(),
+            };
+            guard = next;
         }
     }
 }
@@ -1620,31 +2002,100 @@ mod tests {
         assert!(body.contains("third"), "{body}");
         let outside = paths::real_target(&roots, "/etc/passwd", false);
         assert!(outside.is_err());
+
+        // Verify confined atomic write leaves no randomized temp files behind.
+        let leftover: Vec<_> = fs::read_dir(&roots.files)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".agentlink-tmp-"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
+
+        // Patch paths escaping root are rejected.
+        let escape_patch = "--- a/../escape.txt\n+++ b/../escape.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(apply_patch_blocking(&roots, "app:/files", escape_patch).is_err());
+
+        #[cfg(unix)]
+        {
+            let secret = _dir.path().join("outside-secret.txt");
+            fs::write(&secret, "keep-me\n").unwrap();
+            let link = roots.files.join("link.txt");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            assert!(
+                replace_blocking(&roots, "app:/files/link.txt", "keep-me", "pwned", false).is_err()
+            );
+            let sym_patch = "--- a/link.txt\n+++ b/link.txt\n@@ -1 +1 @@\n-keep-me\n+pwned\n";
+            assert!(apply_patch_blocking(&roots, "app:/files", sym_patch).is_err());
+            assert_eq!(fs::read_to_string(&secret).unwrap(), "keep-me\n");
+        }
     }
 
     #[tokio::test]
     async fn watch_and_background_echo() {
         let (_dir, roots) = roots();
         let tools = ToolState::default();
-        let started = tools.watches.start(&roots, "app:/files", true).unwrap();
+        let started = tools
+            .watches
+            .start(&roots, "app:/files", true, "peer-alice", "jti-a", None)
+            .await
+            .unwrap();
         let id = started["watch_id"].as_str().unwrap().to_string();
         fs::write(roots.files.join("created.txt"), "new\n").unwrap();
-        let polled = tools.watches.poll(&id, 0, 200, 20).await.unwrap();
+        // Peer isolation on watch_poll & watch_stop.
+        assert!(tools.watches.poll(&id, 0, 20, 20, "peer-eve").await.is_err());
+        assert!(tools.watches.stop(&id, "peer-eve").is_err());
+
+        let polled = tools
+            .watches
+            .poll(&id, 0, 200, 20, "peer-alice")
+            .await
+            .unwrap();
+        let events_str = polled["events"].to_string();
         assert!(
-            polled["events"].to_string().contains("created.txt"),
-            "{polled}"
+            events_str.contains("app:/files/created.txt"),
+            "watch must return guest path, got {polled}"
         );
-        tools.watches.stop(&id).unwrap();
+        assert!(
+            !events_str.contains(&roots.files.display().to_string()),
+            "watch must not leak host filesystem path: {polled}"
+        );
+        tools.watches.stop(&id, "peer-alice").unwrap();
 
         let bg = tools
             .procs
-            .start(&roots, "echo bg-ok", &[], None, &[], true, None)
+            .start(
+                &roots,
+                "echo bg-ok",
+                &[],
+                None,
+                &[],
+                true,
+                None,
+                "peer-alice",
+                "jti-a",
+                None,
+            )
             .unwrap();
         let proc_id = bg["id"].as_str().unwrap().to_string();
+        // Peer isolation on bg_*
+        assert!(tools.procs.status(&proc_id, "peer-eve").is_err());
+        assert!(tools.procs.output(&proc_id, 0, 0, 65_536, "peer-eve").is_err());
+        assert!(tools.procs.kill(&proc_id, "peer-eve").is_err());
+        assert_eq!(
+            tools.procs.list("peer-eve").unwrap()["processes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut text = String::new();
         while Instant::now() < deadline {
-            let chunk = tools.procs.output(&proc_id, 0, 0, 65_536).unwrap();
+            let chunk = tools
+                .procs
+                .output(&proc_id, 0, 0, 65_536, "peer-alice")
+                .unwrap();
             text = chunk["stdout"]["text"].as_str().unwrap_or("").to_string();
             if text.contains("bg-ok") {
                 break;
@@ -1652,12 +2103,117 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
         assert!(text.contains("bg-ok"), "{text}");
-        tools.procs.kill(&proc_id).unwrap();
+        tools.procs.kill(&proc_id, "peer-alice").unwrap();
         let info = system_info_blocking().unwrap();
         assert!(info["cpu"]["count"].as_u64().unwrap_or(0) > 0, "{info}");
         assert!(
             info["memory"]["total_bytes"].as_u64().unwrap_or(0) > 0,
             "{info}"
         );
+    }
+
+    #[tokio::test]
+    async fn proc_kill_does_not_deadlock_and_revocation_sweeps_procs_and_watches() {
+        let (_dir, roots) = roots();
+        let tools = ToolState::default();
+        let sleeper = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >nul"
+        } else {
+            "sleep 30"
+        };
+        let bg = bg_start(
+            &tools,
+            &roots,
+            sleeper,
+            &[],
+            None,
+            &[],
+            true,
+            None,
+            "peer-alice",
+            "jti-kill",
+            Some(util::unix_now() + 60),
+        )
+        .await
+        .unwrap();
+        let id = bg["id"].as_str().unwrap().to_string();
+        // Must complete promptly (no wait()/kill() mutex deadlock!).
+        let killed = tokio::time::timeout(
+            Duration::from_secs(5),
+            bg_kill(&tools, &id, "peer-alice"),
+        )
+        .await
+        .expect("bg_kill must not deadlock")
+        .unwrap();
+        assert_eq!(killed["running"], json!(false));
+
+        // Revocation sweep removes both watch and running proc for revoked jti.
+        let w = watch_start(
+            &tools,
+            &roots,
+            "app:/files",
+            false,
+            "peer-alice",
+            "jti-revoked",
+            Some(util::unix_now() + 60),
+        )
+        .await
+        .unwrap();
+        let wid = w["watch_id"].as_str().unwrap().to_string();
+        let bg2 = bg_start(
+            &tools,
+            &roots,
+            sleeper,
+            &[],
+            None,
+            &[],
+            true,
+            None,
+            "peer-alice",
+            "jti-revoked",
+            Some(util::unix_now() + 60),
+        )
+        .await
+        .unwrap();
+        let pid2 = bg2["id"].as_str().unwrap().to_string();
+        let revoked = BTreeSet::from(["jti-revoked".to_string()]);
+        tools.close_inactive(&revoked, util::unix_now(), false);
+        assert!(watch_stop(&tools, &wid, "peer-alice").is_err());
+        assert!(bg_status(&tools, &pid2, "peer-alice").is_err());
+    }
+
+    #[tokio::test]
+    async fn proc_hub_evicts_exited_slots_past_max_procs() {
+        let (_dir, roots) = roots();
+        let tools = ToolState::default();
+        for i in 0..(MAX_PROCS + 2) {
+            let started = bg_start(
+                &tools,
+                &roots,
+                &format!("echo n{i}"),
+                &[],
+                None,
+                &[],
+                true,
+                None,
+                "peer-alice",
+                "jti-evict",
+                None,
+            )
+            .await
+            .unwrap();
+            let id = started["id"].as_str().unwrap().to_string();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if bg_status(&tools, &id, "peer-alice")
+                    .ok()
+                    .and_then(|v| v["running"].as_bool())
+                    == Some(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        }
     }
 }

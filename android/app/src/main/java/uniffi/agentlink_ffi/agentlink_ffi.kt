@@ -978,6 +978,38 @@ internal open class UniffiVTableCallbackInterfaceProgressSink(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -1009,11 +1041,15 @@ fun uniffi_agentlink_ffi_checksum_method_desktoplive_failed(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_desktoplive_info(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_desktoplive_poll_clipboard(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_desktoplive_poll_cursor(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_desktoplive_poll_frame(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_desktoplive_request_keyframe(
+): Short
+fun uniffi_agentlink_ffi_checksum_method_desktoplive_send_clipboard(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_desktoplive_send_control(
 ): Short
@@ -1025,7 +1061,11 @@ fun uniffi_agentlink_ffi_checksum_method_keysigner_public_hex(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_keysigner_sign(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_clear_node_pin(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_create_pairing(
+): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_delete_grant(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_enroll_self(
 ): Short
@@ -1033,33 +1073,57 @@ fun uniffi_agentlink_ffi_checksum_method_mobileclient_exec(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_extension(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_find_files(
+): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_import_grant(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_list_devices(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_list_dir(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_list_grants(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_list_machines(
+): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_list_node_pins(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_logout(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_mkdir(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_node_pin_warnings(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_open_live(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_pty_open(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_query_audit(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_read_bytes(
+): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_refresh_ice_servers(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_remove(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_rename(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_revoke_device(
+): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_search_content(
+): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_set_ice_servers(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_set_policy(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_stat_path(
 ): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_sys_info(
+): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_transfer_down(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_transfer_up(
+): Short
+fun uniffi_agentlink_ffi_checksum_method_mobileclient_update_access_token(
 ): Short
 fun uniffi_agentlink_ffi_checksum_method_mobileclient_write_bytes(
 ): Short
@@ -1168,12 +1232,16 @@ fun uniffi_agentlink_ffi_fn_method_desktoplive_failed(`ptr`: Pointer,uniffi_out_
 ): Byte
 fun uniffi_agentlink_ffi_fn_method_desktoplive_info(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_desktoplive_poll_clipboard(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_desktoplive_poll_cursor(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_desktoplive_poll_frame(`ptr`: Pointer,`timeoutMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_desktoplive_request_keyframe(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_agentlink_ffi_fn_method_desktoplive_send_clipboard(`ptr`: Pointer,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_agentlink_ffi_fn_method_desktoplive_send_control(`ptr`: Pointer,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
 fun uniffi_agentlink_ffi_fn_method_desktoplive_shutdown(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1198,42 +1266,70 @@ fun uniffi_agentlink_ffi_fn_constructor_mobileclient_connect(`relay`: RustBuffer
 ): Pointer
 fun uniffi_agentlink_ffi_fn_constructor_mobileclient_connect_user(`relay`: RustBuffer.ByValue,`fingerprint`: RustBuffer.ByValue,`accessToken`: RustBuffer.ByValue,`signer`: Pointer,`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
+fun uniffi_agentlink_ffi_fn_method_mobileclient_clear_node_pin(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_agentlink_ffi_fn_method_mobileclient_create_pairing(`ptr`: Pointer,`name`: RustBuffer.ByValue,`policy`: RustBuffer.ByValue,`ttlSecs`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_delete_grant(`ptr`: Pointer,`nodeId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_agentlink_ffi_fn_method_mobileclient_enroll_self(`ptr`: Pointer,`name`: RustBuffer.ByValue,`nodeDataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_agentlink_ffi_fn_method_mobileclient_exec(`ptr`: Pointer,`node`: RustBuffer.ByValue,`program`: RustBuffer.ByValue,`args`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`env`: RustBuffer.ByValue,`shell`: Byte,`timeoutMs`: Long,`sink`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_extension(`ptr`: Pointer,`node`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`payloadJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_find_files(`ptr`: Pointer,`node`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`pattern`: RustBuffer.ByValue,`regex`: Byte,`includeHidden`: Byte,`caseInsensitive`: Byte,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_import_grant(`ptr`: Pointer,`grantJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_list_devices(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_list_dir(`ptr`: Pointer,`node`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_list_grants(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_list_machines(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_list_node_pins(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_logout(`ptr`: Pointer,`refreshToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_agentlink_ffi_fn_method_mobileclient_mkdir(`ptr`: Pointer,`node`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`recursive`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_agentlink_ffi_fn_method_mobileclient_node_pin_warnings(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_open_live(`ptr`: Pointer,`node`: RustBuffer.ByValue,`maxFps`: Int,`bitrate`: Int,`monitor`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
 fun uniffi_agentlink_ffi_fn_method_mobileclient_pty_open(`ptr`: Pointer,`node`: RustBuffer.ByValue,`command`: RustBuffer.ByValue,`rows`: Short,`cols`: Short,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
+fun uniffi_agentlink_ffi_fn_method_mobileclient_query_audit(`ptr`: Pointer,`nodeId`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_read_bytes(`ptr`: Pointer,`node`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`offset`: Long,`maxBytes`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_refresh_ice_servers(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_remove(`ptr`: Pointer,`node`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`recursive`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_agentlink_ffi_fn_method_mobileclient_rename(`ptr`: Pointer,`node`: RustBuffer.ByValue,`from`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_agentlink_ffi_fn_method_mobileclient_revoke_device(`ptr`: Pointer,`deviceId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_agentlink_ffi_fn_method_mobileclient_search_content(`ptr`: Pointer,`node`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`pattern`: RustBuffer.ByValue,`literal`: Byte,`includeHidden`: Byte,`caseInsensitive`: Byte,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_set_ice_servers(`ptr`: Pointer,`iceServersJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_agentlink_ffi_fn_method_mobileclient_set_policy(`ptr`: Pointer,`node`: RustBuffer.ByValue,`policy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_stat_path(`ptr`: Pointer,`node`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_sys_info(`ptr`: Pointer,`node`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_transfer_down(`ptr`: Pointer,`node`: RustBuffer.ByValue,`remote`: RustBuffer.ByValue,`local`: RustBuffer.ByValue,`preferDirect`: Byte,`sink`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_agentlink_ffi_fn_method_mobileclient_transfer_up(`ptr`: Pointer,`node`: RustBuffer.ByValue,`remote`: RustBuffer.ByValue,`local`: RustBuffer.ByValue,`preferDirect`: Byte,`sink`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_agentlink_ffi_fn_method_mobileclient_update_access_token(`ptr`: Pointer,`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_agentlink_ffi_fn_method_mobileclient_write_bytes(`ptr`: Pointer,`node`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_agentlink_ffi_fn_clone_mobilenode(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1464,6 +1560,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_agentlink_ffi_checksum_method_desktoplive_info() != 44682.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_agentlink_ffi_checksum_method_desktoplive_poll_clipboard() != 15545.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_agentlink_ffi_checksum_method_desktoplive_poll_cursor() != 46490.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1471,6 +1570,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_desktoplive_request_keyframe() != 10775.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_desktoplive_send_clipboard() != 52075.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_desktoplive_send_control() != 59144.toShort()) {
@@ -1488,7 +1590,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_agentlink_ffi_checksum_method_keysigner_sign() != 7741.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_clear_node_pin() != 24890.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_create_pairing() != 7932.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_delete_grant() != 54971.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_enroll_self() != 26296.toShort()) {
@@ -1500,13 +1608,25 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_extension() != 54449.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_find_files() != 64211.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_import_grant() != 30314.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_list_devices() != 17345.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_list_dir() != 43545.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_list_grants() != 12430.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_list_machines() != 55586.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_list_node_pins() != 36695.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_logout() != 7785.toShort()) {
@@ -1515,13 +1635,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_mkdir() != 20126.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_node_pin_warnings() != 51046.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_open_live() != 15547.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_pty_open() != 5049.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_query_audit() != 21511.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_read_bytes() != 50678.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_refresh_ice_servers() != 4304.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_remove() != 1651.toShort()) {
@@ -1530,16 +1659,31 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_rename() != 54453.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_revoke_device() != 6749.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_search_content() != 56332.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_set_ice_servers() != 30588.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_set_policy() != 1728.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_stat_path() != 8089.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_sys_info() != 9593.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_transfer_down() != 51072.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_transfer_up() != 40504.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_update_access_token() != 56988.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_agentlink_ffi_checksum_method_mobileclient_write_bytes() != 11447.toShort()) {
@@ -2130,11 +2274,15 @@ public interface DesktopLiveInterface {
     
     fun `info`(): LiveInfo
     
+    fun `pollClipboard`(): LiveClipboard?
+    
     fun `pollCursor`(): LiveCursor?
     
     fun `pollFrame`(`timeoutMs`: kotlin.UInt): LiveFrame?
     
     fun `requestKeyframe`()
+    
+    fun `sendClipboard`(`text`: kotlin.String): kotlin.Boolean
     
     fun `sendControl`(`json`: kotlin.String): kotlin.Boolean
     
@@ -2257,6 +2405,18 @@ open class DesktopLive: Disposable, AutoCloseable, DesktopLiveInterface
     }
     
 
+    override fun `pollClipboard`(): LiveClipboard? {
+            return FfiConverterOptionalTypeLiveClipboard.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_desktoplive_poll_clipboard(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
     override fun `pollCursor`(): LiveCursor? {
             return FfiConverterOptionalTypeLiveCursor.lift(
     callWithPointer {
@@ -2290,6 +2450,18 @@ open class DesktopLive: Disposable, AutoCloseable, DesktopLiveInterface
 }
     }
     
+    
+
+    override fun `sendClipboard`(`text`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_desktoplive_send_clipboard(
+        it, FfiConverterString.lower(`text`),_status)
+}
+    }
+    )
+    }
     
 
     override fun `sendControl`(`json`: kotlin.String): kotlin.Boolean {
@@ -2772,7 +2944,11 @@ public object FfiConverterTypeKeySigner: FfiConverter<KeySigner, Pointer> {
 
 public interface MobileClientInterface {
     
+    fun `clearNodePin`(`name`: kotlin.String): kotlin.Boolean
+    
     fun `createPairing`(`name`: kotlin.String, `policy`: FfiPolicy, `ttlSecs`: kotlin.ULong): FfiPairing
+    
+    fun `deleteGrant`(`nodeId`: kotlin.String): kotlin.Boolean
     
     /**
      * Enroll the phone's node key under the logged-in user. No pairing token.
@@ -2783,15 +2959,25 @@ public interface MobileClientInterface {
     
     fun `extension`(`node`: kotlin.String, `name`: kotlin.String, `payloadJson`: kotlin.String): kotlin.String
     
+    fun `findFiles`(`node`: kotlin.String, `path`: kotlin.String, `pattern`: kotlin.String, `regex`: kotlin.Boolean, `includeHidden`: kotlin.Boolean, `caseInsensitive`: kotlin.Boolean, `limit`: kotlin.UInt): kotlin.String
+    
+    fun `importGrant`(`grantJson`: kotlin.String): FfiGrant
+    
     fun `listDevices`(): List<FfiDevice>
     
     fun `listDir`(`node`: kotlin.String, `path`: kotlin.String): List<FfiEntry>
     
+    fun `listGrants`(): List<FfiGrant>
+    
     fun `listMachines`(): List<MachineInfo>
+    
+    fun `listNodePins`(): List<FfiNodePin>
     
     fun `logout`(`refreshToken`: kotlin.String)
     
     fun `mkdir`(`node`: kotlin.String, `path`: kotlin.String, `recursive`: kotlin.Boolean)
+    
+    fun `nodePinWarnings`(): List<kotlin.String>
     
     /**
      * Open the phase-3 desktop stream. The returned object depacketizes
@@ -2802,19 +2988,44 @@ public interface MobileClientInterface {
     
     fun `ptyOpen`(`node`: kotlin.String, `command`: kotlin.String?, `rows`: kotlin.UShort, `cols`: kotlin.UShort): PtyHandle
     
+    fun `queryAudit`(`nodeId`: kotlin.String, `limit`: kotlin.UInt): kotlin.String
+    
     fun `readBytes`(`node`: kotlin.String, `path`: kotlin.String, `offset`: kotlin.ULong, `maxBytes`: kotlin.ULong): kotlin.ByteArray
+    
+    /**
+     * Fetch fresh ICE/TURN servers from the relay (`/api/ice` with fallback to
+     * `/view/config.json`) using the current relay settings and access token.
+     */
+    fun `refreshIceServers`(): kotlin.String
     
     fun `remove`(`node`: kotlin.String, `path`: kotlin.String, `recursive`: kotlin.Boolean)
     
     fun `rename`(`node`: kotlin.String, `from`: kotlin.String, `to`: kotlin.String)
     
+    fun `revokeDevice`(`deviceId`: kotlin.String)
+    
+    fun `searchContent`(`node`: kotlin.String, `path`: kotlin.String, `pattern`: kotlin.String, `literal`: kotlin.Boolean, `includeHidden`: kotlin.Boolean, `caseInsensitive`: kotlin.Boolean, `limit`: kotlin.UInt): kotlin.String
+    
+    /**
+     * Override or clear (`""`) the ICE/TURN servers used by [`Self::open_live`].
+     */
+    fun `setIceServers`(`iceServersJson`: kotlin.String)
+    
     fun `setPolicy`(`node`: kotlin.String, `policy`: FfiPolicy): FfiPolicy
     
     fun `statPath`(`node`: kotlin.String, `path`: kotlin.String): FfiStat
     
+    fun `sysInfo`(`node`: kotlin.String): kotlin.String
+    
     fun `transferDown`(`node`: kotlin.String, `remote`: kotlin.String, `local`: kotlin.String, `preferDirect`: kotlin.Boolean, `sink`: ProgressSink): FfiStats
     
     fun `transferUp`(`node`: kotlin.String, `remote`: kotlin.String, `local`: kotlin.String, `preferDirect`: kotlin.Boolean, `sink`: ProgressSink): FfiStats
+    
+    /**
+     * Update the access token used on future reconnects and relay API calls
+     * without interrupting active PTY, live desktop, or file transfer sessions.
+     */
+    fun `updateAccessToken`(`token`: kotlin.String)
     
     fun `writeBytes`(`node`: kotlin.String, `path`: kotlin.String, `data`: kotlin.ByteArray)
     
@@ -2904,12 +3115,38 @@ open class MobileClient: Disposable, AutoCloseable, MobileClientInterface
     }
 
     
+    @Throws(LinkException::class)override fun `clearNodePin`(`name`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_clear_node_pin(
+        it, FfiConverterString.lower(`name`),_status)
+}
+    }
+    )
+    }
+    
+
+    
     @Throws(LinkException::class)override fun `createPairing`(`name`: kotlin.String, `policy`: FfiPolicy, `ttlSecs`: kotlin.ULong): FfiPairing {
             return FfiConverterTypeFfiPairing.lift(
     callWithPointer {
     uniffiRustCallWithError(LinkException) { _status ->
     UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_create_pairing(
         it, FfiConverterString.lower(`name`),FfiConverterTypeFfiPolicy.lower(`policy`),FfiConverterULong.lower(`ttlSecs`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(LinkException::class)override fun `deleteGrant`(`nodeId`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_delete_grant(
+        it, FfiConverterString.lower(`nodeId`),_status)
 }
     }
     )
@@ -2958,6 +3195,32 @@ open class MobileClient: Disposable, AutoCloseable, MobileClientInterface
     
 
     
+    @Throws(LinkException::class)override fun `findFiles`(`node`: kotlin.String, `path`: kotlin.String, `pattern`: kotlin.String, `regex`: kotlin.Boolean, `includeHidden`: kotlin.Boolean, `caseInsensitive`: kotlin.Boolean, `limit`: kotlin.UInt): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_find_files(
+        it, FfiConverterString.lower(`node`),FfiConverterString.lower(`path`),FfiConverterString.lower(`pattern`),FfiConverterBoolean.lower(`regex`),FfiConverterBoolean.lower(`includeHidden`),FfiConverterBoolean.lower(`caseInsensitive`),FfiConverterUInt.lower(`limit`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(LinkException::class)override fun `importGrant`(`grantJson`: kotlin.String): FfiGrant {
+            return FfiConverterTypeFfiGrant.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_import_grant(
+        it, FfiConverterString.lower(`grantJson`),_status)
+}
+    }
+    )
+    }
+    
+
+    
     @Throws(LinkException::class)override fun `listDevices`(): List<FfiDevice> {
             return FfiConverterSequenceTypeFfiDevice.lift(
     callWithPointer {
@@ -2984,11 +3247,37 @@ open class MobileClient: Disposable, AutoCloseable, MobileClientInterface
     
 
     
+    @Throws(LinkException::class)override fun `listGrants`(): List<FfiGrant> {
+            return FfiConverterSequenceTypeFfiGrant.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_list_grants(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
     @Throws(LinkException::class)override fun `listMachines`(): List<MachineInfo> {
             return FfiConverterSequenceTypeMachineInfo.lift(
     callWithPointer {
     uniffiRustCallWithError(LinkException) { _status ->
     UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_list_machines(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(LinkException::class)override fun `listNodePins`(): List<FfiNodePin> {
+            return FfiConverterSequenceTypeFfiNodePin.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_list_node_pins(
         it, _status)
 }
     }
@@ -3018,6 +3307,18 @@ open class MobileClient: Disposable, AutoCloseable, MobileClientInterface
 }
     }
     
+    
+
+    override fun `nodePinWarnings`(): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_node_pin_warnings(
+        it, _status)
+}
+    }
+    )
+    }
     
 
     
@@ -3052,12 +3353,42 @@ open class MobileClient: Disposable, AutoCloseable, MobileClientInterface
     
 
     
+    @Throws(LinkException::class)override fun `queryAudit`(`nodeId`: kotlin.String, `limit`: kotlin.UInt): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_query_audit(
+        it, FfiConverterString.lower(`nodeId`),FfiConverterUInt.lower(`limit`),_status)
+}
+    }
+    )
+    }
+    
+
+    
     @Throws(LinkException::class)override fun `readBytes`(`node`: kotlin.String, `path`: kotlin.String, `offset`: kotlin.ULong, `maxBytes`: kotlin.ULong): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
     callWithPointer {
     uniffiRustCallWithError(LinkException) { _status ->
     UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_read_bytes(
         it, FfiConverterString.lower(`node`),FfiConverterString.lower(`path`),FfiConverterULong.lower(`offset`),FfiConverterULong.lower(`maxBytes`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Fetch fresh ICE/TURN servers from the relay (`/api/ice` with fallback to
+     * `/view/config.json`) using the current relay settings and access token.
+     */
+    @Throws(LinkException::class)override fun `refreshIceServers`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_refresh_ice_servers(
+        it, _status)
 }
     }
     )
@@ -3083,6 +3414,46 @@ open class MobileClient: Disposable, AutoCloseable, MobileClientInterface
     uniffiRustCallWithError(LinkException) { _status ->
     UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_rename(
         it, FfiConverterString.lower(`node`),FfiConverterString.lower(`from`),FfiConverterString.lower(`to`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(LinkException::class)override fun `revokeDevice`(`deviceId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_revoke_device(
+        it, FfiConverterString.lower(`deviceId`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(LinkException::class)override fun `searchContent`(`node`: kotlin.String, `path`: kotlin.String, `pattern`: kotlin.String, `literal`: kotlin.Boolean, `includeHidden`: kotlin.Boolean, `caseInsensitive`: kotlin.Boolean, `limit`: kotlin.UInt): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_search_content(
+        it, FfiConverterString.lower(`node`),FfiConverterString.lower(`path`),FfiConverterString.lower(`pattern`),FfiConverterBoolean.lower(`literal`),FfiConverterBoolean.lower(`includeHidden`),FfiConverterBoolean.lower(`caseInsensitive`),FfiConverterUInt.lower(`limit`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Override or clear (`""`) the ICE/TURN servers used by [`Self::open_live`].
+     */
+    @Throws(LinkException::class)override fun `setIceServers`(`iceServersJson`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_set_ice_servers(
+        it, FfiConverterString.lower(`iceServersJson`),_status)
 }
     }
     
@@ -3115,6 +3486,19 @@ open class MobileClient: Disposable, AutoCloseable, MobileClientInterface
     
 
     
+    @Throws(LinkException::class)override fun `sysInfo`(`node`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_sys_info(
+        it, FfiConverterString.lower(`node`),_status)
+}
+    }
+    )
+    }
+    
+
+    
     @Throws(LinkException::class)override fun `transferDown`(`node`: kotlin.String, `remote`: kotlin.String, `local`: kotlin.String, `preferDirect`: kotlin.Boolean, `sink`: ProgressSink): FfiStats {
             return FfiConverterTypeFfiStats.lift(
     callWithPointer {
@@ -3138,6 +3522,22 @@ open class MobileClient: Disposable, AutoCloseable, MobileClientInterface
     }
     )
     }
+    
+
+    
+    /**
+     * Update the access token used on future reconnects and relay API calls
+     * without interrupting active PTY, live desktop, or file transfer sessions.
+     */
+    @Throws(LinkException::class)override fun `updateAccessToken`(`token`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(LinkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_agentlink_ffi_fn_method_mobileclient_update_access_token(
+        it, FfiConverterString.lower(`token`),_status)
+}
+    }
+    
     
 
     
@@ -4970,6 +5370,62 @@ public object FfiConverterTypeFfiEntry: FfiConverterRustBuffer<FfiEntry> {
 
 
 
+data class FfiGrant (
+    var `nodeId`: kotlin.String, 
+    var `granteeId`: kotlin.String, 
+    var `issuerId`: kotlin.String, 
+    var `jti`: kotlin.String, 
+    var `nbfUnix`: kotlin.Long, 
+    var `expUnix`: kotlin.Long, 
+    var `preset`: kotlin.String, 
+    var `policy`: FfiPolicy
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiGrant: FfiConverterRustBuffer<FfiGrant> {
+    override fun read(buf: ByteBuffer): FfiGrant {
+        return FfiGrant(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypeFfiPolicy.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiGrant) = (
+            FfiConverterString.allocationSize(value.`nodeId`) +
+            FfiConverterString.allocationSize(value.`granteeId`) +
+            FfiConverterString.allocationSize(value.`issuerId`) +
+            FfiConverterString.allocationSize(value.`jti`) +
+            FfiConverterLong.allocationSize(value.`nbfUnix`) +
+            FfiConverterLong.allocationSize(value.`expUnix`) +
+            FfiConverterString.allocationSize(value.`preset`) +
+            FfiConverterTypeFfiPolicy.allocationSize(value.`policy`)
+    )
+
+    override fun write(value: FfiGrant, buf: ByteBuffer) {
+            FfiConverterString.write(value.`nodeId`, buf)
+            FfiConverterString.write(value.`granteeId`, buf)
+            FfiConverterString.write(value.`issuerId`, buf)
+            FfiConverterString.write(value.`jti`, buf)
+            FfiConverterLong.write(value.`nbfUnix`, buf)
+            FfiConverterLong.write(value.`expUnix`, buf)
+            FfiConverterString.write(value.`preset`, buf)
+            FfiConverterTypeFfiPolicy.write(value.`policy`, buf)
+    }
+}
+
+
+
 data class FfiLogin (
     var `user`: kotlin.String, 
     var `role`: kotlin.String, 
@@ -5017,6 +5473,38 @@ public object FfiConverterTypeFfiLogin: FfiConverterRustBuffer<FfiLogin> {
             FfiConverterLong.write(value.`accessExpiresUnix`, buf)
             FfiConverterString.write(value.`refreshToken`, buf)
             FfiConverterLong.write(value.`refreshExpiresUnix`, buf)
+    }
+}
+
+
+
+data class FfiNodePin (
+    var `name`: kotlin.String, 
+    var `nodeId`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiNodePin: FfiConverterRustBuffer<FfiNodePin> {
+    override fun read(buf: ByteBuffer): FfiNodePin {
+        return FfiNodePin(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiNodePin) = (
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterString.allocationSize(value.`nodeId`)
+    )
+
+    override fun write(value: FfiNodePin, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterString.write(value.`nodeId`, buf)
     }
 }
 
@@ -5214,10 +5702,45 @@ public object FfiConverterTypeFfiStats: FfiConverterRustBuffer<FfiStats> {
 
 
 
+data class LiveClipboard (
+    var `text`: kotlin.String, 
+    var `truncated`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLiveClipboard: FfiConverterRustBuffer<LiveClipboard> {
+    override fun read(buf: ByteBuffer): LiveClipboard {
+        return LiveClipboard(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: LiveClipboard) = (
+            FfiConverterString.allocationSize(value.`text`) +
+            FfiConverterBoolean.allocationSize(value.`truncated`)
+    )
+
+    override fun write(value: LiveClipboard, buf: ByteBuffer) {
+            FfiConverterString.write(value.`text`, buf)
+            FfiConverterBoolean.write(value.`truncated`, buf)
+    }
+}
+
+
+
 data class LiveCursor (
     var `x`: kotlin.Int, 
     var `y`: kotlin.Int, 
-    var `shape`: kotlin.String
+    var `shape`: kotlin.String, 
+    var `visible`: kotlin.Boolean, 
+    var `hotspotX`: kotlin.UShort, 
+    var `hotspotY`: kotlin.UShort
 ) {
     
     companion object
@@ -5232,19 +5755,28 @@ public object FfiConverterTypeLiveCursor: FfiConverterRustBuffer<LiveCursor> {
             FfiConverterInt.read(buf),
             FfiConverterInt.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterUShort.read(buf),
         )
     }
 
     override fun allocationSize(value: LiveCursor) = (
             FfiConverterInt.allocationSize(value.`x`) +
             FfiConverterInt.allocationSize(value.`y`) +
-            FfiConverterString.allocationSize(value.`shape`)
+            FfiConverterString.allocationSize(value.`shape`) +
+            FfiConverterBoolean.allocationSize(value.`visible`) +
+            FfiConverterUShort.allocationSize(value.`hotspotX`) +
+            FfiConverterUShort.allocationSize(value.`hotspotY`)
     )
 
     override fun write(value: LiveCursor, buf: ByteBuffer) {
             FfiConverterInt.write(value.`x`, buf)
             FfiConverterInt.write(value.`y`, buf)
             FfiConverterString.write(value.`shape`, buf)
+            FfiConverterBoolean.write(value.`visible`, buf)
+            FfiConverterUShort.write(value.`hotspotX`, buf)
+            FfiConverterUShort.write(value.`hotspotY`, buf)
     }
 }
 
@@ -5301,7 +5833,10 @@ data class LiveInfo (
     var `hardware`: kotlin.Boolean, 
     var `width`: kotlin.UInt, 
     var `height`: kotlin.UInt, 
-    var `control`: kotlin.Boolean
+    var `srcWidth`: kotlin.UInt, 
+    var `srcHeight`: kotlin.UInt, 
+    var `control`: kotlin.Boolean, 
+    var `cursorPresentation`: kotlin.String
 ) {
     
     companion object
@@ -5319,7 +5854,10 @@ public object FfiConverterTypeLiveInfo: FfiConverterRustBuffer<LiveInfo> {
             FfiConverterBoolean.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterString.read(buf),
         )
     }
 
@@ -5330,7 +5868,10 @@ public object FfiConverterTypeLiveInfo: FfiConverterRustBuffer<LiveInfo> {
             FfiConverterBoolean.allocationSize(value.`hardware`) +
             FfiConverterUInt.allocationSize(value.`width`) +
             FfiConverterUInt.allocationSize(value.`height`) +
-            FfiConverterBoolean.allocationSize(value.`control`)
+            FfiConverterUInt.allocationSize(value.`srcWidth`) +
+            FfiConverterUInt.allocationSize(value.`srcHeight`) +
+            FfiConverterBoolean.allocationSize(value.`control`) +
+            FfiConverterString.allocationSize(value.`cursorPresentation`)
     )
 
     override fun write(value: LiveInfo, buf: ByteBuffer) {
@@ -5340,7 +5881,10 @@ public object FfiConverterTypeLiveInfo: FfiConverterRustBuffer<LiveInfo> {
             FfiConverterBoolean.write(value.`hardware`, buf)
             FfiConverterUInt.write(value.`width`, buf)
             FfiConverterUInt.write(value.`height`, buf)
+            FfiConverterUInt.write(value.`srcWidth`, buf)
+            FfiConverterUInt.write(value.`srcHeight`, buf)
             FfiConverterBoolean.write(value.`control`, buf)
+            FfiConverterString.write(value.`cursorPresentation`, buf)
     }
 }
 
@@ -5658,6 +6202,38 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeLiveClipboard: FfiConverterRustBuffer<LiveClipboard?> {
+    override fun read(buf: ByteBuffer): LiveClipboard? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeLiveClipboard.read(buf)
+    }
+
+    override fun allocationSize(value: LiveClipboard?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeLiveClipboard.allocationSize(value)
+        }
+    }
+
+    override fun write(value: LiveClipboard?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeLiveClipboard.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeLiveCursor: FfiConverterRustBuffer<LiveCursor?> {
     override fun read(buf: ByteBuffer): LiveCursor? {
         if (buf.get().toInt() == 0) {
@@ -5796,6 +6372,62 @@ public object FfiConverterSequenceTypeFfiEntry: FfiConverterRustBuffer<List<FfiE
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFfiEntry.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiGrant: FfiConverterRustBuffer<List<FfiGrant>> {
+    override fun read(buf: ByteBuffer): List<FfiGrant> {
+        val len = buf.getInt()
+        return List<FfiGrant>(len) {
+            FfiConverterTypeFfiGrant.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiGrant>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiGrant.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiGrant>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiGrant.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiNodePin: FfiConverterRustBuffer<List<FfiNodePin>> {
+    override fun read(buf: ByteBuffer): List<FfiNodePin> {
+        val len = buf.getInt()
+        return List<FfiNodePin>(len) {
+            FfiConverterTypeFfiNodePin.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiNodePin>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiNodePin.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiNodePin>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiNodePin.write(it, buf)
         }
     }
 }

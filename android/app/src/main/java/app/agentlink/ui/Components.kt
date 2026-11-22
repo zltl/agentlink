@@ -44,6 +44,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -193,9 +194,9 @@ fun SelfHostedRelay(
     onFingerprint: (String) -> Unit,
     relayModifier: Modifier = Modifier.fillMaxWidth(),
     fingerprintModifier: Modifier = Modifier.fillMaxWidth(),
-    startOpen: Boolean = false,
+    startOpen: Boolean = relay.isBlank(),
 ) {
-    var open by remember { mutableStateOf(startOpen) }
+    var open by rememberSaveable { mutableStateOf(startOpen) }
     val custom = fingerprint.isNotBlank() || relay.trim() != DEFAULT_RELAY
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         QuietButton(

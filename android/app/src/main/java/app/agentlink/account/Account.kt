@@ -2,6 +2,8 @@ package app.agentlink.account
 
 import android.net.Uri
 import app.agentlink.bridge.ClientSession
+import app.agentlink.bridge.GrantRow
+import app.agentlink.bridge.NodePinRow
 
 /** No built-in relay. Callers pass a URL or keep one already saved. */
 const val DEFAULT_RELAY = ""
@@ -61,6 +63,13 @@ interface AccountApi {
     fun logout(account: UserAccount)
     fun listNodes(account: UserAccount): List<NodeRow>
     fun listDevices(account: UserAccount): List<DeviceRow>
+    fun revokeDevice(account: UserAccount, deviceId: String) = Unit
+    fun listNodePins(account: UserAccount): List<NodePinRow> = emptyList()
+    fun clearNodePin(account: UserAccount, name: String): Boolean = false
+    fun listGrants(account: UserAccount): List<GrantRow> = emptyList()
+    fun importGrant(account: UserAccount, grantJson: String): GrantRow =
+        throw UnsupportedOperationException("importGrant")
+    fun deleteGrant(account: UserAccount, nodeId: String): Boolean = false
 
     /**
      * Hex Ed25519 public key this device signs with. It is the grantee id of

@@ -1,5 +1,6 @@
 package app.agentlink.ui
 
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
@@ -27,11 +28,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Refresh
@@ -79,6 +83,8 @@ import app.agentlink.model.LIVE_MAX_FPS
 import app.agentlink.model.childPath
 import app.agentlink.model.controllerKeyFromRejection
 import app.agentlink.model.decorateGrantFailure
+import app.agentlink.model.defaultRootPath
+import app.agentlink.model.defaultTransferPath
 import app.agentlink.model.isGrantFixNote
 import app.agentlink.model.isSignedGrantFailure
 import app.agentlink.model.jsonField
@@ -114,34 +120,57 @@ import java.io.File
 private enum class ShellPhase { Opening, Connected, Closed, Failed }
 
 @Composable
-internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
+internal fun FilesPane(model: ClientViewModel, machine: MachineRow, account: AccountApi? = null) {
     val context = LocalContext.current
-    var path by remember { mutableStateOf("app:/") }
+    val identityDir = context.filesDir
+    var path by rememberSaveable(machine.id) { mutableStateOf(defaultRootPath(machine.os)) }
+    var pathInput by rememberSaveable(machine.id) { mutableStateOf(path) }
     var entries by remember { mutableStateOf<List<FileRow>>(emptyList()) }
     var query by remember { mutableStateOf("") }
+    var searchContentMode by remember { mutableStateOf(false) }
     var hits by remember { mutableStateOf<List<String>>(emptyList()) }
     var editor by remember { mutableStateOf<String?>(null) }
     var draft by remember { mutableStateOf("") }
     var note by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf<String?>(null) }
+    var deviceKey by remember(machine.id) { mutableStateOf<String?>(null) }
+    var grantKey by remember(machine.id) { mutableStateOf<String?>(null) }
+    var grantHelp by remember(machine.id) { mutableStateOf(false) }
+    LaunchedEffect(machine.id, account) {
+        deviceKey = withContext(Dispatchers.IO) {
+            runCatching { account?.devicePublicHex() }.getOrNull()
+        }?.takeIf { it.isNotBlank() }
+    }
+    fun grantNote(message: String): String {
+        if (!isSignedGrantFailure(message)) return message
+        val checked = controllerKeyFromRejection(message)
+        if (checked.isNotEmpty()) grantKey = checked
+        else if (grantKey.isNullOrBlank()) grantKey = deviceKey?.trim()?.lowercase()?.ifBlank { null }
+        return decorateGrantFailure(message, machine.id, deviceKey, identityDir.absolutePath)
+    }
     fun showProgress(value: String?) {
         onMain { progress = value }
     }
     var askFolder by remember { mutableStateOf(false) }
     var folderName by remember { mutableStateOf("") }
+    var renameTarget by remember { mutableStateOf<FileRow?>(null) }
+    var renameInput by remember { mutableStateOf("") }
+    var deleteTarget by remember { mutableStateOf<FileRow?>(null) }
     val canRead = machine.online && machine.allowRead
     val canWrite = machine.online && machine.allowWrite
     fun load(target: String) {
         if (!machine.online || !machine.allowRead) return
+        val cleaned = target.trim().ifBlank { defaultRootPath(machine.os) }
         loading = true
-        model.work({ it.listDir(machine.id, target) }) { result ->
+        model.work({ it.listDir(machine.id, cleaned) }) { result ->
             loading = false
             result.onSuccess {
-                path = target
+                path = cleaned
+                pathInput = cleaned
                 entries = it.sortedWith(compareBy<FileRow> { !it.isDir }.thenBy { it.name.lowercase() })
                 note = null
-            }.onFailure { note = it.message ?: "Couldn't list that folder." }
+            }.onFailure { note = grantNote(it.message ?: "Couldn't list that folder.") }
         }
     }
     fun openFile(file: String, size: ULong) {
@@ -158,26 +187,31 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
                 } else {
                     note = "This file is not shown as text. Download it instead."
                 }
-            }.onFailure { note = it.message ?: "Couldn't open that file." }
+            }.onFailure { note = grantNote(it.message ?: "Couldn't open that file.") }
         }
     }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         val remote = childPath(path, safeFileName(displayName(context, uri)))
         model.work({ session ->
-            val dest = File(context.cacheDir, "upload-${System.currentTimeMillis()}.bin")
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { input.copyTo(it) }
-            } ?: error("Could not read the picked file")
-            session.transferUp(machine.id, remote, dest.absolutePath, true) { done, total ->
-                showProgress(progressLabel(done, total))
+            val xferDir = File(context.cacheDir, "client-xfer").apply { mkdirs() }
+            val dest = File(xferDir, "upload-${System.currentTimeMillis()}-${java.util.UUID.randomUUID()}.bin")
+            try {
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    dest.outputStream().use { input.copyTo(it) }
+                } ?: error("Could not read the picked file")
+                session.transferUp(machine.id, remote, dest.absolutePath, true) { done, total ->
+                    showProgress(progressLabel(done, total))
+                }
+            } finally {
+                runCatching { dest.delete() }
             }
         }) { result ->
             progress = null
             result.onSuccess {
                 note = "Uploaded ${it.logicalBytes} bytes via ${it.transport}"
                 load(path)
-            }.onFailure { note = it.message ?: "Upload failed." }
+            }.onFailure { note = grantNote(it.message ?: "Upload failed.") }
         }
     }
     LaunchedEffect(machine.id, machine.online, machine.allowRead) {
@@ -195,7 +229,7 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
             onSave = {
                 val file = editor ?: return@FileEditor
                 model.work({ it.writeBytes(machine.id, file, draft.encodeToByteArray()) }) { result ->
-                    result.onSuccess { note = "Saved $file" }.onFailure { note = it.message ?: "Couldn't save that file." }
+                    result.onSuccess { note = "Saved $file" }.onFailure { note = grantNote(it.message ?: "Couldn't save that file.") }
                 }
             },
         )
@@ -222,26 +256,65 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     MachineContextLine(machine)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        val up = parentPath(path)
+                        IconButton(
+                            onClick = { if (up != null) load(up) },
+                            enabled = canRead && up != null,
+                            modifier = Modifier.size(48.dp).testTag("path-up"),
+                        ) {
+                            Icon(Icons.Filled.ArrowUpward, contentDescription = "Up folder")
+                        }
+                        AgentField(pathInput, { pathInput = it }, "Path", Modifier.weight(1f).testTag("path-input"), enabled = canRead)
+                        SecondaryButton("Go", onClick = { load(pathInput) }, enabled = canRead)
+                    }
                     PathBar(path, canRead) { load(it) }
                     if (loading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     progress?.let { SupportingText(it) }
-                    note?.let { FileNote(it) }
+                    note?.let {
+                        FileNote(it)
+                        if (isGrantFixNote(it)) {
+                            SecondaryButton("Import grant", { grantHelp = true }, Modifier.testTag("import-grant"))
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        AgentFilterChip(!searchContentMode, "Names", { searchContentMode = false })
+                        AgentFilterChip(searchContentMode, "Content", { searchContentMode = true })
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        AgentField(query, { query = it }, "Search names", Modifier.weight(1f))
+                        AgentField(
+                            query,
+                            { query = it },
+                            if (searchContentMode) "Search file contents" else "Search names",
+                            Modifier.weight(1f),
+                        )
                         IconButton(
                             onClick = {
                                 if (!canRead) return@IconButton
                                 if (query.isBlank()) {
                                     hits = emptyList()
-                                    note = "Enter a name to search."
+                                    note = "Enter a query to search."
                                     return@IconButton
                                 }
                                 model.work({ session ->
-                                    searchFiles(path, query) { dir ->
-                                        session.listDir(machine.id, dir).map { DirItem(it.name, it.isDir) }
+                                    if (searchContentMode) {
+                                        val raw = session.searchContent(machine.id, path, query.trim())
+                                        parseSearchHits(raw, isContent = true)
+                                    } else {
+                                        val raw = runCatching {
+                                            session.findFiles(machine.id, path, query.trim())
+                                        }.getOrDefault("")
+                                        val serverHits = parseSearchHits(raw, isContent = false)
+                                        if (raw.isNotBlank()) serverHits
+                                        else searchFiles(path, query) { dir ->
+                                            session.listDir(machine.id, dir).map { DirItem(it.name, it.isDir) }
+                                        }
                                     }
                                 }) { result ->
-                                    result.onSuccess { hits = it }.onFailure { note = it.message ?: "Search failed." }
+                                    result.onSuccess {
+                                        hits = it
+                                        note = if (it.isEmpty()) "No matches." else "${it.size} match(es)."
+                                    }.onFailure { note = grantNote(it.message ?: "Search failed.") }
                                 }
                             },
                             enabled = canRead,
@@ -287,6 +360,7 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
                 FileRowItem(
                     entry = entry,
                     canDownload = canRead && !entry.isDir,
+                    canWrite = canWrite,
                     onOpen = {
                         val child = childPath(path, entry.name)
                         if (entry.isDir) load(child) else openFile(child, entry.size)
@@ -294,9 +368,14 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
                     onDownload = {
                         downloadRemote(context, model, machine.id, childPath(path, entry.name), true, { progress = it }) {
                             progress = null
-                            note = it
+                            note = grantNote(it)
                         }
                     },
+                    onRename = {
+                        renameTarget = entry
+                        renameInput = entry.name
+                    },
+                    onDelete = { deleteTarget = entry },
                 )
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             }
@@ -305,23 +384,24 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
                     SectionLabel("Search results", Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
                 }
                 items(hits) { hit ->
+                    val hitPath = hit.substringBefore(": ")
                     Text(
                         hit,
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable {
-                                val parent = parentPath(hit) ?: path
-                                val name = hit.substringAfterLast('/')
+                                val parent = parentPath(hitPath) ?: path
+                                val name = hitPath.substringAfterLast('/')
                                 model.work({ session ->
                                     session.listDir(machine.id, parent).firstOrNull { it.name == name }
                                 }) { result ->
                                     result.onSuccess { found ->
                                         when {
-                                            found == null -> note = "Couldn't find $hit"
-                                            found.isDir -> load(hit)
-                                            else -> openFile(hit, found.size)
+                                            found == null -> note = "Couldn't find $hitPath"
+                                            found.isDir -> load(hitPath)
+                                            else -> openFile(hitPath, found.size)
                                         }
-                                    }.onFailure { note = it.message ?: "Couldn't open $hit" }
+                                    }.onFailure { note = grantNote(it.message ?: "Couldn't open $hitPath") }
                                 }
                             }
                             .padding(horizontal = 16.dp, vertical = 12.dp),
@@ -331,6 +411,19 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
                 }
             }
         }
+    }
+    if (grantHelp) {
+        GrantFixDialog(
+            node = machine.id,
+            pubkey = grantKey ?: deviceKey,
+            identityDir = identityDir,
+            onClose = { grantHelp = false },
+            onImported = {
+                grantHelp = false
+                note = "Grant imported. Reloading folder."
+                load(path)
+            },
+        )
     }
     if (askFolder) {
         AlertDialog(
@@ -347,7 +440,7 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
                         result.onSuccess {
                             note = "Created $name"
                             load(path)
-                        }.onFailure { note = it.message ?: "Couldn't create the folder." }
+                        }.onFailure { note = grantNote(it.message ?: "Couldn't create the folder.") }
                     }
                 }) { Text("Create") }
             },
@@ -356,6 +449,92 @@ internal fun FilesPane(model: ClientViewModel, machine: MachineRow) {
             },
         )
     }
+    renameTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            title = { Text("Rename ${target.name}") },
+            text = {
+                AgentField(renameInput, { renameInput = it }, "New name", Modifier.fillMaxWidth())
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val nextName = safeFileName(renameInput)
+                    renameTarget = null
+                    model.work({
+                        it.rename(machine.id, childPath(path, target.name), childPath(path, nextName))
+                    }) { result ->
+                        result.onSuccess {
+                            note = "Renamed to $nextName"
+                            load(path)
+                        }.onFailure { note = grantNote(it.message ?: "Couldn't rename.") }
+                    }
+                }) { Text("Rename") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
+            },
+        )
+    }
+    deleteTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("Delete ${target.name}?") },
+            text = {
+                Text(
+                    if (target.isDir) "This deletes the folder and everything inside it."
+                    else "This permanently deletes ${target.name} on ${machine.name}.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleteTarget = null
+                    model.work({
+                        it.remove(machine.id, childPath(path, target.name), target.isDir)
+                    }) { result ->
+                        result.onSuccess {
+                            note = "Deleted ${target.name}"
+                            load(path)
+                        }.onFailure { note = grantNote(it.message ?: "Couldn't delete.") }
+                    }
+                }) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+private fun parseSearchHits(rawJson: String, isContent: Boolean): List<String> {
+    if (rawJson.isBlank()) return emptyList()
+    return runCatching {
+        val obj = JSONObject(rawJson)
+        val out = mutableListOf<String>()
+        if (isContent) {
+            val matches = obj.optJSONArray("matches") ?: return emptyList()
+            for (i in 0 until matches.length()) {
+                val item = matches.optJSONObject(i) ?: continue
+                val p = item.optString("path")
+                if (p.isBlank()) continue
+                val line = item.optInt("line", 0)
+                val text = item.optString("text").trim()
+                out += if (line > 0) "$p: L$line $text" else "$p: $text"
+            }
+        } else {
+            val files = obj.optJSONArray("files") ?: obj.optJSONArray("matches") ?: return emptyList()
+            for (i in 0 until files.length()) {
+                val elem = files.opt(i)
+                when (elem) {
+                    is String -> if (elem.isNotBlank()) out += elem
+                    is JSONObject -> {
+                        val p = elem.optString("path").ifBlank { elem.optString("name") }
+                        if (p.isNotBlank()) out += p
+                    }
+                }
+            }
+        }
+        out
+    }.getOrDefault(emptyList())
 }
 
 @Composable
@@ -380,7 +559,15 @@ private fun PathBar(path: String, enabled: Boolean, onOpen: (String) -> Unit) {
 }
 
 @Composable
-private fun FileRowItem(entry: FileRow, canDownload: Boolean, onOpen: () -> Unit, onDownload: () -> Unit) {
+private fun FileRowItem(
+    entry: FileRow,
+    canDownload: Boolean,
+    canWrite: Boolean,
+    onOpen: () -> Unit,
+    onDownload: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+) {
     val meta = buildList {
         if (entry.isSymlink) add("Link")
         if (!entry.isDir) add(formatBytes(entry.size))
@@ -389,7 +576,7 @@ private fun FileRowItem(entry: FileRow, canDownload: Boolean, onOpen: () -> Unit
     Row(
         modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(onClick = onOpen).padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Icon(
             imageVector = when {
@@ -409,6 +596,14 @@ private fun FileRowItem(entry: FileRow, canDownload: Boolean, onOpen: () -> Unit
         if (canDownload) {
             IconButton(onClick = onDownload, modifier = Modifier.size(48.dp)) {
                 Icon(Icons.Filled.Download, contentDescription = "Download ${entry.name}")
+            }
+        }
+        if (canWrite) {
+            IconButton(onClick = onRename, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Filled.Edit, contentDescription = "Rename ${entry.name}")
+            }
+            IconButton(onClick = onDelete, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Filled.Delete, contentDescription = "Delete ${entry.name}")
             }
         }
     }
@@ -465,9 +660,12 @@ private fun FileNote(text: String) {
 
 @Composable
 internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: AccountApi) {
-    var pty by remember { mutableStateOf<PtySession?>(null) }
-    var phase by remember { mutableStateOf(ShellPhase.Closed) }
-    var note by remember { mutableStateOf<String?>(null) }
+    val existingPty = remember(machine.id) { model.retainedPty(machine.id) }
+    var pty by remember(machine.id) { mutableStateOf<PtySession?>(existingPty) }
+    var phase by remember(machine.id) {
+        mutableStateOf(if (existingPty != null) ShellPhase.Connected else ShellPhase.Closed)
+    }
+    var note by remember(machine.id) { mutableStateOf<String?>(null) }
     var grantRetry by remember { mutableIntStateOf(0) }
     var grantHelp by remember(machine.id) { mutableStateOf(false) }
     var deviceKey by remember(machine.id) { mutableStateOf<String?>(null) }
@@ -477,6 +675,8 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
     var sizeLabel by remember { mutableStateOf("") }
     var scrolledAway by remember { mutableStateOf(false) }
     var copied by remember { mutableStateOf(false) }
+    var stickyCtrl by remember { mutableStateOf(false) }
+    var stickyAlt by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val identityDir = context.filesDir
@@ -498,29 +698,34 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
     }
     val ptyRef = remember { AtomicReference<PtySession?>(null) }
     ptyRef.set(pty)
-    val ptyWrites = remember { Channel<ByteArray>(PtyClientPolicy.WRITE_QUEUE_CAP) }
-    LaunchedEffect(Unit) {
+    // Tie write queue lifecycle to the active PTY handle so Reconnect gets a fresh open channel.
+    val ptyWrites = remember(pty) { Channel<ByteArray>(PtyClientPolicy.WRITE_QUEUE_CAP) }
+    LaunchedEffect(pty, ptyWrites) {
+        val handle = pty ?: return@LaunchedEffect
         withContext(Dispatchers.IO) {
             for (bytes in ptyWrites) {
-                val handle = ptyRef.get() ?: continue
+                if (ptyRef.get() !== handle) break
                 runCatching { handle.write(bytes) }.onFailure {
                     val message = it.message ?: PTY_WRITE_FULL_MESSAGE
                     withContext(Dispatchers.Main) {
-                        note = message
-                        phase = ShellPhase.Failed
-                        ptyWrites.close()
-                        pty?.close()
-                        pty = null
+                        if (pty === handle) {
+                            note = message
+                            phase = ShellPhase.Failed
+                            ptyWrites.close()
+                            model.releasePty(machine.id, handle)
+                            pty = null
+                        }
                     }
                 }
             }
         }
     }
     fun failWrite(message: String) {
+        val current = pty
         note = message
         phase = ShellPhase.Failed
         ptyWrites.close()
-        pty?.close()
+        if (current != null) model.releasePty(machine.id, current)
         pty = null
     }
     fun writePty(bytes: ByteArray) {
@@ -531,6 +736,13 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
             PtyWriteOffer.Closed -> failWrite(PTY_WRITE_CLOSED_MESSAGE)
         }
     }
+    fun sendExtra(bytes: ByteArray) {
+        view?.flushOrDiscardComposing()
+        val payload = if (stickyAlt && bytes.isNotEmpty()) byteArrayOf(0x1b) + bytes else bytes
+        stickyCtrl = false
+        stickyAlt = false
+        writePty(payload)
+    }
     fun openShell() {
         if (!machine.online || !machine.allowExec || phase == ShellPhase.Opening) return
         phase = ShellPhase.Opening
@@ -539,7 +751,7 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
         val cols = view?.cols() ?: 80
         model.work({ it.openPty(machine.id, null, rows, cols) }) { result ->
             result.onSuccess {
-                pty?.close()
+                model.retainPty(machine.id, it)
                 pty = it
                 phase = ShellPhase.Connected
                 view?.showKeyboard()
@@ -549,10 +761,11 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
             }
         }
     }
-    DisposableEffect(Unit) {
+    DisposableEffect(ptyWrites) {
         onDispose {
+            // Only close the UI-local write channel on pane switch; the PTY
+            // itself stays alive in ClientViewModel until Reconnect/Exit/Disconnect.
             ptyWrites.close()
-            pty?.close()
         }
     }
     LaunchedEffect(copied) {
@@ -578,6 +791,8 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
                 if (polled.isFailure) {
                     note = grantNote(polled.exceptionOrNull()?.message ?: "The shell connection dropped.")
                     phase = ShellPhase.Failed
+                    model.releasePty(machine.id, handle)
+                    pty = null
                     finished = true
                     break
                 }
@@ -595,7 +810,7 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
                         val code = runCatching { JSONObject(event).optInt("code") }.getOrDefault(-1)
                         phase = ShellPhase.Closed
                         note = "Shell exited ($code)"
-                        handle.close()
+                        model.releasePty(machine.id, handle)
                         pty = null
                         withContext(Dispatchers.Main) { terminal.feed("\r\n[exit $code]\r\n".encodeToByteArray()) }
                         finished = true
@@ -647,7 +862,7 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
                 onClose = { grantHelp = false },
                 onImported = {
                     grantHelp = false
-                    pty?.close()
+                    model.releasePty(machine.id)
                     pty = null
                     phase = ShellPhase.Closed
                     note = "Grant imported. Opening the shell."
@@ -666,8 +881,8 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
             return@Column
         }
         AndroidView(
-            factory = { context ->
-                TerminalView(context).apply {
+            factory = { ctx ->
+                TerminalView(ctx).apply {
                     onBytes = { bytes -> writePty(bytes) }
                     onResize = { rows, cols ->
                         sizeLabel = "${cols}×${rows}"
@@ -677,10 +892,16 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
                         }
                     }
                     onScrolledAway = { scrolledAway = it }
+                    onModifiersConsumed = {
+                        stickyCtrl = false
+                        stickyAlt = false
+                    }
                 }
             },
             update = { terminal ->
                 view = terminal
+                terminal.stickyCtrl = stickyCtrl
+                terminal.stickyAlt = stickyAlt
                 terminal.onBytes = { bytes -> writePty(bytes) }
                 terminal.onResize = { rows, cols ->
                     sizeLabel = "${cols}×${rows}"
@@ -690,6 +911,10 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
                     }
                 }
                 terminal.onScrolledAway = { scrolledAway = it }
+                terminal.onModifiersConsumed = {
+                    stickyCtrl = false
+                    stickyAlt = false
+                }
                 if (!viewReady) viewReady = true
             },
             modifier = Modifier.fillMaxWidth().weight(1f).testTag("terminal-view"),
@@ -700,6 +925,15 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
             verticalAlignment = Alignment.CenterVertically,
         ) {
             SecondaryButton("Keyboard", onClick = { view?.showKeyboard() })
+            AgentFilterChip(stickyCtrl, "Ctrl", { stickyCtrl = !stickyCtrl }, Modifier.testTag("key-ctrl"))
+            AgentFilterChip(stickyAlt, "Alt", { stickyAlt = !stickyAlt }, Modifier.testTag("key-alt"))
+            SecondaryButton("Paste", onClick = {
+                view?.flushOrDiscardComposing()
+                val cm = context.getSystemService(ClipboardManager::class.java)
+                val clip = cm?.primaryClip?.takeIf { it.itemCount > 0 }
+                    ?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                if (clip.isNotEmpty()) writePty(clip.encodeToByteArray())
+            })
             SecondaryButton("Copy", onClick = {
                 val text = view?.transcript().orEmpty()
                 if (text.isNotBlank()) {
@@ -714,7 +948,7 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
                     else -> "Reconnect"
                 },
                 onClick = {
-                    pty?.close()
+                    model.releasePty(machine.id)
                     pty = null
                     view?.clearTranscript()
                     phase = ShellPhase.Closed
@@ -725,14 +959,18 @@ internal fun TerminalPane(model: ClientViewModel, machine: MachineRow, account: 
             if (scrolledAway) {
                 SecondaryButton("Latest", onClick = { view?.jumpToLatest() })
             }
-            SecondaryButton("Esc", onClick = { writePty(ptySequence(PtyKey.Escape, false)) })
-            SecondaryButton("Tab", onClick = { writePty(ptySequence(PtyKey.Tab, false)) })
-            SecondaryButton("Ctrl-C", onClick = { writePty(ptyText("c", ctrl = true)) })
-            SecondaryButton("Ctrl-D", onClick = { writePty(ptyText("d", ctrl = true)) })
-            SecondaryButton("Up", onClick = { writePty(ptySequence(PtyKey.Up, view?.screen?.applicationCursor == true)) })
-            SecondaryButton("Down", onClick = { writePty(ptySequence(PtyKey.Down, view?.screen?.applicationCursor == true)) })
-            SecondaryButton("Left", onClick = { writePty(ptySequence(PtyKey.Left, view?.screen?.applicationCursor == true)) })
-            SecondaryButton("Right", onClick = { writePty(ptySequence(PtyKey.Right, view?.screen?.applicationCursor == true)) })
+            SecondaryButton("Esc", onClick = { sendExtra(ptySequence(PtyKey.Escape, false)) })
+            SecondaryButton("Tab", onClick = { sendExtra(ptySequence(PtyKey.Tab, false)) })
+            SecondaryButton("Ctrl-C", onClick = { sendExtra(ptyText("c", ctrl = true)) })
+            SecondaryButton("Ctrl-D", onClick = { sendExtra(ptyText("d", ctrl = true)) })
+            SecondaryButton("Up", onClick = { sendExtra(ptySequence(PtyKey.Up, view?.screen?.applicationCursor == true)) })
+            SecondaryButton("Down", onClick = { sendExtra(ptySequence(PtyKey.Down, view?.screen?.applicationCursor == true)) })
+            SecondaryButton("Left", onClick = { sendExtra(ptySequence(PtyKey.Left, view?.screen?.applicationCursor == true)) })
+            SecondaryButton("Right", onClick = { sendExtra(ptySequence(PtyKey.Right, view?.screen?.applicationCursor == true)) })
+            SecondaryButton("Home", onClick = { sendExtra(ptySequence(PtyKey.Home, false)) })
+            SecondaryButton("End", onClick = { sendExtra(ptySequence(PtyKey.End, false)) })
+            SecondaryButton("PgUp", onClick = { sendExtra(ptySequence(PtyKey.PageUp, false)) })
+            SecondaryButton("PgDn", onClick = { sendExtra(ptySequence(PtyKey.PageDown, false)) })
         }
     }
 }
@@ -803,13 +1041,29 @@ private fun ShellStatusBar(
 }
 
 @Composable
-internal fun TransferPane(model: ClientViewModel, machine: MachineRow) {
+internal fun TransferPane(model: ClientViewModel, machine: MachineRow, account: AccountApi? = null) {
     val context = LocalContext.current
-    var remote by remember { mutableStateOf("app:/files/from-phone.bin") }
+    val identityDir = context.filesDir
+    var remote by rememberSaveable(machine.id) { mutableStateOf(defaultTransferPath(machine.os)) }
     var direct by remember { mutableStateOf(true) }
     var note by remember { mutableStateOf("Tries a direct connection, then the relay.") }
     val progress = remember { MutableStateFlow("idle") }
     var progressText by remember { mutableStateOf("idle") }
+    var deviceKey by remember(machine.id) { mutableStateOf<String?>(null) }
+    var grantKey by remember(machine.id) { mutableStateOf<String?>(null) }
+    var grantHelp by remember(machine.id) { mutableStateOf(false) }
+    LaunchedEffect(machine.id, account) {
+        deviceKey = withContext(Dispatchers.IO) {
+            runCatching { account?.devicePublicHex() }.getOrNull()
+        }?.takeIf { it.isNotBlank() }
+    }
+    fun grantNote(message: String): String {
+        if (!isSignedGrantFailure(message)) return message
+        val checked = controllerKeyFromRejection(message)
+        if (checked.isNotEmpty()) grantKey = checked
+        else if (grantKey.isNullOrBlank()) grantKey = deviceKey?.trim()?.lowercase()?.ifBlank { null }
+        return decorateGrantFailure(message, machine.id, deviceKey, identityDir.absolutePath)
+    }
     val online = machine.online
     val canRead = online && machine.allowRead
     val canWrite = online && machine.allowWrite
@@ -817,16 +1071,21 @@ internal fun TransferPane(model: ClientViewModel, machine: MachineRow) {
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri == null || !canWrite) return@rememberLauncherForActivityResult
         model.work({ session ->
-            val dest = File(context.cacheDir, "upload-${System.currentTimeMillis()}.bin")
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { input.copyTo(it) }
-            } ?: error("Could not read the picked file")
-            session.transferUp(machine.id, remote, dest.absolutePath, direct) { done, total ->
-                progress.value = progressLabel(done, total)
+            val xferDir = File(context.cacheDir, "client-xfer").apply { mkdirs() }
+            val dest = File(xferDir, "upload-${System.currentTimeMillis()}-${java.util.UUID.randomUUID()}.bin")
+            try {
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    dest.outputStream().use { input.copyTo(it) }
+                } ?: error("Could not read the picked file")
+                session.transferUp(machine.id, remote, dest.absolutePath, direct) { done, total ->
+                    progress.value = progressLabel(done, total)
+                }
+            } finally {
+                runCatching { dest.delete() }
             }
         }) { result ->
             result.onSuccess { note = "Uploaded ${it.logicalBytes} bytes via ${it.transport}" }
-                .onFailure { note = it.message ?: "Upload failed." }
+                .onFailure { note = grantNote(it.message ?: "Upload failed.") }
         }
     }
     Column(
@@ -856,12 +1115,15 @@ internal fun TransferPane(model: ClientViewModel, machine: MachineRow) {
             }
         }
         FileNote(note)
+        if (isGrantFixNote(note)) {
+            SecondaryButton("Import grant", { grantHelp = true }, Modifier.testTag("import-grant"))
+        }
         PrimaryButton("Upload to the machine", onClick = { pick.launch("*/*") }, enabled = canWrite, modifier = Modifier.fillMaxWidth())
         PrimaryButton(
             "Download to the phone",
             onClick = {
                 downloadRemote(context, model, machine.id, remote, direct, { progress.value = it }) { message ->
-                    note = message
+                    note = grantNote(message)
                 }
             },
             enabled = canRead,
@@ -870,23 +1132,64 @@ internal fun TransferPane(model: ClientViewModel, machine: MachineRow) {
         if (online && !canWrite) SupportingText("Uploads need write permission.")
         if (online && !canRead) SupportingText("Downloads need read permission.")
     }
+    if (grantHelp) {
+        GrantFixDialog(
+            node = machine.id,
+            pubkey = grantKey ?: deviceKey,
+            identityDir = identityDir,
+            onClose = { grantHelp = false },
+            onImported = {
+                grantHelp = false
+                note = "Grant imported. Try the transfer again."
+            },
+        )
+    }
 }
 
 @Composable
-internal fun AuditPane(model: ClientViewModel, machine: MachineRow) {
+internal fun AuditPane(model: ClientViewModel, machine: MachineRow, account: AccountApi? = null) {
+    val context = LocalContext.current
+    val identityDir = context.filesDir
     var text by remember { mutableStateOf("") }
     var note by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
+    var deviceKey by remember(machine.id) { mutableStateOf<String?>(null) }
+    var grantKey by remember(machine.id) { mutableStateOf<String?>(null) }
+    var grantHelp by remember(machine.id) { mutableStateOf(false) }
+    LaunchedEffect(machine.id, account) {
+        deviceKey = withContext(Dispatchers.IO) {
+            runCatching { account?.devicePublicHex() }.getOrNull()
+        }?.takeIf { it.isNotBlank() }
+    }
+    fun grantNote(message: String): String {
+        if (!isSignedGrantFailure(message)) return message
+        val checked = controllerKeyFromRejection(message)
+        if (checked.isNotEmpty()) grantKey = checked
+        else if (grantKey.isNullOrBlank()) grantKey = deviceKey?.trim()?.lowercase()?.ifBlank { null }
+        return decorateGrantFailure(message, machine.id, deviceKey, identityDir.absolutePath)
+    }
+    val isAndroidNode = "android" in machine.os.lowercase()
     fun load() {
         if (!machine.online || !machine.allowRead) return
         loading = true
-        model.work({ it.readBytes(machine.id, "app:/audit.log", 0u, 512000u) }) { result ->
+        model.work({ session ->
+            val queried = runCatching { session.queryAudit(machine.id, 80u) }.getOrDefault("")
+            val formatted = formatAuditQuery(queried)
+            if (formatted.isNotBlank()) {
+                formatted
+            } else if (isAndroidNode) {
+                session.readBytes(machine.id, "app:/audit.log", 0u, 512000u)
+                    .decodeToString().lineSequence().toList().takeLast(80).joinToString("\n")
+            } else {
+                ""
+            }
+        }) { result ->
             loading = false
-            result.onSuccess { bytes ->
+            result.onSuccess { lines ->
                 note = null
-                text = bytes.decodeToString().lineSequence().toList().takeLast(80).joinToString("\n")
+                text = lines
             }.onFailure {
-                note = it.message ?: "Couldn't read the audit log."
+                note = grantNote(it.message ?: "Couldn't read the audit log.")
                 text = ""
             }
         }
@@ -905,7 +1208,12 @@ internal fun AuditPane(model: ClientViewModel, machine: MachineRow) {
             SecondaryButton("Refresh", onClick = { load() }, modifier = Modifier.fillMaxWidth(), enabled = !loading)
         }
         if (loading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        note?.let { FileNote(it) }
+        note?.let {
+            FileNote(it)
+            if (isGrantFixNote(it)) {
+                SecondaryButton("Import grant", { grantHelp = true }, Modifier.testTag("import-grant"))
+            }
+        }
         AgentCard(modifier = Modifier.weight(1f)) {
             Text(
                 text.ifBlank { if (loading) "Loading" else "No audit lines yet." },
@@ -916,6 +1224,34 @@ internal fun AuditPane(model: ClientViewModel, machine: MachineRow) {
             )
         }
     }
+    if (grantHelp) {
+        GrantFixDialog(
+            node = machine.id,
+            pubkey = grantKey ?: deviceKey,
+            identityDir = identityDir,
+            onClose = { grantHelp = false },
+            onImported = {
+                grantHelp = false
+                note = "Grant imported. Reloading audit log."
+                load()
+            },
+        )
+    }
+}
+
+private fun formatAuditQuery(raw: String): String {
+    if (raw.isBlank()) return ""
+    return runCatching {
+        val trimmed = raw.trim()
+        val arr = if (trimmed.startsWith("[")) org.json.JSONArray(trimmed)
+        else JSONObject(trimmed).optJSONArray("entries") ?: JSONObject(trimmed).optJSONArray("events")
+        if (arr == null) return trimmed
+        val lines = ArrayList<String>(arr.length())
+        for (i in 0 until arr.length()) {
+            lines += arr.opt(i)?.toString().orEmpty()
+        }
+        lines.filter { it.isNotBlank() }.joinToString("\n")
+    }.getOrDefault(raw)
 }
 
 @Composable
@@ -951,6 +1287,9 @@ private fun DesktopSession(
     var bitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var shotW by remember { mutableIntStateOf(1) }
     var shotH by remember { mutableIntStateOf(1) }
+    var srcW by remember { mutableIntStateOf(1) }
+    var srcH by remember { mutableIntStateOf(1) }
+    var cursorPresentation by remember { mutableStateOf("embedded") }
     var watch by remember(machine.id) { mutableStateOf(capability.screenshots || capability.live) }
     var retryToken by remember(machine.id) { mutableIntStateOf(0) }
     var typed by remember { mutableStateOf("") }
@@ -962,6 +1301,7 @@ private fun DesktopSession(
     var connecting by remember { mutableStateOf(false) }
     var cursor by remember { mutableStateOf<LiveCursor?>(null) }
     var decoderLabel by remember { mutableStateOf("decoder") }
+    var lastRemoteClip by remember { mutableStateOf("") }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val identityDir = context.filesDir
@@ -983,71 +1323,90 @@ private fun DesktopSession(
         }
         return decorateGrantFailure(message, machine.id, deviceKey, identityDir.absolutePath)
     }
-    fun grab() {
-        model.work({ it.extension(machine.id, "screenshot", """{"quality":55}""") }) { result ->
-            result.onSuccess { body ->
-                if (webrtcFallsBackToScreenshot(body)) {
-                    note = "Live video is not available. Showing screenshots."
-                }
-                val parsed = runCatching { JSONObject(body) }.getOrNull()
-                val encoded = parsed?.optString("data_b64").orEmpty()
-                if (encoded.isNotEmpty()) {
-                    val bytes = Base64.decode(encoded, Base64.DEFAULT)
-                    val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    bitmap = decoded
-                    val reportedW = parsed?.optInt("width") ?: 0
-                    val reportedH = parsed?.optInt("height") ?: 0
-                    shotW = if (reportedW > 0) reportedW else decoded?.width?.takeIf { it > 0 } ?: 1
-                    shotH = if (reportedH > 0) reportedH else decoded?.height?.takeIf { it > 0 } ?: 1
-                    note = "Screenshot ${shotW}×${shotH}"
-                } else if (!webrtcFallsBackToScreenshot(body)) {
-                    note = shortNote(body)
-                }
-            }.onFailure {
-                val message = it.message ?: "Screenshot failed."
-                note = grantNote(message)
-                if (fatalDesktopMessage(message) || looksLikeSessionExpiry(message)) watch = false
+    suspend fun grab() {
+        val session = model.session ?: return
+        val result = withContext(Dispatchers.IO) {
+            runCatching { session.extension(machine.id, "screenshot", """{"quality":55}""") }
+        }
+        result.onSuccess { body ->
+            if (webrtcFallsBackToScreenshot(body)) {
+                note = "Live video is not available. Showing screenshots."
             }
+            val parsed = runCatching { JSONObject(body) }.getOrNull()
+            val encoded = parsed?.optString("data_b64").orEmpty()
+            if (encoded.isNotEmpty()) {
+                val decoded = withContext(Dispatchers.Default) {
+                    val bytes = Base64.decode(encoded, Base64.DEFAULT)
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                }
+                bitmap = decoded
+                val reportedW = parsed?.optInt("width") ?: 0
+                val reportedH = parsed?.optInt("height") ?: 0
+                shotW = if (reportedW > 0) reportedW else decoded?.width?.takeIf { it > 0 } ?: 1
+                shotH = if (reportedH > 0) reportedH else decoded?.height?.takeIf { it > 0 } ?: 1
+                srcW = shotW
+                srcH = shotH
+                note = "Screenshot ${shotW}×${shotH}"
+            } else if (!webrtcFallsBackToScreenshot(body)) {
+                note = shortNote(body)
+            }
+        }.onFailure {
+            val message = it.message ?: "Screenshot failed."
+            note = grantNote(message)
+            if (fatalDesktopMessage(message) || looksLikeSessionExpiry(message)) watch = false
         }
     }
     fun send(payload: JSONObject) {
         if (!capability.control) return
-        scope.launch {
-            model.work({ it.extension(machine.id, "inject_input", payload.toString()) }) { result ->
-                result.onFailure { note = grantNote(it.message ?: "Couldn't send input.") }
-            }
+        model.work({ it.extension(machine.id, "inject_input", payload.toString()) }) { result ->
+            result.onFailure { note = grantNote(it.message ?: "Couldn't send input.") }
         }
-    }
-    fun sendLive(
-        kind: String,
-        x: Float = 0f,
-        y: Float = 0f,
-        x2: Float = 0f,
-        y2: Float = 0f,
-        text: String = "",
-        name: String = "",
-    ): Boolean {
-        val current = live ?: return false
-        val messages = liveControlMessages(kind, shotW, shotH, x, y, x2, y2, text, name)
-        if (messages.isEmpty()) return false
-        return messages.all { current.sendControl(it) }
     }
     fun deliver(payload: JSONObject) {
+        if (!capability.control) return
+        val current = live
         val kind = payload.optString("action")
-        val sent = when (kind) {
-            "tap" -> sendLive("tap", x = payload.optDouble("x").toFloat(), y = payload.optDouble("y").toFloat())
-            "swipe" -> sendLive(
-                "swipe",
-                x = payload.optDouble("x").toFloat(),
-                y = payload.optDouble("y").toFloat(),
-                x2 = payload.optDouble("x2").toFloat(),
-                y2 = payload.optDouble("y2").toFloat(),
-            )
-            "type" -> sendLive("type", text = payload.optString("text"))
-            "key" -> sendLive("key", name = payload.optString("name"))
-            else -> false
+        val targetW = if (srcW > 0) srcW else shotW
+        val targetH = if (srcH > 0) srcH else shotH
+        val messages = if (current != null) {
+            when (kind) {
+                "tap" -> liveControlMessages("tap", targetW, targetH, x = payload.optDouble("x").toFloat(), y = payload.optDouble("y").toFloat())
+                "right_click" -> liveControlMessages("right_click", targetW, targetH, x = payload.optDouble("x").toFloat(), y = payload.optDouble("y").toFloat())
+                "scroll" -> liveControlMessages(
+                    "scroll",
+                    targetW,
+                    targetH,
+                    x = payload.optDouble("x").toFloat(),
+                    y = payload.optDouble("y").toFloat(),
+                    dx = payload.optDouble("dx").toFloat(),
+                    dy = payload.optDouble("dy").toFloat(),
+                )
+                "swipe" -> liveControlMessages(
+                    "swipe",
+                    targetW,
+                    targetH,
+                    x = payload.optDouble("x").toFloat(),
+                    y = payload.optDouble("y").toFloat(),
+                    x2 = payload.optDouble("x2").toFloat(),
+                    y2 = payload.optDouble("y2").toFloat(),
+                )
+                "type" -> liveControlMessages("type", targetW, targetH, text = payload.optString("text"))
+                "key" -> liveControlMessages("key", targetW, targetH, name = payload.optString("name"))
+                else -> emptyList()
+            }
+        } else {
+            emptyList()
         }
-        if (!sent) send(payload)
+        if (current != null && messages.isNotEmpty()) {
+            scope.launch(Dispatchers.IO) {
+                val ok = runCatching { messages.all { current.sendControl(it) } }.getOrDefault(false)
+                if (!ok) {
+                    withContext(Dispatchers.Main) { send(payload) }
+                }
+            }
+        } else {
+            send(payload)
+        }
     }
     suspend fun runLive(autoRetry: Boolean): LiveEnd {
         val session = model.session ?: return LiveEnd.Stopped
@@ -1076,12 +1435,17 @@ private fun DesktopSession(
             return LiveEnd.Fallback
         }
         connecting = false
-        val decoder = H264Player(context)
+        val decoder = H264Player(context, onRequestKeyframe = {
+            scope.launch(Dispatchers.IO) { runCatching { opened.requestKeyframe() } }
+        })
         live = opened
         player = decoder
-        val info = opened.info()
+        val info = withContext(Dispatchers.IO) { opened.info() }
         if (info.width > 0) shotW = info.width
         if (info.height > 0) shotH = info.height
+        srcW = if (info.srcWidth > 0) info.srcWidth else shotW
+        srcH = if (info.srcHeight > 0) info.srcHeight else shotH
+        cursorPresentation = info.cursorPresentation
         decoder.setVideoSize(shotW, shotH)
         note = liveStatus(info.codec, info.encoder, info.hardware, shotW, shotH, decoder.decoderLabel(), 0.0)
         val started = SystemClock.elapsedRealtime()
@@ -1123,6 +1487,11 @@ private fun DesktopSession(
                     break
                 }
                 cursor = opened.pollCursor()
+                val remoteClip = opened.pollClipboard()
+                if (remoteClip != null && remoteClip.text.isNotEmpty() && remoteClip.text != lastRemoteClip) {
+                    lastRemoteClip = remoteClip.text
+                    copyPlainText(context, "Remote clipboard", remoteClip.text)
+                }
             }
             if (!watch) end = LiveEnd.Stopped
         } finally {
@@ -1140,8 +1509,11 @@ private fun DesktopSession(
         onDispose { current?.dispose() }
     }
     LaunchedEffect(watch, machine.id, retryToken, capability.live, capability.screenshots) {
-        live?.close()
+        val oldLive = live
         live = null
+        if (oldLive != null) {
+            withContext(Dispatchers.IO) { runCatching { oldLive.close() } }
+        }
         player = null
         usingJpeg = false
         cursor = null
@@ -1179,19 +1551,40 @@ private fun DesktopSession(
         frame = frame,
         shotW = shotW,
         shotH = shotH,
+        srcWidth = srcW,
+        srcHeight = srcH,
+        cursorPresentation = cursorPresentation,
         stream = watch,
         onStream = { watch = it },
         typed = typed,
         onTyped = { typed = it },
         onLive = {
             if (connected) {
-                live?.requestKeyframe()
+                val active = live
+                if (active != null) {
+                    scope.launch(Dispatchers.IO) { runCatching { active.requestKeyframe() } }
+                }
             } else {
                 watch = true
                 retryToken += 1
             }
         },
         onInject = { payload -> deliver(payload) },
+        onSendClipboard = if (connected) {
+            { clipText ->
+                val active = live
+                if (active != null) {
+                    scope.launch(Dispatchers.IO) {
+                        val sent = runCatching { active.sendClipboard(clipText) }.getOrDefault(false)
+                        if (sent) {
+                            withContext(Dispatchers.Main) { note = "Sent clipboard to ${machine.name}" }
+                        }
+                    }
+                }
+            }
+        } else {
+            null
+        },
         fullscreen = fullscreen,
         onFullscreenChange = { fullscreen = it },
         viewport = viewport,
@@ -1254,7 +1647,8 @@ private fun downloadRemote(
 ) {
     model.work({ session ->
         val name = safeFileName(remote.substringAfterLast('/'))
-        val dest = File(context.cacheDir, name)
+        val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
+        val dest = File(shareDir, name)
         val stats = session.transferDown(node, remote, dest.absolutePath, direct) { done, total ->
             onProgress(progressLabel(done, total))
         }

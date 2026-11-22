@@ -8,13 +8,13 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use agentlink_core::audit::{
     self, assign_chain, prepare, AuditEvent, AuditPolicy, AuditRecord, SinkSpec,
 };
 use agentlink_core::protocol::Envelope;
-use agentlink_core::s3::{self, S3Client};
+use agentlink_core::s3::{self, S3Client, S3Config};
 use agentlink_core::ws::Outbound;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -59,11 +59,6 @@ pub fn record(
     }
 }
 
-pub fn read_all(path: &Path) -> Vec<u8> {
-    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
-    std::fs::read(path).unwrap_or_default()
-}
-
 pub fn tail(path: &Path, limit: usize) -> String {
     let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
     // Bounded per-line and O(limit) ring — never `BufRead::lines().collect()` of
@@ -90,6 +85,14 @@ struct ChainState {
     prev: String,
 }
 
+struct S3Job {
+    config: S3Config,
+    key: String,
+    body: Vec<u8>,
+}
+
+const S3_QUEUE_CAP: usize = 256;
+
 /// Hash chain and sinks for one phone node. Survives a relay reconnect.
 pub struct AuditHub {
     node_id: String,
@@ -98,6 +101,7 @@ pub struct AuditHub {
     policy: RwLock<AuditPolicy>,
     chain: Mutex<ChainState>,
     tx: Mutex<Option<mpsc::Sender<Outbound>>>,
+    s3_tx: Mutex<Option<std::sync::mpsc::SyncSender<S3Job>>>,
 }
 
 impl AuditHub {
@@ -107,6 +111,19 @@ impl AuditHub {
         let _ = fs::create_dir_all(root.join("blobs"));
         let policy = load_policy(data_dir);
         let chain = load_chain(&root);
+        let (s3_tx, s3_rx) = std::sync::mpsc::sync_channel::<S3Job>(S3_QUEUE_CAP);
+        let worker_tx = match std::thread::Builder::new()
+            .name("agentlink-audit-s3".into())
+            .spawn(move || {
+                while let Ok(job) = s3_rx.recv() {
+                    if let Ok(client) = S3Client::new(job.config) {
+                        let _ = client.put(&job.key, &job.body, "application/gzip");
+                    }
+                }
+            }) {
+            Ok(_) => Some(s3_tx),
+            Err(_) => None,
+        };
         Self {
             node_id: node_id.to_string(),
             node_name: node_name.to_string(),
@@ -114,6 +131,7 @@ impl AuditHub {
             policy: RwLock::new(policy),
             chain: Mutex::new(chain),
             tx: Mutex::new(None),
+            s3_tx: Mutex::new(worker_tx),
         }
     }
 
@@ -240,8 +258,10 @@ impl AuditHub {
                     let Some(body) = gzip_line(record) else {
                         continue;
                     };
-                    if let Ok(client) = S3Client::new(config) {
-                        let _ = client.put(&key, &body, "application/gzip");
+                    if let Ok(guard) = self.s3_tx.lock() {
+                        if let Some(tx) = guard.as_ref() {
+                            let _ = tx.try_send(S3Job { config, key, body });
+                        }
                     }
                 }
             }
@@ -274,8 +294,8 @@ pub fn event_for(
     }
 }
 
-pub fn submit_op(
-    hub: &AuditHub,
+pub async fn submit_op(
+    hub: &Arc<AuditHub>,
     action: &str,
     client_id: &str,
     detail: &str,
@@ -283,7 +303,9 @@ pub fn submit_op(
     error: Option<String>,
 ) {
     let category = audit::category_for_action(action);
-    hub.submit(event_for(category, action, client_id, detail, ok, error));
+    let event = event_for(category, action, client_id, detail, ok, error);
+    let hub = Arc::clone(hub);
+    let _ = tokio::task::spawn_blocking(move || hub.submit(event)).await;
 }
 
 fn load_policy(data_dir: &Path) -> AuditPolicy {

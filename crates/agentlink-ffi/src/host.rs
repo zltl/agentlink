@@ -6,7 +6,7 @@
 //! The methods run on a Rust worker thread and must not call back into a
 //! blocking agentlink call.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use agentlink_core::{Error, Result};
@@ -33,6 +33,8 @@ pub trait NodeHost: Send + Sync {
 struct HostSession {
     owner_peer: String,
     release: String,
+    grant_jti: String,
+    grant_exp_unix: Option<i64>,
 }
 
 /// Rust-side owner/release gate. The registered owner is the sealed E2E
@@ -48,6 +50,17 @@ impl HostSessionRegistry {
     }
 
     pub fn register(&self, session_id: &str, owner_peer: &str, release: &str) -> Result<()> {
+        self.register_with_grant(session_id, owner_peer, release, "", None)
+    }
+
+    pub fn register_with_grant(
+        &self,
+        session_id: &str,
+        owner_peer: &str,
+        release: &str,
+        grant_jti: &str,
+        grant_exp_unix: Option<i64>,
+    ) -> Result<()> {
         let owner = owner_peer.trim();
         if owner.is_empty() || release.trim().is_empty() || session_id.trim().is_empty() {
             return Err(Error::Auth("session owner is required".into()));
@@ -61,9 +74,54 @@ impl HostSessionRegistry {
             HostSession {
                 owner_peer: owner.to_string(),
                 release: release.to_string(),
+                grant_jti: grant_jti.trim().to_string(),
+                grant_exp_unix,
             },
         );
         Ok(())
+    }
+
+    /// Remove and return `(session_id, release)` for sessions whose grant
+    /// expired, is revoked, or when the deny-list could not be read (`fail_closed`).
+    pub fn take_inactive(
+        &self,
+        revoked: &BTreeSet<String>,
+        now_unix: i64,
+        fail_closed: bool,
+    ) -> Vec<(String, String)> {
+        let Ok(mut map) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, session)| {
+                if session.grant_exp_unix.is_some_and(|exp| now_unix >= exp) {
+                    return true;
+                }
+                let jti = session.grant_jti.trim();
+                if fail_closed {
+                    return true;
+                }
+                !jti.is_empty()
+                    && revoked
+                        .iter()
+                        .any(|item| item.trim().eq_ignore_ascii_case(jti))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| map.remove(&id).map(|session| (id, session.release)))
+            .collect()
+    }
+
+    /// Remove and return every tracked `(session_id, release)` for teardown.
+    pub fn take_all(&self) -> Vec<(String, String)> {
+        let Ok(mut map) = self.inner.lock() else {
+            return Vec::new();
+        };
+        map.drain()
+            .map(|(id, session)| (id, session.release))
+            .collect()
     }
 
     pub fn authorize_caller(&self, session_id: &str, caller: &str) -> Result<()> {

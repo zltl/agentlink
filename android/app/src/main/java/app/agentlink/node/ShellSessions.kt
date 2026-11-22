@@ -9,12 +9,17 @@ import java.io.IOException
 import java.io.InputStream
 import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 class ShellSessions {
     private val sessions = ConcurrentHashMap<String, Running>()
 
     fun open(kind: String, payload: JSONObject, allowShizuku: Boolean, allowRoot: Boolean): String {
+        val ownerPeer = payload.optString("_owner_peer").trim()
+        if (ownerPeer.isEmpty()) {
+            error("session owner is required")
+        }
         // Always a server-generated UUID. Client session_id is ignored so it
         // cannot be used as a map key or a file name.
         val id = java.util.UUID.randomUUID().toString()
@@ -47,18 +52,18 @@ class ShellSessions {
                 )
             }
         }
+        val stdinBytes = if (payload.has("stdin_b64") && !payload.isNull("stdin_b64")) {
+            unb64(payload.optString("stdin_b64"))
+        } else {
+            null
+        }
         val argv = rootWithCwd(plan.argv, plan.via, cwd)
         val process = start(argv, env, if (plan.via == "root") null else cwd, plan.via)
         val stream = if (kind == "pty") "pty" else "stdout"
-        val ownerPeer = payload.optString("_owner_peer").trim()
-        if (ownerPeer.isEmpty()) {
-            process.destroy()
-            error("session owner is required")
-        }
         val release = payload.optString("release").trim()
         val running = Running(process, stream, ownerPeer, release)
         sessions[id] = running
-        running.pump()
+        running.pump(stdinBytes)
         return id
     }
 
@@ -78,7 +83,7 @@ class ShellSessions {
     fun close(id: String, caller: String) {
         val running = sessions[id] ?: return
         requireOwner(running, caller)
-        sessions.remove(id)?.process?.destroy()
+        sessions.remove(id)?.terminate()
     }
 
     /// In-process cleanup for the task that opened the session. The release
@@ -89,7 +94,14 @@ class ShellSessions {
         if (running.release.isEmpty() || token.isEmpty() || running.release != token) {
             error("shell session not found for this peer")
         }
-        sessions.remove(id)?.process?.destroy()
+        sessions.remove(id)?.terminate()
+    }
+
+    fun closeAll() {
+        val ids = sessions.keys.toList()
+        for (id in ids) {
+            sessions.remove(id)?.terminate()
+        }
     }
 
     fun resize(id: String, caller: String) {
@@ -132,25 +144,54 @@ class ShellSessions {
         val release: String,
     ) {
         private val events = ArrayDeque<JSONObject>()
-        private val lock = Any()
+        private val lock = Object()
         private var exitCode: Int? = null
+        @Volatile private var closed = false
 
-        fun pump() {
-            thread(name = "agentlink-stdout", isDaemon = true) { drain(process.inputStream, stdoutName) }
-            thread(name = "agentlink-stderr", isDaemon = true) { drain(process.errorStream, "stderr") }
+        fun pump(stdinBytes: ByteArray?) {
+            if (stdinBytes != null) {
+                thread(name = "agentlink-stdin", isDaemon = true) {
+                    try {
+                        process.outputStream.use { out ->
+                            if (stdinBytes.isNotEmpty()) {
+                                out.write(stdinBytes)
+                                out.flush()
+                            }
+                        }
+                    } catch (_: IOException) {
+                        // Process exited before reading all of stdin.
+                    }
+                }
+            }
+            val outThread = thread(name = "agentlink-stdout", isDaemon = true) {
+                drain(process.inputStream, stdoutName)
+            }
+            val errThread = thread(name = "agentlink-stderr", isDaemon = true) {
+                drain(process.errorStream, "stderr")
+            }
             thread(name = "agentlink-wait", isDaemon = true) {
                 val code = try {
                     process.waitFor()
                 } catch (_: InterruptedException) {
                     -1
                 }
-                synchronized(lock) { exitCode = code }
+                // Wait for stdout/stderr readers to finish draining buffered pipe
+                // output before publishing the exit event so trailing chunks are not lost.
+                runCatching { outThread.join(2_000) }
+                runCatching { errThread.join(2_000) }
+                synchronized(lock) {
+                    exitCode = code
+                    lock.notifyAll()
+                }
             }
         }
 
         fun poll(): JSONObject {
             synchronized(lock) {
-                events.poll()?.let { return it }
+                events.poll()?.let {
+                    lock.notifyAll()
+                    return it
+                }
                 val code = exitCode
                 if (code != null) {
                     return JSONObject().put("event", "exit").put("code", code)
@@ -159,10 +200,26 @@ class ShellSessions {
             }
         }
 
+        fun terminate() {
+            closed = true
+            synchronized(lock) {
+                events.clear()
+                lock.notifyAll()
+            }
+            runCatching { process.outputStream.close() }
+            runCatching { process.destroy() }
+            val exited = runCatching { process.waitFor(200, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+            if (!exited) {
+                runCatching { process.destroyForcibly() }
+            }
+            runCatching { process.inputStream.close() }
+            runCatching { process.errorStream.close() }
+        }
+
         private fun drain(stream: InputStream, name: String) {
             val buf = ByteArray(16 * 1024)
             try {
-                while (true) {
+                while (!closed) {
                     val n = stream.read(buf)
                     if (n < 0) break
                     if (n == 0) continue
@@ -170,12 +227,27 @@ class ShellSessions {
                         .put("event", "chunk")
                         .put("stream", name)
                         .put("data_b64", b64(buf.copyOf(n)))
-                    synchronized(lock) { events.add(event) }
+                    synchronized(lock) {
+                        while (events.size >= MAX_QUEUED_EVENTS && !closed) {
+                            try {
+                                lock.wait(100)
+                            } catch (_: InterruptedException) {
+                                return
+                            }
+                        }
+                        if (!closed) {
+                            events.add(event)
+                        }
+                    }
                 }
             } catch (_: IOException) {
                 // The process closed the pipe.
             }
         }
+    }
+
+    companion object {
+        private const val MAX_QUEUED_EVENTS = 256
     }
 }
 

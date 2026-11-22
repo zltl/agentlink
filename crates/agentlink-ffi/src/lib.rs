@@ -30,10 +30,11 @@ use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 pub use client::{
-    ExecDone, FfiEntry, FfiPairing, FfiPolicy, FfiStat, FfiStats, MachineInfo, MobileClient,
-    OutputSink, ProgressSink, PtyHandle,
+    ExecDone, FfiEntry, FfiGrant, FfiNodePin, FfiPairing, FfiPolicy, FfiStat, FfiStats,
+    MachineInfo, MobileClient, OutputSink, ProgressSink, PtyHandle,
 };
 pub use host::{host_err, host_ok, NodeHost};
+pub use live::LiveClipboard;
 pub use node::{serve_node, NodeIo, ServeConfig};
 
 uniffi::setup_scaffolding!();
@@ -222,12 +223,26 @@ pub fn protocol_version() -> u32 {
     PROTOCOL_VERSION
 }
 
+struct ZeroizeBytes(Vec<u8>);
+
+impl Drop for ZeroizeBytes {
+    fn drop(&mut self) {
+        for byte in &mut self.0 {
+            unsafe {
+                std::ptr::write_volatile(byte, 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Sign with a raw ed25519 seed. Android Keystore does not reliably provide
 /// Ed25519, so the seed is wrapped by a Keystore AES key and unwrapped only
 /// for this call.
 #[uniffi::export]
 pub fn sign_ed25519(seed: Vec<u8>, message: Vec<u8>) -> Result<String, LinkError> {
-    let identity = Identity::from_seed(&seed).map_err(|err| LinkError::Fail {
+    let seed = ZeroizeBytes(seed);
+    let identity = Identity::from_seed(&seed.0).map_err(|err| LinkError::Fail {
         detail: err.to_string(),
     })?;
     Ok(identity.sign_message(&message))
@@ -235,7 +250,8 @@ pub fn sign_ed25519(seed: Vec<u8>, message: Vec<u8>) -> Result<String, LinkError
 
 #[uniffi::export]
 pub fn public_hex_ed25519(seed: Vec<u8>) -> Result<String, LinkError> {
-    let identity = Identity::from_seed(&seed).map_err(|err| LinkError::Fail {
+    let seed = ZeroizeBytes(seed);
+    let identity = Identity::from_seed(&seed.0).map_err(|err| LinkError::Fail {
         detail: err.to_string(),
     })?;
     Ok(identity.public_hex().to_string())

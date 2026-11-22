@@ -170,7 +170,7 @@ fun SetupFields(
             onRelay = onRelay,
             fingerprint = fingerprint,
             onFingerprint = onFingerprint,
-            startOpen = fingerprint.isNotBlank() || relay.trim() != DEFAULT_RELAY,
+            startOpen = relay.isBlank() || fingerprint.isNotBlank() || relay.trim() != DEFAULT_RELAY,
         )
         if (problem != null) ErrorNote(problem)
         AgentDivider()

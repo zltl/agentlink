@@ -36,6 +36,9 @@ class TerminalView @JvmOverloads constructor(
     var onBytes: (ByteArray) -> Unit = {}
     var onResize: (rows: Int, cols: Int) -> Unit = { _, _ -> }
     var onScrolledAway: (Boolean) -> Unit = {}
+    var stickyCtrl: Boolean = false
+    var stickyAlt: Boolean = false
+    var onModifiersConsumed: () -> Unit = {}
 
     private val lock = Any()
     private var scrollOffset = 0
@@ -111,15 +114,27 @@ class TerminalView @JvmOverloads constructor(
         invalidate()
     }
 
+    fun flushOrDiscardComposing() {
+        if (composing.text.isNotEmpty()) {
+            flushComposing()
+        }
+    }
+
     override fun onCheckIsTextEditor(): Boolean = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
         return object : BaseInputConnection(this, false) {
             override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
                 discardComposing()
-                send(ptyText(text.toString(), ctrl = false))
+                val raw = text.toString()
+                val ctrl = stickyCtrl
+                val alt = stickyAlt
+                if ((ctrl || alt) && raw.isNotEmpty()) {
+                    consumeStickyModifiers()
+                }
+                send(ptyText(raw, ctrl = ctrl, alt = alt))
                 return true
             }
 
@@ -239,15 +254,21 @@ class TerminalView @JvmOverloads constructor(
         textPaint.isUnderlineText = true
         var col = startCol
         var row = startRow
-        for (ch in composing.text) {
+        val text = composing.text
+        var i = 0
+        while (i < text.length) {
             if (row >= screen.rows) break
-            val width = CellWidth.of(ch.code).coerceAtLeast(1)
+            val cp = text.codePointAt(i)
+            val charCount = Character.charCount(cp)
+            val glyph = text.substring(i, i + charCount)
+            i += charCount
+            val width = CellWidth.of(cp).coerceAtLeast(1)
             if (col + width > screen.cols) {
                 col = 0
                 row++
                 if (row >= screen.rows) break
             }
-            canvas.drawText(ch.toString(), col * cellW, row * cellH + baseline, textPaint)
+            canvas.drawText(glyph, col * cellW, row * cellH + baseline, textPaint)
             col += width
         }
         textPaint.isUnderlineText = false
@@ -270,6 +291,7 @@ class TerminalView @JvmOverloads constructor(
         if (text.isEmpty()) return
         textPaint.color = PALETTE[TerminalScreen.DEFAULT_FG]
         textPaint.isFakeBoldText = false
+        textPaint.isUnderlineText = false
         canvas.drawText(text, 0f, viewRow * cellH + baseline, textPaint)
     }
 
@@ -281,24 +303,30 @@ class TerminalView @JvmOverloads constructor(
                 continue
             }
             val cellWidth = screen.widthAt(gridRow, col).coerceAtLeast(1)
-            val fg = screen.fgAt(gridRow, col)
-            val bg = screen.bgAt(gridRow, col)
+            val rawFg = screen.fgAt(gridRow, col)
+            val rawBg = screen.bgAt(gridRow, col)
+            val inverse = screen.inverseAt(gridRow, col)
             val bold = screen.boldAt(gridRow, col)
+            val underline = screen.underlineAt(gridRow, col)
+            val fg = if (inverse) rawBg else rawFg
+            val bg = if (inverse) rawFg else rawBg
             var end = col + cellWidth
             if (cellWidth == 1) {
                 while (
                     end < cols &&
                     !screen.isSpacer(gridRow, end) &&
                     screen.widthAt(gridRow, end) == 1 &&
-                    screen.fgAt(gridRow, end) == fg &&
-                    screen.bgAt(gridRow, end) == bg &&
-                    screen.boldAt(gridRow, end) == bold
+                    screen.fgAt(gridRow, end) == rawFg &&
+                    screen.bgAt(gridRow, end) == rawBg &&
+                    screen.inverseAt(gridRow, end) == inverse &&
+                    screen.boldAt(gridRow, end) == bold &&
+                    screen.underlineAt(gridRow, end) == underline
                 ) {
                     end++
                 }
             }
             val top = viewRow * cellH
-            if (bg != TerminalScreen.DEFAULT_BG) {
+            if (bg != TerminalScreen.DEFAULT_BG || inverse) {
                 bgPaint.color = colorOf(bg)
                 canvas.drawRect(col * cellW, top, end * cellW, top + cellH, bgPaint)
             }
@@ -309,16 +337,17 @@ class TerminalView @JvmOverloads constructor(
                         c++
                         continue
                     }
-                    append(screen.charAt(gridRow, c))
-                    append(screen.combiningAt(gridRow, c))
+                    append(screen.cellText(gridRow, c))
                     val w = screen.widthAt(gridRow, c).coerceAtLeast(1)
                     c += w
                 }
             }
-            if (text.any { it != ' ' }) {
+            if (underline || text.any { it != ' ' }) {
                 textPaint.color = colorOf(fg)
                 textPaint.isFakeBoldText = bold
+                textPaint.isUnderlineText = underline
                 canvas.drawText(text, col * cellW, top + baseline, textPaint)
+                textPaint.isUnderlineText = false
             }
             col = end
         }
@@ -350,9 +379,17 @@ class TerminalView @JvmOverloads constructor(
         if (bytes.isNotEmpty()) onBytes(bytes)
     }
 
+    private fun consumeStickyModifiers() {
+        if (!stickyCtrl && !stickyAlt) return
+        stickyCtrl = false
+        stickyAlt = false
+        post { onModifiersConsumed() }
+    }
+
     private fun bytesFor(event: KeyEvent): ByteArray? {
         val app = synchronized(lock) { screen.applicationCursor }
-        val ctrl = event.isCtrlPressed || event.metaState and KeyEvent.META_CTRL_ON != 0
+        val ctrl = stickyCtrl || event.isCtrlPressed || event.metaState and KeyEvent.META_CTRL_ON != 0
+        val alt = stickyAlt || event.isAltPressed || event.metaState and KeyEvent.META_ALT_ON != 0
         val named = when (event.keyCode) {
             KeyEvent.KEYCODE_ENTER -> PtyKey.Enter
             KeyEvent.KEYCODE_DEL -> PtyKey.Backspace
@@ -369,13 +406,22 @@ class TerminalView @JvmOverloads constructor(
             KeyEvent.KEYCODE_PAGE_DOWN -> PtyKey.PageDown
             else -> null
         }
-        if (named != null) return ptySequence(named, app)
+        if (named != null) {
+            if (stickyCtrl || stickyAlt) consumeStickyModifiers()
+            val seq = ptySequence(named, app)
+            return if (alt) byteArrayOf(0x1b) + seq else seq
+        }
         val unicode = event.unicodeChar
         if (unicode == 0) return null
-        return ptyText(unicode.toChar().toString(), ctrl)
+        if (stickyCtrl || stickyAlt) consumeStickyModifiers()
+        val text = if (unicode <= 0xFFFF) unicode.toChar().toString() else String(Character.toChars(unicode))
+        return ptyText(text, ctrl = ctrl, alt = alt)
     }
 
     private fun colorOf(index: Int): Int {
+        if (TerminalScreen.isTrueColor(index)) {
+            return 0xFF000000.toInt() or (index and 0x00FF_FFFF)
+        }
         if (index in 0..15) return PALETTE[index]
         if (index in 16..231) {
             val n = index - 16

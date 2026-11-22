@@ -181,10 +181,21 @@ class DeviceKeyLoginTest {
         val file = File(context().noBackupFilesDir, "keys/$DEVICE_KEY_ALIAS.seed")
         assertTrue(file.exists())
         val blob = file.readBytes()
-        val seed = decryptWrappedSeed(stored as SecretKey, blob)
+        val seed = decryptWrappedSeed(stored as SecretKey, blob, DEVICE_KEY_ALIAS)
         assertEquals(32, seed.size)
         assertEquals(publicHex, jca.publicHex(seed))
         assertFalse(blob.containsSlice(seed))
+
+        // Corrupt/truncated blobs must fail cleanly with GeneralSecurityException.
+        val badFile = File(context().noBackupFilesDir, "keys/corrupt.device.seed").apply {
+            parentFile?.mkdirs()
+            writeBytes(byteArrayOf(99, 1, 2, 3))
+        }
+        val corruptSigner = KeystoreSigner(context(), "corrupt.device", jca)
+        org.junit.Assert.assertThrows(java.security.GeneralSecurityException::class.java) {
+            corruptSigner.publicHex()
+        }
+        badFile.delete()
 
         val other = KeystoreSigner(context(), "other.device", jca)
         assertNotEquals(publicHex, other.publicHex())
@@ -212,8 +223,7 @@ class DeviceKeyLoginTest {
                 )
             }
         }
-        rule.onNodeWithTag("advanced-relay").performScrollTo().activate()
-        rule.onNodeWithTag("server").performTextReplacement("wss://relay.example:7443")
+        rule.onNodeWithTag("server").performScrollTo().performTextReplacement("wss://relay.example:7443")
         rule.onNodeWithTag("username").performTextInput("alice")
         rule.onNodeWithTag("password").performTextInput("password-alice")
         rule.onNodeWithTag("login").activate()
@@ -344,12 +354,13 @@ private class EdCertificate(private val key: PublicKey) : Certificate("Ed25519")
     override fun toString(): String = "Ed25519"
 }
 
-private fun decryptWrappedSeed(key: SecretKey, blob: ByteArray): ByteArray {
+private fun decryptWrappedSeed(key: SecretKey, blob: ByteArray, alias: String): ByteArray {
     val ivLen = blob[0].toInt() and 0xff
     val iv = blob.copyOfRange(1, 1 + ivLen)
     val body = blob.copyOfRange(1 + ivLen, blob.size)
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
     cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+    cipher.updateAAD("agentlink.seed.v1:$alias".toByteArray(Charsets.UTF_8))
     return cipher.doFinal(body)
 }
 

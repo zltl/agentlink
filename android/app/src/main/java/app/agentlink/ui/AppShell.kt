@@ -4,6 +4,9 @@ package app.agentlink.ui
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -21,6 +24,7 @@ import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -30,6 +34,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -72,8 +77,10 @@ import app.agentlink.account.isAuthFailure
 import app.agentlink.account.maintainSession
 import app.agentlink.account.newerStoredSession
 import app.agentlink.account.sessionNowUnix
+import app.agentlink.bridge.GrantRow
 import app.agentlink.bridge.LinkBridge
 import app.agentlink.bridge.MachineRow
+import app.agentlink.bridge.NodePinRow
 import app.agentlink.model.ConsentChoices
 import app.agentlink.model.ConsentStep
 import app.agentlink.model.consentSteps
@@ -82,8 +89,7 @@ import app.agentlink.node.ConsentStore
 import app.agentlink.node.NodeForegroundService
 import app.agentlink.node.NodeRuntime
 import app.agentlink.node.NodeSetup
-import android.os.Handler
-import android.os.Looper
+import app.agentlink.node.SafStore
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -162,15 +168,24 @@ internal fun AppShell(
     val scope = rememberCoroutineScope()
     val epoch = remember { AtomicInteger(0) }
     var linkedToken by remember { mutableStateOf<String?>(null) }
-    var relay by rememberSaveable { mutableStateOf(enroll?.server ?: user?.server ?: DEFAULT_RELAY) }
-    var fingerprint by rememberSaveable { mutableStateOf(enroll?.fingerprint ?: user?.fingerprint ?: "") }
+    var linkedAccountKey by remember { mutableStateOf<Triple<String, String, String>?>(null) }
+    val savedNode = remember { runCatching { ConsentStore(context).load() }.getOrNull() }
+    val defaultPhoneName = remember { Build.MODEL?.takeIf { it.isNotBlank() } ?: "phone" }
+    var relay by rememberSaveable {
+        mutableStateOf(enroll?.server ?: user?.server ?: savedNode?.relay ?: DEFAULT_RELAY)
+    }
+    var fingerprint by rememberSaveable {
+        mutableStateOf(enroll?.fingerprint ?: user?.fingerprint ?: savedNode?.fingerprint ?: "")
+    }
     var token by rememberSaveable { mutableStateOf(enroll?.token ?: "") }
-    var name by rememberSaveable { mutableStateOf(enroll?.name ?: "") }
-    var choices by remember { mutableStateOf(ConsentChoices()) }
+    var name by rememberSaveable { mutableStateOf(enroll?.name ?: savedNode?.name ?: "") }
+    var choices by remember { mutableStateOf(savedNode?.choices ?: ConsentChoices()) }
     var step by remember { mutableStateOf(ConsentStep.Notifications) }
     var projection by remember { mutableStateOf<Intent?>(null) }
     var projectionCode by remember { mutableIntStateOf(0) }
     var settingsNote by remember { mutableStateOf("") }
+    var hubGrantNode by remember { mutableStateOf<String?>(null) }
+    var hubDeviceKey by remember { mutableStateOf<String?>(null) }
     val initialEnroll = remember { enroll?.token }
     val entry by nav.currentBackStackEntryAsState()
     val route = entry?.destination?.route ?: startDestination
@@ -204,6 +219,7 @@ internal fun AppShell(
         }
         epoch.incrementAndGet()
         linkedToken = null
+        linkedAccountKey = null
         onUser(null)
         runCatching { sessions.clear() }
         client.disconnect()
@@ -339,10 +355,27 @@ internal fun AppShell(
         val started = epoch.get()
         val current = user ?: return@LaunchedEffect
         if (current.accessToken.isNotBlank() && current.accessToken == linkedToken) return@LaunchedEffect
+        val accountKey = Triple(current.server.trim(), current.fingerprint.trim(), current.deviceId)
+        // If we already hold a live ClientSession for this account, rotate the
+        // access token in-place so active PTY and Desktop sessions stay alive.
+        if (client.session != null && linkedAccountKey == accountKey) {
+            val updated = withContext(Dispatchers.IO) {
+                runCatching { client.updateAccessToken(current.accessToken) }
+            }
+            if (!isActive || epoch.get() != started) return@LaunchedEffect
+            if (updated.isSuccess) {
+                linkedToken = current.accessToken
+                if (client.error != null || client.machines.isEmpty()) {
+                    client.refresh()
+                }
+                return@LaunchedEffect
+            }
+        }
         val opened = withContext(Dispatchers.IO) { runCatching { account.connect(current) } }
         if (!isActive || epoch.get() != started) return@LaunchedEffect
         if (opened.isSuccess) {
             linkedToken = current.accessToken
+            linkedAccountKey = accountKey
             client.adopt(opened.getOrThrow())
             return@LaunchedEffect
         }
@@ -370,6 +403,11 @@ internal fun AppShell(
                 if (!isActive || epoch.get() != started) return@LaunchedEffect
                 if (second.isSuccess) {
                     linkedToken = outcome.account.accessToken
+                    linkedAccountKey = Triple(
+                        outcome.account.server.trim(),
+                        outcome.account.fingerprint.trim(),
+                        outcome.account.deviceId,
+                    )
                     onUser(outcome.account)
                     client.adopt(second.getOrThrow())
                 } else if (isAuthFailure(second.exceptionOrNull()?.message)) {
@@ -498,7 +536,27 @@ internal fun AppShell(
                         onOpen = { action ->
                             nav.navigate(Routes.machinePane(machine.id, action.pane))
                         },
+                        onManageGrant = {
+                            hubGrantNode = machine.id
+                            scope.launch {
+                                hubDeviceKey = withContext(Dispatchers.IO) {
+                                    runCatching { account.devicePublicHex() }.getOrNull()
+                                }?.takeIf { it.isNotBlank() }
+                            }
+                        },
                     )
+                    if (hubGrantNode == machine.id) {
+                        GrantFixDialog(
+                            node = machine.id,
+                            pubkey = hubDeviceKey,
+                            identityDir = context.filesDir,
+                            onClose = { hubGrantNode = null },
+                            onImported = {
+                                hubGrantNode = null
+                                client.refresh()
+                            },
+                        )
+                    }
                 }
             }
             composable(
@@ -512,11 +570,11 @@ internal fun AppShell(
                 val pane = destination.arguments?.getString("pane").orEmpty()
                 MachineRoute(client, id, onBack = { nav.popBackStack() }) { machine ->
                     when (pane) {
-                        MachineAction.Files.pane -> FilesPane(client, machine)
+                        MachineAction.Files.pane -> FilesPane(client, machine, account)
                         MachineAction.Terminal.pane -> TerminalPane(client, machine, account)
                         MachineAction.Desktop.pane -> DesktopPane(client, machine, account)
-                        MachineAction.Transfer.pane -> TransferPane(client, machine)
-                        MachineAction.Audit.pane -> AuditPane(client, machine)
+                        MachineAction.Transfer.pane -> TransferPane(client, machine, account)
+                        MachineAction.Audit.pane -> AuditPane(client, machine, account)
                         else -> MissingMachine(onBack = { nav.popBackStack() })
                     }
                 }
@@ -525,6 +583,7 @@ internal fun AppShell(
                 SettingsPage(
                     user = user,
                     api = account,
+                    client = client,
                     note = settingsNote,
                     onActAsNode = {
                         val current = user
@@ -533,13 +592,13 @@ internal fun AppShell(
                         } else {
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
-                                    runCatching { account.enrollAsNode(current, "phone") }
+                                    runCatching { account.enrollAsNode(current, defaultPhoneName) }
                                 }
                                 result.onSuccess {
                                     relay = current.server
                                     fingerprint = current.fingerprint
                                     token = ""
-                                    name = "phone"
+                                    name = defaultPhoneName
                                     runOnMain { nav.navigate(Routes.Setup) }
                                 }.onFailure { error ->
                                     if (isAuthFailure(error.message)) recoverOrSignOut(current)
@@ -556,6 +615,11 @@ internal fun AppShell(
             composable(Routes.Phone) {
                 PhonePage(
                     onPair = { nav.navigate(Routes.Setup) },
+                    onQuickStart = {
+                        NodeForegroundService.start(context)
+                        nav.navigate(Routes.Running) { launchSingleTop = true }
+                    },
+                    onOpenRunning = { nav.navigate(Routes.Running) { launchSingleTop = true } },
                     onStop = { NodeForegroundService.stop(context) },
                 )
             }
@@ -571,8 +635,11 @@ internal fun AppShell(
                         fingerprint = resolved.fingerprint
                         token = resolved.token
                         name = resolved.name
+                        val prior = runCatching { ConsentStore(context).load()?.choices }.getOrNull()
+                        if (prior != null && choices.visited.isEmpty()) {
+                            choices = prior
+                        }
                         step = ConsentStep.Notifications
-                        choices = ConsentChoices()
                         nav.navigate(Routes.Consent)
                     },
                     problem = problem,
@@ -700,9 +767,18 @@ internal fun AgentScaffold(
 }
 
 @Composable
-private fun PhonePage(onPair: () -> Unit, onStop: () -> Unit) {
+private fun PhonePage(
+    onPair: () -> Unit,
+    onQuickStart: () -> Unit,
+    onOpenRunning: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val context = LocalContext.current
     val running by NodeRuntime.running.collectAsState()
     val status by NodeRuntime.status.collectAsState()
+    val savedSetup = remember(running) { runCatching { ConsentStore(context).load() }.getOrNull() }
+    val safStore = remember { SafStore(context) }
+    var safRoots by remember { mutableStateOf(runCatching { safStore.roots() }.getOrDefault(emptyList())) }
     Column(
         modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -719,14 +795,49 @@ private fun PhonePage(onPair: () -> Unit, onStop: () -> Unit) {
                 )
                 if (running) {
                     StatusLine(status, problem = looksLikeProblem(status))
+                } else if (savedSetup != null && savedSetup.choices.appStorage) {
+                    SupportingText("Saved setup ready for ${savedSetup.relay}.")
                 } else {
                     SupportingText("Pair this phone when another machine should be able to reach it.")
                 }
             }
         }
-        PrimaryButton("Pair this phone", onPair, Modifier.fillMaxWidth().testTag("pair-phone"))
+        if (!running && savedSetup != null && savedSetup.choices.appStorage) {
+            PrimaryButton(
+                "Start with saved setup",
+                onQuickStart,
+                Modifier.fillMaxWidth().testTag("quick-start-phone"),
+            )
+            SecondaryButton("Edit setup & permissions", onPair, Modifier.fillMaxWidth().testTag("pair-phone"))
+        } else {
+            PrimaryButton("Pair this phone", onPair, Modifier.fillMaxWidth().testTag("pair-phone"))
+        }
         if (running) {
+            SecondaryButton("Node status & audit", onOpenRunning, Modifier.fillMaxWidth().testTag("open-node-status"))
             SecondaryButton("Stop node", onStop, Modifier.fillMaxWidth())
+        }
+        if (safRoots.isNotEmpty()) {
+            SectionLabel("Granted folders")
+            safRoots.forEach { (id, uri) ->
+                AgentCard {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp).fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text("saf:/$id", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleMedium)
+                            SupportingText(uri)
+                        }
+                        TextButton(onClick = {
+                            safStore.removeRoot(id)
+                            safRoots = safStore.roots()
+                        }) {
+                            Text("Revoke")
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -735,16 +846,56 @@ private fun PhonePage(onPair: () -> Unit, onStop: () -> Unit) {
 private fun SettingsPage(
     user: UserAccount?,
     api: AccountApi,
+    client: ClientViewModel,
     note: String,
     onActAsNode: () -> Unit,
     onAdmin: () -> Unit,
     onLogout: () -> Unit,
     onAuthFailure: (String) -> Unit,
 ) {
+    val context = LocalContext.current
     var devices by remember { mutableStateOf<List<DeviceRow>>(emptyList()) }
+    var pins by remember { mutableStateOf<List<NodePinRow>>(emptyList()) }
+    var grants by remember { mutableStateOf<List<GrantRow>>(emptyList()) }
+    var pubkey by remember { mutableStateOf("") }
+    var showImportGrant by remember { mutableStateOf(false) }
+    var grantJsonDraft by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
     LaunchedEffect(note) { if (note.isNotEmpty()) status = note }
+    LaunchedEffect(api) {
+        pubkey = withContext(Dispatchers.IO) { runCatching { api.devicePublicHex() }.getOrDefault("") }
+    }
+    fun loadPins() {
+        scope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    client.session?.listNodePins()
+                        ?: user?.let { api.listNodePins(it) }
+                        ?: emptyList()
+                }
+            }
+            res.onSuccess {
+                pins = it
+                if (it.isEmpty()) status = "No node pins saved yet."
+            }.onFailure { status = it.message ?: "Couldn't load node pins." }
+        }
+    }
+    fun loadGrants() {
+        scope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    client.session?.listGrants()
+                        ?: user?.let { api.listGrants(it) }
+                        ?: emptyList()
+                }
+            }
+            res.onSuccess {
+                grants = it
+                if (it.isEmpty()) status = "No signed grants stored."
+            }.onFailure { status = it.message ?: "Couldn't load signed grants." }
+        }
+    }
     Column(
         modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -764,6 +915,23 @@ private fun SettingsPage(
                         modifier = Modifier.testTag("settings-user"),
                     )
                     SupportingText(user.server)
+                }
+            }
+            if (pubkey.isNotBlank()) {
+                AgentCard {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        SectionLabel("Controller public key")
+                        Text(pubkey, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = {
+                            copyPlainText(context, "Controller public key", pubkey)
+                            status = "Copied controller public key."
+                        }) {
+                            Text("Copy key")
+                        }
+                    }
                 }
             }
             SectionLabel("Account")
@@ -807,6 +975,26 @@ private fun SettingsPage(
                                         },
                                     )
                                 }
+                                if (!device.revoked) {
+                                    TextButton(onClick = {
+                                        scope.launch {
+                                            val res = withContext(Dispatchers.IO) {
+                                                runCatching { api.revokeDevice(user, device.id) }
+                                            }
+                                            res.onSuccess {
+                                                status = "Revoked ${device.name}."
+                                                devices = devices.map {
+                                                    if (it.id == device.id) it.copy(revoked = true) else it
+                                                }
+                                            }.onFailure { err ->
+                                                if (isAuthFailure(err.message)) onAuthFailure(SESSION_EXPIRED_MESSAGE)
+                                                else status = err.message ?: "Couldn't revoke device."
+                                            }
+                                        }
+                                    }) {
+                                        Text("Revoke")
+                                    }
+                                }
                             }
                         }
                     }
@@ -814,11 +1002,127 @@ private fun SettingsPage(
             }
             PrimaryButton("Act as node", onActAsNode, Modifier.fillMaxWidth().testTag("act-node"))
         }
+        SectionLabel("Security")
+        SecondaryButton("Node pins", onClick = { loadPins() }, modifier = Modifier.fillMaxWidth().testTag("node-pins-button"))
+        if (pins.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                pins.forEach { pin ->
+                    AgentCard {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(pin.name, style = MaterialTheme.typography.titleMedium)
+                                Text(pin.nodeId, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                            }
+                            TextButton(onClick = {
+                                scope.launch {
+                                    val res = withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            client.session?.clearNodePin(pin.name)
+                                                ?: user?.let { api.clearNodePin(it, pin.name) }
+                                                ?: false
+                                        }
+                                    }
+                                    res.onSuccess {
+                                        pins = pins.filterNot { it.name == pin.name }
+                                        status = "Cleared pin for ${pin.name}."
+                                    }.onFailure { status = it.message ?: "Couldn't clear pin." }
+                                }
+                            }) {
+                                Text("Clear")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            SecondaryButton("Signed grants", onClick = { loadGrants() }, modifier = Modifier.weight(1f).testTag("grants-button"))
+            SecondaryButton("Import grant", onClick = {
+                grantJsonDraft = ""
+                showImportGrant = true
+            }, modifier = Modifier.weight(1f))
+        }
+        if (grants.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                grants.forEach { grant ->
+                    AgentCard {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(grant.nodeId.take(16) + "…", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleMedium)
+                                SupportingText("${grant.preset} · exp ${grant.expUnix}")
+                            }
+                            TextButton(onClick = {
+                                scope.launch {
+                                    val res = withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            client.session?.deleteGrant(grant.nodeId)
+                                                ?: user?.let { api.deleteGrant(it, grant.nodeId) }
+                                                ?: false
+                                        }
+                                    }
+                                    res.onSuccess {
+                                        grants = grants.filterNot { it.nodeId == grant.nodeId }
+                                        status = "Deleted grant for ${grant.nodeId.take(12)}…."
+                                    }.onFailure { status = it.message ?: "Couldn't delete grant." }
+                                }
+                            }) {
+                                Text("Delete")
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (status.isNotEmpty()) {
             StatusLine(status, problem = looksLikeProblem(status) || isAuthFailure(status))
         }
         AgentDivider()
         SecondaryButton("Admin token", onAdmin, Modifier.fillMaxWidth())
         SecondaryButton("Log out", onLogout, Modifier.fillMaxWidth().testTag("logout"))
+    }
+    if (showImportGrant) {
+        AlertDialog(
+            onDismissRequest = { showImportGrant = false },
+            title = { Text("Import signed grant") },
+            text = {
+                AgentField(
+                    grantJsonDraft,
+                    { grantJsonDraft = it },
+                    "Grant JSON",
+                    Modifier.fillMaxWidth(),
+                    singleLine = false,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val raw = grantJsonDraft.trim()
+                    showImportGrant = false
+                    scope.launch {
+                        val res = withContext(Dispatchers.IO) {
+                            runCatching {
+                                client.session?.importGrant(raw)
+                                    ?: user?.let { api.importGrant(it, raw) }
+                                    ?: error("Not connected")
+                            }
+                        }
+                        res.onSuccess {
+                            status = "Imported grant for ${it.nodeId.take(12)}…."
+                            loadGrants()
+                        }.onFailure { status = it.message ?: "Couldn't import grant." }
+                    }
+                }) { Text("Import") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showImportGrant = false }) { Text("Cancel") }
+            },
+        )
     }
 }
