@@ -1003,6 +1003,12 @@ pub fn write_tar(
     Ok(())
 }
 
+fn remove_extracted_link(path: &Path) {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        let _ = crate::paths::remove_link_entry(path, &meta);
+    }
+}
+
 pub fn unpack_tar(tar_path: &Path, dest: &Path) -> Result<u32> {
     unpack_tar_confined(tar_path, dest, None)
 }
@@ -1064,12 +1070,12 @@ pub fn unpack_tar_confined(
             // Verify both lexically and canonically against `dest` and `sandbox_root`.
             if let Err(err) = ensure_link_target_inside(dest, sandbox_root, &out, &target) {
                 for sym in &created_symlinks {
-                    let _ = fs::remove_file(sym);
+                    remove_extracted_link(sym);
                 }
                 return Err(err);
             }
             if out.symlink_metadata().is_ok() {
-                let _ = fs::remove_file(&out);
+                remove_extracted_link(&out);
             }
             create_symlink(&target, &out)?;
             created_symlinks.push(out.clone());
@@ -1111,7 +1117,7 @@ pub fn unpack_tar_confined(
         };
         if let Err(err) = ok_dest.and(ok_root) {
             for created in &created_symlinks {
-                let _ = fs::remove_file(created);
+                remove_extracted_link(created);
             }
             return Err(err);
         }
@@ -4696,6 +4702,42 @@ mod security_hardening_tests {
         }
     }
 
+    fn can_create_symlinks(dir: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = dir;
+            true
+        }
+        #[cfg(windows)]
+        {
+            let probe = dir.join(".symlink-probe");
+            match std::os::windows::fs::symlink_file("nonexistent", &probe) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&probe);
+                    true
+                }
+                Err(err) if err.raw_os_error() == Some(1314) => false,
+                Err(_) => false,
+            }
+        }
+    }
+
+    fn build_symlink_tar(tar_path: &Path, entries: &[(&str, &str)]) {
+        let file = File::create(tar_path).unwrap();
+        let mut builder = tar::Builder::new(file);
+        for (path, link_target) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_path(path).unwrap();
+            h.set_link_name(link_target).unwrap();
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_cksum();
+            builder.append(&h, std::io::empty()).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
     #[test]
     fn sec04_unpack_tar_confined_blocks_multihop_symlink_escape() {
         let dir = tempfile::tempdir().unwrap();
@@ -4703,43 +4745,78 @@ mod security_hardening_tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("secret.txt"), b"top-secret").unwrap();
         let sandbox = dir.path().join("sandbox");
-        let dest = sandbox.join("sub");
-        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&sandbox).unwrap();
 
-        // Pre-existing symlink inside sandbox pointing outside (or symlink created by tar).
-        let tar_path = dir.path().join("chain.tar");
-        {
-            let file = File::create(&tar_path).unwrap();
-            let mut builder = tar::Builder::new(file);
-            // Reverse-order chain: `a` points to `sub2/hop`, then `sub2/hop` points to `../../outside/secret.txt`.
-            let mut h1 = tar::Header::new_gnu();
-            h1.set_entry_type(tar::EntryType::Symlink);
-            h1.set_path("a").unwrap();
-            h1.set_link_name("sub2/hop").unwrap();
-            h1.set_size(0);
-            h1.set_mode(0o777);
-            h1.set_cksum();
-            builder.append(&h1, std::io::empty()).unwrap();
-
-            let mut h2 = tar::Header::new_gnu();
-            h2.set_entry_type(tar::EntryType::Symlink);
-            h2.set_path("sub2/hop").unwrap();
-            h2.set_link_name("../../../outside/secret.txt").unwrap();
-            h2.set_size(0);
-            h2.set_mode(0o777);
-            h2.set_cksum();
-            builder.append(&h2, std::io::empty()).unwrap();
-
-            builder.finish().unwrap();
-        }
-        let err = unpack_tar_confined(&tar_path, &dest, Some(&sandbox)).unwrap_err();
+        // 1. Direct lexical escape is blocked even without symlink creation privileges.
+        let dest_lex = sandbox.join("lex");
+        let tar_lex = dir.path().join("lex.tar");
+        build_symlink_tar(
+            &tar_lex,
+            &[("sub2/hop", "../../../outside/secret.txt")],
+        );
+        let err = unpack_tar_confined(&tar_lex, &dest_lex, Some(&sandbox)).unwrap_err();
         assert!(
             err.to_string().contains("escapes") || err.to_string().contains("symlink"),
             "unexpected error: {err}"
         );
+        assert!(std::fs::symlink_metadata(dest_lex.join("sub2/hop")).is_err());
+
+        if !can_create_symlinks(dir.path()) {
+            return;
+        }
+
+        // 2. Lexically-inside 2-hop chain (forward order: `hop` created before `evil`):
+        //    - `d1/d2/d3/hop -> ../../..` resolves lexically & canonically to `dest` (inside).
+        //    - `d1/d2/d3/evil -> hop/../../../../outside/secret.txt` collapses lexically to
+        //      `dest/outside/secret.txt` (appears inside!), but canonically traverses `hop`
+        //      to `dest`, then climbs 4 levels above `dest` to escape `dest` and `sandbox`!
+        let dest_fwd = sandbox.join("fwd");
+        let tar_fwd = dir.path().join("fwd.tar");
+        build_symlink_tar(
+            &tar_fwd,
+            &[
+                ("d1/d2/d3/hop", "../../.."),
+                ("d1/d2/d3/evil", "hop/../../../../outside/secret.txt"),
+            ],
+        );
+        let err = unpack_tar_confined(&tar_fwd, &dest_fwd, Some(&sandbox)).unwrap_err();
         assert!(
-            std::fs::symlink_metadata(dest.join("sub2/hop")).is_err(),
-            "escaping symlink must not remain on disk"
+            err.to_string().contains("escapes") || err.to_string().contains("symlink"),
+            "forward 2-hop chain must fail with escape error, got: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest_fwd.join("d1/d2/d3/hop")).is_err(),
+            "forward 2-hop chain must scrub hop symlink on rejection"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest_fwd.join("d1/d2/d3/evil")).is_err(),
+            "forward 2-hop chain must not leave evil symlink on disk"
+        );
+
+        // 3. Same lexically-inside 2-hop chain in REVERSE order (`evil` before `hop`):
+        //    Per-entry check cannot see `hop` yet when `evil` is unpacked, so the
+        //    post-unpack canonical re-validation loop MUST catch and scrub both links!
+        let dest_rev = sandbox.join("rev");
+        let tar_rev = dir.path().join("rev.tar");
+        build_symlink_tar(
+            &tar_rev,
+            &[
+                ("d1/d2/d3/evil", "hop/../../../../outside/secret.txt"),
+                ("d1/d2/d3/hop", "../../.."),
+            ],
+        );
+        let err = unpack_tar_confined(&tar_rev, &dest_rev, Some(&sandbox)).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes") || err.to_string().contains("symlink"),
+            "reverse 2-hop chain must fail with escape error, got: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest_rev.join("d1/d2/d3/evil")).is_err(),
+            "reverse 2-hop chain must scrub evil symlink on rejection"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest_rev.join("d1/d2/d3/hop")).is_err(),
+            "reverse 2-hop chain must scrub hop symlink on rejection"
         );
     }
 
@@ -4750,7 +4827,7 @@ mod security_hardening_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("bin");
         std::fs::write(&file, b"elf").unwrap();
-        apply_mode_mtime(&file, 0o6755, 0);
+        apply_mode_mtime(&file, Some(0o6755), Some(0));
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o0755, "setuid/setgid/sticky bits must be masked off");
     }

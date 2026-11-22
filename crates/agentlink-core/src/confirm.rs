@@ -100,12 +100,21 @@ impl ConfirmPolicy {
     }
 
     /// Match a file/directory transfer (`kind` e.g. `"push"`, `"pull"`,
-    /// `"push_dir"`, `"push_stream"`) targeting `path` against `transfer`/`any` rules.
+    /// `"push_dir"`, `"push_stream"`) targeting `path` against `transfer`,
+    /// `any`, and (for push/write transfers) `write` rules (`SEC-10`).
     pub fn matching_transfer(&self, kind: &str, path: &str) -> Option<&ConfirmRule> {
+        let kind_lower = kind.trim().to_ascii_lowercase();
+        let is_push_write = matches!(
+            kind_lower.as_str(),
+            "push" | "push_dir" | "push_stream" | "upload" | "write"
+        ) || kind_lower.starts_with("push_");
         let summary = format!("transfer {kind} {path}");
         self.rules.iter().find(|rule| {
             let category = rule.category.to_ascii_lowercase();
-            if category != "transfer" && category != "any" {
+            let category_ok = category == "transfer"
+                || category == "any"
+                || (is_push_write && category == "write");
+            if !category_ok {
                 return false;
             }
             if rule.recursive {
@@ -120,6 +129,9 @@ impl ConfirmPolicy {
                 return true;
             }
             crate::sandbox::glob_match(&rule.pattern, &summary)
+                || (is_push_write
+                    && category == "write"
+                    && crate::sandbox::glob_match(&rule.pattern, &format!("write {path}")))
         })
     }
 
@@ -918,5 +930,58 @@ mod tests {
                 "unexpected false positive hold on: {safe}"
             );
         }
+    }
+
+    #[test]
+    fn sec10_matching_transfer_enforces_write_rules_for_pushes_not_pulls() {
+        let policy = ConfirmPolicy {
+            timeout_secs: 30,
+            rules: vec![ConfirmRule {
+                category: "write".into(),
+                pattern: String::new(),
+                outside: Some("/work".into()),
+                recursive: false,
+            }],
+        };
+
+        // Push writes outside `/work` (including `..` traversal) MUST match `category = "write"`.
+        for kind in ["push", "push_dir", "push_stream"] {
+            assert!(
+                policy.matching_transfer(kind, "/etc/passwd").is_some(),
+                "expected write rule to hold {kind} outside /work"
+            );
+            assert!(
+                policy
+                    .matching_transfer(kind, "/work/../etc/passwd")
+                    .is_some(),
+                "expected write rule to hold {kind} dotdot traversal"
+            );
+            assert!(
+                policy.matching_transfer(kind, "/work/ok.txt").is_none(),
+                "expected write rule to allow {kind} inside /work"
+            );
+        }
+
+        // Read-side pulls MUST NOT trigger `category = "write"`.
+        for kind in ["pull", "pull_dir", "pull_stream"] {
+            assert!(
+                policy.matching_transfer(kind, "/etc/passwd").is_none(),
+                "pull ({kind}) must not trigger category = write"
+            );
+        }
+
+        // Explicit `transfer` rule still matches both push and pull outside `/work`.
+        let xfer_policy = ConfirmPolicy {
+            timeout_secs: 30,
+            rules: vec![ConfirmRule {
+                category: "transfer".into(),
+                pattern: String::new(),
+                outside: Some("/work".into()),
+                recursive: false,
+            }],
+        };
+        assert!(xfer_policy.matching_transfer("pull", "/etc/passwd").is_some());
+        assert!(xfer_policy.matching_transfer("push", "/etc/passwd").is_some());
+        assert!(xfer_policy.matching_transfer("pull", "/work/a.txt").is_none());
     }
 }
