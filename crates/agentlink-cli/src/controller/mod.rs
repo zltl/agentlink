@@ -39,6 +39,8 @@ mod input_adapter;
 #[cfg(not(target_env = "musl"))]
 mod ordered_send;
 #[cfg(not(target_env = "musl"))]
+mod tabs;
+#[cfg(not(target_env = "musl"))]
 mod ui;
 #[cfg(not(target_env = "musl"))]
 mod viewport;

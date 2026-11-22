@@ -65,7 +65,9 @@
 
 ```
 # 控制端（远程）
-agentlink grant offer --policy desktop --ttl 4h [--node <目标64位公钥>] 
+agentlink grant offer --policy desktop --ttl 4h [--node <目标64位公钥>]
+# 或申请长期/永久授权（仍须目标机本地核对批准，且目标机仍可随时本地 revoke）：
+agentlink grant offer --policy full --permanent [--node <目标64位公钥>]
 
 # 目标机（本地）
 agentlink grant paste 'agentlink-offer:v1:…' --data-dir <节点数据目录>

@@ -108,6 +108,10 @@ pub const BG_PAGE: Color32 = Color32::from_rgb(0x08, 0x09, 0x0a);
 pub const BG_PANEL: Color32 = Color32::from_rgb(0x0f, 0x10, 0x11);
 pub const BG_SURFACE: Color32 = Color32::from_rgb(0x19, 0x1a, 0x1b);
 pub const BG_HOVER: Color32 = Color32::from_rgb(0x28, 0x28, 0x2c);
+pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x0D, 0x0D, 0x12);
+pub const TAB_STRIP_BG: Color32 = BG_PAGE;
+pub const TAB_ACTIVE_BG: Color32 = BG_PANEL;
+pub const TAB_HOVER_BG: Color32 = BG_SURFACE;
 
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xf7, 0xf8, 0xf8);
 pub const TEXT_BODY: Color32 = Color32::from_rgb(0xd0, 0xd6, 0xe0);
@@ -172,6 +176,11 @@ pub const BTN_PAD_X: f32 = 12.0;
 pub const BAR_HEIGHT: f32 = 30.0;
 pub const STATUS_DOT: f32 = 6.0;
 pub const ICON_BTN: f32 = 28.0;
+pub const TAB_BAR_HEIGHT: f32 = 36.0;
+pub const TAB_HEIGHT: f32 = 32.0;
+pub const TAB_MIN_WIDTH: f32 = 104.0;
+pub const TAB_MAX_WIDTH: f32 = 188.0;
+pub const TAB_PINNED_WIDTH: f32 = 96.0;
 
 // —— Type ————————————————————————————————————————————————————————————————
 

@@ -187,11 +187,13 @@ agentlink grant trust-owner <controller-public-id-hex> --data-dir <node-data-dir
 
 # 3. Back on the controller machine: mint, inspect, renew, or batch-ensure grants.
 # Both positional `[NODE]` and `--node <name-or-node-id>` are accepted.
+# Lifetimes accept seconds (`900`), units (`15m`, `1h`, `7d`, `1y`), or `--ttl permanent` / `--permanent` (wire-compatible `9999-12-31T23:59:59Z`).
 agentlink grant issue laptop --policy exec --ttl 1h [--issuer auto|operator|node] [--issuer-data-dir <dir>] [--grantee <hex>] [--out -]
+agentlink grant issue --all --policy full --permanent [--issuer operator]
 agentlink grant show laptop
 agentlink grant list                         # resolves names, human TTLs, flags EXPIRED or WRONG GRANTEE
 agentlink grant refresh laptop [--ttl 1h]    # re-signs keeping grantee, node, and policy
-agentlink grant refresh --all [--ttl 1h]     # renew stored grants across fleet
+agentlink grant refresh --all [--ttl 1h|--permanent]     # renew stored grants across fleet
 agentlink grant ensure laptop --policy exec --ttl 1h
 agentlink grant ensure --all --policy exec --ttl 1h
 agentlink grant prune                        # delete expired and wrong-grantee local grant files
@@ -249,7 +251,14 @@ use via `--issuer`:
 - `grant ensure` reuses a valid stored grant for this controller identity,
   refreshes an expired one (keeping its policy), or issues a new one with
   `--policy`. Add `--all` to ensure grants across your online/pinned nodes in
-  one step.
+  one step. Requesting `--permanent` / `--ttl permanent` also upgrades a finite
+  stored grant to permanent.
+- `grant issue --all --policy full --permanent` issues permanent grants (encoded
+  as `exp_unix = 253402300799`, `9999-12-31T23:59:59Z` for wire compatibility
+  with `agentlink-grant-v1` nodes) across all paired/pinned nodes. Permanent
+  grants never expire automatically, but remain **locally revocable at any time**
+  via `agentlink grant revoke --data-dir <node-data-dir>` (and `revoked-grants.json`
+  never prunes revoked permanent entries).
 - `grant refresh --all` re-signs stored grants for this controller across the
   fleet.
 - `grant prune` cleans up expired or wrong-grantee `.json` files from

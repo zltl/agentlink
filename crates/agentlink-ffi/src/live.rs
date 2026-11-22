@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use agentlink_core::protocol::Op;
 use agentlink_core::{
-    apply_relay_defaults, parse_relay_url, tls, Client, ClientSettings, PHASE3_WEBRTC_SIGNAL,
+    parse_relay_url, tls, Client, ClientSettings, PHASE3_WEBRTC_SIGNAL,
 };
 use agentlink_view::{LiveOptions, Signal, Viewer};
 use serde_json::{json, Value};
@@ -352,7 +352,7 @@ async fn relay_https_json(
 ) -> Option<Value> {
     let mut relay_url = settings.relay.clone();
     let mut trust_opt = settings.trust.clone();
-    apply_relay_defaults(&mut relay_url, &settings.fingerprint, &mut trust_opt);
+    crate::apply_mobile_relay_defaults(&mut relay_url, &settings.fingerprint, &mut trust_opt);
     let relay = parse_relay_url(&relay_url).ok()?;
     let trust = tls::RelayTrust::parse(&settings.fingerprint, trust_opt.as_deref()).ok()?;
     let tcp = timeout(

@@ -163,12 +163,16 @@ fn load_pending(dir: &std::path::Path) -> Vec<PendingItem> {
         .map(|r| {
             let fp = agentlink_core::grant_offer::sha256_ssh_fingerprint(&r.grantee_id)
                 .unwrap_or_else(|_| "SHA256:?".into());
+            let ttl_label = if agentlink_core::grant::is_permanent_ttl(r.ttl_secs) {
+                "permanent".to_string()
+            } else {
+                format!("ttl {}s", r.ttl_secs)
+            };
             PendingItem {
                 request_id: r.request_id,
                 label: format!(
-                    "{fp} — {} — ttl {}s (signature != identity name)",
+                    "{fp} — {} — {ttl_label} (signature != identity name)",
                     r.policy.capability_summary(),
-                    r.ttl_secs
                 ),
             }
         })

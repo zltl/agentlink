@@ -19,8 +19,7 @@ use agentlink_core::tls;
 use agentlink_core::util::{self, FILE_CHUNK};
 use agentlink_core::ws::{self, Incoming, Outbound};
 use agentlink_core::{
-    apply_relay_defaults, parse_relay_url, Error, Identity, NodePolicy, Result,
-    PHASE3_WEBRTC_SIGNAL,
+    parse_relay_url, Error, Identity, NodePolicy, Result, PHASE3_WEBRTC_SIGNAL,
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
@@ -285,7 +284,7 @@ async fn connect_once(
 ) -> Result<()> {
     let mut relay_url = config.relay_url.clone();
     let mut trust = config.trust.clone();
-    apply_relay_defaults(&mut relay_url, &config.fingerprint, &mut trust);
+    crate::apply_mobile_relay_defaults(&mut relay_url, &config.fingerprint, &mut trust);
     let relay = parse_relay_url(&relay_url)?;
     let trust = tls::RelayTrust::parse(&config.fingerprint, trust.as_deref())?;
     let tcp = timeout(
@@ -747,7 +746,7 @@ async fn handle_env(
                 return;
             }
             let grant_jti = authz.as_ref().map(|g| g.jti.clone()).unwrap_or_default();
-            let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
+            let grant_exp_unix = authz.as_ref().and_then(|g| g.effective_exp_unix());
             let Some(log) =
                 live.sessions
                     .begin(&request_id, &grantee, &grant_jti, grant_exp_unix)
@@ -1885,7 +1884,7 @@ fn release_all_host_sessions(
 fn normalized_relay(relay_url: &str, fingerprint: &str) -> (String, Option<String>) {
     let mut relay_url = relay_url.to_string();
     let mut trust = None;
-    apply_relay_defaults(&mut relay_url, fingerprint, &mut trust);
+    crate::apply_mobile_relay_defaults(&mut relay_url, fingerprint, &mut trust);
     (relay_url, trust)
 }
 

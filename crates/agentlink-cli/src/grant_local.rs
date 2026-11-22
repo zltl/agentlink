@@ -56,17 +56,18 @@ pub fn request_prompt_body(
 ) -> String {
     let power_note = power_note_for_access(access);
     format!(
-        "agentlink local node authorization\n\n\
+        "Agentlink local node authorization\n\n\
          Request: {request_id}\n\
          Controller key fingerprint: {fingerprint}\n\
          Controller public key: {grantee_id}\n\
          Requested access: {access}\n\
-         Grant ttl if allowed: {ttl_secs}s\n\
+         Grant ttl if allowed: {}\n\
          Request expires unix: {exp_unix}\n\n\
          {SIGNATURE_DISCLAIMER}\n\
          {SCOPE_NOTE}\n\
          {power_note}\n\n\
-         Allow signs a grant using this node's local issuer. Deny rejects the request. Neither is `agentlink approve allow` (held destructive ops). The issuer key never leaves this machine and is never printed."
+         Allow signs a grant using this node's local issuer. Deny rejects the request. Neither is `agentlink approve allow` (held destructive ops). The issuer key never leaves this machine and is never printed.",
+        agentlink_core::grant::format_ttl_summary(ttl_secs)
     )
 }
 
@@ -252,7 +253,7 @@ pub fn shrink_grant_prompt(
                 "--title",
                 "Shorten grant TTL",
                 "--inputbox",
-                "TTL (seconds or 5m/1h; may only be shortened)",
+                "TTL (seconds or 5m/1h/7d/1y/permanent; may only be shortened)",
                 &default_ttl,
             ])
             .output()?;
@@ -391,6 +392,9 @@ pub fn default_shrink_ttl_text(
             return Ok(raw.to_string());
         }
     }
+    if agentlink_core::grant::is_permanent_ttl(requested_ttl_secs) {
+        return Ok("permanent".to_string());
+    }
     Ok(requested_ttl_secs.to_string())
 }
 
@@ -408,10 +412,11 @@ pub fn issue_confirm_body(policy: &str, ttl_secs: u64) -> String {
             }
         })
         .unwrap_or_else(|| power_note_for_access(policy));
+    let ttl_text = agentlink_core::grant::format_ttl_summary(ttl_secs);
     format!(
         "Grant about to be signed (this final summary is authoritative):\n\n\
          Access: {summary}\n\
-         TTL: {ttl_secs}s\n\n\
+         TTL: {ttl_text}\n\n\
          {power_note}\n\n\
          Cancelling does not authorize access; the pending request remains. The issuer key is never printed."
     )
@@ -432,10 +437,11 @@ fn shrink_hint(
         .find(|(n, _)| n == default_policy)
         .map(|(_, s)| s.clone())
         .unwrap_or_else(|| default_policy.to_string());
+    let requested_ttl_text = agentlink_core::grant::format_ttl_summary(requested_ttl_secs);
     format!(
         "You may narrow access or shorten the TTL, never enlarge it.\n\
          Requested access: {requested_summary}\n\
-         Requested TTL: {requested_ttl_secs}s\n\
+         Requested TTL: {requested_ttl_text}\n\
          Default minimum access: {default_summary}\n\
          Default TTL: {default_ttl}\n\
          Choose the policy to issue below (verified again in the final confirmation)."
@@ -528,7 +534,7 @@ fn zenity_ttl_entry(default_ttl: &str) -> Result<Option<String>> {
             "--width",
             "480",
             "--text",
-            "TTL (seconds or 5m/1h; may only be shortened)",
+            "TTL (seconds or 5m/1h/7d/1y/permanent; may only be shortened)",
             "--entry-text",
             default_ttl,
             "--ok-label",
@@ -653,6 +659,12 @@ pub fn parse_shrink_ttl(raw: &str) -> Result<u64> {
     if raw.is_empty() {
         return Err(anyhow!("TTL cannot be empty"));
     }
+    if matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "permanent" | "never" | "forever"
+    ) {
+        return Ok(agentlink_core::grant::PERMANENT_GRANT_TTL_SECS);
+    }
     if let Ok(secs) = raw.parse::<u64>() {
         return Ok(secs);
     }
@@ -663,7 +675,11 @@ pub fn parse_shrink_ttl(raw: &str) -> Result<u64> {
         "m" | "min" | "mins" | "minute" | "minutes" => Ok(n.saturating_mul(60)),
         "h" | "hr" | "hrs" | "hour" | "hours" => Ok(n.saturating_mul(3600)),
         "d" | "day" | "days" => Ok(n.saturating_mul(86400)),
-        _ => Err(anyhow!("could not parse TTL `{raw}` (use seconds or 5m/1h/7d)")),
+        "w" | "wk" | "wks" | "week" | "weeks" => Ok(n.saturating_mul(604_800)),
+        "y" | "yr" | "yrs" | "year" | "years" => Ok(n.saturating_mul(365 * 86_400)),
+        _ => Err(anyhow!(
+            "could not parse TTL `{raw}` (use seconds, 5m/1h/7d/1y, or permanent)"
+        )),
     }
 }
 
@@ -801,5 +817,42 @@ mod tests {
         let summary = parse_access("desktop").unwrap().capability_summary();
         assert!(summary.contains("exec/shell"));
         assert_eq!(power_note_for_access(&summary), EXEC_POWER_NOTE);
+    }
+
+    #[test]
+    fn shrink_ttl_supports_permanent_weeks_years_and_prefill() {
+        assert_eq!(
+            parse_shrink_ttl("permanent").unwrap(),
+            agentlink_core::grant::PERMANENT_GRANT_TTL_SECS
+        );
+        assert_eq!(
+            parse_shrink_ttl("never").unwrap(),
+            agentlink_core::grant::PERMANENT_GRANT_TTL_SECS
+        );
+        assert_eq!(
+            parse_shrink_ttl("forever").unwrap(),
+            agentlink_core::grant::PERMANENT_GRANT_TTL_SECS
+        );
+        assert_eq!(parse_shrink_ttl("2w").unwrap(), 2 * 604_800);
+        assert_eq!(parse_shrink_ttl("1y").unwrap(), 365 * 86_400);
+
+        assert_eq!(
+            default_shrink_ttl_text(agentlink_core::grant::PERMANENT_GRANT_TTL_SECS, None)
+                .unwrap(),
+            "permanent"
+        );
+        assert_eq!(
+            default_shrink_ttl_text(
+                agentlink_core::grant::PERMANENT_GRANT_TTL_SECS,
+                Some("30d")
+            )
+            .unwrap(),
+            "30d"
+        );
+        let confirm = issue_confirm_body(
+            "full",
+            agentlink_core::grant::PERMANENT_GRANT_TTL_SECS,
+        );
+        assert!(confirm.contains("permanent (never expires)"), "{confirm}");
     }
 }

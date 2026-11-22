@@ -171,32 +171,47 @@ pub fn classify_connect_error(raw: &str) -> String {
     }
 }
 
+/// True when the top chrome (tab strip + connection bar) should paint (fullscreen auto-hide).
+pub fn top_chrome_visible(
+    fullscreen: bool,
+    idle_for: Duration,
+    pointer_y: Option<f32>,
+    chrome_height: f32,
+) -> bool {
+    if !fullscreen {
+        return true;
+    }
+    if pointer_y.is_some_and(|y| y <= chrome_height + BAR_REVEAL_PAD) {
+        return true;
+    }
+    idle_for < BAR_HIDE_AFTER
+}
+
 /// True when the connection bar should paint (fullscreen auto-hide).
 pub fn connection_bar_visible(
     fullscreen: bool,
     idle_for: Duration,
     pointer_y: Option<f32>,
 ) -> bool {
-    if !fullscreen {
-        return true;
-    }
-    if pointer_y.is_some_and(|y| y <= BAR_HEIGHT + BAR_REVEAL_PAD) {
-        return true;
-    }
-    idle_for < BAR_HIDE_AFTER
+    top_chrome_visible(fullscreen, idle_for, pointer_y, BAR_HEIGHT)
 }
 
-/// Reserved height above the connection bar for a future multi-session tab strip.
-///
-/// Always zero today. Callers should add this to the top chrome so a later tab
-/// row does not need a layout rewrite.
-pub fn session_tab_strip_height(_tab_count: usize) -> f32 {
-    0.0
+/// Height of the top multi-session tab strip.
+pub fn session_tab_strip_height(tab_count: usize) -> f32 {
+    if tab_count > 0 {
+        theme::TAB_BAR_HEIGHT
+    } else {
+        0.0
+    }
 }
 
-/// Total top chrome height for the active session shell.
+/// Total top chrome height for the active desktop session shell.
 pub fn session_chrome_top_height(tab_count: usize, bar_visible: bool) -> f32 {
-    session_tab_strip_height(tab_count) + if bar_visible { BAR_HEIGHT } else { 0.0 }
+    if bar_visible {
+        session_tab_strip_height(tab_count) + BAR_HEIGHT
+    } else {
+        0.0
+    }
 }
 
 /// How much chrome the connection bar can afford at the current width.
@@ -276,10 +291,6 @@ pub fn estimate_bar_width_with(
     let item = theme::SPACE_XS;
     let vsep = 1.0 + item * 2.0;
 
-    let back = match density {
-        BarDensity::Icons | BarDensity::Minimal => btn_w(advance("←", theme::BAR_SIZE, false)),
-        _ => btn_w(advance("← Back", theme::BAR_SIZE, false)),
-    };
     let name = advance(m.node_name, theme::SECONDARY_SIZE, false);
     let dot = theme::STATUS_DOT + theme::SPACE_SM;
     let mode = if density == BarDensity::Minimal {
@@ -378,9 +389,7 @@ pub fn estimate_bar_width_with(
         }
     };
 
-    let left = back
-        + item
-        + name
+    let left = name
         + item
         + dot
         + mode
@@ -776,9 +785,43 @@ mod tests {
 
     #[test]
     fn chrome_height_reserves_tab_strip() {
-        assert_eq!(session_tab_strip_height(1), 0.0);
-        assert_eq!(session_chrome_top_height(1, true), BAR_HEIGHT);
+        assert_eq!(session_tab_strip_height(0), 0.0);
+        assert_eq!(session_tab_strip_height(1), theme::TAB_BAR_HEIGHT);
+        assert_eq!(
+            session_chrome_top_height(1, true),
+            theme::TAB_BAR_HEIGHT + BAR_HEIGHT
+        );
+        assert_eq!(session_chrome_top_height(0, true), BAR_HEIGHT);
         assert_eq!(session_chrome_top_height(1, false), 0.0);
+    }
+
+    #[test]
+    fn top_chrome_visible_uses_combined_tab_and_connection_bar_height() {
+        let combined = theme::TAB_BAR_HEIGHT + BAR_HEIGHT;
+        assert!(top_chrome_visible(
+            false,
+            Duration::from_secs(30),
+            Some(500.0),
+            combined
+        ));
+        assert!(!top_chrome_visible(
+            true,
+            Duration::from_secs(30),
+            Some(combined + BAR_REVEAL_PAD + 1.0),
+            combined
+        ));
+        assert!(top_chrome_visible(
+            true,
+            Duration::from_secs(30),
+            Some(combined + BAR_REVEAL_PAD),
+            combined
+        ));
+        assert!(top_chrome_visible(
+            true,
+            Duration::from_millis(500),
+            Some(500.0),
+            combined
+        ));
     }
 
     #[test]

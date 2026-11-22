@@ -1057,7 +1057,8 @@ private fun SettingsPage(
                         ) {
                             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Text(grant.nodeId.take(16) + "…", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleMedium)
-                                SupportingText("${grant.preset} · exp ${grant.expUnix}")
+                                val expiryText = if (grant.expUnix >= 253_402_300_799L) "permanent" else "exp ${grant.expUnix}"
+                                SupportingText("${grant.preset} · $expiryText")
                             }
                             TextButton(onClick = {
                                 scope.launch {

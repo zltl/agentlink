@@ -238,12 +238,18 @@ fn get_status_tool(state: &Mcp) -> String {
                 agentlink_core::node_pin::name_for_id(&state.config.config_dir, &item.grant.node_id)
                     .ok()
                     .flatten();
+            let expires_in_secs = if item.grant.is_permanent() {
+                None
+            } else {
+                Some(item.grant.exp_unix - now)
+            };
             json!({
                 "node_id": item.grant.node_id,
                 "node_name": node_name,
                 "jti": item.grant.jti,
                 "grant_status": mcp_grant_status_str(status),
-                "grant_expires_in_secs": item.grant.exp_unix - now,
+                "permanent": item.grant.is_permanent(),
+                "grant_expires_in_secs": expires_in_secs,
                 "exp_unix": item.grant.exp_unix,
                 "access": item.grant.policy.capability_summary(),
             })
@@ -280,23 +286,27 @@ async fn call_tool(
             let mut enriched = Vec::with_capacity(nodes.len());
             for node in nodes {
                 let mut val = serde_json::to_value(&node).unwrap_or_else(|_| json!({}));
-                let (grant_status_str, expires_in) = match agentlink_core::grant::load_grant(
-                    &state.config.config_dir,
-                    &node.id,
-                ) {
-                    Ok(Some(grant)) => {
-                        let status = agentlink_core::grant::grant_status(
-                            &grant,
-                            Some(&node.id),
-                            local_public_id.as_deref(),
-                            now,
-                        );
-                        (mcp_grant_status_str(status), Some(grant.exp_unix - now))
-                    }
-                    _ => ("missing", None),
-                };
+                let (grant_status_str, expires_in, grant_permanent) =
+                    match agentlink_core::grant::load_grant(&state.config.config_dir, &node.id) {
+                        Ok(Some(grant)) => {
+                            let status = agentlink_core::grant::grant_status(
+                                &grant,
+                                Some(&node.id),
+                                local_public_id.as_deref(),
+                                now,
+                            );
+                            let expires_in = if grant.is_permanent() {
+                                None
+                            } else {
+                                Some(grant.exp_unix - now)
+                            };
+                            (mcp_grant_status_str(status), expires_in, grant.is_permanent())
+                        }
+                        _ => ("missing", None, false),
+                    };
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert("grant_status".into(), json!(grant_status_str));
+                    obj.insert("grant_permanent".into(), json!(grant_permanent));
                     obj.insert("grant_expires_in_secs".into(), json!(expires_in));
                 }
                 enriched.push(val);

@@ -3,8 +3,10 @@ package app.agentlink.account
 import android.content.Context
 import app.agentlink.bridge.ClientSession
 import app.agentlink.bridge.GrantRow
+import app.agentlink.bridge.LinkFailure
 import app.agentlink.bridge.NativeClient
 import app.agentlink.bridge.NodePinRow
+import uniffi.agentlink_ffi.LinkException
 import uniffi.agentlink_ffi.MobileClient
 import uniffi.agentlink_ffi.loginAccount
 import uniffi.agentlink_ffi.refreshAccount
@@ -26,7 +28,7 @@ class NativeAccount(context: Context) : AccountApi {
         totp: String,
         deviceName: String,
     ): UserAccount {
-        val issued = loginAccount(server, fingerprint, username, password, totp, deviceName, signer)
+        val issued = call { loginAccount(server, fingerprint, username, password, totp, deviceName, signer) }
         return UserAccount(
             server = server.trim(),
             fingerprint = fingerprint.trim(),
@@ -41,7 +43,7 @@ class NativeAccount(context: Context) : AccountApi {
     }
 
     override fun refresh(account: UserAccount): UserAccount {
-        val issued = refreshAccount(account.server, account.fingerprint, account.refreshToken, signer)
+        val issued = call { refreshAccount(account.server, account.fingerprint, account.refreshToken, signer) }
         return account.copy(
             user = issued.user,
             role = issued.role,
@@ -55,14 +57,14 @@ class NativeAccount(context: Context) : AccountApi {
 
     override fun logout(account: UserAccount) {
         try {
-            use(account) { it.logout(account.refreshToken) }
+            use(account) { call { it.logout(account.refreshToken) } }
         } finally {
             closeCached()
         }
     }
 
     override fun listNodes(account: UserAccount): List<NodeRow> = use(account) { client ->
-        client.listMachines().map { machine ->
+        call { client.listMachines() }.map { machine ->
             NodeRow(
                 id = machine.id,
                 name = machine.name,
@@ -75,25 +77,25 @@ class NativeAccount(context: Context) : AccountApi {
     }
 
     override fun listDevices(account: UserAccount): List<DeviceRow> = use(account) { client ->
-        client.listDevices().map { device ->
+        call { client.listDevices() }.map { device ->
             DeviceRow(id = device.id, name = device.name, revoked = device.revoked)
         }
     }
 
     override fun revokeDevice(account: UserAccount, deviceId: String) {
-        use(account) { it.revokeDevice(deviceId) }
+        use(account) { call { it.revokeDevice(deviceId) } }
     }
 
     override fun listNodePins(account: UserAccount): List<NodePinRow> = use(account) { client ->
-        client.listNodePins().map { NodePinRow(name = it.name, nodeId = it.nodeId) }
+        call { client.listNodePins() }.map { NodePinRow(name = it.name, nodeId = it.nodeId) }
     }
 
     override fun clearNodePin(account: UserAccount, name: String): Boolean = use(account) { client ->
-        client.clearNodePin(name)
+        call { client.clearNodePin(name) }
     }
 
     override fun listGrants(account: UserAccount): List<GrantRow> = use(account) { client ->
-        client.listGrants().map {
+        call { client.listGrants() }.map {
             GrantRow(
                 nodeId = it.nodeId,
                 granteeId = it.granteeId,
@@ -107,7 +109,7 @@ class NativeAccount(context: Context) : AccountApi {
     }
 
     override fun importGrant(account: UserAccount, grantJson: String): GrantRow = use(account) { client ->
-        val g = client.importGrant(grantJson)
+        val g = call { client.importGrant(grantJson) }
         GrantRow(
             nodeId = g.nodeId,
             granteeId = g.granteeId,
@@ -120,13 +122,13 @@ class NativeAccount(context: Context) : AccountApi {
     }
 
     override fun deleteGrant(account: UserAccount, nodeId: String): Boolean = use(account) { client ->
-        client.deleteGrant(nodeId)
+        call { client.deleteGrant(nodeId) }
     }
 
     override fun devicePublicHex(): String = signer.publicHex()
 
     override fun enrollAsNode(account: UserAccount, name: String) {
-        use(account) { it.enrollSelf(name, nodeDir.absolutePath) }
+        use(account) { call { it.enrollSelf(name, nodeDir.absolutePath) } }
     }
 
     override fun connect(account: UserAccount): ClientSession = NativeClient(open(account))
@@ -157,11 +159,21 @@ class NativeAccount(context: Context) : AccountApi {
         }
     }
 
-    private fun open(account: UserAccount): MobileClient = MobileClient.connectUser(
-        account.server,
-        account.fingerprint,
-        account.accessToken,
-        signer,
-        appContext.filesDir.absolutePath,
-    )
+    private fun open(account: UserAccount): MobileClient = call {
+        MobileClient.connectUser(
+            account.server,
+            account.fingerprint,
+            account.accessToken,
+            signer,
+            appContext.filesDir.absolutePath,
+        )
+    }
+
+    private inline fun <T> call(block: () -> T): T {
+        try {
+            return block()
+        } catch (err: LinkException.Fail) {
+            throw LinkFailure(err.detail)
+        }
+    }
 }

@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentlink_core::{
-    apply_relay_defaults, parse_join_text, Identity, JoinText, NodePolicy, PROTOCOL_VERSION,
+    apply_relay_defaults, parse_join_text, Identity, JoinText, NodePolicy, DEFAULT_RELAY_TRUST,
+    PROTOCOL_VERSION,
 };
 use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
@@ -114,6 +115,18 @@ impl MobileNode {
     }
 }
 
+pub(crate) fn apply_mobile_relay_defaults(
+    relay: &mut String,
+    fingerprint: &str,
+    trust: &mut Option<String>,
+) {
+    apply_relay_defaults(relay, fingerprint, trust);
+    let trust_empty = trust.as_deref().map(str::trim).unwrap_or("").is_empty();
+    if fingerprint.trim().is_empty() && trust_empty {
+        *trust = Some(DEFAULT_RELAY_TRUST.to_string());
+    }
+}
+
 fn prepare_serve_config(opts: &NodeOptions) -> Result<ServeConfig, LinkError> {
     init_log();
     let ceiling = NodePolicy {
@@ -147,7 +160,7 @@ fn prepare_serve_config(opts: &NodeOptions) -> Result<ServeConfig, LinkError> {
             Some(invite.token)
         }
     };
-    apply_relay_defaults(&mut relay_url, &fingerprint, &mut trust);
+    apply_mobile_relay_defaults(&mut relay_url, &fingerprint, &mut trust);
     Ok(ServeConfig {
         relay_url,
         fingerprint,
@@ -344,5 +357,28 @@ mod tests {
         assert!(!prepared.ceiling.allow_write);
         assert!(!prepared.ceiling.allow_desktop);
         assert!(!prepared.ceiling.allow_remote_control);
+    }
+
+    #[test]
+    fn mobile_defaults_trust_to_system_webpki_only_when_pin_is_empty() {
+        let mut empty_pin = opts("");
+        empty_pin.fingerprint = String::new();
+        let prepared = prepare_serve_config(&empty_pin).unwrap();
+        assert_eq!(prepared.trust.as_deref(), Some(DEFAULT_RELAY_TRUST));
+        assert!(agentlink_core::RelayTrust::parse(
+            &prepared.fingerprint,
+            prepared.trust.as_deref()
+        )
+        .is_ok());
+
+        let mut explicit_pin = opts("");
+        explicit_pin.fingerprint = format!("sha256:{}", "ab".repeat(32));
+        let prepared_pinned = prepare_serve_config(&explicit_pin).unwrap();
+        assert!(prepared_pinned.trust.is_none());
+        assert!(agentlink_core::RelayTrust::parse(
+            &prepared_pinned.fingerprint,
+            prepared_pinned.trust.as_deref()
+        )
+        .is_ok());
     }
 }

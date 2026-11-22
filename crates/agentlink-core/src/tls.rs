@@ -527,6 +527,44 @@ fn root_verifiers(sources: &[RootSource]) -> Result<Vec<Arc<WebPkiServerVerifier
     Ok(out)
 }
 
+#[cfg(any(target_os = "android", test))]
+fn load_pem_certs_from_dir(dir: &Path) -> Vec<CertificateDer<'static>> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut certs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        for cert in rustls_pemfile::certs(&mut reader).flatten() {
+            certs.push(cert);
+        }
+    }
+    certs
+}
+
+#[cfg(target_os = "android")]
+fn load_android_system_certs() -> Vec<CertificateDer<'static>> {
+    // openssl-probe only checks /etc/ssl/certs and a Termux path on Android;
+    // Android stores system CAs under Conscrypt APEX (API 34+) or /system/etc/security/cacerts.
+    for dir in [
+        "/apex/com.android.conscrypt/cacerts",
+        "/system/etc/security/cacerts",
+    ] {
+        let certs = load_pem_certs_from_dir(Path::new(dir));
+        if !certs.is_empty() {
+            return certs;
+        }
+    }
+    Vec::new()
+}
+
 fn root_verifier(source: RootSource) -> Result<Arc<WebPkiServerVerifier>> {
     let mut store = RootCertStore::empty();
     match source {
@@ -535,7 +573,18 @@ fn root_verifier(source: RootSource) -> Result<Arc<WebPkiServerVerifier>> {
         }
         RootSource::System => {
             let loaded = rustls_native_certs::load_native_certs();
-            if loaded.certs.is_empty() {
+            #[cfg(target_os = "android")]
+            let certs = if loaded.certs.is_empty()
+                && std::env::var_os("SSL_CERT_FILE").is_none()
+                && std::env::var_os("SSL_CERT_DIR").is_none()
+            {
+                load_android_system_certs()
+            } else {
+                loaded.certs
+            };
+            #[cfg(not(target_os = "android"))]
+            let certs = loaded.certs;
+            if certs.is_empty() {
                 let detail = if loaded.errors.is_empty() {
                     "no certificates".to_string()
                 } else {
@@ -550,7 +599,7 @@ fn root_verifier(source: RootSource) -> Result<Arc<WebPkiServerVerifier>> {
                     "system trust store is empty ({detail}). Use --trust webpki to verify with the Mozilla root set"
                 )));
             }
-            let (added, _ignored) = store.add_parsable_certificates(loaded.certs);
+            let (added, _ignored) = store.add_parsable_certificates(certs);
             if added == 0 {
                 return Err(Error::Tls(
                     "system trust store had no usable CA certificates. Use --trust webpki".into(),
@@ -1010,5 +1059,24 @@ mod tests {
             dial.adopted_leaf.is_none(),
             "a public-root check stays in force on loopback"
         );
+    }
+
+    #[test]
+    fn load_pem_certs_from_dir_parses_android_style_cert_files() {
+        let cert_dir = tempfile::tempdir().unwrap();
+        let _cert = RelayCert::load_or_create(cert_dir.path()).unwrap();
+        let pem = std::fs::read_to_string(cert_dir.path().join("cert.pem")).unwrap();
+
+        let cacerts = tempfile::tempdir().unwrap();
+        let android_style = format!("{pem}Certificate:\n  Data:\nSHA1 Fingerprint=AA:BB\n");
+        std::fs::write(cacerts.path().join("01419da9.0"), android_style).unwrap();
+        std::fs::write(cacerts.path().join("ignored.txt"), "not a pem certificate").unwrap();
+
+        let loaded = load_pem_certs_from_dir(cacerts.path());
+        assert_eq!(loaded.len(), 1);
+        let mut store = RootCertStore::empty();
+        let (added, ignored) = store.add_parsable_certificates(loaded);
+        assert_eq!(added, 1);
+        assert_eq!(ignored, 0);
     }
 }

@@ -21,7 +21,7 @@ pub const MAX_PENDING_TOTAL: usize = 32;
 pub const DEFAULT_REQUEST_TTL_SECS: u64 = 10 * 60;
 pub const MIN_REQUEST_TTL_SECS: u64 = 30;
 pub const MAX_REQUEST_TTL_SECS: u64 = 24 * 60 * 60;
-pub const MAX_GRANT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+pub const MAX_GRANT_TTL_SECS: u64 = crate::grant::PERMANENT_GRANT_TTL_SECS;
 const USED_NONCES_FILE: &str = "used-nonces.json";
 const MAX_NONCE_LEN: usize = 80;
 const NONCE_RETAIN_SECS: i64 = 8 * 24 * 60 * 60;
@@ -359,7 +359,7 @@ pub fn allow_request(
         )));
     }
     let (policy, ttl_secs) = resolve_allow_scope(req.policy, req.ttl_secs, policy, ttl_secs)?;
-    let exp = now_unix.saturating_add(ttl_secs as i64);
+    let exp = grant::exp_unix_for_ttl(now_unix, ttl_secs as i64)?;
     let grant = SignedGrant::sign(
         issuer,
         &req.grantee_id,
@@ -612,5 +612,77 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("replay"), "{err}");
+    }
+
+    #[test]
+    fn permanent_request_allows_permanent_or_shrinks_and_never_enlarges_finite() {
+        let dir = tempfile::tempdir().unwrap();
+        let (issuer, grantee, node) = ids();
+        let now = 1_700_000_000;
+
+        assert!(draft_request(&grantee, &node, NodePolicy::exec(), 0, now, 600).is_err());
+
+        let req = draft_request(
+            &grantee,
+            &node,
+            NodePolicy::full(),
+            grant::PERMANENT_GRANT_TTL_SECS,
+            now,
+            600,
+        )
+        .unwrap();
+        let stored = submit_request(dir.path(), &node, req, now).unwrap();
+        let (_decided, perm_grant) = allow_request(
+            dir.path(),
+            &stored.request_id,
+            &issuer,
+            &node,
+            now,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(perm_grant.is_permanent());
+        assert_eq!(perm_grant.exp_unix, grant::PERMANENT_GRANT_EXP_UNIX);
+
+        // Permanent request can still be shrunk by the target to 3600s.
+        let req2 = draft_request(
+            &grantee,
+            &node,
+            NodePolicy::full(),
+            grant::PERMANENT_GRANT_TTL_SECS,
+            now,
+            600,
+        )
+        .unwrap();
+        let stored2 = submit_request(dir.path(), &node, req2, now).unwrap();
+        let (_decided2, shrunk_grant) = allow_request(
+            dir.path(),
+            &stored2.request_id,
+            &issuer,
+            &node,
+            now,
+            None,
+            Some(3600),
+        )
+        .unwrap();
+        assert!(!shrunk_grant.is_permanent());
+        assert_eq!(shrunk_grant.exp_unix, now + 3600);
+
+        // A finite request cannot be widened to permanent.
+        let finite_req = draft_request(&grantee, &node, NodePolicy::full(), 3600, now, 600).unwrap();
+        let finite_stored = submit_request(dir.path(), &node, finite_req, now).unwrap();
+        let err = allow_request(
+            dir.path(),
+            &finite_stored.request_id,
+            &issuer,
+            &node,
+            now,
+            None,
+            Some(grant::PERMANENT_GRANT_TTL_SECS),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cannot extend"), "{err}");
     }
 }

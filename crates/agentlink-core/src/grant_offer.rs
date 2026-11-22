@@ -434,4 +434,31 @@ mod tests {
             .to_string();
         assert!(err.contains("expired"), "{err}");
     }
+
+    #[test]
+    fn permanent_and_long_term_offer_roundtrip_and_zero_ttl_rejected() {
+        let controller = Identity::generate();
+        let target = node();
+        let now = 1_700_000_000;
+        assert!(issue_offer(&controller, NodePolicy::full(), 0, now, 600, None, None).is_err());
+
+        let perm_offer = issue_offer(
+            &controller,
+            NodePolicy::full(),
+            crate::grant::PERMANENT_GRANT_TTL_SECS,
+            now,
+            600,
+            Some(&target),
+            None,
+        )
+        .unwrap();
+        assert!(crate::grant::is_permanent_ttl(perm_offer.ttl_secs));
+        let card = encode_offer(&perm_offer).unwrap();
+        let decoded = decode_offer(&card).unwrap();
+        verify_offer(&decoded, now, Some(&target), None).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let req = paste_offer_as_request(dir.path(), &decoded, &target, None, now).unwrap();
+        assert_eq!(req.ttl_secs, crate::grant::PERMANENT_GRANT_TTL_SECS);
+    }
 }

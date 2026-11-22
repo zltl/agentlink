@@ -61,8 +61,9 @@ pub use config::{
 pub use error::{Error, Result};
 pub use extensions::{NodeExtension, PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL};
 pub use grant::{
-    format_grant_status, grant_matches_grantee, grant_status, resolve_e2e_policy, GrantStatus,
-    SignedGrant, OWNER_KEYS_FILE,
+    exp_unix_for_ttl, format_grant_status, grant_matches_grantee, grant_status, is_permanent_exp,
+    is_permanent_ttl, resolve_e2e_policy, GrantStatus, SignedGrant, OWNER_KEYS_FILE,
+    PERMANENT_GRANT_EXP_UNIX, PERMANENT_GRANT_TTL_SECS,
 };
 pub use ice::{
     fetch_relay_ice_servers, ice_attempts, is_default_stun_url, parse_relay_ice_response,

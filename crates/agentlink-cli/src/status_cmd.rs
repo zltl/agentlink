@@ -141,6 +141,14 @@ fn relative_time_label(now_unix: i64, target_unix: i64) -> String {
     }
 }
 
+fn grant_expiry_label(now_unix: i64, exp_unix: i64) -> String {
+    if grant::is_permanent_exp(exp_unix) {
+        "permanent".to_string()
+    } else {
+        relative_time_label(now_unix, exp_unix)
+    }
+}
+
 fn short_hex(id: &str) -> String {
     id.trim().to_ascii_lowercase().chars().take(12).collect()
 }
@@ -173,7 +181,7 @@ fn authorization_section(config_dir: &Path, expected_grantee: Option<&str>) -> V
                     let node_name = node_pin::name_for_id(config_dir, &grant.node_id)
                         .ok()
                         .flatten();
-                    let expires_relative = relative_time_label(now, grant.exp_unix);
+                    let expires_relative = grant_expiry_label(now, grant.exp_unix);
                     json!({
                         "node_name": node_name,
                         "node_id": grant.node_id,
@@ -183,6 +191,7 @@ fn authorization_section(config_dir: &Path, expected_grantee: Option<&str>) -> V
                         "policy": grant.policy.preset_name(),
                         "capability": grant.policy.capability_summary(),
                         "status": status,
+                        "permanent": grant.is_permanent(),
                         "expires_relative": expires_relative,
                         "exp_unix": grant.exp_unix,
                         "jti": grant.jti,
@@ -406,5 +415,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = default_identity_path(dir.path());
         assert_eq!(run(dir.path(), &path, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn status_formats_permanent_grant_as_active_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_id = Identity::load_or_create(&default_identity_path(dir.path())).unwrap();
+        let issuer = Identity::generate();
+        let node = Identity::generate();
+        node_pin::observe(dir.path(), "probe", node.public_hex()).unwrap();
+        let now = util::unix_now();
+        let perm = grant::SignedGrant::sign_permanent(
+            &issuer,
+            local_id.public_hex(),
+            node.public_hex(),
+            NodePolicy::full(),
+            now - 60,
+            "jti-perm",
+        )
+        .unwrap();
+        grant::save_grant(dir.path(), &perm).unwrap();
+
+        let auth = authorization_section(dir.path(), Some(local_id.public_hex()));
+        let list = auth["grants"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["status"], "ACTIVE");
+        assert_eq!(list[0]["permanent"], true);
+        assert_eq!(list[0]["expires_relative"], "permanent");
     }
 }

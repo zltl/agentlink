@@ -1245,7 +1245,7 @@ async fn handle_env(
                 }
             };
             let grant_jti = authz.as_ref().map(|g| g.jti.clone());
-            let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
+            let grant_exp_unix = authz.as_ref().and_then(|g| g.effective_exp_unix());
             let owner = ReplayOwner {
                 owner_peer: grantee.clone(),
                 grant_jti: grant_jti.clone().unwrap_or_default(),
@@ -1492,7 +1492,7 @@ async fn handle_env(
                 .as_ref()
                 .map(|g| g.jti.clone())
                 .unwrap_or_default();
-            let grant_exp_unix = authz.as_ref().map(|g| g.exp_unix);
+            let grant_exp_unix = authz.as_ref().and_then(|g| g.effective_exp_unix());
 
             // SEC-10: Evaluate `confirm.toml` uniformly on Transfer writes
             // (`Push`, `PushStream`, `PushDir`) before starting the transfer.

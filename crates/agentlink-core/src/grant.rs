@@ -30,6 +30,50 @@ pub const GRANTS_DIR: &str = "grants";
 pub const GRANT_FILE_ENV: &str = "AGENTLINK_GRANT_FILE";
 /// Raw grant JSON for one invocation.
 pub const GRANT_JSON_ENV: &str = "AGENTLINK_GRANT_JSON";
+/// Sentinel expiry timestamp for a permanent (non-expiring) grant (`9999-12-31T23:59:59Z`).
+///
+/// Fits in signed 64-bit Unix seconds, remains exact in IEEE-754 double/JS numbers
+/// (`<= Number.MAX_SAFE_INTEGER`), is valid ISO-8601/RFC 3339, and remains
+/// compatible with deployed `agentlink-grant-v1` nodes.
+pub const PERMANENT_GRANT_EXP_UNIX: i64 = 253_402_300_799;
+/// Sentinel TTL in seconds representing a permanent (non-expiring) grant.
+pub const PERMANENT_GRANT_TTL_SECS: u64 = PERMANENT_GRANT_EXP_UNIX as u64;
+
+/// True when `exp_unix` denotes a permanent (non-expiring) grant.
+pub const fn is_permanent_exp(exp_unix: i64) -> bool {
+    exp_unix >= PERMANENT_GRANT_EXP_UNIX
+}
+
+/// True when `ttl_secs` denotes a permanent (non-expiring) grant lifetime.
+pub const fn is_permanent_ttl(ttl_secs: u64) -> bool {
+    ttl_secs >= PERMANENT_GRANT_TTL_SECS
+}
+
+/// Compute `exp_unix` from `now_unix` and a positive `ttl_secs`.
+///
+/// Permanent sentinel TTLs map to [`PERMANENT_GRANT_EXP_UNIX`]. Finite TTLs are
+/// clamped strictly below [`PERMANENT_GRANT_EXP_UNIX`] so a large finite span
+/// cannot accidentally flip into a permanent grant.
+pub fn exp_unix_for_ttl(now_unix: i64, ttl_secs: i64) -> Result<i64> {
+    if ttl_secs <= 0 {
+        return Err(Error::Message("grant ttl must be positive".into()));
+    }
+    if ttl_secs >= PERMANENT_GRANT_EXP_UNIX {
+        return Ok(PERMANENT_GRANT_EXP_UNIX);
+    }
+    Ok(now_unix
+        .saturating_add(ttl_secs)
+        .min(PERMANENT_GRANT_EXP_UNIX - 1))
+}
+
+/// Human-readable summary for a requested or granted TTL in seconds.
+pub fn format_ttl_summary(ttl_secs: u64) -> String {
+    if is_permanent_ttl(ttl_secs) {
+        "permanent (never expires)".to_string()
+    } else {
+        format!("{ttl_secs}s")
+    }
+}
 /// What [`ensure_grant`] did with the stored grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnsureGrantAction {
@@ -250,6 +294,36 @@ impl SignedGrant {
         })
     }
 
+    /// True when this grant is permanent (does not expire).
+    pub fn is_permanent(&self) -> bool {
+        is_permanent_exp(self.exp_unix)
+    }
+
+    /// Finite expiry timestamp for runtime teardown timers, or `None` when permanent.
+    pub fn effective_exp_unix(&self) -> Option<i64> {
+        (!self.is_permanent()).then_some(self.exp_unix)
+    }
+
+    /// Sign a permanent (non-expiring) grant using [`PERMANENT_GRANT_EXP_UNIX`].
+    pub fn sign_permanent(
+        issuer: &Identity,
+        grantee_id: &str,
+        node_id: &str,
+        policy: NodePolicy,
+        nbf_unix: i64,
+        jti: impl Into<String>,
+    ) -> Result<Self> {
+        Self::sign(
+            issuer,
+            grantee_id,
+            node_id,
+            policy,
+            nbf_unix,
+            PERMANENT_GRANT_EXP_UNIX,
+            jti,
+        )
+    }
+
     /// Check signature and binding. Does not consult the clock or owner-key store.
     pub fn verify_signature(&self) -> Result<()> {
         let message = canonical_bytes(
@@ -307,7 +381,7 @@ impl SignedGrant {
         if now_unix < self.nbf_unix {
             return Err(Error::Auth("grant is not valid yet".into()));
         }
-        if now_unix > self.exp_unix {
+        if !self.is_permanent() && now_unix > self.exp_unix {
             return Err(Error::Auth("grant has expired".into()));
         }
         let jti = self.jti.trim();
@@ -367,18 +441,17 @@ pub fn ensure_grant(
     policy: NodePolicy,
     ttl_secs: i64,
 ) -> Result<(SignedGrant, EnsureGrantAction)> {
-    if ttl_secs <= 0 {
-        return Err(Error::Message("grant ttl must be positive".into()));
-    }
     let now = util::unix_now();
     let nbf = now.saturating_sub(60);
-    let exp = now.saturating_add(ttl_secs);
+    let exp = exp_unix_for_ttl(now, ttl_secs)?;
+    let want_permanent = is_permanent_exp(exp);
     let stored = load_grant(config_dir, node_id)?;
     match stored {
         Some(grant)
             if grant.node_id.eq_ignore_ascii_case(node_id.trim())
                 && grant.grantee_id.eq_ignore_ascii_case(grantee_id.trim())
-                && now <= grant.exp_unix =>
+                && (grant.is_permanent() || now <= grant.exp_unix)
+                && (!want_permanent || grant.is_permanent()) =>
         {
             Ok((grant, EnsureGrantAction::Reused))
         }
@@ -544,10 +617,10 @@ fn persist_revoked_map(dir: &Path, map: &BTreeMap<String, Option<i64>>) -> Resul
 }
 
 /// Drop entries whose grant expiry is strictly before `now`. Returns whether
-/// anything was removed.
+/// anything was removed. Permanent grants (`is_permanent_exp`) are never pruned.
 fn prune_revoked_map(map: &mut BTreeMap<String, Option<i64>>, now_unix: i64) -> bool {
     let before = map.len();
-    map.retain(|_, exp| !matches!(exp, Some(exp) if now_unix > *exp));
+    map.retain(|_, exp| !matches!(exp, Some(exp) if !is_permanent_exp(*exp) && now_unix > *exp));
     map.len() != before
 }
 
@@ -666,12 +739,13 @@ pub fn bootstrap_issuer(data_dir: &Path) -> Result<Option<Identity>> {
     bootstrap_issuer_with_mode(data_dir)
 }
 
-/// Sign a full grant with the issuer stored in `node_data`.
-///
-/// This writes nothing to the relay. The caller stores the result wherever
-/// the controller reads grants. The node accepts it only when that issuer is
-/// already in `owner-keys.json` (bootstrap creates both on a fresh data dir).
-pub fn issue_local_grant(node_data: &Path, node_id: &str, grantee_id: &str) -> Result<SignedGrant> {
+/// Sign a full grant with the issuer stored in `node_data` for the given TTL.
+pub fn issue_local_grant_with_ttl(
+    node_data: &Path,
+    node_id: &str,
+    grantee_id: &str,
+    ttl_secs: i64,
+) -> Result<SignedGrant> {
     if load_owner_keys(node_data)?.is_empty() {
         bootstrap_issuer_with_mode(node_data)?;
     }
@@ -683,15 +757,34 @@ pub fn issue_local_grant(node_data: &Path, node_id: &str, grantee_id: &str) -> R
         )
     })?;
     let now = util::unix_now();
+    let exp = exp_unix_for_ttl(now, ttl_secs)?;
     SignedGrant::sign(
         &issuer,
         grantee_id,
         node_id,
         NodePolicy::full(),
         now.saturating_sub(30),
-        now.saturating_add(24 * 3600),
+        exp,
         uuid::Uuid::new_v4().to_string(),
     )
+}
+
+/// Sign a full 24h grant with the issuer stored in `node_data`.
+///
+/// This writes nothing to the relay. The caller stores the result wherever
+/// the controller reads grants. The node accepts it only when that issuer is
+/// already in `owner-keys.json` (bootstrap creates both on a fresh data dir).
+pub fn issue_local_grant(node_data: &Path, node_id: &str, grantee_id: &str) -> Result<SignedGrant> {
+    issue_local_grant_with_ttl(node_data, node_id, grantee_id, 24 * 3600)
+}
+
+/// Sign a permanent full grant with the issuer stored in `node_data`.
+pub fn issue_local_permanent_grant(
+    node_data: &Path,
+    node_id: &str,
+    grantee_id: &str,
+) -> Result<SignedGrant> {
+    issue_local_grant_with_ttl(node_data, node_id, grantee_id, PERMANENT_GRANT_EXP_UNIX)
 }
 
 /// Add one issuer without dropping the others.
@@ -890,7 +983,7 @@ pub fn grant_status(
             return GrantStatus::GranteeMismatch;
         }
     }
-    if now_unix > grant.exp_unix {
+    if !grant.is_permanent() && now_unix > grant.exp_unix {
         return GrantStatus::Expired;
     }
     if now_unix < grant.nbf_unix {
@@ -942,10 +1035,16 @@ pub fn format_grant_status(
     now_unix: i64,
 ) -> String {
     match grant_status(grant, expected_node_id, expected_grantee_id, now_unix) {
-        GrantStatus::Active => format!(
-            "active (expires in {})",
-            format_relative_duration(grant.exp_unix.saturating_sub(now_unix))
-        ),
+        GrantStatus::Active => {
+            if grant.is_permanent() {
+                "active (permanent)".to_string()
+            } else {
+                format!(
+                    "active (expires in {})",
+                    format_relative_duration(grant.exp_unix.saturating_sub(now_unix))
+                )
+            }
+        }
         GrantStatus::Expired => format!(
             "expired ({} ago)",
             format_relative_duration(now_unix.saturating_sub(grant.exp_unix))
@@ -986,7 +1085,7 @@ pub fn validate_grant_for(
             grant.grantee_id
         )));
     }
-    if now_unix > grant.exp_unix {
+    if !grant.is_permanent() && now_unix > grant.exp_unix {
         return Err(Error::Message(format!(
             "grant expired at unix {}; run `agentlink grant refresh --node {node_id}` (or \
              `agentlink grant issue --node {node_id}` to change policy)",
@@ -2204,6 +2303,115 @@ mod tests {
                 now - 120
             ),
             GrantStatus::NotYetValid
+        );
+    }
+
+    #[test]
+    fn permanent_grant_signs_authorizes_revokes_and_upgrades_via_ensure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (owner, grantee, _) = ids();
+        let node = Identity::generate();
+        let now = util::unix_now();
+
+        let perm = SignedGrant::sign_permanent(
+            &owner,
+            grantee.public_hex(),
+            node.public_hex(),
+            NodePolicy::full(),
+            now - 10,
+            "perm-jti",
+        )
+        .unwrap();
+        assert!(perm.is_permanent());
+        assert_eq!(perm.exp_unix, PERMANENT_GRANT_EXP_UNIX);
+        assert_eq!(perm.effective_exp_unix(), None);
+        perm.verify_signature().unwrap();
+
+        let trusted = BTreeSet::from([owner.public_hex().to_ascii_lowercase()]);
+        assert_eq!(
+            perm.authorize(
+                &trusted,
+                &BTreeSet::new(),
+                node.public_hex(),
+                grantee.public_hex(),
+                PERMANENT_GRANT_EXP_UNIX + 10_000,
+            )
+            .unwrap(),
+            NodePolicy::full()
+        );
+        assert_eq!(
+            format_grant_status(
+                &perm,
+                Some(node.public_hex()),
+                Some(grantee.public_hex()),
+                now,
+            ),
+            "active (permanent)"
+        );
+
+        // Revocation must still block permanent grants and never prune them.
+        add_revoked_jti_until(dir.path(), "perm-jti", Some(PERMANENT_GRANT_EXP_UNIX)).unwrap();
+        let active_revoked =
+            prune_expired_revoked_jtis(dir.path(), PERMANENT_GRANT_EXP_UNIX + 10_000).unwrap();
+        assert!(active_revoked.contains("perm-jti"));
+        assert!(perm
+            .authorize(
+                &trusted,
+                &active_revoked,
+                node.public_hex(),
+                grantee.public_hex(),
+                now,
+            )
+            .is_err());
+
+        // `ensure_grant` upgrades an active finite grant to permanent, then reuses it.
+        let ensure_dir = tempfile::tempdir().unwrap();
+        let (finite, act1) = ensure_grant(
+            ensure_dir.path(),
+            &owner,
+            node.public_hex(),
+            grantee.public_hex(),
+            NodePolicy::full(),
+            3600,
+        )
+        .unwrap();
+        assert_eq!(act1, EnsureGrantAction::Issued);
+        assert!(!finite.is_permanent());
+
+        let (upgraded, act2) = ensure_grant(
+            ensure_dir.path(),
+            &owner,
+            node.public_hex(),
+            grantee.public_hex(),
+            NodePolicy::full(),
+            PERMANENT_GRANT_EXP_UNIX,
+        )
+        .unwrap();
+        assert_eq!(act2, EnsureGrantAction::Refreshed);
+        assert!(upgraded.is_permanent());
+        assert_eq!(upgraded.exp_unix, PERMANENT_GRANT_EXP_UNIX);
+
+        let (reused, act3) = ensure_grant(
+            ensure_dir.path(),
+            &owner,
+            node.public_hex(),
+            grantee.public_hex(),
+            NodePolicy::full(),
+            PERMANENT_GRANT_EXP_UNIX,
+        )
+        .unwrap();
+        assert_eq!(act3, EnsureGrantAction::Reused);
+        assert_eq!(reused.jti, upgraded.jti);
+
+        assert!(exp_unix_for_ttl(now, 0).is_err());
+        assert!(exp_unix_for_ttl(now, -5).is_err());
+        assert_eq!(
+            exp_unix_for_ttl(now, PERMANENT_GRANT_EXP_UNIX).unwrap(),
+            PERMANENT_GRANT_EXP_UNIX
+        );
+        assert_eq!(
+            exp_unix_for_ttl(now, PERMANENT_GRANT_EXP_UNIX - 1).unwrap(),
+            PERMANENT_GRANT_EXP_UNIX - 1
         );
     }
 }

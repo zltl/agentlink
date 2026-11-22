@@ -15,8 +15,8 @@ use agentlink_core::engine::XferOpts;
 use agentlink_core::grant::SignedGrant;
 use agentlink_core::protocol::Op;
 use agentlink_core::{
-    apply_relay_defaults, Client, ClientSettings, ExecRequest, Identity, NodePolicy, PtySession,
-    PHASE2_INJECT_INPUT, PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
+    Client, ClientSettings, ExecRequest, Identity, NodePolicy, PtySession, PHASE2_INJECT_INPUT,
+    PHASE2_SCREENSHOT, PHASE3_WEBRTC_SIGNAL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -251,7 +251,7 @@ impl MobileClient {
     ) -> Result<Self, LinkError> {
         let mut relay = relay;
         let mut trust = None;
-        apply_relay_defaults(&mut relay, &fingerprint, &mut trust);
+        crate::apply_mobile_relay_defaults(&mut relay, &fingerprint, &mut trust);
         Ok(Self {
             handle,
             runtime: Mutex::new(Some(runtime)),
@@ -1096,7 +1096,7 @@ pub fn refresh_account(
 fn relay_defaults(relay: String, fingerprint: String) -> (String, String, Option<String>) {
     let mut relay = relay;
     let mut trust = None;
-    apply_relay_defaults(&mut relay, &fingerprint, &mut trust);
+    crate::apply_mobile_relay_defaults(&mut relay, &fingerprint, &mut trust);
     (relay, fingerprint, trust)
 }
 
@@ -1334,5 +1334,35 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert!(client.delete_grant(node_id.clone()).unwrap());
         assert!(client.list_grants().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_fingerprint_defaults_to_system_webpki_for_mobile_client_and_login() {
+        let (relay, fp, trust) = relay_defaults(" wss://relay.example.com ".into(), String::new());
+        assert_eq!(relay, "wss://relay.example.com");
+        assert_eq!(fp, "");
+        assert_eq!(trust.as_deref(), Some(agentlink_core::DEFAULT_RELAY_TRUST));
+        assert!(agentlink_core::RelayTrust::parse(&fp, trust.as_deref()).is_ok());
+
+        let leaf = format!("sha256:{}", "ab".repeat(32));
+        let (_relay2, fp2, trust2) =
+            relay_defaults("wss://relay.example.com".into(), leaf.clone());
+        assert_eq!(fp2, leaf);
+        assert!(trust2.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = MobileClient::connect(
+            "wss://relay.example.com".into(),
+            "tok".into(),
+            String::new(),
+            dir.path().display().to_string(),
+        )
+        .unwrap();
+        let settings = client.current_settings().unwrap();
+        assert_eq!(settings.fingerprint, "");
+        assert_eq!(
+            settings.trust.as_deref(),
+            Some(agentlink_core::DEFAULT_RELAY_TRUST)
+        );
     }
 }

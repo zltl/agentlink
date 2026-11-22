@@ -262,21 +262,53 @@ pub enum UiEvent {
         gen: u64,
     },
     Dir {
+        session: u64,
         path: String,
         entries: Vec<DirEntry>,
     },
-    File(LoadedFile),
+    File {
+        session: u64,
+        file: LoadedFile,
+    },
+    FilesFailed {
+        session: u64,
+        message: String,
+    },
+    FilesNotice {
+        session: u64,
+        message: String,
+    },
     Enrolled {
         unix: String,
         powershell: String,
         token: String,
     },
-    Link(String),
+    Link {
+        session: u64,
+        label: String,
+    },
     Pins(Vec<String>),
-    Monitors(Vec<MonitorEntry>),
-    Hud(LiveHud),
+    Monitors {
+        session: u64,
+        monitors: Vec<MonitorEntry>,
+    },
+    Hud {
+        session: u64,
+        hud: LiveHud,
+    },
     /// Handshake/negotiation stage only; must not change the painted media path.
-    Handshake(String),
+    Handshake {
+        session: u64,
+        stage: String,
+    },
+    DesktopFailed {
+        session: u64,
+        message: String,
+    },
+    DesktopNotice {
+        session: u64,
+        message: String,
+    },
 }
 
 pub enum Cmd {
@@ -308,47 +340,68 @@ pub enum Cmd {
     PtyWrite {
         data: Vec<u8>,
     },
+    PtyWriteGen {
+        gen: u64,
+        data: Vec<u8>,
+    },
     PtyResize {
         rows: u16,
         cols: u16,
     },
+    PtyResizeGen {
+        gen: u64,
+        rows: u16,
+        cols: u16,
+    },
     PtyProbe,
+    PtyProbeGen {
+        gen: u64,
+    },
     PtyClose,
+    PtyCloseAll,
     List {
+        session: u64,
         node: String,
         path: String,
     },
     Read {
+        session: u64,
         node: String,
         path: String,
         size_hint: Option<u64>,
     },
     Write {
+        session: u64,
         node: String,
         path: String,
         text: String,
     },
     Upload {
+        session: u64,
         node: String,
         local_path: std::path::PathBuf,
         remote_path: String,
     },
     Download {
+        session: u64,
         node: String,
         remote_path: String,
         local_path: std::path::PathBuf,
     },
     Mkdir {
+        session: u64,
         node: String,
         path: String,
     },
     Remove {
+        session: u64,
         node: String,
         path: String,
     },
     /// Start or restart a live session. Offer carries `monitor`; `quality`
     /// maps to bitrate when `max_fps` is zero. `scale` downscales capture.
     Live {
+        session: u64,
         node: String,
         control: bool,
         monitor: u32,
@@ -359,12 +412,18 @@ pub enum Cmd {
         /// True when sent from desktop Retry (vs first View open).
         retry: bool,
     },
+    /// Stop a single desktop session by tab id.
+    LiveStopSession {
+        session: u64,
+    },
+    /// Stop all live desktop sessions.
     LiveStop,
     /// Toggle automatic bidirectional clipboard sync for desktop sessions (`DESK-18`).
     ClipboardSync {
         enabled: bool,
     },
     Input {
+        session: u64,
         node: String,
         live: String,
         inject: String,
@@ -373,15 +432,18 @@ pub enum Cmd {
         barrier: bool,
     },
     Monitors {
+        session: u64,
         node: String,
         /// True when sent from desktop Retry (vs first View open).
         retry: bool,
     },
     Clipboard {
+        session: u64,
         node: String,
         text: String,
     },
     Shot {
+        session: u64,
         node: String,
         path: String,
         monitor: Option<u32>,
@@ -400,18 +462,37 @@ enum PtyCmd {
     Close(Option<tokio::sync::oneshot::Sender<()>>),
 }
 
+struct DesktopSlot {
+    picture: Mutex<Option<Picture>>,
+    cursor: Mutex<DeskCursor>,
+    live_gen: AtomicU64,
+    terminal_handshake: AtomicBool,
+    has_any_frame: AtomicBool,
+    last_frame_at: Mutex<Option<Instant>>,
+}
+
+impl DesktopSlot {
+    fn new() -> Self {
+        Self {
+            picture: Mutex::new(None),
+            cursor: Mutex::new(DeskCursor::default()),
+            live_gen: AtomicU64::new(0),
+            terminal_handshake: AtomicBool::new(false),
+            has_any_frame: AtomicBool::new(false),
+            last_frame_at: Mutex::new(None),
+        }
+    }
+}
+
 pub struct Shared {
     events: Mutex<Vec<UiEvent>>,
-    picture: Mutex<Option<Picture>>,
+    desktop_slots: Mutex<HashMap<u64, Arc<DesktopSlot>>>,
+    active_desktop_session: AtomicU64,
+    global_live_epoch: AtomicU64,
     rgba_pool: Mutex<Vec<Vec<u8>>>,
-    cursor: Mutex<DeskCursor>,
     cursor_rev: AtomicU64,
     seq: AtomicU64,
-    live_gen: AtomicU64,
     egui_ctx: SharedEguiCtx,
-    /// Once a terminal handshake is published, progress/cleanup stages
-    /// must not overwrite it until the next live attempt.
-    terminal_handshake: AtomicBool,
     pub perf: ClientPerf,
 }
 
@@ -419,16 +500,65 @@ impl Shared {
     pub fn new() -> Self {
         Self {
             events: Mutex::new(Vec::new()),
-            picture: Mutex::new(None),
+            desktop_slots: Mutex::new(HashMap::new()),
+            active_desktop_session: AtomicU64::new(0),
+            global_live_epoch: AtomicU64::new(0),
             rgba_pool: Mutex::new(Vec::new()),
-            cursor: Mutex::new(DeskCursor::default()),
             cursor_rev: AtomicU64::new(0),
             seq: AtomicU64::new(0),
-            live_gen: AtomicU64::new(0),
             egui_ctx: Arc::new(OnceLock::new()),
-            terminal_handshake: AtomicBool::new(false),
             perf: ClientPerf::default(),
         }
+    }
+
+    fn slot(&self, session: u64) -> Arc<DesktopSlot> {
+        let mut map = self
+            .desktop_slots
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        Arc::clone(
+            map.entry(session)
+                .or_insert_with(|| Arc::new(DesktopSlot::new())),
+        )
+    }
+
+    pub fn set_active_desktop_session(&self, session: u64) {
+        self.active_desktop_session.store(session, Ordering::Relaxed);
+    }
+
+    pub fn remove_desktop_slot(&self, session: u64) {
+        let removed = self
+            .desktop_slots
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&session));
+        if let Some(slot) = removed {
+            let old = slot.picture.lock().ok().and_then(|mut p| p.take());
+            if let Some(old) = old {
+                self.recycle_rgba(old.rgba);
+            }
+        }
+    }
+
+    pub fn clear_all_desktop_slots(&self) {
+        self.global_live_epoch.fetch_add(1, Ordering::AcqRel);
+        let drained: Vec<Arc<DesktopSlot>> = self
+            .desktop_slots
+            .lock()
+            .ok()
+            .map(|mut map| map.drain().map(|(_, s)| s).collect())
+            .unwrap_or_default();
+        for slot in drained {
+            slot.live_gen.fetch_add(1, Ordering::AcqRel);
+            let old = slot.picture.lock().ok().and_then(|mut p| p.take());
+            if let Some(old) = old {
+                self.recycle_rgba(old.rgba);
+            }
+        }
+    }
+
+    pub fn current_global_live_epoch(&self) -> u64 {
+        self.global_live_epoch.load(Ordering::Acquire)
     }
 
     pub fn set_egui_ctx(&self, ctx: eframe::egui::Context) {
@@ -445,12 +575,31 @@ impl Shared {
         }
     }
 
-    pub fn bump_live_gen(&self) -> u64 {
-        self.live_gen.fetch_add(1, Ordering::AcqRel) + 1
+    pub fn bump_live_gen_for(&self, session: u64) -> u64 {
+        let slot = self.slot(session);
+        slot.has_any_frame.store(false, Ordering::Relaxed);
+        if let Ok(mut at) = slot.last_frame_at.lock() {
+            *at = None;
+        }
+        slot.live_gen.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    pub fn current_live_gen_for(&self, session: u64) -> u64 {
+        self.desktop_slots
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&session).map(|s| s.live_gen.load(Ordering::Acquire)))
+            .unwrap_or(0)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn bump_live_gen(&self) -> u64 {
+        self.bump_live_gen_for(0)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn current_live_gen(&self) -> u64 {
-        self.live_gen.load(Ordering::Acquire)
+        self.current_live_gen_for(0)
     }
 
     pub fn push(&self, event: UiEvent) {
@@ -477,19 +626,32 @@ impl Shared {
         }
         buf.clear();
         if let Ok(mut pool) = self.rgba_pool.lock() {
-            if pool.len() < 2 {
+            if pool.len() < 4 {
                 pool.push(buf);
             }
         }
     }
 
-    pub fn set_picture(&self, rgba: Vec<u8>, width: usize, height: usize, kind: &str, path: &str) {
+    pub fn set_picture_for(
+        &self,
+        session: u64,
+        rgba: Vec<u8>,
+        width: usize,
+        height: usize,
+        kind: &str,
+        path: &str,
+    ) {
         if rgba.len() != width.saturating_mul(height).saturating_mul(4) || width == 0 {
             return;
         }
+        let slot = self.slot(session);
+        let was_first = !slot.has_any_frame.swap(true, Ordering::AcqRel);
+        if let Ok(mut at) = slot.last_frame_at.lock() {
+            *at = Some(Instant::now());
+        }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let replaced = if let Ok(mut slot) = self.picture.lock() {
-            slot.replace(Picture {
+        let replaced = if let Ok(mut pic_slot) = slot.picture.lock() {
+            pic_slot.replace(Picture {
                 rgba,
                 width,
                 height,
@@ -503,70 +665,174 @@ impl Shared {
         if let Some(old) = replaced {
             self.recycle_rgba(old.rgba);
         }
-        self.request_repaint();
+        if session == 0
+            || session == self.active_desktop_session.load(Ordering::Relaxed)
+            || was_first
+        {
+            self.request_repaint();
+        }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_picture(&self, rgba: Vec<u8>, width: usize, height: usize, kind: &str, path: &str) {
+        self.set_picture_for(0, rgba, width, height, kind, path);
+    }
+
+    pub fn latest_picture_for(&self, session: u64) -> Option<Picture> {
+        let slot = self
+            .desktop_slots
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&session).cloned())?;
+        slot.picture.lock().ok().and_then(|mut pic| pic.take())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn latest_picture(&self) -> Option<Picture> {
-        self.picture.lock().ok().and_then(|mut slot| slot.take())
+        self.latest_picture_for(0)
     }
 
-    pub fn clear_picture(&self) {
-        let old = self.picture.lock().ok().and_then(|mut slot| slot.take());
+    pub fn last_frame_at_for(&self, session: u64) -> Option<Instant> {
+        let slot = self
+            .desktop_slots
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&session).cloned())?;
+        slot.last_frame_at.lock().ok().and_then(|at| *at)
+    }
+
+    pub fn clear_picture_for(&self, session: u64) {
+        let Some(slot) = self
+            .desktop_slots
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&session).cloned())
+        else {
+            return;
+        };
+        if let Ok(mut at) = slot.last_frame_at.lock() {
+            *at = None;
+        }
+        slot.has_any_frame.store(false, Ordering::Relaxed);
+        let old = slot.picture.lock().ok().and_then(|mut p| p.take());
         if let Some(old) = old {
             self.recycle_rgba(old.rgba);
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn clear_picture(&self) {
+        self.clear_picture_for(0);
+    }
+
+    pub fn set_hud_for(&self, session: u64, hud: LiveHud) {
+        self.push(UiEvent::Hud { session, hud });
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_hud(&self, hud: LiveHud) {
-        self.push(UiEvent::Hud(hud));
+        self.set_hud_for(0, hud);
     }
 
-    pub fn set_cursor(&self, mut cursor: DeskCursor) {
+    pub fn set_cursor_for(&self, session: u64, mut cursor: DeskCursor) {
         cursor.rev = self.cursor_rev.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Ok(mut slot) = self.cursor.lock() {
-            *slot = cursor;
+        let slot = self.slot(session);
+        if let Ok(mut c) = slot.cursor.lock() {
+            *c = cursor;
         }
-        self.request_repaint();
+        if session == 0 || session == self.active_desktop_session.load(Ordering::Relaxed) {
+            self.request_repaint();
+        }
     }
 
-    pub fn reset_cursor(&self) {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_cursor(&self, cursor: DeskCursor) {
+        self.set_cursor_for(0, cursor);
+    }
+
+    pub fn reset_cursor_for(&self, session: u64) {
         let rev = self.cursor_rev.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Ok(mut slot) = self.cursor.lock() {
-            *slot = DeskCursor {
+        let slot = self.slot(session);
+        if let Ok(mut c) = slot.cursor.lock() {
+            *c = DeskCursor {
                 rev,
                 ..DeskCursor::default()
             };
-        }
+        };
     }
 
-    pub fn latest_cursor(&self) -> DeskCursor {
-        self.cursor
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reset_cursor(&self) {
+        self.reset_cursor_for(0);
+    }
+
+    pub fn latest_cursor_for(&self, session: u64) -> DeskCursor {
+        let Some(slot) = self
+            .desktop_slots
             .lock()
-            .map(|slot| slot.clone())
+            .ok()
+            .and_then(|map| map.get(&session).cloned())
+        else {
+            return DeskCursor::default();
+        };
+        slot.cursor
+            .lock()
+            .map(|c| c.clone())
             .unwrap_or_default()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn latest_cursor(&self) -> DeskCursor {
+        self.latest_cursor_for(0)
+    }
+
     /// Start a new live attempt: later progress stages may update the HUD again.
+    pub fn begin_handshake_for(&self, session: u64) {
+        self.slot(session)
+            .terminal_handshake
+            .store(false, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn begin_handshake(&self) {
-        self.terminal_handshake.store(false, Ordering::Relaxed);
+        self.begin_handshake_for(0);
     }
 
     /// Progress stage. Ignored after a terminal reason has been recorded.
-    pub fn set_handshake(&self, stage: impl Into<String>) {
+    pub fn set_handshake_for(&self, session: u64, stage: impl Into<String>) {
         let stage = stage.into();
         if handshake_is_cleanup(&stage) {
             return;
         }
-        if self.terminal_handshake.load(Ordering::Relaxed) {
+        if self
+            .slot(session)
+            .terminal_handshake
+            .load(Ordering::Relaxed)
+        {
             return;
         }
-        self.push(UiEvent::Handshake(stage));
+        self.push(UiEvent::Handshake { session, stage });
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_handshake(&self, stage: impl Into<String>) {
+        self.set_handshake_for(0, stage);
     }
 
     /// Terminal negotiation result. Survives cleanup/close until the next attempt.
+    pub fn set_handshake_terminal_for(&self, session: u64, stage: impl Into<String>) {
+        self.slot(session)
+            .terminal_handshake
+            .store(true, Ordering::Relaxed);
+        self.push(UiEvent::Handshake {
+            session,
+            stage: stage.into(),
+        });
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_handshake_terminal(&self, stage: impl Into<String>) {
-        self.terminal_handshake.store(true, Ordering::Relaxed);
-        self.push(UiEvent::Handshake(stage.into()));
+        self.set_handshake_terminal_for(0, stage);
     }
 }
 
@@ -772,7 +1038,7 @@ struct Live {
 }
 
 type ClientSlot = Arc<tokio::sync::Mutex<Option<Arc<Client>>>>;
-type LiveHolder = Arc<Mutex<(Option<Live>, Option<tokio::task::JoinHandle<()>>)>>;
+type LiveHolder = Arc<Mutex<HashMap<u64, (Option<Live>, Option<tokio::task::JoinHandle<()>>)>>>;
 
 enum PtyEntry {
     Opening {
@@ -803,19 +1069,60 @@ impl PtyHub {
 }
 
 struct QueuedInput {
+    session: u64,
     node: String,
     live: String,
     inject: String,
     barrier: bool,
 }
 
-fn stop_live_holder(holder: &LiveHolder, shared: &Shared) {
-    shared.bump_live_gen();
-    shared.clear_picture();
-    let (live, shots) = holder
-        .lock()
-        .map(|mut slot| (slot.0.take(), slot.1.take()))
-        .unwrap_or((None, None));
+#[derive(Default)]
+struct SessionInputQueues {
+    closed: bool,
+    queues: HashMap<u64, OrderedControlQueue<QueuedInput>>,
+    cursor: usize,
+}
+
+impl SessionInputQueues {
+    fn enqueue(&mut self, session: u64, kind: ControlKind, item: QueuedInput) {
+        if self.closed {
+            return;
+        }
+        let q = self
+            .queues
+            .entry(session)
+            .or_insert_with(|| OrderedControlQueue::new(256));
+        let _ = q.enqueue(kind, item);
+    }
+
+    fn pop(&mut self) -> Option<(ControlKind, QueuedInput)> {
+        let keys: Vec<u64> = self.queues.keys().copied().collect();
+        if keys.is_empty() {
+            return None;
+        }
+        for offset in 0..keys.len() {
+            let idx = (self.cursor + offset) % keys.len();
+            let key = keys[idx];
+            if let Some(q) = self.queues.get_mut(&key) {
+                if let Some(item) = q.pop() {
+                    self.cursor = (idx + 1) % keys.len();
+                    return Some(item);
+                }
+            }
+        }
+        None
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        for q in self.queues.values_mut() {
+            q.close();
+        }
+    }
+}
+
+fn close_live_pair(pair: (Option<Live>, Option<tokio::task::JoinHandle<()>>)) {
+    let (live, shots) = pair;
     if let Some(session) = live {
         session.stop.store(true, Ordering::Relaxed);
         if let Ok(slot) = session.viewer.lock() {
@@ -829,6 +1136,112 @@ fn stop_live_holder(holder: &LiveHolder, shared: &Shared) {
     }
     if let Some(task) = shots {
         task.abort();
+    }
+}
+
+fn stop_live_session(holder: &LiveHolder, shared: &Shared, session: u64) {
+    shared.bump_live_gen_for(session);
+    shared.clear_picture_for(session);
+    let removed = holder
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(&session));
+    if let Some(pair) = removed {
+        close_live_pair(pair);
+    }
+}
+
+fn stop_all_live_sessions(holder: &LiveHolder, shared: &Shared) {
+    shared.clear_all_desktop_slots();
+    let drained: Vec<_> = holder
+        .lock()
+        .map(|mut map| map.drain().map(|(_, pair)| pair).collect())
+        .unwrap_or_default();
+    for pair in drained {
+        close_live_pair(pair);
+    }
+}
+
+fn pty_write_for(
+    pty_hub: &Arc<Mutex<PtyHub>>,
+    shared: &Shared,
+    gen: Option<u64>,
+    data: Vec<u8>,
+) {
+    let mut closed_gen = None;
+    if let Ok(mut hub) = pty_hub.lock() {
+        let target_gen = gen.unwrap_or(hub.active_gen);
+        if let Some(entry) = hub.sessions.get_mut(&target_gen) {
+            match entry {
+                PtyEntry::Opening { pending_writes, .. } => {
+                    if pending_writes.len() < 256 {
+                        pending_writes.push(data);
+                    }
+                }
+                PtyEntry::Live(tx) => {
+                    if tx.send(PtyCmd::Write(data)).is_err() {
+                        hub.sessions.remove(&target_gen);
+                        if hub.active_gen == target_gen {
+                            hub.active_gen = 0;
+                        }
+                        if target_gen != 0 {
+                            closed_gen = Some(target_gen);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(gen) = closed_gen {
+        shared.push(UiEvent::PtyFailed {
+            gen,
+            message: "Shell session is no longer active; reopen shell to continue.".into(),
+        });
+        shared.push(UiEvent::PtyDone { gen });
+    }
+}
+
+fn pty_resize_for(pty_hub: &Arc<Mutex<PtyHub>>, gen: Option<u64>, rows: u16, cols: u16) {
+    if let Ok(mut hub) = pty_hub.lock() {
+        let target_gen = gen.unwrap_or(hub.active_gen);
+        if let Some(entry) = hub.sessions.get_mut(&target_gen) {
+            match entry {
+                PtyEntry::Opening { pending_resize, .. } => {
+                    *pending_resize = Some((rows, cols));
+                }
+                PtyEntry::Live(tx) => {
+                    let _ = tx.send(PtyCmd::Resize(rows, cols));
+                }
+            }
+        }
+    }
+}
+
+fn pty_probe_for(pty_hub: &Arc<Mutex<PtyHub>>, gen: Option<u64>) {
+    if let Ok(hub) = pty_hub.lock() {
+        let target_gen = gen.unwrap_or(hub.active_gen);
+        if let Some(PtyEntry::Live(tx)) = hub.sessions.get(&target_gen) {
+            let _ = tx.send(PtyCmd::Probe);
+        }
+    }
+}
+
+fn pty_close_gen(pty_hub: &Arc<Mutex<PtyHub>>, gen: Option<u64>) {
+    let removed = pty_hub.lock().ok().and_then(|mut hub| {
+        let target_gen = gen.unwrap_or(hub.active_gen);
+        if hub.active_gen == target_gen {
+            hub.active_gen = 0;
+        }
+        match hub.sessions.remove(&target_gen) {
+            Some(PtyEntry::Live(tx)) => Some(tx),
+            _ => None,
+        }
+    });
+    if let Some(tx) = removed {
+        tokio::spawn(async move {
+            let mut slot = Some(tx);
+            close_pty(&mut slot).await;
+        });
     }
 }
 
@@ -950,12 +1363,12 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
     runtime.block_on(async move {
         let client_slot: ClientSlot = Arc::new(tokio::sync::Mutex::new(None));
         let pty_hub: Arc<Mutex<PtyHub>> = Arc::new(Mutex::new(PtyHub::default()));
-        let live_holder: LiveHolder = Arc::new(Mutex::new((None, None)));
+        let live_holder: LiveHolder = Arc::new(Mutex::new(HashMap::new()));
         let clipboard_sync_enabled = Arc::new(AtomicBool::new(false));
 
         // Dedicated fast-lane ordered input consumer (`DESK-11`, `DESK-12`, `ordered_send`).
-        let input_queue: Arc<Mutex<OrderedControlQueue<QueuedInput>>> =
-            Arc::new(Mutex::new(OrderedControlQueue::new(256)));
+        let input_queue: Arc<Mutex<SessionInputQueues>> =
+            Arc::new(Mutex::new(SessionInputQueues::default()));
         let input_notify = Arc::new(Notify::new());
         let input_closed = Arc::new(AtomicBool::new(false));
         let input_task = {
@@ -980,8 +1393,8 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         notified.await;
                         continue;
                     };
-                    let live_pair = live_holder.lock().ok().and_then(|slot| {
-                        let session = slot.0.as_ref()?;
+                    let live_pair = live_holder.lock().ok().and_then(|map| {
+                        let session = map.get(&item.session)?.0.as_ref()?;
                         let viewer = session.viewer.lock().ok()?.clone()?;
                         Some((viewer, Arc::clone(&session.dc_ready)))
                     });
@@ -1039,7 +1452,10 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         {
                             Ok(_) => {}
                             Err(err) if err == "Sign in first." => {}
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Err(err) => shared.push(UiEvent::DesktopFailed {
+                                session: item.session,
+                                message: err,
+                            }),
                         }
                     }
                 }
@@ -1143,7 +1559,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 }
                 Cmd::Logout => {
                     // Immediate local teardown — never blocked by slow RPCs.
-                    stop_live_holder(&live_holder, &shared);
+                    stop_all_live_sessions(&live_holder, &shared);
                     let to_close = pty_hub
                         .lock()
                         .map(|mut hub| hub.close_all())
@@ -1266,93 +1682,48 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     }
                 }
                 Cmd::PtyCloseGen { gen } => {
-                    let removed = pty_hub.lock().ok().and_then(|mut hub| {
-                        if hub.active_gen == gen {
-                            hub.active_gen = 0;
-                        }
-                        match hub.sessions.remove(&gen) {
-                            Some(PtyEntry::Live(tx)) => Some(tx),
-                            _ => None,
-                        }
-                    });
-                    if let Some(tx) = removed {
-                        tokio::spawn(async move {
-                            let mut slot = Some(tx);
-                            close_pty(&mut slot).await;
-                        });
-                    }
+                    pty_close_gen(&pty_hub, Some(gen));
                 }
                 Cmd::PtyWrite { data } => {
-                    let mut closed_gen = None;
-                    if let Ok(mut hub) = pty_hub.lock() {
-                        let gen = hub.active_gen;
-                        if let Some(entry) = hub.sessions.get_mut(&gen) {
-                            match entry {
-                                PtyEntry::Opening { pending_writes, .. } => {
-                                    if pending_writes.len() < 256 {
-                                        pending_writes.push(data);
-                                    }
-                                }
-                                PtyEntry::Live(tx) => {
-                                    if tx.send(PtyCmd::Write(data)).is_err() {
-                                        hub.sessions.remove(&gen);
-                                        if gen != 0 {
-                                            closed_gen = Some(gen);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(gen) = closed_gen {
-                        shared.push(UiEvent::PtyFailed {
-                            gen,
-                            message:
-                                "Shell session is no longer active; reopen shell to continue."
-                                    .into(),
-                        });
-                        shared.push(UiEvent::PtyDone { gen });
-                    }
+                    pty_write_for(&pty_hub, &shared, None, data);
+                }
+                Cmd::PtyWriteGen { gen, data } => {
+                    pty_write_for(&pty_hub, &shared, Some(gen), data);
                 }
                 Cmd::PtyResize { rows, cols } => {
-                    if let Ok(mut hub) = pty_hub.lock() {
-                        let gen = hub.active_gen;
-                        if let Some(entry) = hub.sessions.get_mut(&gen) {
-                            match entry {
-                                PtyEntry::Opening { pending_resize, .. } => {
-                                    *pending_resize = Some((rows, cols));
-                                }
-                                PtyEntry::Live(tx) => {
-                                    let _ = tx.send(PtyCmd::Resize(rows, cols));
-                                }
-                            }
-                        }
-                    }
+                    pty_resize_for(&pty_hub, None, rows, cols);
+                }
+                Cmd::PtyResizeGen { gen, rows, cols } => {
+                    pty_resize_for(&pty_hub, Some(gen), rows, cols);
                 }
                 Cmd::PtyProbe => {
-                    if let Ok(hub) = pty_hub.lock() {
-                        if let Some(PtyEntry::Live(tx)) = hub.sessions.get(&hub.active_gen) {
-                            let _ = tx.send(PtyCmd::Probe);
-                        }
-                    }
+                    pty_probe_for(&pty_hub, None);
+                }
+                Cmd::PtyProbeGen { gen } => {
+                    pty_probe_for(&pty_hub, Some(gen));
                 }
                 Cmd::PtyClose => {
-                    let removed = pty_hub.lock().ok().and_then(|mut hub| {
-                        let gen = hub.active_gen;
-                        hub.active_gen = 0;
-                        match hub.sessions.remove(&gen) {
-                            Some(PtyEntry::Live(tx)) => Some(tx),
-                            _ => None,
-                        }
-                    });
-                    if let Some(tx) = removed {
+                    pty_close_gen(&pty_hub, None);
+                }
+                Cmd::PtyCloseAll => {
+                    let to_close = pty_hub
+                        .lock()
+                        .map(|mut hub| hub.close_all())
+                        .unwrap_or_default();
+                    if !to_close.is_empty() {
                         tokio::spawn(async move {
-                            let mut slot = Some(tx);
-                            close_pty(&mut slot).await;
+                            for tx in to_close {
+                                let mut slot = Some(tx);
+                                close_pty(&mut slot).await;
+                            }
                         });
                     }
                 }
-                Cmd::List { node, path } => {
+                Cmd::List {
+                    session,
+                    node,
+                    path,
+                } => {
                     let client_slot = Arc::clone(&client_slot);
                     let shared = Arc::clone(&shared);
                     let config_dir = config_dir.clone();
@@ -1371,12 +1742,20 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         })
                         .await
                         {
-                            Ok((entries, _)) => shared.push(UiEvent::Dir { path, entries }),
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Ok((entries, _)) => shared.push(UiEvent::Dir {
+                                session,
+                                path,
+                                entries,
+                            }),
+                            Err(err) => shared.push(UiEvent::FilesFailed {
+                                session,
+                                message: err,
+                            }),
                         }
                     });
                 }
                 Cmd::Read {
+                    session,
                     node,
                     path,
                     size_hint,
@@ -1409,13 +1788,24 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         {
                             Ok(((bytes, total_size), _)) => {
                                 let loaded = inspect_file_for_editor(path, &bytes, total_size);
-                                shared.push(UiEvent::File(loaded));
+                                shared.push(UiEvent::File {
+                                    session,
+                                    file: loaded,
+                                });
                             }
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Err(err) => shared.push(UiEvent::FilesFailed {
+                                session,
+                                message: err,
+                            }),
                         }
                     });
                 }
-                Cmd::Write { node, path, text } => {
+                Cmd::Write {
+                    session,
+                    node,
+                    path,
+                    text,
+                } => {
                     let client_slot = Arc::clone(&client_slot);
                     let shared = Arc::clone(&shared);
                     let config_dir = config_dir.clone();
@@ -1443,20 +1833,30 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         {
                             Ok(()) => {
                                 let len = text.len() as u64;
-                                shared.push(UiEvent::Notice(format!("Saved {path}")));
-                                shared.push(UiEvent::File(LoadedFile {
-                                    path,
-                                    text,
-                                    read_only: false,
-                                    read_only_reason: None,
-                                    total_size: Some(len),
-                                }));
+                                shared.push(UiEvent::FilesNotice {
+                                    session,
+                                    message: format!("Saved {path}"),
+                                });
+                                shared.push(UiEvent::File {
+                                    session,
+                                    file: LoadedFile {
+                                        path,
+                                        text,
+                                        read_only: false,
+                                        read_only_reason: None,
+                                        total_size: Some(len),
+                                    },
+                                });
                             }
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Err(err) => shared.push(UiEvent::FilesFailed {
+                                session,
+                                message: err,
+                            }),
                         }
                     });
                 }
                 Cmd::Upload {
+                    session,
                     node,
                     local_path,
                     remote_path,
@@ -1490,9 +1890,10 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         .await
                         {
                             Ok(bytes) => {
-                                shared.push(UiEvent::Notice(format!(
-                                    "Uploaded {remote_path} ({bytes} bytes)"
-                                )));
+                                shared.push(UiEvent::FilesNotice {
+                                    session,
+                                    message: format!("Uploaded {remote_path} ({bytes} bytes)"),
+                                });
                                 let parent_arg = parent.clone();
                                 if let Ok((entries, _)) =
                                     slot_run_idempotent(&client_slot, &config_dir, |current| {
@@ -1508,16 +1909,21 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                                     .await
                                 {
                                     shared.push(UiEvent::Dir {
+                                        session,
                                         path: parent,
                                         entries,
                                     });
                                 }
                             }
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Err(err) => shared.push(UiEvent::FilesFailed {
+                                session,
+                                message: err,
+                            }),
                         }
                     });
                 }
                 Cmd::Download {
+                    session,
                     node,
                     remote_path,
                     local_path,
@@ -1550,15 +1956,25 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         })
                         .await
                         {
-                            Ok((bytes, _)) => shared.push(UiEvent::Notice(format!(
-                                "Downloaded {} ({bytes} bytes)",
-                                local_path.display()
-                            ))),
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Ok((bytes, _)) => shared.push(UiEvent::FilesNotice {
+                                session,
+                                message: format!(
+                                    "Downloaded {} ({bytes} bytes)",
+                                    local_path.display()
+                                ),
+                            }),
+                            Err(err) => shared.push(UiEvent::FilesFailed {
+                                session,
+                                message: err,
+                            }),
                         }
                     });
                 }
-                Cmd::Mkdir { node, path } => {
+                Cmd::Mkdir {
+                    session,
+                    node,
+                    path,
+                } => {
                     let client_slot = Arc::clone(&client_slot);
                     let shared = Arc::clone(&shared);
                     let config_dir = config_dir.clone();
@@ -1598,17 +2014,28 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                                 .await
                                 {
                                     Ok((entries, _)) => shared.push(UiEvent::Dir {
+                                        session,
                                         path: parent,
                                         entries,
                                     }),
-                                    Err(err) => shared.push(UiEvent::Failed(err)),
+                                    Err(err) => shared.push(UiEvent::FilesFailed {
+                                        session,
+                                        message: err,
+                                    }),
                                 }
                             }
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Err(err) => shared.push(UiEvent::FilesFailed {
+                                session,
+                                message: err,
+                            }),
                         }
                     });
                 }
-                Cmd::Remove { node, path } => {
+                Cmd::Remove {
+                    session,
+                    node,
+                    path,
+                } => {
                     let client_slot = Arc::clone(&client_slot);
                     let shared = Arc::clone(&shared);
                     let config_dir = config_dir.clone();
@@ -1648,17 +2075,25 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                                 .await
                                 {
                                     Ok((entries, _)) => shared.push(UiEvent::Dir {
+                                        session,
                                         path: parent,
                                         entries,
                                     }),
-                                    Err(err) => shared.push(UiEvent::Failed(err)),
+                                    Err(err) => shared.push(UiEvent::FilesFailed {
+                                        session,
+                                        message: err,
+                                    }),
                                 }
                             }
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Err(err) => shared.push(UiEvent::FilesFailed {
+                                session,
+                                message: err,
+                            }),
                         }
                     });
                 }
                 Cmd::Live {
+                    session,
                     node,
                     control,
                     monitor,
@@ -1667,8 +2102,9 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     max_fps,
                     retry,
                 } => {
-                    stop_live_holder(&live_holder, &shared);
-                    let live_gen = shared.current_live_gen();
+                    stop_live_session(&live_holder, &shared, session);
+                    let live_gen = shared.current_live_gen_for(session);
+                    let global_epoch = shared.current_global_live_epoch();
                     let client_slot = Arc::clone(&client_slot);
                     let live_holder = Arc::clone(&live_holder);
                     let shared = Arc::clone(&shared);
@@ -1681,13 +2117,20 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                             Ok(current) => current,
                             Err(err) => {
                                 diag_client(&config_dir, "live_ensure_err", Some("Live"), None, None);
-                                if shared.current_live_gen() == live_gen {
-                                    shared.push(UiEvent::Failed(err));
+                                if shared.current_live_gen_for(session) == live_gen
+                                    && shared.current_global_live_epoch() == global_epoch
+                                {
+                                    shared.push(UiEvent::DesktopFailed {
+                                        session,
+                                        message: err,
+                                    });
                                 }
                                 return;
                             }
                         };
-                        if shared.current_live_gen() != live_gen {
+                        if shared.current_live_gen_for(session) != live_gen
+                            || shared.current_global_live_epoch() != global_epoch
+                        {
                             return;
                         }
                         diag_client(
@@ -1697,11 +2140,14 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                             Some(current.as_ref()),
                             None,
                         );
-                        shared.push(UiEvent::Link(if control {
-                            "connecting · control".into()
-                        } else {
-                            "connecting · view".into()
-                        }));
+                        shared.push(UiEvent::Link {
+                            session,
+                            label: if control {
+                                "connecting · control".into()
+                            } else {
+                                "connecting · view".into()
+                            },
+                        });
                         let started = start_live_with_config(
                             current,
                             config_dir,
@@ -1712,28 +2158,49 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                             scale,
                             max_fps,
                             Arc::clone(&shared),
+                            session,
                             live_gen,
                             clipboard_sync_enabled,
                         );
-                        if shared.current_live_gen() != live_gen {
+                        if shared.current_live_gen_for(session) != live_gen
+                            || shared.current_global_live_epoch() != global_epoch
+                        {
                             started.live.stop.store(true, Ordering::Relaxed);
                             started.shots.abort();
                             return;
                         }
-                        if let Ok(mut slot) = live_holder.lock() {
-                            *slot = (Some(started.live), Some(started.shots));
+                        if let Ok(mut map) = live_holder.lock() {
+                            map.insert(session, (Some(started.live), Some(started.shots)));
                         }
                     });
                 }
+                Cmd::LiveStopSession { session } => {
+                    stop_live_session(&live_holder, &shared, session);
+                    shared.remove_desktop_slot(session);
+                    if let Ok(mut q) = input_queue.lock() {
+                        q.queues.remove(&session);
+                    }
+                    shared.set_hud_for(session, LiveHud::default());
+                    shared.push(UiEvent::Link {
+                        session,
+                        label: "disconnected".into(),
+                    });
+                }
                 Cmd::LiveStop => {
-                    stop_live_holder(&live_holder, &shared);
-                    shared.set_hud(LiveHud::default());
-                    shared.push(UiEvent::Link("relay".into()));
+                    stop_all_live_sessions(&live_holder, &shared);
+                    if let Ok(mut q) = input_queue.lock() {
+                        q.queues.clear();
+                    }
+                    shared.push(UiEvent::Link {
+                        session: 0,
+                        label: "relay".into(),
+                    });
                 }
                 Cmd::ClipboardSync { enabled } => {
                     clipboard_sync_enabled.store(enabled, Ordering::Relaxed);
                 }
                 Cmd::Input {
+                    session,
                     node,
                     live: body,
                     inject,
@@ -1745,9 +2212,11 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         ControlKind::Move
                     };
                     if let Ok(mut q) = input_queue.lock() {
-                        let _ = q.enqueue(
+                        q.enqueue(
+                            session,
                             kind,
                             QueuedInput {
+                                session,
                                 node,
                                 live: body,
                                 inject,
@@ -1757,7 +2226,11 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                     }
                     input_notify.notify_one();
                 }
-                Cmd::Monitors { node, retry } => {
+                Cmd::Monitors {
+                    session,
+                    node,
+                    retry,
+                } => {
                     let client_slot = Arc::clone(&client_slot);
                     let shared = Arc::clone(&shared);
                     let config_dir = config_dir.clone();
@@ -1784,11 +2257,12 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                                     Some(reconnected),
                                 );
                                 if reconnected {
-                                    shared.push(UiEvent::Notice(
-                                        "Reconnected after a closed relay session.".into(),
-                                    ));
+                                    shared.push(UiEvent::DesktopNotice {
+                                        session,
+                                        message: "Reconnected after a closed relay session.".into(),
+                                    });
                                 }
-                                shared.push(UiEvent::Monitors(monitors));
+                                shared.push(UiEvent::Monitors { session, monitors });
                             }
                             Err(err) => {
                                 diag_client(
@@ -1798,22 +2272,29 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                                     None,
                                     None,
                                 );
-                                shared.push(UiEvent::Failed(err));
+                                shared.push(UiEvent::DesktopFailed {
+                                    session,
+                                    message: err,
+                                });
                             }
                         }
                     });
                 }
-                Cmd::Clipboard { node, text } => {
+                Cmd::Clipboard {
+                    session,
+                    node,
+                    text,
+                } => {
                     let live_holder = Arc::clone(&live_holder);
                     let client_slot = Arc::clone(&client_slot);
                     let shared = Arc::clone(&shared);
                     let config_dir = config_dir.clone();
                     tokio::spawn(async move {
                         let body = json!({"type": "clipboard", "text": text}).to_string();
-                        let viewer = live_holder.lock().ok().and_then(|slot| {
-                            slot.0
-                                .as_ref()
-                                .and_then(|session| session.viewer.lock().ok())
+                        let viewer = live_holder.lock().ok().and_then(|map| {
+                            map.get(&session)
+                                .and_then(|pair| pair.0.as_ref())
+                                .and_then(|live| live.viewer.lock().ok())
                                 .and_then(|v| v.clone())
                         });
                         let sent_rtc = match viewer {
@@ -1821,7 +2302,10 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                             None => false,
                         };
                         if sent_rtc {
-                            shared.push(UiEvent::Notice("Clipboard sent to the machine.".into()));
+                            shared.push(UiEvent::DesktopNotice {
+                                session,
+                                message: "Clipboard sent to the machine.".into(),
+                            });
                             return;
                         }
                         // Fallback to relay inject_input clipboard in JPEG mode (`DESK-18`).
@@ -1849,15 +2333,19 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         )
                         .await
                         {
-                            Ok(_) => shared
-                                .push(UiEvent::Notice("Clipboard sent to the machine.".into())),
-                            Err(err) => shared.push(UiEvent::Failed(format!(
-                                "Clipboard send failed: {err}"
-                            ))),
+                            Ok(_) => shared.push(UiEvent::DesktopNotice {
+                                session,
+                                message: "Clipboard sent to the machine.".into(),
+                            }),
+                            Err(err) => shared.push(UiEvent::DesktopFailed {
+                                session,
+                                message: format!("Clipboard send failed: {err}"),
+                            }),
                         }
                     });
                 }
                 Cmd::Shot {
+                    session,
                     node,
                     path,
                     monitor,
@@ -1877,10 +2365,14 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                         })
                         .await
                         {
-                            Ok((saved, _)) => {
-                                shared.push(UiEvent::Notice(format!("Saved {saved}")))
-                            }
-                            Err(err) => shared.push(UiEvent::Failed(err)),
+                            Ok((saved, _)) => shared.push(UiEvent::DesktopNotice {
+                                session,
+                                message: format!("Saved {saved}"),
+                            }),
+                            Err(err) => shared.push(UiEvent::DesktopFailed {
+                                session,
+                                message: err,
+                            }),
                         }
                     });
                 }
@@ -1942,7 +2434,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
                 }
             }
         }
-        // Teardown: close ordered input queue, stop live session, and close all PTYs.
+        // Teardown: close ordered input queue, stop live sessions, and close all PTYs.
         input_closed.store(true, Ordering::Release);
         if let Ok(mut q) = input_queue.lock() {
             q.close();
@@ -1957,7 +2449,7 @@ pub fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Shared>, config_dir: std:
             let mut slot = Some(tx);
             close_pty(&mut slot).await;
         }
-        stop_live_holder(&live_holder, &shared);
+        stop_all_live_sessions(&live_holder, &shared);
     });
 }
 
@@ -2092,6 +2584,7 @@ fn start_live_with_config(
     scale: f32,
     max_fps_override: u32,
     shared: Arc<Shared>,
+    session: u64,
     live_gen: u64,
     clipboard_sync_enabled: Arc<AtomicBool>,
 ) -> Started {
@@ -2119,6 +2612,7 @@ fn start_live_with_config(
         LiveSchedule::default(),
         Arc::new(|_| IceFault::None),
         Some(ice_refresh),
+        session,
         live_gen,
         clipboard_sync_enabled,
     )
@@ -2139,7 +2633,8 @@ fn start_live_from(
     schedule: LiveSchedule,
     ice_fault_for: Arc<dyn Fn(u32) -> IceFault + Send + Sync>,
 ) -> Started {
-    let live_gen = shared.current_live_gen();
+    let session = 0;
+    let live_gen = shared.current_live_gen_for(session);
     start_live_with_options(
         signal,
         jpeg,
@@ -2153,6 +2648,7 @@ fn start_live_from(
         schedule,
         ice_fault_for,
         None,
+        session,
         live_gen,
         Arc::new(AtomicBool::new(false)),
     )
@@ -2172,6 +2668,7 @@ fn start_live_with_options(
     schedule: LiveSchedule,
     ice_fault_for: Arc<dyn Fn(u32) -> IceFault + Send + Sync>,
     ice_refresh: Option<Arc<dyn Fn() -> Vec<Value> + Send + Sync>>,
+    session: u64,
     live_gen: u64,
     clipboard_sync_enabled: Arc<AtomicBool>,
 ) -> Started {
@@ -2197,7 +2694,7 @@ fn start_live_with_options(
         .spawn(move || {
             const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
             let is_stale = |shared: &Shared, stop: &AtomicBool| -> bool {
-                stop.load(Ordering::Relaxed) || shared.current_live_gen() != live_gen
+                stop.load(Ordering::Relaxed) || shared.current_live_gen_for(session) != live_gen
             };
             let last_stage = Arc::new(Mutex::new("starting".to_string()));
             let on_stage: Arc<dyn Fn(&str) + Send + Sync> = {
@@ -2205,13 +2702,15 @@ fn start_live_with_options(
                 let events = Arc::clone(&thread_shared);
                 let stop_check = Arc::clone(&thread_stop);
                 Arc::new(move |msg: &str| {
-                    if stop_check.load(Ordering::Relaxed) || events.current_live_gen() != live_gen {
+                    if stop_check.load(Ordering::Relaxed)
+                        || events.current_live_gen_for(session) != live_gen
+                    {
                         return;
                     }
                     if let Ok(mut slot) = last_stage.lock() {
                         *slot = msg.to_string();
                     }
-                    events.set_handshake(msg);
+                    events.set_handshake_for(session, msg);
                 })
             };
             let traced: Arc<dyn Signal> = Arc::new(TracingSignal {
@@ -2242,13 +2741,14 @@ fn start_live_with_options(
                 if let Ok(mut slot) = last_stage.lock() {
                     *slot = "starting".to_string();
                 }
-                thread_shared.begin_handshake();
+                thread_shared.begin_handshake_for(session);
                 if offers_sent == 1 {
-                    thread_shared.set_handshake("webrtc: starting");
+                    thread_shared.set_handshake_for(session, "webrtc: starting");
                 } else {
-                    thread_shared.set_handshake(format!(
-                        "webrtc: starting attempt {offers_sent} (JPEG stills remain)"
-                    ));
+                    thread_shared.set_handshake_for(
+                        session,
+                        format!("webrtc: starting attempt {offers_sent} (JPEG stills remain)"),
+                    );
                 }
                 let opts = LiveOptions {
                     viewer: "desktop".into(),
@@ -2271,7 +2771,7 @@ fn start_live_with_options(
                     .spawn(move || {
                         let res = Viewer::connect(connect_traced, opts);
                         if connect_stop.load(Ordering::Relaxed)
-                            || connect_shared.current_live_gen() != live_gen
+                            || connect_shared.current_live_gen_for(session) != live_gen
                         {
                             if let Ok(v) = res {
                                 v.close();
@@ -2322,25 +2822,39 @@ fn start_live_with_options(
                             return;
                         }
                         if super::model::webrtc_connect_is_hard_reject(&err) {
-                            thread_shared
-                                .set_handshake_terminal(format!("webrtc: failed ({err})"));
+                            thread_shared.set_handshake_terminal_for(
+                                session,
+                                format!("webrtc: failed ({err})"),
+                            );
                             thread_stop.store(true, Ordering::Relaxed);
-                            thread_shared.push(UiEvent::Failed(err));
+                            thread_shared.push(UiEvent::DesktopFailed {
+                                session,
+                                message: err,
+                            });
                             let _ = control;
                             return;
                         }
                         last_soft = Some(format!("webrtc: failed ({err})"));
-                        thread_shared.push(UiEvent::Notice(format!(
-                            "Live video is not up ({err}). Showing JPEG over the relay."
-                        )));
-                        thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                        thread_shared.push(UiEvent::DesktopNotice {
+                            session,
+                            message: format!(
+                                "Live video is not up ({err}). Showing JPEG over the relay."
+                            ),
+                        });
+                        thread_shared.push(UiEvent::Link {
+                            session,
+                            label: "jpeg · relay".into(),
+                        });
                         if let Some(delay) = live_retry_backoff(&schedule, streak) {
-                            thread_shared.set_handshake(format!(
-                                "webrtc: retry in {}s after connect failure (attempt {offers_sent}; JPEG stills remain)",
-                                delay.as_secs().max(1)
-                            ));
+                            thread_shared.set_handshake_for(
+                                session,
+                                format!(
+                                    "webrtc: retry in {}s after connect failure (attempt {offers_sent}; JPEG stills remain)",
+                                    delay.as_secs().max(1)
+                                ),
+                            );
                             if !wait_interruptible(&thread_stop, delay)
-                                || thread_shared.current_live_gen() != live_gen
+                                || thread_shared.current_live_gen_for(session) != live_gen
                             {
                                 break 'live;
                             }
@@ -2374,16 +2888,17 @@ fn start_live_with_options(
                 } else {
                     info.encoder.clone()
                 };
-                thread_shared.set_handshake(
+                thread_shared.set_handshake_for(
+                    session,
                     "webrtc: signaling complete, waiting for ICE pair / video".to_string(),
                 );
                 let ice_deadline = Instant::now() + schedule.ice_wait;
                 let mut decoder = H264Decoder::new();
                 if !decoder.available() {
-                    thread_shared.push(UiEvent::Notice(
-                        "H.264 frames are arriving, but this build could not open a decoder. JPEG stays on."
-                            .into(),
-                    ));
+                    thread_shared.push(UiEvent::DesktopNotice {
+                        session,
+                        message: "H.264 frames are arriving, but this build could not open a decoder. JPEG stays on.".into(),
+                    });
                 }
                 let mut window_start = Instant::now();
                 let mut window_frames = 0u32;
@@ -2403,15 +2918,20 @@ fn start_live_with_options(
                                 soft = Some(
                                     "webrtc: connection lost; JPEG stills remain".to_string(),
                                 );
-                                thread_shared.push(UiEvent::Notice(
-                                    "WebRTC live video is not up. Showing JPEG over the relay."
-                                        .into(),
-                                ));
-                                thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                                thread_shared.push(UiEvent::DesktopNotice {
+                                    session,
+                                    message: "WebRTC live video is not up. Showing JPEG over the relay.".into(),
+                                });
+                                thread_shared.push(UiEvent::Link {
+                                    session,
+                                    label: "jpeg · relay".into(),
+                                });
                                 break;
                             }
-                            thread_shared
-                                .push(UiEvent::Failed("WebRTC connection failed".into()));
+                            thread_shared.push(UiEvent::DesktopFailed {
+                                session,
+                                message: "WebRTC connection failed".into(),
+                            });
                             hard = true;
                             break;
                         }
@@ -2431,11 +2951,14 @@ fn start_live_with_options(
                                 eprintln!("agentlink live-ice: timeout snapshot {checks}");
                             }
                             thread_h264.store(false, Ordering::Relaxed);
-                            thread_shared.push(UiEvent::Notice(
-                                "WebRTC live video is not up. Showing JPEG over the relay."
-                                    .into(),
-                            ));
-                            thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                            thread_shared.push(UiEvent::DesktopNotice {
+                                session,
+                                message: "WebRTC live video is not up. Showing JPEG over the relay.".into(),
+                            });
+                            thread_shared.push(UiEvent::Link {
+                                session,
+                                label: "jpeg · relay".into(),
+                            });
                             soft = Some(reason);
                             break;
                         }
@@ -2446,11 +2969,14 @@ fn start_live_with_options(
                                     "webrtc: no H.264 frame for 8s after takeover; JPEG stills remain"
                                         .to_string(),
                                 );
-                                thread_shared.push(UiEvent::Notice(
-                                    "WebRTC live video is not up. Showing JPEG over the relay."
-                                        .into(),
-                                ));
-                                thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                                thread_shared.push(UiEvent::DesktopNotice {
+                                    session,
+                                    message: "WebRTC live video is not up. Showing JPEG over the relay.".into(),
+                                });
+                                thread_shared.push(UiEvent::Link {
+                                    session,
+                                    label: "jpeg · relay".into(),
+                                });
                                 break;
                             }
                         }
@@ -2534,7 +3060,7 @@ fn start_live_with_options(
                         thread_h264.store(true, Ordering::Relaxed);
                         if first_h264 {
                             streak = 0;
-                            thread_shared.set_handshake_terminal("webrtc: receiving video");
+                            thread_shared.set_handshake_terminal_for(session, "webrtc: receiving video");
                         }
                         let move_ms = thread_shared
                             .perf
@@ -2552,18 +3078,28 @@ fn start_live_with_options(
                         }
                         thread_shared.perf.frames.fetch_add(1, Ordering::Relaxed);
                         let (path_label, path_note) = live_path_for_hud(&viewer);
-                        thread_shared.set_picture(rgba, width, height, "h264", &path_label);
+                        thread_shared.set_picture_for(
+                            session,
+                            rgba,
+                            width,
+                            height,
+                            "h264",
+                            &path_label,
+                        );
                         if let Some(cursor) = viewer.poll_cursor() {
-                            thread_shared.set_cursor(DeskCursor {
-                                shape: cursor.shape,
-                                visible: cursor.visible,
-                                hotspot_x: cursor.hotspot_x,
-                                hotspot_y: cursor.hotspot_y,
-                                bitmap_w: cursor.bitmap_w,
-                                bitmap_h: cursor.bitmap_h,
-                                bitmap_rgba: cursor.bitmap_rgba,
-                                rev: 0,
-                            });
+                            thread_shared.set_cursor_for(
+                                session,
+                                DeskCursor {
+                                    shape: cursor.shape,
+                                    visible: cursor.visible,
+                                    hotspot_x: cursor.hotspot_x,
+                                    hotspot_y: cursor.hotspot_y,
+                                    bitmap_w: cursor.bitmap_w,
+                                    bitmap_h: cursor.bitmap_h,
+                                    bitmap_rgba: cursor.bitmap_rgba,
+                                    rev: 0,
+                                },
+                            );
                         }
                         window_frames += 1;
                         let elapsed = window_start.elapsed();
@@ -2574,23 +3110,26 @@ fn start_live_with_options(
                                 0.0
                             };
                             let stats = viewer.stats();
-                            thread_shared.set_hud(LiveHud {
-                                path: path_label,
-                                kind: "h264".into(),
-                                width: width as u32,
-                                height: height as u32,
-                                latency_ms: stats.latency_ms,
-                                fps,
-                                bitrate_kbps: (bitrate / 1000).max(1),
-                                encoder: encoder.clone(),
-                                hardware: info.hardware,
-                                frames_dropped: stats.frames_dropped,
-                                path_note,
-                                handshake: "webrtc: receiving video".into(),
-                                cursor_presentation: info.cursor_presentation.clone(),
-                                src_width: info.src_width,
-                                src_height: info.src_height,
-                            });
+                            thread_shared.set_hud_for(
+                                session,
+                                LiveHud {
+                                    path: path_label,
+                                    kind: "h264".into(),
+                                    width: width as u32,
+                                    height: height as u32,
+                                    latency_ms: stats.latency_ms,
+                                    fps,
+                                    bitrate_kbps: (bitrate / 1000).max(1),
+                                    encoder: encoder.clone(),
+                                    hardware: info.hardware,
+                                    frames_dropped: stats.frames_dropped,
+                                    path_note,
+                                    handshake: "webrtc: receiving video".into(),
+                                    cursor_presentation: info.cursor_presentation.clone(),
+                                    src_width: info.src_width,
+                                    src_height: info.src_height,
+                                },
+                            );
                             window_start = Instant::now();
                             window_frames = 0;
                         }
@@ -2608,17 +3147,20 @@ fn start_live_with_options(
                 if let Some(reason) = soft {
                     last_soft = Some(reason);
                     if let Some(delay) = live_retry_backoff(&schedule, streak) {
-                        thread_shared.set_handshake(format!(
-                            "webrtc: retry in {}s ({}); JPEG stills remain",
-                            if delay.as_secs() >= 1 {
-                                delay.as_secs().to_string()
-                            } else {
-                                format!("{:.1}", delay.as_secs_f32())
-                            },
-                            last_soft.as_deref().unwrap_or("soft failure")
-                        ));
+                        thread_shared.set_handshake_for(
+                            session,
+                            format!(
+                                "webrtc: retry in {}s ({}); JPEG stills remain",
+                                if delay.as_secs() >= 1 {
+                                    delay.as_secs().to_string()
+                                } else {
+                                    format!("{:.1}", delay.as_secs_f32())
+                                },
+                                last_soft.as_deref().unwrap_or("soft failure")
+                            ),
+                        );
                         if !wait_interruptible(&thread_stop, delay)
-                            || thread_shared.current_live_gen() != live_gen
+                            || thread_shared.current_live_gen_for(session) != live_gen
                         {
                             break 'live;
                         }
@@ -2635,11 +3177,15 @@ fn start_live_with_options(
                     } else {
                         reason
                     };
-                    thread_shared.set_handshake_terminal(terminal);
-                    thread_shared.push(UiEvent::Notice(
-                        "WebRTC live video is not up. Showing JPEG over the relay.".into(),
-                    ));
-                    thread_shared.push(UiEvent::Link("jpeg · relay".into()));
+                    thread_shared.set_handshake_terminal_for(session, terminal);
+                    thread_shared.push(UiEvent::DesktopNotice {
+                        session,
+                        message: "WebRTC live video is not up. Showing JPEG over the relay.".into(),
+                    });
+                    thread_shared.push(UiEvent::Link {
+                        session,
+                        label: "jpeg · relay".into(),
+                    });
                 }
             }
             let _ = control;
@@ -2653,7 +3199,9 @@ fn start_live_with_options(
         let mut still_times: Vec<Instant> = Vec::new();
         loop {
             tick.tick().await;
-            if shot_stop.load(Ordering::Relaxed) || shared.current_live_gen() != live_gen {
+            if shot_stop.load(Ordering::Relaxed)
+                || shared.current_live_gen_for(session) != live_gen
+            {
                 break;
             }
             if shot_h264.load(Ordering::Relaxed) {
@@ -2672,7 +3220,7 @@ fn start_live_with_options(
                 Ok(bytes) => {
                     if shot_h264.load(Ordering::Relaxed)
                         || shot_stop.load(Ordering::Relaxed)
-                        || shared.current_live_gen() != live_gen
+                        || shared.current_live_gen_for(session) != live_gen
                     {
                         continue;
                     }
@@ -2684,39 +3232,51 @@ fn start_live_with_options(
                     if let Some((rgba, width, height)) = decoded {
                         if shot_h264.load(Ordering::Relaxed)
                             || shot_stop.load(Ordering::Relaxed)
-                            || shared.current_live_gen() != live_gen
+                            || shared.current_live_gen_for(session) != live_gen
                         {
                             shared.recycle_rgba(rgba);
                             continue;
                         }
-                        shared.set_picture(rgba, width, height, "jpeg", "relay");
+                        shared.set_picture_for(session, rgba, width, height, "jpeg", "relay");
                         let now = Instant::now();
                         still_times.push(now);
                         still_times.retain(|t| {
                             now.saturating_duration_since(*t) <= Duration::from_secs(5)
                         });
                         let stills_hz = stills_rate_hz(&still_times).unwrap_or(0.0);
-                        shared.set_hud(LiveHud {
-                            path: "relay".into(),
-                            kind: "jpeg".into(),
-                            width: width as u32,
-                            height: height as u32,
-                            fps: stills_hz,
-                            encoder: "jpeg".into(),
-                            path_note: super::model::connection_path_hint("jpeg", "relay").into(),
-                            ..LiveHud::default()
-                        });
+                        shared.set_hud_for(
+                            session,
+                            LiveHud {
+                                path: "relay".into(),
+                                kind: "jpeg".into(),
+                                width: width as u32,
+                                height: height as u32,
+                                fps: stills_hz,
+                                encoder: "jpeg".into(),
+                                path_note: super::model::connection_path_hint("jpeg", "relay")
+                                    .into(),
+                                ..LiveHud::default()
+                            },
+                        );
                     }
                 }
                 Err(err) => {
-                    if shot_stop.load(Ordering::Relaxed) || shared.current_live_gen() != live_gen {
+                    if shot_stop.load(Ordering::Relaxed)
+                        || shared.current_live_gen_for(session) != live_gen
+                    {
                         break;
                     }
                     if super::model::webrtc_connect_is_hard_reject(&err) {
-                        shared.push(UiEvent::Failed(err));
+                        shared.push(UiEvent::DesktopFailed {
+                            session,
+                            message: err,
+                        });
                         break;
                     }
-                    shared.push(UiEvent::Notice(format!("JPEG still failed ({err})")));
+                    shared.push(UiEvent::DesktopNotice {
+                        session,
+                        message: format!("JPEG still failed ({err})"),
+                    });
                 }
             }
         }
@@ -3703,7 +4263,7 @@ mod live_pipeline_tests {
             }
             for ev in self.shared.drain() {
                 match ev {
-                    UiEvent::Hud(hud) => {
+                    UiEvent::Hud { hud, .. } => {
                         self.hud_history
                             .push((hud.kind.clone(), hud.path.clone(), hud.fps));
                         self.last_hud = Some(HudSnap {
@@ -3713,10 +4273,14 @@ mod live_pipeline_tests {
                             fps: hud.fps,
                         });
                     }
-                    UiEvent::Handshake(text) => self.handshakes.push(text),
-                    UiEvent::Notice(text) => self.notices.push(text),
-                    UiEvent::Failed(text) => self.failed.push(text),
-                    UiEvent::Link(text) => self.links.push(text),
+                    UiEvent::Handshake { stage: text, .. } => self.handshakes.push(text),
+                    UiEvent::Notice(text) | UiEvent::DesktopNotice { message: text, .. } => {
+                        self.notices.push(text)
+                    }
+                    UiEvent::Failed(text) | UiEvent::DesktopFailed { message: text, .. } => {
+                        self.failed.push(text)
+                    }
+                    UiEvent::Link { label: text, .. } => self.links.push(text),
                     _ => {}
                 }
             }
@@ -4573,7 +5137,7 @@ mod handshake_retention_tests {
             .drain()
             .into_iter()
             .filter_map(|ev| match ev {
-                UiEvent::Handshake(text) => Some(text),
+                UiEvent::Handshake { stage: text, .. } => Some(text),
                 _ => None,
             })
             .collect();
@@ -4609,7 +5173,7 @@ mod handshake_retention_tests {
             .drain()
             .into_iter()
             .filter_map(|ev| match ev {
-                UiEvent::Handshake(text) => Some(text),
+                UiEvent::Handshake { stage: text, .. } => Some(text),
                 _ => None,
             })
             .collect();
@@ -4986,6 +5550,7 @@ mod worker_client_recovery_tests {
         // 3. WITHOUT restarting Controller or re-sending Cmd::Login, open PTY #2 AND list files!
         cmd_tx
             .send(Cmd::List {
+                session: 1,
                 node: box_id.clone(),
                 path: ".".into(),
             })
@@ -4999,7 +5564,7 @@ mod worker_client_recovery_tests {
                         assert!(entries.iter().any(|e| e.name == "hello.txt"));
                         listed = true;
                     }
-                    UiEvent::Failed(err) => {
+                    UiEvent::Failed(err) | UiEvent::FilesFailed { message: err, .. } => {
                         panic!("Cmd::List failed on dead worker Client instead of rebootstrapping: {err}");
                     }
                     _ => {}
@@ -5180,6 +5745,7 @@ mod worker_client_recovery_tests {
         // Send non-idempotent Cmd::Input (stills fallback extension route).
         cmd_tx
             .send(Cmd::Input {
+                session: 1,
                 node: box_id.clone(),
                 live: String::new(),
                 inject: r#"{"action":"click","x":0.5,"y":0.5,"button":"left","count":1}"#.into(),
@@ -5232,8 +5798,11 @@ mod worker_client_recovery_tests {
         let until = std::time::Instant::now() + Duration::from_secs(10);
         while fail_msg.is_empty() {
             for ev in shared.drain() {
-                if let UiEvent::Failed(msg) = ev {
-                    fail_msg = msg;
+                match ev {
+                    UiEvent::Failed(msg) | UiEvent::DesktopFailed { message: msg, .. } => {
+                        fail_msg = msg;
+                    }
+                    _ => {}
                 }
             }
             assert!(
@@ -5257,6 +5826,7 @@ mod worker_client_recovery_tests {
         // Next read-only command MUST still reconnect cleanly via pre-call ensure_worker_client!
         cmd_tx
             .send(Cmd::List {
+                session: 1,
                 node: box_id,
                 path: ".".into(),
             })
@@ -5839,7 +6409,7 @@ mod pty_fairness_tests {
     fn shared_cursor_defaults_visible_and_rgba_pool_recycles_desk_11() {
         let shared = Shared::new();
         assert!(
-            shared.cursor.lock().unwrap().visible,
+            shared.latest_cursor().visible,
             "DeskCursor must default to visible=true so cursor is not hidden until first cursor message"
         );
 
@@ -5847,11 +6417,11 @@ mod pty_fairness_tests {
         hidden.visible = false;
         hidden.hotspot_x = 42;
         shared.set_cursor(hidden);
-        assert!(!shared.cursor.lock().unwrap().visible);
+        assert!(!shared.latest_cursor().visible);
 
         shared.reset_cursor();
         assert!(
-            shared.cursor.lock().unwrap().visible,
+            shared.latest_cursor().visible,
             "reset_cursor on node switch must restore visible=true"
         );
 
@@ -5943,5 +6513,76 @@ mod pty_fairness_tests {
             }),
             "expected fetched TURN server from /api/ice via same runtime spawn_blocking, got {servers_same:?}"
         );
+    }
+
+    #[test]
+    fn live_hub_isolates_multiple_desktop_sessions() {
+        let shared = Shared::new();
+        let g1 = shared.bump_live_gen_for(1);
+        let g2 = shared.bump_live_gen_for(2);
+        assert_eq!(g1, 1);
+        assert_eq!(g2, 1);
+        assert_eq!(shared.current_live_gen_for(1), 1);
+        assert_eq!(shared.current_live_gen_for(2), 1);
+
+        let red = vec![255, 0, 0, 255].repeat(4);
+        let blue = vec![0, 0, 255, 255].repeat(4);
+        shared.set_picture_for(1, red.clone(), 2, 2, "live", "webrtc");
+        shared.set_picture_for(2, blue.clone(), 2, 2, "live", "relay");
+
+        let mut c1 = super::DeskCursor::default();
+        c1.visible = false;
+        c1.hotspot_x = 3;
+        shared.set_cursor_for(1, c1);
+
+        let mut c2 = super::DeskCursor::default();
+        c2.visible = true;
+        c2.hotspot_x = 7;
+        shared.set_cursor_for(2, c2);
+
+        shared.begin_handshake_for(1);
+        shared.begin_handshake_for(2);
+        shared.set_handshake_terminal_for(1, "failed");
+        shared.set_handshake_for(2, "offer sent");
+        let events = shared.drain();
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            UiEvent::Handshake { session: 1, stage } if stage == "failed"
+        )));
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            UiEvent::Handshake { session: 2, stage } if stage == "offer sent"
+        )));
+
+        let p1 = shared
+            .latest_picture_for(1)
+            .expect("session 1 picture present");
+        assert_eq!(p1.rgba, red);
+        assert!(shared.last_frame_at_for(1).is_some());
+        assert!(shared.last_frame_at_for(2).is_some());
+
+        let p2 = shared
+            .latest_picture_for(2)
+            .expect("session 2 picture preserved");
+        assert_eq!(p2.rgba, blue);
+
+        let cur1 = shared.latest_cursor_for(1);
+        let cur2 = shared.latest_cursor_for(2);
+        assert!(!cur1.visible);
+        assert_eq!(cur1.hotspot_x, 3);
+        assert!(cur2.visible);
+        assert_eq!(cur2.hotspot_x, 7);
+
+        shared.remove_desktop_slot(1);
+        assert_eq!(shared.current_live_gen_for(1), 0);
+        assert!(shared.last_frame_at_for(1).is_none());
+        assert_eq!(shared.current_live_gen_for(2), 1);
+        assert!(shared.last_frame_at_for(2).is_some());
+
+        let epoch_before = shared.current_global_live_epoch();
+        shared.clear_all_desktop_slots();
+        assert_eq!(shared.current_global_live_epoch(), epoch_before + 1);
+        assert_eq!(shared.current_live_gen_for(2), 0);
+        assert!(shared.last_frame_at_for(2).is_none());
     }
 }

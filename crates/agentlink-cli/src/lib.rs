@@ -1070,7 +1070,7 @@ enum PortCommand {
 
 #[derive(Subcommand, Debug)]
 enum GrantCommand {
-    /// Sign a time-limited grant and store it for a node.
+    /// Sign a grant and store it for one or all nodes.
     Issue {
         /// Node name, alias, or public id (positional alternative to `--node`).
         #[arg(value_name = "NODE")]
@@ -1078,9 +1078,15 @@ enum GrantCommand {
         /// Node name, alias, or public id.
         #[arg(long = "node")]
         node_flag: Option<String>,
-        /// Lifetime: seconds (`900`) or units (`15m`, `1h`, `7d`, `1h30m`).
+        /// Issue grants across all paired/pinned machines.
+        #[arg(long)]
+        all: bool,
+        /// Lifetime: seconds (`900`), units (`15m`, `1h`, `7d`, `1y`, `1h30m`), or `permanent`/`never`/`forever`.
         #[arg(long, default_value = "1h")]
         ttl: String,
+        /// Issue a permanent (non-expiring) grant.
+        #[arg(long, conflicts_with = "ttl")]
+        permanent: bool,
         /// Access preset: `read-only`, `read-write`, `exec`, `desktop`, `remote-view`, `remote-control`, or `full`.
         #[arg(long, default_value = "full")]
         policy: String,
@@ -1108,9 +1114,12 @@ enum GrantCommand {
         /// Refresh every stored grant in the config directory.
         #[arg(long)]
         all: bool,
-        /// Lifetime: seconds (`900`) or units (`15m`, `1h`, `7d`, `1h30m`).
+        /// Lifetime: seconds (`900`), units (`15m`, `1h`, `7d`, `1y`, `1h30m`), or `permanent`/`never`/`forever`.
         #[arg(long, default_value = "1h")]
         ttl: String,
+        /// Refresh into a permanent (non-expiring) grant.
+        #[arg(long, conflicts_with = "ttl")]
+        permanent: bool,
         /// Issuer key selection: `auto`, `operator`, or `node`.
         #[arg(long, value_enum, default_value_t = GrantIssuerMode::Auto)]
         issuer: GrantIssuerMode,
@@ -1133,9 +1142,12 @@ enum GrantCommand {
         /// Ensure grants across all paired/pinned machines.
         #[arg(long)]
         all: bool,
-        /// Lifetime: seconds (`900`) or units (`15m`, `1h`, `7d`, `1h30m`).
+        /// Lifetime: seconds (`900`), units (`15m`, `1h`, `7d`, `1y`, `1h30m`), or `permanent`/`never`/`forever`.
         #[arg(long, default_value = "1h")]
         ttl: String,
+        /// Ensure a permanent (non-expiring) grant.
+        #[arg(long, conflicts_with = "ttl")]
+        permanent: bool,
         /// Access preset used only when a new grant is issued; refresh keeps the stored policy.
         /// `read-only`, `read-write`, `exec`, `desktop`, `remote-view`, `remote-control`, or `full`.
         #[arg(long, default_value = "full")]
@@ -1265,9 +1277,12 @@ enum GrantCommand {
         /// Requested access preset. `desktop` includes exec and file read/write and is shown on the target.
         #[arg(long, default_value = "desktop")]
         policy: String,
-        /// Grant lifetime if the target approves.
+        /// Grant lifetime if the target approves (`1h`, `30d`, `1y`, or `permanent`/`never`/`forever`).
         #[arg(long, default_value = "1h")]
         ttl: String,
+        /// Request a permanent (non-expiring) grant.
+        #[arg(long, conflicts_with = "ttl")]
+        permanent: bool,
         /// Optional: bind to a specific 64-hex target node public key.
         #[arg(long)]
         node: Option<String>,
@@ -1319,9 +1334,12 @@ enum GrantCommand {
         /// Access preset. See the printed capability list; `desktop` includes exec.
         #[arg(long, default_value = "desktop")]
         policy: String,
-        /// Lifetime of the grant if later allowed (`15m`, `1h`, `7d`).
+        /// Lifetime of the grant if later allowed (`15m`, `1h`, `7d`, `1y`, `permanent`/`never`/`forever`).
         #[arg(long, default_value = "1h")]
         ttl: String,
+        /// Request a permanent (non-expiring) grant.
+        #[arg(long, conflicts_with = "ttl")]
+        permanent: bool,
         /// Node data directory. Defaults to the local node dir.
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -18448,17 +18466,28 @@ fn trust_owner_report(dir: &std::path::Path, keys: &std::collections::BTreeSet<S
     )
 }
 
-/// Parse `900`, `15m`, `1h`, `7d`, `1h30m`, and mixes of those units.
+/// Parse `900`, `15m`, `1h`, `7d`, `1y`, `1h30m`, or `permanent`/`never`/`forever`.
 fn parse_ttl(text: &str) -> Result<i64> {
     let text = text.trim();
     if text.is_empty() {
         return Err(anyhow!("--ttl is empty"));
     }
+    if matches!(
+        text.to_ascii_lowercase().as_str(),
+        "permanent" | "never" | "forever"
+    ) {
+        return Ok(agentlink_core::grant::PERMANENT_GRANT_EXP_UNIX);
+    }
     if let Ok(secs) = text.parse::<i64>() {
-        if secs > 0 {
-            return Ok(secs);
+        if secs <= 0 {
+            return Err(anyhow!("--ttl must be positive"));
         }
-        return Err(anyhow!("--ttl must be positive"));
+        if secs >= agentlink_core::grant::PERMANENT_GRANT_EXP_UNIX {
+            return Err(anyhow!(
+                "--ttl `{text}` exceeds finite grant range; pass `--ttl permanent` or `--permanent` for a non-expiring grant"
+            ));
+        }
+        return Ok(secs);
     }
     let mut total = 0i64;
     let mut digits = String::new();
@@ -18473,15 +18502,21 @@ fn parse_ttl(text: &str) -> Result<i64> {
         let value: i64 = digits
             .parse()
             .map_err(|_| anyhow!("--ttl `{text}`: number is too large"))?;
-        let mult = match ch.to_ascii_lowercase() {
+        let mult: i64 = match ch.to_ascii_lowercase() {
             's' => 1,
             'm' => 60,
             'h' => 3600,
             'd' => 86_400,
             'w' => 604_800,
+            'y' => 365 * 86_400,
             _ => return Err(anyhow!("--ttl `{text}`: unknown unit `{ch}`")),
         };
-        total = total.saturating_add(value.saturating_mul(mult));
+        let span = value.checked_mul(mult).ok_or_else(|| {
+            anyhow!("--ttl `{text}` is too large; use `--ttl permanent` or `--permanent`")
+        })?;
+        total = total.checked_add(span).ok_or_else(|| {
+            anyhow!("--ttl `{text}` is too large; use `--ttl permanent` or `--permanent`")
+        })?;
         digits.clear();
     }
     if !digits.is_empty() {
@@ -18490,7 +18525,20 @@ fn parse_ttl(text: &str) -> Result<i64> {
     if total <= 0 {
         return Err(anyhow!("--ttl must be positive"));
     }
+    if total >= agentlink_core::grant::PERMANENT_GRANT_EXP_UNIX {
+        return Err(anyhow!(
+            "--ttl `{text}` exceeds finite grant range; pass `--ttl permanent` or `--permanent` for a non-expiring grant"
+        ));
+    }
     Ok(total)
+}
+
+fn resolve_grant_ttl(ttl: &str, permanent: bool) -> Result<i64> {
+    if permanent {
+        Ok(agentlink_core::grant::PERMANENT_GRANT_EXP_UNIX)
+    } else {
+        parse_ttl(ttl)
+    }
 }
 
 /// `1d 2h`, `3h 4m`, `5m`, `6s` for a positive elapsed/remaining span.
@@ -18518,8 +18566,11 @@ fn grant_duration_text(secs: u64) -> String {
     }
 }
 
-/// `EXPIRED` or `in 1h 30m` for a grant expiry relative to `now_unix`.
+/// `EXPIRED`, `permanent`, or `in 1h 30m` for a grant expiry relative to `now_unix`.
 fn grant_expiry_status(now_unix: i64, exp_unix: i64) -> String {
+    if agentlink_core::grant::is_permanent_exp(exp_unix) {
+        return "permanent".to_string();
+    }
     let remaining = exp_unix - now_unix;
     if remaining < 0 {
         return "EXPIRED".to_string();
@@ -18543,10 +18594,10 @@ fn grant_issued_status(now_unix: i64, nbf_unix: i64) -> String {
     format!("{} ago", grant_duration_text(elapsed as u64))
 }
 
-/// `ACTIVE` through the expiry instant (inclusive), otherwise `EXPIRED`.
+/// `ACTIVE` through the expiry instant (inclusive) or when permanent, otherwise `EXPIRED`.
 #[allow(dead_code)]
 fn grant_status_label(now_unix: i64, exp_unix: i64) -> &'static str {
-    if now_unix <= exp_unix {
+    if agentlink_core::grant::is_permanent_exp(exp_unix) || now_unix <= exp_unix {
         "ACTIVE"
     } else {
         "EXPIRED"
@@ -18664,7 +18715,7 @@ fn grant_status_label_for(
             return "WRONG GRANTEE";
         }
     }
-    if now_unix > grant.exp_unix {
+    if !grant.is_permanent() && now_unix > grant.exp_unix {
         "EXPIRED"
     } else if now_unix < grant.nbf_unix {
         "NOT YET VALID"
@@ -18706,7 +18757,7 @@ fn grant_list_line_with_status(
     let short = grant_short_id(node_id);
     let timing = if status == "ACTIVE" {
         grant_expiry_status(now_unix, exp_unix)
-    } else if now_unix > exp_unix {
+    } else if !agentlink_core::grant::is_permanent_exp(exp_unix) && now_unix > exp_unix {
         format!(
             "expired {} ago",
             grant_duration_text((now_unix - exp_unix) as u64)
@@ -18739,7 +18790,8 @@ fn grant_list_json_item(
     let mut item = json!({
         "path": path,
         "grant": grant,
-        "expired": now_unix > grant.exp_unix,
+        "expired": !grant.is_permanent() && now_unix > grant.exp_unix,
+        "permanent": grant.is_permanent(),
         "status": status,
         "grantee_matches": grantee_matches,
         "node_short": grant_short_id(&grant.node_id),
@@ -18777,13 +18829,21 @@ fn format_grant_show_for(
         None => short,
     };
     let status = grant_status_label_for(grant, local_grantee_id, now_unix);
-    let expires = if now_unix > grant.exp_unix {
-        format!(
+    let expires_line = if grant.is_permanent() {
+        format!("{:<10}never (permanent)", "expires:")
+    } else if now_unix > grant.exp_unix {
+        let expires = format!(
             "EXPIRED ({} ago)",
             grant_duration_text((now_unix - grant.exp_unix) as u64)
-        )
+        );
+        format!("{:<10}{expires} (unix {})", "expires:", grant.exp_unix)
     } else {
-        grant_expiry_status(now_unix, grant.exp_unix)
+        format!(
+            "{:<10}{} (unix {})",
+            "expires:",
+            grant_expiry_status(now_unix, grant.exp_unix),
+            grant.exp_unix
+        )
     };
     let mut lines = vec![
         format!("{:<10}{node}", "node:"),
@@ -18795,7 +18855,7 @@ fn format_grant_show_for(
             grant_issued_status(now_unix, grant.nbf_unix),
             grant.nbf_unix
         ),
-        format!("{:<10}{expires} (unix {})", "expires:", grant.exp_unix),
+        expires_line,
         format!("{:<10}{}", "jti:", grant.jti),
         format!("{:<10}{}", "issuer:", grant_short_id(&grant.issuer_id)),
         format!("{:<10}{}", "grantee:", grant_short_id(&grant.grantee_id)),
@@ -19681,6 +19741,139 @@ mod grant_ttl_tests {
     }
 
     #[test]
+    fn ttl_accepts_year_and_permanent_aliases_and_rejects_huge_finite() {
+        assert_eq!(parse_ttl("1y").unwrap(), 365 * 86_400);
+        assert_eq!(parse_ttl("2Y").unwrap(), 2 * 365 * 86_400);
+        for alias in ["permanent", "PERMANENT", " never ", "forever"] {
+            assert_eq!(
+                parse_ttl(alias).unwrap(),
+                agentlink_core::grant::PERMANENT_GRANT_EXP_UNIX
+            );
+        }
+        assert!(parse_ttl("0").is_err());
+        assert!(parse_ttl("99999y").is_err());
+        assert!(parse_ttl(&agentlink_core::grant::PERMANENT_GRANT_EXP_UNIX.to_string()).is_err());
+        assert_eq!(
+            resolve_grant_ttl("1h", true).unwrap(),
+            agentlink_core::grant::PERMANENT_GRANT_EXP_UNIX
+        );
+        assert_eq!(resolve_grant_ttl("15m", false).unwrap(), 900);
+    }
+
+    #[test]
+    fn grant_permanent_and_all_flags_parse_and_conflict_with_explicit_ttl() {
+        let issue_all = Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "issue",
+            "--all",
+            "--policy",
+            "full",
+            "--permanent",
+            "--issuer",
+            "operator",
+        ])
+        .unwrap();
+        match issue_all.command {
+            Command::Grant(args) => match args.action {
+                GrantCommand::Issue {
+                    all,
+                    permanent,
+                    policy,
+                    issuer,
+                    ..
+                } => {
+                    assert!(all);
+                    assert!(permanent);
+                    assert_eq!(policy, "full");
+                    assert_eq!(issuer, GrantIssuerMode::Operator);
+                }
+                other => panic!("expected grant issue --all --permanent, got {other:?}"),
+            },
+            other => panic!("expected grant, got {other:?}"),
+        }
+
+        // Explicit `--ttl` conflicts with `--permanent`.
+        assert!(Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "issue",
+            "--all",
+            "--permanent",
+            "--ttl",
+            "1h",
+        ])
+        .is_err());
+
+        assert!(Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "refresh",
+            "--all",
+            "--permanent",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "ensure",
+            "--all",
+            "--permanent",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "offer",
+            "--policy",
+            "full",
+            "--permanent",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "agentlink",
+            "grant",
+            "request",
+            "--grantee",
+            &"ab".repeat(32),
+            "--permanent",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn permanent_grant_display_and_json_helpers() {
+        let now = 1_700_000_000;
+        let exp = agentlink_core::grant::PERMANENT_GRANT_EXP_UNIX;
+        assert_eq!(grant_expiry_status(now, exp), "permanent");
+        assert_eq!(grant_status_label(now, exp), "ACTIVE");
+        assert_eq!(grant_status_label(exp + 10_000, exp), "ACTIVE");
+
+        let node = "907AF48D6786D69A05776A83B94AABBE784F9FA5452C0AC0E469BAD4B1243043";
+        let line = grant_list_line(
+            Some("probe"),
+            node,
+            "full",
+            now,
+            exp,
+            "0e31d8db-5496-43eb-8138-e05a35bfb7dc",
+        );
+        assert!(line.contains("ACTIVE"), "{line}");
+        assert!(line.contains("permanent"), "{line}");
+
+        let grant = fixture_grant(NodePolicy::full(), now - 60, exp);
+        let path = std::path::PathBuf::from("/cfg/grants/907af48d6786.json");
+        let show = format_grant_show(Some("probe"), &grant, now, &path);
+        assert!(show.contains("status:   ACTIVE"), "{show}");
+        assert!(show.contains("expires:  never (permanent)"), "{show}");
+
+        let item = grant_list_json_item(&grant, &path, Some("probe"), now, None);
+        assert_eq!(item["expired"], json!(false));
+        assert_eq!(item["permanent"], json!(true));
+        assert_eq!(item["expires_in"], json!("permanent"));
+    }
+
+    #[test]
     fn untrusted_grant_detection_ignores_other_errors() {
         assert_eq!(
             untrusted_grant_issuer_hex("authentication failed: bad token"),
@@ -20292,6 +20485,7 @@ fn grant_result_json(
         "grant": grant,
         "path": path,
         "issuer": issuer.public_hex(),
+        "permanent": grant.is_permanent(),
     });
     if let Some(cmd) = trust_owner_cmd {
         out["trust_owner_cmd"] = json!(cmd);
@@ -20342,13 +20536,20 @@ fn write_grant_result(
         grant_result_json(grant, path, issuer, trust_owner_cmd),
         || {
             let now = agentlink_core::util::unix_now();
-            println!(
-                "grant {} on node {} ({}; unix {})",
-                grant.grantee_id,
-                grant.node_id,
-                grant_expiry_status(now, grant.exp_unix),
-                grant.exp_unix
-            );
+            if grant.is_permanent() {
+                println!(
+                    "grant {} on node {} (permanent; never expires)",
+                    grant.grantee_id, grant.node_id
+                );
+            } else {
+                println!(
+                    "grant {} on node {} ({}; unix {})",
+                    grant.grantee_id,
+                    grant.node_id,
+                    grant_expiry_status(now, grant.exp_unix),
+                    grant.exp_unix
+                );
+            }
             println!("access: {}", grant.policy.capability_summary());
             println!("issuer: {}", issuer.public_hex());
             println!("jti: {}", grant.jti);
@@ -20500,6 +20701,7 @@ fn grant_paste_card(
             "fingerprint": fp,
             "access": req.policy.capability_summary(),
             "ttl_secs": req.ttl_secs,
+            "permanent": agentlink_core::grant::is_permanent_ttl(req.ttl_secs),
             "exp_unix": req.exp_unix,
             "status": "pending",
         }),
@@ -20511,7 +20713,10 @@ fn grant_paste_card(
             println!("controller fingerprint: {fp}");
             println!("controller public key:  {}", req.grantee_id);
             println!("requested access:       {}", req.policy.capability_summary());
-            println!("grant lifetime if allowed: {}s", req.ttl_secs);
+            println!(
+                "grant lifetime if allowed: {}",
+                agentlink_core::grant::format_ttl_summary(req.ttl_secs)
+            );
             eprintln!("{}", grant_local::SIGNATURE_DISCLAIMER);
             eprintln!("{}", grant_local::SCOPE_NOTE);
             eprintln!(
@@ -20576,6 +20781,31 @@ fn grant_paste_card(
     Ok(0)
 }
 
+async fn collect_fleet_grant_targets(
+    cli: &Cli,
+    dir: &Path,
+) -> Result<Vec<(Option<String>, String)>> {
+    let mut targets: Vec<(Option<String>, String)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Ok(client) = connect_client(cli, "grant").await {
+        if let Ok(nodes) = client.list_nodes().await {
+            for n in nodes {
+                let id = n.id.trim().to_ascii_lowercase();
+                if !id.is_empty() && seen.insert(id.clone()) {
+                    targets.push((Some(n.name), id));
+                }
+            }
+        }
+    }
+    for (name, id) in load_pin_map(dir)? {
+        let id = id.trim().to_ascii_lowercase();
+        if !id.is_empty() && seen.insert(id.clone()) {
+            targets.push((Some(name), id));
+        }
+    }
+    Ok(targets)
+}
+
 async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
     let mutating = !matches!(
         action,
@@ -20592,15 +20822,16 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
         GrantCommand::Issue {
             node_pos,
             node_flag,
+            all,
             ttl,
+            permanent,
             policy,
             grantee,
             issuer: issuer_mode,
             issuer_data_dir,
             out,
         } => {
-            let node = resolve_grant_node_arg(cli, node_flag.as_deref(), node_pos.as_deref())?;
-            let ttl_secs = parse_ttl(ttl)?;
+            let ttl_secs = resolve_grant_ttl(ttl, *permanent)?;
             let policy = parse_access(policy)?;
             let operator = Identity::load_or_create(&operator_identity_path(cli)?)
                 .map_err(|err| anyhow!(err.to_string()))?;
@@ -20612,6 +20843,98 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     "--grantee must be a 32-byte ed25519 public key hex"
                 ));
             }
+            if *all {
+                if node_pos.is_some() || node_flag.is_some() {
+                    return Err(anyhow!(
+                        "cannot combine `--all` with a specific node target"
+                    ));
+                }
+                if out.is_some() {
+                    return Err(anyhow!("cannot combine `--all` with `--out`"));
+                }
+                let targets = collect_fleet_grant_targets(cli, &dir).await?;
+                if targets.is_empty() {
+                    emit(cli.json, json!({"ok": true, "results": []}), || {
+                        println!("no paired or pinned machines found");
+                    });
+                    return Ok(0);
+                }
+                let now = agentlink_core::util::unix_now();
+                let exp = agentlink_core::grant::exp_unix_for_ttl(now, ttl_secs)
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                let mut results = Vec::new();
+                let mut any_err = false;
+                let mut operator_issuer_tip: Option<String> = None;
+                for (name, node_id) in targets {
+                    let res = (|| -> Result<(String, Value)> {
+                        let resolved_dir = resolve_issuer_data_dir(
+                            issuer_data_dir.as_deref(),
+                            *issuer_mode,
+                            Some(&node_id),
+                        )?;
+                        let issuer = grant_issuer(resolved_dir.as_deref(), &operator)?;
+                        let trust_owner_cmd =
+                            operator_trust_owner_cmd(&issuer, resolved_dir.as_deref());
+                        if trust_owner_cmd.is_some() && operator_issuer_tip.is_none() {
+                            operator_issuer_tip = Some(issuer.public_hex().to_string());
+                        }
+                        let grant = agentlink_core::grant::SignedGrant::sign(
+                            &issuer,
+                            &grantee,
+                            &node_id,
+                            policy.clone(),
+                            now,
+                            exp,
+                            uuid::Uuid::new_v4().to_string(),
+                        )
+                        .map_err(|err| anyhow!(err.to_string()))?;
+                        let path = agentlink_core::grant::save_grant(&dir, &grant)
+                            .map_err(|err| anyhow!(err.to_string()))?;
+                        let val = grant_result_json(
+                            &grant,
+                            &path,
+                            &issuer,
+                            trust_owner_cmd.as_deref(),
+                        );
+                        Ok((
+                            format!("issued ({})", grant_expiry_status(now, grant.exp_unix)),
+                            val,
+                        ))
+                    })();
+                    match res {
+                        Ok((summary, val)) => {
+                            if !cli.json {
+                                let label = match name.as_deref() {
+                                    Some(n) => format!("{n} ({})", grant_short_id(&node_id)),
+                                    None => grant_short_id(&node_id),
+                                };
+                                println!("{label:<32} {summary}");
+                            }
+                            results.push(json!({"node_id": node_id, "name": name, "ok": true, "result": val}));
+                        }
+                        Err(err) => {
+                            any_err = true;
+                            if !cli.json {
+                                eprintln!(
+                                    "error issuing {}: {err}",
+                                    name.as_deref().unwrap_or(&node_id)
+                                );
+                            }
+                            results.push(json!({"node_id": node_id, "name": name, "ok": false, "error": err.to_string()}));
+                        }
+                    }
+                }
+                if !cli.json {
+                    if let Some(issuer_hex) = operator_issuer_tip {
+                        eprintln!("{}", grant_issuer_trust_tip(&issuer_hex));
+                    }
+                }
+                if cli.json {
+                    println!("{}", json!({"ok": !any_err, "results": results}));
+                }
+                return Ok(if any_err { 1 } else { 0 });
+            }
+            let node = resolve_grant_node_arg(cli, node_flag.as_deref(), node_pos.as_deref())?;
             let node_id =
                 resolve_grant_node_local_or_relay(cli, &node, issuer_data_dir.as_deref()).await?;
             let resolved_issuer_dir =
@@ -20619,7 +20942,8 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             let issuer = grant_issuer(resolved_issuer_dir.as_deref(), &operator)?;
             let trust_owner_cmd = operator_trust_owner_cmd(&issuer, resolved_issuer_dir.as_deref());
             let now = agentlink_core::util::unix_now();
-            let exp = now.saturating_add(ttl_secs);
+            let exp = agentlink_core::grant::exp_unix_for_ttl(now, ttl_secs)
+                .map_err(|err| anyhow!(err.to_string()))?;
             let grant = agentlink_core::grant::SignedGrant::sign(
                 &issuer,
                 &grantee,
@@ -20647,11 +20971,12 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             node_flag,
             all,
             ttl,
+            permanent,
             issuer: issuer_mode,
             issuer_data_dir,
             out,
         } => {
-            let ttl_secs = parse_ttl(ttl)?;
+            let ttl_secs = resolve_grant_ttl(ttl, *permanent)?;
             let operator = Identity::load_or_create(&operator_identity_path(cli)?)
                 .map_err(|err| anyhow!(err.to_string()))?;
             if *all {
@@ -20664,7 +20989,8 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     return Ok(0);
                 }
                 let now = agentlink_core::util::unix_now();
-                let exp = now.saturating_add(ttl_secs);
+                let exp = agentlink_core::grant::exp_unix_for_ttl(now, ttl_secs)
+                    .map_err(|err| anyhow!(err.to_string()))?;
                 let mut results = Vec::new();
                 let mut any_err = false;
                 for stored in stored_list {
@@ -20744,7 +21070,8 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             let issuer = grant_issuer(resolved_issuer_dir.as_deref(), &operator)?;
             let trust_owner_cmd = operator_trust_owner_cmd(&issuer, resolved_issuer_dir.as_deref());
             let now = agentlink_core::util::unix_now();
-            let exp = now.saturating_add(ttl_secs);
+            let exp = agentlink_core::grant::exp_unix_for_ttl(now, ttl_secs)
+                .map_err(|err| anyhow!(err.to_string()))?;
             let grant = agentlink_core::grant::refresh_grant(
                 &issuer,
                 &stored,
@@ -20770,12 +21097,13 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             node_flag,
             all,
             ttl,
+            permanent,
             policy,
             grantee,
             issuer: issuer_mode,
             issuer_data_dir,
         } => {
-            let ttl_secs = parse_ttl(ttl)?;
+            let ttl_secs = resolve_grant_ttl(ttl, *permanent)?;
             let policy = parse_access(policy)?;
             let operator = Identity::load_or_create(&operator_identity_path(cli)?)
                 .map_err(|err| anyhow!(err.to_string()))?;
@@ -20788,19 +21116,7 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                 ));
             }
             if *all {
-                let mut targets: Vec<(Option<String>, String)> = Vec::new();
-                if let Ok(client) = connect_client(cli, "grant").await {
-                    if let Ok(nodes) = client.list_nodes().await {
-                        for n in nodes {
-                            targets.push((Some(n.name), n.id));
-                        }
-                    }
-                }
-                if targets.is_empty() {
-                    for (name, id) in load_pin_map(&dir)? {
-                        targets.push((Some(name), id));
-                    }
-                }
+                let targets = collect_fleet_grant_targets(cli, &dir).await?;
                 if targets.is_empty() {
                     emit(cli.json, json!({"ok": true, "results": []}), || {
                         println!("no paired or pinned machines found");
@@ -20892,12 +21208,19 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                 },
                 || {
                     let now = agentlink_core::util::unix_now();
-                    println!(
-                        "grant {action} for node {} ({}; unix {})",
-                        grant.node_id,
-                        grant_expiry_status(now, grant.exp_unix),
-                        grant.exp_unix
-                    );
+                    if grant.is_permanent() {
+                        println!(
+                            "grant {action} for node {} (permanent; never expires)",
+                            grant.node_id
+                        );
+                    } else {
+                        println!(
+                            "grant {action} for node {} ({}; unix {})",
+                            grant.node_id,
+                            grant_expiry_status(now, grant.exp_unix),
+                            grant.exp_unix
+                        );
+                    }
                     println!("access: {}", grant.policy.capability_summary());
                     println!("issuer: {}", issuer.public_hex());
                     println!("jti: {}", grant.jti);
@@ -21202,7 +21525,7 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             );
             let grant_exp = stored_grant
                 .as_ref()
-                .filter(|grant| grant.jti.eq_ignore_ascii_case(&jti))
+                .filter(|grant| grant.jti.eq_ignore_ascii_case(&jti) && !grant.is_permanent())
                 .map(|grant| grant.exp_unix);
             let node_id = target.as_ref().map(|target| target.node_id.clone());
             let label = node_id.clone().unwrap_or_else(|| node.clone());
@@ -21293,6 +21616,7 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     "policy": r.policy,
                     "access": r.policy.capability_summary(),
                     "ttl_secs": r.ttl_secs,
+                    "permanent": agentlink_core::grant::is_permanent_ttl(r.ttl_secs),
                     "status": r.status,
                     "created_unix": r.created_unix,
                     "exp_unix": r.exp_unix,
@@ -21304,13 +21628,18 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                         return;
                     }
                     for r in &reqs {
+                        let ttl_label = if agentlink_core::grant::is_permanent_ttl(r.ttl_secs) {
+                            "permanent".to_string()
+                        } else {
+                            r.ttl_secs.to_string()
+                        };
                         println!(
                             "{:<10} {}  {}  {}  ttl {}  expires unix {}  {}",
                             format!("{:?}:", r.status).to_lowercase(),
                             r.request_id,
                             &r.grantee_id[..16.min(r.grantee_id.len())],
                             r.policy.capability_summary(),
-                            r.ttl_secs,
+                            ttl_label,
                             r.exp_unix,
                             if r.is_pending(now) { "PENDING" } else { "" }
                         );
@@ -21450,6 +21779,7 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
         GrantCommand::Offer {
             policy,
             ttl,
+            permanent,
             node,
             offer_ttl,
             relay_fp,
@@ -21458,8 +21788,14 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             let operator = Identity::load_or_create(&operator_identity_path(cli)?)
                 .map_err(|err| anyhow!(err.to_string()))?;
             let policy = parse_access(policy)?;
-            let ttl_secs = parse_ttl(ttl)? as u64;
-            let offer_ttl_secs = parse_ttl(offer_ttl)? as u64;
+            let ttl_secs = resolve_grant_ttl(ttl, *permanent)? as u64;
+            let offer_ttl_i64 = parse_ttl(offer_ttl)?;
+            if agentlink_core::grant::is_permanent_exp(offer_ttl_i64) {
+                return Err(anyhow!(
+                    "--offer-ttl must be a finite duration (max 24h); use --ttl permanent or --permanent for the grant lifetime"
+                ));
+            }
+            let offer_ttl_secs = offer_ttl_i64 as u64;
             let now = agentlink_core::util::unix_now();
             let offer = agentlink_core::grant_offer::issue_offer(
                 &operator,
@@ -21495,6 +21831,7 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     "fingerprint": fp,
                     "access": offer.policy.capability_summary(),
                     "ttl_secs": offer.ttl_secs,
+                    "permanent": agentlink_core::grant::is_permanent_ttl(offer.ttl_secs),
                     "offer_exp_unix": offer.exp_unix,
                     "node_id": offer.node_id,
                 }),
@@ -21506,7 +21843,10 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     eprintln!("controller fingerprint: {fp}");
                     eprintln!("controller public key:  {}", offer.grantee_id);
                     eprintln!("requested access:       {}", offer.policy.capability_summary());
-                    eprintln!("grant lifetime if allowed: {}s", offer.ttl_secs);
+                    eprintln!(
+                        "grant lifetime if allowed: {}",
+                        agentlink_core::grant::format_ttl_summary(offer.ttl_secs)
+                    );
                     eprintln!("offer expires unix:     {}", offer.exp_unix);
                     if let Some(id) = offer.node_id.as_deref() {
                         eprintln!("bound target node key:  {id}");
@@ -21540,12 +21880,13 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
             grantee,
             policy,
             ttl,
+            permanent,
             data_dir,
         } => {
             let dir = grant_node_data_dir(data_dir.as_deref())?;
             let node_id = local_node_public_id(&dir)?;
             let policy = parse_access(policy)?;
-            let ttl_secs = parse_ttl(ttl)? as u64;
+            let ttl_secs = resolve_grant_ttl(ttl, *permanent)? as u64;
             let now = agentlink_core::util::unix_now();
             let draft = agentlink_core::grant_request::draft_request(
                 grantee,
@@ -21566,6 +21907,7 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     "node_id": stored.node_id,
                     "access": stored.policy.capability_summary(),
                     "ttl_secs": stored.ttl_secs,
+                    "permanent": agentlink_core::grant::is_permanent_ttl(stored.ttl_secs),
                     "exp_unix": stored.exp_unix,
                     "status": "pending",
                     "note": "not a grant; run grant allow locally to sign",
@@ -21574,6 +21916,10 @@ async fn grant_cmd(cli: &Cli, action: &GrantCommand) -> Result<i32> {
                     println!("recorded pending request {}", stored.request_id);
                     println!("controller: {}", stored.grantee_id);
                     println!("access: {}", stored.policy.capability_summary());
+                    println!(
+                        "lifetime: {}",
+                        agentlink_core::grant::format_ttl_summary(stored.ttl_secs)
+                    );
                     eprintln!(
                         "this is not a grant. On this machine allow with:\n  agentlink grant allow {} --data-dir {}",
                         stored.request_id,
